@@ -7,6 +7,7 @@ from PyQt5.QtCore import Qt
 
 from .canvas import MapCanvas
 from .layer_panel import LayerPanel
+from .axis_ruler import MapCanvasWithAxes
 
 
 class MainWindow(QMainWindow):
@@ -29,9 +30,10 @@ class MainWindow(QMainWindow):
         self.layer_panel = LayerPanel()
         splitter.addWidget(self.layer_panel)
         
-        # Map canvas on the right
+        # Map canvas with axes on the right
         self.canvas = MapCanvas()
-        splitter.addWidget(self.canvas)
+        self.canvas_with_axes = MapCanvasWithAxes(self.canvas)
+        splitter.addWidget(self.canvas_with_axes)
         
         # Set initial sizes (layer panel smaller than canvas)
         splitter.setSizes([250, 774])
