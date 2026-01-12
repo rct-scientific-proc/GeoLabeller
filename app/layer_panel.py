@@ -7,6 +7,17 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, pyqtSignal
 
 
+class LayerTreeWidget(QTreeWidget):
+    """Tree widget that emits signal after drag-drop."""
+    
+    items_reordered = pyqtSignal()
+    
+    def dropEvent(self, event):
+        """Handle drop and emit reorder signal."""
+        super().dropEvent(event)
+        self.items_reordered.emit()
+
+
 class LayerPanel(QWidget):
     """Panel for managing layers and groups."""
     
@@ -24,7 +35,7 @@ class LayerPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         
         # Tree widget for layers and groups
-        self.tree = QTreeWidget()
+        self.tree = LayerTreeWidget()
         self.tree.setHeaderLabel("Layers")
         self.tree.setDragDropMode(QTreeWidget.InternalMove)
         self.tree.setSelectionMode(QTreeWidget.ExtendedSelection)
@@ -33,7 +44,7 @@ class LayerPanel(QWidget):
         # Connect signals
         self.tree.itemChanged.connect(self._on_item_changed)
         self.tree.customContextMenuRequested.connect(self._show_context_menu)
-        self.tree.model().rowsMoved.connect(self._on_rows_moved)
+        self.tree.items_reordered.connect(self._on_rows_moved)
         
         layout.addWidget(self.tree)
     
