@@ -95,7 +95,7 @@ class MainWindow(QMainWindow):
                 self.layer_panel.add_layer(layer_id, file_path)
     
     def _add_directory(self):
-        """Open directory dialog and load all GeoTIFFs in it."""
+        """Open directory dialog and load all GeoTIFFs preserving directory structure."""
         from pathlib import Path
         
         dir_path = QFileDialog.getExistingDirectory(
@@ -109,19 +109,54 @@ class MainWindow(QMainWindow):
             return
         
         # Find all GeoTIFF files recursively
-        path = Path(dir_path)
-        tiff_files = list(path.rglob("*.tif")) + list(path.rglob("*.tiff"))
+        root_path = Path(dir_path)
+        tiff_files = list(root_path.rglob("*.tif")) + list(root_path.rglob("*.tiff"))
         
-        # Sort by name for consistent ordering
+        # Sort by path for consistent ordering
         tiff_files.sort()
         
-        # Load each file
+        if not tiff_files:
+            self.statusBar.showMessage("No GeoTIFF files found in directory", 5000)
+            return
+        
+        # Build directory structure with groups
+        # Maps relative directory path -> group item
+        group_cache: dict[Path, any] = {}
+        
+        def get_or_create_group(rel_dir: Path):
+            """Get or create group hierarchy for a relative directory path."""
+            if rel_dir == Path("."):
+                return None
+            
+            if rel_dir in group_cache:
+                return group_cache[rel_dir]
+            
+            # Get or create parent group first
+            parent_group = get_or_create_group(rel_dir.parent)
+            
+            # Create this group
+            group = self.layer_panel.add_group(rel_dir.name, parent_group)
+            group_cache[rel_dir] = group
+            return group
+        
+        # Load each file into appropriate group
         loaded_count = 0
         for file_path in tiff_files:
+            # Get relative path from root
+            rel_path = file_path.relative_to(root_path)
+            rel_dir = rel_path.parent
+            
+            # Get or create the group for this directory
+            parent_group = get_or_create_group(rel_dir)
+            
+            # Load the layer
             layer_id = self.canvas.add_layer(str(file_path))
             if layer_id:
-                self.layer_panel.add_layer(layer_id, str(file_path))
+                self.layer_panel.add_layer(layer_id, str(file_path), parent_group)
                 loaded_count += 1
+        
+        # Expand all groups
+        self.layer_panel.tree.expandAll()
         
         # Show status message
         self.statusBar.showMessage(f"Loaded {loaded_count} of {len(tiff_files)} GeoTIFF files", 5000)

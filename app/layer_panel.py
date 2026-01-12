@@ -50,8 +50,14 @@ class LayerPanel(QWidget):
         
         layout.addWidget(self.tree)
     
-    def add_layer(self, layer_id: str, file_path: str):
-        """Add a layer item to the tree."""
+    def add_layer(self, layer_id: str, file_path: str, parent: QTreeWidgetItem = None):
+        """Add a layer item to the tree.
+        
+        Args:
+            layer_id: Unique identifier for the layer
+            file_path: Path to the GeoTIFF file
+            parent: Optional parent group item. If None, adds to top level.
+        """
         item = QTreeWidgetItem()
         item.setText(0, os.path.basename(file_path))
         item.setData(0, Qt.UserRole, layer_id)
@@ -60,17 +66,28 @@ class LayerPanel(QWidget):
         item.setCheckState(0, Qt.Checked)
         item.setToolTip(0, file_path)
         
-        self.tree.addTopLevelItem(item)
+        if parent:
+            parent.addChild(item)
+        else:
+            self.tree.addTopLevelItem(item)
     
-    def add_group(self, name: str):
-        """Add a group to the tree."""
+    def add_group(self, name: str, parent: QTreeWidgetItem = None):
+        """Add a group to the tree.
+        
+        Args:
+            name: Display name for the group
+            parent: Optional parent group item. If None, adds to top level.
+        """
         item = QTreeWidgetItem()
         item.setText(0, name)
         item.setData(0, Qt.UserRole + 1, "group")
         item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
         item.setCheckState(0, Qt.Checked)
         
-        self.tree.addTopLevelItem(item)
+        if parent:
+            parent.addChild(item)
+        else:
+            self.tree.addTopLevelItem(item)
         return item
     
     def _on_item_changed(self, item: QTreeWidgetItem, column: int):
