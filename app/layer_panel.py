@@ -24,6 +24,7 @@ class LayerPanel(QWidget):
     # Signals
     layer_visibility_changed = pyqtSignal(str, bool)  # layer_id, visible
     layers_reordered = pyqtSignal(list)  # list of layer_ids
+    zoom_to_layer_requested = pyqtSignal(str)  # layer_id
     
     def __init__(self):
         super().__init__()
@@ -119,9 +120,18 @@ class LayerPanel(QWidget):
         add_group_action = menu.addAction("New Group")
         add_group_action.triggered.connect(self._create_group)
         
-        # If item selected, show remove option
+        # If item selected, show options
         item = self.tree.itemAt(position)
         if item:
+            item_type = item.data(0, Qt.UserRole + 1)
+            
+            # Zoom to layer option (only for layers, not groups)
+            if item_type == "layer":
+                menu.addSeparator()
+                zoom_action = menu.addAction("Zoom to Layer")
+                layer_id = item.data(0, Qt.UserRole)
+                zoom_action.triggered.connect(lambda: self.zoom_to_layer_requested.emit(layer_id))
+            
             menu.addSeparator()
             remove_action = menu.addAction("Remove")
             remove_action.triggered.connect(lambda: self._remove_item(item))

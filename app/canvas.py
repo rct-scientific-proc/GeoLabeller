@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 from PyQt5.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 from PyQt5.QtGui import QImage, QPixmap, QWheelEvent, QTransform
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal, QRectF
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterio.crs import CRS
@@ -179,6 +179,20 @@ class MapCanvas(QGraphicsView):
             del self._layers[layer_id]
             if layer_id in self._layer_order:
                 self._layer_order.remove(layer_id)
+    
+    def zoom_to_layer(self, layer_id: str):
+        """Zoom the view to fit a specific layer's bounds."""
+        if layer_id not in self._layers:
+            return
+        
+        bounds = self._layers[layer_id]["bounds"]
+        west, south, east, north = bounds
+        
+        # Create rect in scene coordinates (Y is flipped)
+        rect = QRectF(west, -north, east - west, north - south)
+        
+        # Fit view to the rect with some padding
+        self.fitInView(rect, Qt.KeepAspectRatio)
     
     def wheelEvent(self, event: QWheelEvent):
         """Zoom in/out with mouse wheel."""

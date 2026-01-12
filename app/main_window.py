@@ -47,6 +47,7 @@ class MainWindow(QMainWindow):
         # Connect signals
         self.layer_panel.layer_visibility_changed.connect(self.canvas.set_layer_visibility)
         self.layer_panel.layers_reordered.connect(self.canvas.update_layer_order)
+        self.layer_panel.zoom_to_layer_requested.connect(self.canvas.zoom_to_layer)
         self.canvas.coordinates_changed.connect(self._update_coordinates)
     
     def _setup_menu(self):
