@@ -1,0 +1,1 @@
+"""GeoLabel application package."""
