@@ -1,6 +1,7 @@
 """Main application window."""
 from PyQt5.QtWidgets import (
-    QMainWindow, QSplitter, QMenuBar, QMenu, QAction, QFileDialog
+    QMainWindow, QSplitter, QMenuBar, QMenu, QAction, QFileDialog,
+    QStatusBar, QLabel
 )
 from PyQt5.QtCore import Qt
 
@@ -37,9 +38,16 @@ class MainWindow(QMainWindow):
         
         self.setCentralWidget(splitter)
         
+        # Set up status bar
+        self.statusBar = QStatusBar()
+        self.setStatusBar(self.statusBar)
+        self.coord_label = QLabel("")
+        self.statusBar.addPermanentWidget(self.coord_label)
+        
         # Connect signals
         self.layer_panel.layer_visibility_changed.connect(self.canvas.set_layer_visibility)
         self.layer_panel.layers_reordered.connect(self.canvas.update_layer_order)
+        self.canvas.coordinates_changed.connect(self._update_coordinates)
     
     def _setup_menu(self):
         """Set up the menu bar."""
@@ -75,3 +83,7 @@ class MainWindow(QMainWindow):
             layer_id = self.canvas.add_layer(file_path)
             if layer_id:
                 self.layer_panel.add_layer(layer_id, file_path)
+    
+    def _update_coordinates(self, lon: float, lat: float):
+        """Update the coordinate display in the status bar."""
+        self.coord_label.setText(f"Lon: {lon:.6f}°  Lat: {lat:.6f}°")
