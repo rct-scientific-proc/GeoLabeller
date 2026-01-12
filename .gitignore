@@ -40,3 +40,6 @@ Thumbs.db
 # Project specific
 *.tif
 *.tiff
+
+# Test scripts
+tests/
