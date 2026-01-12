@@ -25,6 +25,7 @@ class LayerPanel(QWidget):
     layer_visibility_changed = pyqtSignal(str, bool)  # layer_id, visible
     layers_reordered = pyqtSignal(list)  # list of layer_ids
     zoom_to_layer_requested = pyqtSignal(str)  # layer_id
+    layer_removed = pyqtSignal(str)  # layer_id
     
     def __init__(self):
         super().__init__()
@@ -158,10 +159,27 @@ class LayerPanel(QWidget):
             if reply == QMessageBox.No:
                 return
         
-        # Get parent and remove
+        # Collect layer IDs to remove (for groups, get all children)
+        layer_ids_to_remove = []
+        self._collect_layer_ids(item, layer_ids_to_remove)
+        
+        # Get parent and remove from tree
         parent = item.parent()
         if parent:
             parent.removeChild(item)
         else:
             index = self.tree.indexOfTopLevelItem(item)
             self.tree.takeTopLevelItem(index)
+        
+        # Emit removal signals for each layer
+        for layer_id in layer_ids_to_remove:
+            self.layer_removed.emit(layer_id)
+    
+    def _collect_layer_ids(self, item: QTreeWidgetItem, layer_ids: list):
+        """Recursively collect layer IDs from an item and its children."""
+        item_type = item.data(0, Qt.UserRole + 1)
+        if item_type == "layer":
+            layer_ids.append(item.data(0, Qt.UserRole))
+        else:
+            for i in range(item.childCount()):
+                self._collect_layer_ids(item.child(i), layer_ids)

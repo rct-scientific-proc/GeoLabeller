@@ -105,11 +105,15 @@ class TiledLayer:
         px_right = min((tx + 1) * TILE_SIZE, self._width)
         px_bottom = min((ty + 1) * TILE_SIZE, self._height)
         
-        # World bounds - tile (0,0) is top-left of image
-        tile_west = west + tx * self._tile_world_width
-        tile_east = west + (tx + 1) * self._tile_world_width
-        tile_north = north - ty * self._tile_world_height
-        tile_south = north - (ty + 1) * self._tile_world_height
+        # Calculate world coords per pixel
+        world_per_pixel_x = (east - west) / self._width
+        world_per_pixel_y = (north - south) / self._height
+        
+        # World bounds based on actual pixel bounds
+        tile_west = west + px_left * world_per_pixel_x
+        tile_east = west + px_right * world_per_pixel_x
+        tile_north = north - px_top * world_per_pixel_y
+        tile_south = north - px_bottom * world_per_pixel_y
         
         return px_left, px_top, px_right, px_bottom, tile_west, tile_south, tile_east, tile_north
     

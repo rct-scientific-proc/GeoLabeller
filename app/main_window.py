@@ -50,6 +50,7 @@ class MainWindow(QMainWindow):
         self.layer_panel.layer_visibility_changed.connect(self.canvas.set_layer_visibility)
         self.layer_panel.layers_reordered.connect(self.canvas.update_layer_order)
         self.layer_panel.zoom_to_layer_requested.connect(self.canvas.zoom_to_layer)
+        self.layer_panel.layer_removed.connect(self.canvas.remove_layer)
         self.canvas.coordinates_changed.connect(self._update_coordinates)
     
     def _setup_menu(self):
@@ -64,6 +65,12 @@ class MainWindow(QMainWindow):
         add_action.setShortcut("Ctrl+O")
         add_action.triggered.connect(self._add_geotiff)
         file_menu.addAction(add_action)
+        
+        # Add Directory action
+        add_dir_action = QAction("Add &Directory...", self)
+        add_dir_action.setShortcut("Ctrl+Shift+O")
+        add_dir_action.triggered.connect(self._add_directory)
+        file_menu.addAction(add_dir_action)
         
         file_menu.addSeparator()
         
@@ -86,6 +93,38 @@ class MainWindow(QMainWindow):
             layer_id = self.canvas.add_layer(file_path)
             if layer_id:
                 self.layer_panel.add_layer(layer_id, file_path)
+    
+    def _add_directory(self):
+        """Open directory dialog and load all GeoTIFFs in it."""
+        from pathlib import Path
+        
+        dir_path = QFileDialog.getExistingDirectory(
+            self,
+            "Select Directory with GeoTIFFs",
+            "",
+            QFileDialog.ShowDirsOnly
+        )
+        
+        if not dir_path:
+            return
+        
+        # Find all GeoTIFF files recursively
+        path = Path(dir_path)
+        tiff_files = list(path.rglob("*.tif")) + list(path.rglob("*.tiff"))
+        
+        # Sort by name for consistent ordering
+        tiff_files.sort()
+        
+        # Load each file
+        loaded_count = 0
+        for file_path in tiff_files:
+            layer_id = self.canvas.add_layer(str(file_path))
+            if layer_id:
+                self.layer_panel.add_layer(layer_id, str(file_path))
+                loaded_count += 1
+        
+        # Show status message
+        self.statusBar.showMessage(f"Loaded {loaded_count} of {len(tiff_files)} GeoTIFF files", 5000)
     
     def _update_coordinates(self, lon: float, lat: float):
         """Update the coordinate display in the status bar."""
