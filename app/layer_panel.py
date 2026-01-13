@@ -180,6 +180,15 @@ class LayerPanel(QWidget):
                 layer_id = item.data(0, Qt.UserRole)
                 zoom_action.triggered.connect(lambda: self.zoom_to_layer_requested.emit(layer_id))
             
+            # Group-specific options
+            if item_type == "group":
+                menu.addSeparator()
+                select_all_action = menu.addAction("Select all children")
+                select_all_action.triggered.connect(lambda: self._set_all_children_checked(item, True))
+                
+                unselect_all_action = menu.addAction("Unselect all children")
+                unselect_all_action.triggered.connect(lambda: self._set_all_children_checked(item, False))
+            
             menu.addSeparator()
             remove_action = menu.addAction("Remove")
             remove_action.triggered.connect(lambda: self._remove_item(item))
@@ -191,6 +200,27 @@ class LayerPanel(QWidget):
         name, ok = QInputDialog.getText(self, "New Group", "Group name:")
         if ok and name:
             self.add_group(name)
+    
+    def _set_all_children_checked(self, item: QTreeWidgetItem, checked: bool):
+        """Recursively set check state for all children of an item.
+        
+        Args:
+            item: The parent item whose children will be updated
+            checked: True to check all children, False to uncheck
+        """
+        check_state = Qt.Checked if checked else Qt.Unchecked
+        
+        def set_children_state(parent: QTreeWidgetItem):
+            for i in range(parent.childCount()):
+                child = parent.child(i)
+                child.setCheckState(0, check_state)
+                # Recurse into nested groups
+                if child.data(0, Qt.UserRole + 1) == "group":
+                    set_children_state(child)
+        
+        set_children_state(item)
+        # Also set the group item itself
+        item.setCheckState(0, check_state)
     
     def _remove_item(self, item: QTreeWidgetItem):
         """Remove an item from the tree."""
