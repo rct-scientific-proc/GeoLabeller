@@ -1,6 +1,7 @@
 """Main application window."""
 from pathlib import Path
 
+import numpy as np
 from PyQt5.QtWidgets import (
     QMainWindow, QSplitter, QMenuBar, QMenu, QAction, QFileDialog,
     QStatusBar, QLabel, QToolBar, QComboBox, QMessageBox
@@ -158,6 +159,11 @@ class MainWindow(QMainWindow):
         export_gt_action = QAction("&Ground Truth...", self)
         export_gt_action.triggered.connect(self._export_ground_truth)
         export_menu.addAction(export_gt_action)
+        
+        # Export Sub-images
+        export_subimages_action = QAction("&Sub-images...", self)
+        export_subimages_action.triggered.connect(self._export_subimages)
+        export_menu.addAction(export_subimages_action)
     
     def _setup_toolbar(self):
         """Set up the toolbar for labeling."""
@@ -540,6 +546,194 @@ class MainWindow(QMainWindow):
                 self.statusBar.showMessage(f"Exported {self.project.label_count} labels to {file_path}", 3000)
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to export ground truth: {e}")
+
+    def _export_subimages(self):
+        """Export sub-images centered on labels for use with PyTorch ImageFolder."""
+        from PyQt5.QtWidgets import QInputDialog, QProgressDialog
+        from PyQt5.QtCore import Qt as QtCore_Qt
+        import rasterio
+        import os
+        from PIL import Image
+        
+        if self.project.label_count == 0:
+            QMessageBox.information(self, "Export", "No labels to export.")
+            return
+        
+        # Prompt for sub-image size in meters
+        size_meters, ok = QInputDialog.getDouble(
+            self,
+            "Sub-image Size",
+            "Enter the sub-image size in meters (width and height):",
+            value=10.0,
+            min=0.1,
+            max=10000.0,
+            decimals=2
+        )
+        if not ok:
+            return
+        
+        # Prompt for output directory
+        output_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select Output Directory for Sub-images",
+            "",
+            QFileDialog.ShowDirsOnly
+        )
+        if not output_dir:
+            return
+        
+        output_path = Path(output_dir)
+        
+        # Progress dialog
+        progress = QProgressDialog("Exporting sub-images...", "Cancel", 0, self.project.label_count, self)
+        progress.setWindowModality(QtCore_Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        
+        exported = 0
+        errors = []
+        
+        for idx, (image_data, label) in enumerate(self.project.get_all_labels()):
+            if progress.wasCanceled():
+                break
+            
+            progress.setValue(idx)
+            
+            image_path = image_data.path
+            if not os.path.exists(image_path):
+                errors.append(f"Image not found: {image_path}")
+                continue
+            
+            try:
+                with rasterio.open(image_path) as src:
+                    # Get the pixel resolution (meters per pixel)
+                    # For projected CRS, transform coefficients give pixel size directly
+                    # For geographic CRS, we need to approximate
+                    transform = src.transform
+                    
+                    if src.crs.is_geographic:
+                        # Approximate meters per degree at the label's latitude
+                        import math
+                        lat_rad = math.radians(label.lat)
+                        meters_per_deg_lat = 111320  # approximate
+                        meters_per_deg_lon = 111320 * math.cos(lat_rad)
+                        pixel_width_m = abs(transform.a) * meters_per_deg_lon
+                        pixel_height_m = abs(transform.e) * meters_per_deg_lat
+                    else:
+                        # Projected CRS - transform gives pixel size in CRS units (usually meters)
+                        pixel_width_m = abs(transform.a)
+                        pixel_height_m = abs(transform.e)
+                    
+                    # Calculate pixel size for the requested meter size
+                    half_size_px_x = max(1, int((size_meters / 2) / pixel_width_m))
+                    half_size_px_y = max(1, int((size_meters / 2) / pixel_height_m))
+                    full_size_px_x = half_size_px_x * 2
+                    full_size_px_y = half_size_px_y * 2
+                    
+                    # Get pixel coordinates from the label
+                    pixel_x = int(round(label.pixel_x))
+                    pixel_y = int(round(label.pixel_y))
+                    
+                    # Skip if pixel coordinates are outside image bounds
+                    if pixel_x < 0 or pixel_x >= src.width or pixel_y < 0 or pixel_y >= src.height:
+                        errors.append(f"Label {label.id}: pixel coords ({pixel_x}, {pixel_y}) outside image bounds ({src.width}x{src.height})")
+                        continue
+                    
+                    # Calculate initial window bounds (centered on label)
+                    col_start = pixel_x - half_size_px_x
+                    col_end = pixel_x + half_size_px_x
+                    row_start = pixel_y - half_size_px_y
+                    row_end = pixel_y + half_size_px_y
+                    
+                    # Handle edge cases by shifting the window to stay within bounds
+                    # while maintaining the full requested size if possible
+                    if col_start < 0:
+                        # Shift window right
+                        shift = -col_start
+                        col_start = 0
+                        col_end = min(src.width, col_end + shift)
+                    if col_end > src.width:
+                        # Shift window left
+                        shift = col_end - src.width
+                        col_end = src.width
+                        col_start = max(0, col_start - shift)
+                    
+                    if row_start < 0:
+                        # Shift window down
+                        shift = -row_start
+                        row_start = 0
+                        row_end = min(src.height, row_end + shift)
+                    if row_end > src.height:
+                        # Shift window up
+                        shift = row_end - src.height
+                        row_end = src.height
+                        row_start = max(0, row_start - shift)
+                    
+                    # Final clamp to ensure we're within bounds
+                    col_start = max(0, col_start)
+                    col_end = min(src.width, col_end)
+                    row_start = max(0, row_start)
+                    row_end = min(src.height, row_end)
+                    
+                    window_width = col_end - col_start
+                    window_height = row_end - row_start
+                    
+                    # Skip if the resulting window is too small or invalid
+                    if window_width <= 0 or window_height <= 0:
+                        errors.append(f"Label {label.id}: invalid window size, skipped")
+                        continue
+                    
+                    if window_width < full_size_px_x // 2 or window_height < full_size_px_y // 2:
+                        errors.append(f"Label {label.id} too close to edge, skipped")
+                        continue
+                    
+                    # Read the window using bounded reading
+                    window = rasterio.windows.Window(
+                        col_off=col_start, 
+                        row_off=row_start,
+                        width=window_width, 
+                        height=window_height
+                    )
+                    
+                    # Use boundless=False to ensure we stay within image bounds
+                    data = src.read(window=window, boundless=False)
+                    
+                    # Convert to RGB image
+                    if data.shape[0] >= 3:
+                        rgb = data[:3].transpose(1, 2, 0)
+                    else:
+                        rgb = np.stack([data[0]] * 3, axis=-1)
+                    
+                    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+                    
+                    # Create output directory for this class
+                    class_dir = output_path / label.class_name
+                    class_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Generate unique filename
+                    image_stem = Path(image_path).stem
+                    out_filename = f"{image_stem}_label{label.id}.png"
+                    out_path = class_dir / out_filename
+                    
+                    # Save as PNG
+                    img = Image.fromarray(rgb)
+                    img.save(out_path)
+                    exported += 1
+                    
+            except Exception as e:
+                errors.append(f"Error processing label {label.id} from {image_path}: {e}")
+        
+        progress.setValue(self.project.label_count)
+        
+        # Show results
+        msg = f"Exported {exported} sub-images to {output_dir}"
+        if errors:
+            msg += f"\n\n{len(errors)} errors occurred:\n" + "\n".join(errors[:5])
+            if len(errors) > 5:
+                msg += f"\n... and {len(errors) - 5} more errors"
+            QMessageBox.warning(self, "Export Complete", msg)
+        else:
+            self.statusBar.showMessage(msg, 5000)
+            QMessageBox.information(self, "Export Complete", msg)
 
     def _add_geotiff(self):
         """Open file dialog to add a GeoTIFF."""
