@@ -74,11 +74,19 @@ class TiledLayer:
             self._width = width
             self._height = height
             
-            # Reproject each band
+            # Use a sentinel nodata value to identify padded pixels after reprojection
+            # We use np.nan for float operations, then track the nodata mask
+            NODATA_SENTINEL = np.nan
+            
+            # Reproject each band using float32 to support nan as nodata
             bands = []
             for i in range(1, src.count + 1):
-                src_band = src.read(i)
-                dst_band = np.zeros((height, width), dtype=src_band.dtype)
+                src_band = src.read(i).astype(np.float32)
+                # Handle source nodata - convert to nan
+                if src.nodata is not None:
+                    src_band[src_band == src.nodata] = np.nan
+                
+                dst_band = np.full((height, width), NODATA_SENTINEL, dtype=np.float32)
                 reproject(
                     source=src_band,
                     destination=dst_band,
@@ -86,7 +94,9 @@ class TiledLayer:
                     src_crs=src.crs,
                     dst_transform=transform,
                     dst_crs=dst_crs,
-                    resampling=Resampling.bilinear
+                    resampling=Resampling.bilinear,
+                    src_nodata=np.nan,
+                    dst_nodata=NODATA_SENTINEL
                 )
                 bands.append(dst_band)
             
@@ -94,11 +104,20 @@ class TiledLayer:
             self.bounds = rasterio.transform.array_bounds(height, width, transform)
             west, south, east, north = self.bounds
             
+            # Create nodata mask - pixels are nodata if ALL bands are nan
+            # This identifies padded areas from reprojection
+            nodata_mask = np.all([np.isnan(b) for b in bands], axis=0)
+            
             # Convert to RGBA
             if len(bands) >= 3:
                 r, g, b = bands[0], bands[1], bands[2]
             else:
                 r = g = b = bands[0]
+            
+            # Replace nan with 0 before converting to uint8, then clip
+            r = np.nan_to_num(r, nan=0.0)
+            g = np.nan_to_num(g, nan=0.0)
+            b = np.nan_to_num(b, nan=0.0)
             
             r = np.clip(r, 0, 255).astype(np.uint8)
             g = np.clip(g, 0, 255).astype(np.uint8)
@@ -108,7 +127,8 @@ class TiledLayer:
             self._rgba_data[:, :, 0] = r
             self._rgba_data[:, :, 1] = g
             self._rgba_data[:, :, 2] = b
-            self._rgba_data[:, :, 3] = 255
+            # Set alpha to 0 for nodata/padded pixels, 255 for valid pixels
+            self._rgba_data[:, :, 3] = np.where(nodata_mask, 0, 255).astype(np.uint8)
             
             # Calculate tile grid
             self._n_tiles_x = math.ceil(width / TILE_SIZE)
