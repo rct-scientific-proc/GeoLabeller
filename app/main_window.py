@@ -166,6 +166,20 @@ class MainWindow(QMainWindow):
         export_subimages_action = QAction("&Sub-images...", self)
         export_subimages_action.triggered.connect(self._export_subimages)
         export_menu.addAction(export_subimages_action)
+        
+        # Help menu
+        help_menu = menubar.addMenu("&Help")
+        
+        # Keyboard Shortcuts
+        shortcuts_action = QAction("&Keyboard Shortcuts...", self)
+        shortcuts_action.setShortcut("F1")
+        shortcuts_action.triggered.connect(self._show_shortcuts)
+        help_menu.addAction(shortcuts_action)
+        
+        # About
+        about_action = QAction("&About", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
     
     def _setup_toolbar(self):
         """Set up the toolbar for labeling."""
@@ -881,4 +895,72 @@ class MainWindow(QMainWindow):
         file_path = self.canvas.get_layer_file_path(layer_id)
         if file_path:
             self.project.update_image_group(file_path, group_path)
+    
+    def _show_shortcuts(self):
+        """Show keyboard shortcuts dialog."""
+        shortcuts_text = """
+<h2>Keyboard Shortcuts</h2>
+
+<h3>File Operations</h3>
+<table>
+<tr><td><b>Ctrl+N</b></td><td>New Project</td></tr>
+<tr><td><b>Ctrl+Shift+P</b></td><td>Open Project</td></tr>
+<tr><td><b>Ctrl+S</b></td><td>Save Project</td></tr>
+<tr><td><b>Ctrl+Shift+S</b></td><td>Save Project As</td></tr>
+<tr><td><b>Ctrl+O</b></td><td>Add GeoTIFF</td></tr>
+<tr><td><b>Ctrl+Shift+O</b></td><td>Add Directory</td></tr>
+<tr><td><b>Ctrl+Q</b></td><td>Exit</td></tr>
+</table>
+
+<h3>Navigation</h3>
+<table>
+<tr><td><b>Mouse Wheel</b></td><td>Zoom in/out</td></tr>
+<tr><td><b>Click + Drag</b></td><td>Pan (in Pan mode)</td></tr>
+<tr><td><b>Right-click</b></td><td>Context menu</td></tr>
+</table>
+
+<h3>Labeling</h3>
+<table>
+<tr><td><b>Left-click</b></td><td>Place label (in Label mode)</td></tr>
+<tr><td><b>Right-click label</b></td><td>Label options (remove, link)</td></tr>
+<tr><td><b>Escape</b></td><td>Cancel link mode</td></tr>
+</table>
+
+<h3>Layer Panel</h3>
+<table>
+<tr><td><b>Right-click group</b></td><td>Select/Unselect all children</td></tr>
+<tr><td><b>Right-click layer</b></td><td>Zoom to layer, Remove</td></tr>
+<tr><td><b>Drag & Drop</b></td><td>Reorder layers/groups</td></tr>
+</table>
+
+<h3>Help</h3>
+<table>
+<tr><td><b>F1</b></td><td>Show this help</td></tr>
+</table>
+"""
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Keyboard Shortcuts")
+        msg.setTextFormat(Qt.RichText)
+        msg.setText(shortcuts_text)
+        msg.setIcon(QMessageBox.Information)
+        msg.exec_()
+    
+    def _show_about(self):
+        """Show about dialog."""
+        QMessageBox.about(
+            self,
+            "About GeoLabel",
+            "<h2>GeoLabel</h2>"
+            "<p>A geospatial image labeling tool for creating ground truth datasets.</p>"
+            "<p>Load GeoTIFF images, place point labels, and export annotations "
+            "for machine learning workflows.</p>"
+            "<p><b>Features:</b></p>"
+            "<ul>"
+            "<li>Multi-layer GeoTIFF support</li>"
+            "<li>Web Mercator reprojection</li>"
+            "<li>Point labeling with custom classes</li>"
+            "<li>Label linking across images</li>"
+            "<li>Ground truth export</li>"
+            "</ul>"
+        )
 
