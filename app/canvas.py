@@ -6,7 +6,7 @@ from enum import Enum, auto
 import numpy as np
 from PyQt5.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
-    QGraphicsEllipseItem, QGraphicsTextItem
+    QGraphicsEllipseItem, QGraphicsTextItem, QMenu
 )
 from PyQt5.QtGui import QImage, QPixmap, QWheelEvent, QTransform, QPen, QBrush, QColor, QFont
 from PyQt5.QtCore import Qt, pyqtSignal, QRectF, QTimer
@@ -263,6 +263,9 @@ class MapCanvas(QGraphicsView):
     # Signal emitted when a label is placed: (pixel_x, pixel_y, lon, lat, image_name, image_group, image_path)
     label_placed = pyqtSignal(float, float, float, float, str, str, str)
     
+    # Signal emitted when a label is removed: (label_id, image_path)
+    label_removed = pyqtSignal(int, str)
+    
     def __init__(self):
         super().__init__()
         self._scene = QGraphicsScene()
@@ -492,6 +495,9 @@ class MapCanvas(QGraphicsView):
                 # Convert lat/lon to pixel coordinates in the original image
                 pixel_x, pixel_y = layer.latlon_to_pixel(lon, lat)
                 self.label_placed.emit(pixel_x, pixel_y, lon, lat, layer_name, group_path, layer.file_path)
+        elif self._mode == CanvasMode.LABEL and event.button() == Qt.RightButton:
+            # Right-click in label mode - check if we're on a label
+            self._show_label_context_menu(event.pos())
         else:
             super().mousePressEvent(event)
     
@@ -590,7 +596,7 @@ class MapCanvas(QGraphicsView):
         return None
     
     def add_label_marker(self, label_id: int, lon: float, lat: float, 
-                         image_name: str, image_group: str,
+                         image_name: str, image_group: str, image_path: str,
                          class_name: str, color: QColor = None):
         """Add a visual marker for a label on the canvas.
         
@@ -600,6 +606,7 @@ class MapCanvas(QGraphicsView):
             lat: Latitude (WGS84)
             image_name: Name of the image the label belongs to
             image_group: Group path of the image
+            image_path: Full file path of the image
             class_name: Class name to display
             color: Optional color for the marker
         """
@@ -624,6 +631,7 @@ class MapCanvas(QGraphicsView):
         ellipse.setPen(QPen(color.darker(150), marker_size / 5))
         ellipse.setBrush(QBrush(color))
         ellipse.setZValue(self._label_z_base)
+        ellipse.setData(0, image_path)  # Store image_path for later retrieval
         
         # Create text label
         text = QGraphicsTextItem(class_name)
@@ -675,3 +683,51 @@ class MapCanvas(QGraphicsView):
             text.setScale(1 / view_scale)
             pos = ellipse.pos()
             text.setPos(pos.x() + marker_size / 2, pos.y() - marker_size / 2)
+    
+    def _get_label_at_position(self, view_pos) -> tuple[int | None, str | None]:
+        """Find the label at the given view position.
+        
+        Returns:
+            Tuple of (label_id, image_path) or (None, None) if no label found.
+        """
+        scene_pos = self.mapToScene(view_pos)
+        
+        # Check each label marker
+        for label_id, (ellipse, text) in self._label_items.items():
+            # Get ellipse bounding rect in scene coordinates
+            item_pos = ellipse.pos()
+            rect = ellipse.boundingRect()
+            scene_rect = QRectF(
+                item_pos.x() + rect.x(),
+                item_pos.y() + rect.y(),
+                rect.width(),
+                rect.height()
+            )
+            
+            # Expand hit area slightly for easier clicking
+            hit_margin = rect.width() * 0.5
+            scene_rect.adjust(-hit_margin, -hit_margin, hit_margin, hit_margin)
+            
+            if scene_rect.contains(scene_pos):
+                # Found a label - now find the image_path
+                # We need to look up which image this label belongs to
+                # The label stores its position in scene coords, we need to find
+                # which layer it's on based on the stored data
+                image_path = ellipse.data(0)  # We'll store image_path in the ellipse
+                return label_id, image_path
+        
+        return None, None
+    
+    def _show_label_context_menu(self, view_pos):
+        """Show context menu for label under cursor."""
+        label_id, image_path = self._get_label_at_position(view_pos)
+        
+        if label_id is not None:
+            menu = QMenu(self)
+            remove_action = menu.addAction("Remove Label")
+            
+            action = menu.exec_(self.mapToGlobal(view_pos))
+            
+            if action == remove_action:
+                self.label_removed.emit(label_id, image_path)
+

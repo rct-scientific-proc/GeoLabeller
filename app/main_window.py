@@ -77,6 +77,7 @@ class MainWindow(QMainWindow):
         self.layer_panel.layer_removed.connect(self.canvas.remove_layer)
         self.canvas.coordinates_changed.connect(self._update_coordinates)
         self.canvas.label_placed.connect(self._on_label_placed)
+        self.canvas.label_removed.connect(self._on_label_removed)
     
     def _setup_menu(self):
         """Set up the menu bar."""
@@ -227,13 +228,23 @@ class MainWindow(QMainWindow):
         # Add visual marker
         color = self._get_class_color(class_name)
         self.canvas.add_label_marker(
-            label.id, lon, lat, image_name, image_group, class_name, color
+            label.id, lon, lat, image_name, image_group, image_path, class_name, color
         )
         
         self.statusBar.showMessage(
             f"Added label: {class_name} at ({lon:.6f}, {lat:.6f}) on {image_name}", 
             3000
         )
+    
+    def _on_label_removed(self, label_id: int, image_path: str):
+        """Handle a label being removed."""
+        # Remove from project
+        self.project.remove_label(label_id)
+        
+        # Remove visual marker
+        self.canvas.remove_label_marker(label_id)
+        
+        self.statusBar.showMessage(f"Removed label", 3000)
     
     def _refresh_label_markers(self):
         """Refresh all label markers on the canvas."""
@@ -242,7 +253,7 @@ class MainWindow(QMainWindow):
             color = self._get_class_color(label.class_name)
             self.canvas.add_label_marker(
                 label.id, label.lon, label.lat, 
-                image.name, image.group,
+                image.name, image.group, image.path,
                 label.class_name, color
             )
     
