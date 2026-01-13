@@ -24,6 +24,7 @@ class LayerPanel(QWidget):
     # Signals
     layer_visibility_changed = pyqtSignal(str, bool)  # layer_id, visible
     layers_reordered = pyqtSignal(list)  # list of layer_ids
+    layer_group_changed = pyqtSignal(str, str)  # layer_id, group_path
     zoom_to_layer_requested = pyqtSignal(str)  # layer_id
     layer_removed = pyqtSignal(str)  # layer_id
     
@@ -108,6 +109,35 @@ class LayerPanel(QWidget):
         """Handle drag-drop reordering."""
         layer_order = self._get_layer_order()
         self.layers_reordered.emit(layer_order)
+        
+        # Emit group changes for all layers (their groups may have changed)
+        self._emit_all_layer_group_changes()
+    
+    def _get_group_path(self, item: QTreeWidgetItem) -> str:
+        """Get the group path for an item by traversing up the tree."""
+        parts = []
+        parent = item.parent()
+        while parent:
+            parts.append(parent.text(0))
+            parent = parent.parent()
+        # Reverse to get root-to-leaf order
+        parts.reverse()
+        return "/".join(parts)
+    
+    def _emit_all_layer_group_changes(self):
+        """Emit group change signals for all layers."""
+        def emit_for_item(item: QTreeWidgetItem):
+            item_type = item.data(0, Qt.UserRole + 1)
+            if item_type == "layer":
+                layer_id = item.data(0, Qt.UserRole)
+                group_path = self._get_group_path(item)
+                self.layer_group_changed.emit(layer_id, group_path)
+            else:
+                for i in range(item.childCount()):
+                    emit_for_item(item.child(i))
+        
+        for i in range(self.tree.topLevelItemCount()):
+            emit_for_item(self.tree.topLevelItem(i))
     
     def _get_layer_order(self) -> list[str]:
         """Get layer IDs in current order (top to bottom in tree = front to back)."""

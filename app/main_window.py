@@ -49,6 +49,7 @@ class MainWindow(QMainWindow):
         # Connect signals
         self.layer_panel.layer_visibility_changed.connect(self.canvas.set_layer_visibility)
         self.layer_panel.layers_reordered.connect(self.canvas.update_layer_order)
+        self.layer_panel.layer_group_changed.connect(self.canvas.set_layer_group)
         self.layer_panel.zoom_to_layer_requested.connect(self.canvas.zoom_to_layer)
         self.layer_panel.layer_removed.connect(self.canvas.remove_layer)
         self.canvas.coordinates_changed.connect(self._update_coordinates)
@@ -153,6 +154,9 @@ class MainWindow(QMainWindow):
             layer_id = self.canvas.add_layer(str(file_path))
             if layer_id:
                 self.layer_panel.add_layer(layer_id, str(file_path), parent_group)
+                # Set the group path for display (convert Path to forward-slash string)
+                group_path_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
+                self.canvas.set_layer_group(layer_id, group_path_str)
                 loaded_count += 1
         
         # Expand all groups
@@ -161,6 +165,19 @@ class MainWindow(QMainWindow):
         # Show status message
         self.statusBar.showMessage(f"Loaded {loaded_count} of {len(tiff_files)} GeoTIFF files", 5000)
     
-    def _update_coordinates(self, lon: float, lat: float):
+    def _update_coordinates(self, lon: float, lat: float, layer_name: str, group_path: str):
         """Update the coordinate display in the status bar."""
-        self.coord_label.setText(f"Lon: {lon:.6f}°  Lat: {lat:.6f}°")
+        if layer_name:
+            # Build display name with group path if present
+            if group_path:
+                display_name = f"{group_path}/{layer_name.lstrip('~')}"
+            else:
+                display_name = layer_name.lstrip('~')
+            
+            if layer_name.startswith("~"):
+                # Layer name prefixed with ~ means "closest to"
+                self.coord_label.setText(f"Lon: {lon:.6f}°  Lat: {lat:.6f}°  |  Nearest: {display_name}")
+            else:
+                self.coord_label.setText(f"Lon: {lon:.6f}°  Lat: {lat:.6f}°  |  Image: {display_name}")
+        else:
+            self.coord_label.setText(f"Lon: {lon:.6f}°  Lat: {lat:.6f}°")

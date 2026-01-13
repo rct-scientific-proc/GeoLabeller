@@ -21,6 +21,8 @@ class TiledLayer:
     
     def __init__(self, file_path: str):
         self.file_path = file_path
+        self.name = Path(file_path).stem  # File name without extension
+        self.group_path = ""  # Group hierarchy (e.g., "folder/subfolder")
         self.visible = True
         self.bounds = None  # (west, south, east, north) in Web Mercator
         self.tiles: dict[tuple[int, int], QGraphicsPixmapItem] = {}
@@ -184,13 +186,32 @@ class TiledLayer:
         for item in self.tiles.values():
             scene.removeItem(item)
         self.tiles.clear()
+    
+    def contains_point(self, easting: float, northing: float) -> bool:
+        """Check if a point (in Web Mercator) is within this layer's bounds."""
+        if self.bounds is None:
+            return False
+        west, south, east, north = self.bounds
+        return west <= easting <= east and south <= northing <= north
+    
+    def get_center(self) -> tuple[float, float]:
+        """Get the center point of this layer in Web Mercator coordinates."""
+        if self.bounds is None:
+            return (0, 0)
+        west, south, east, north = self.bounds
+        return ((west + east) / 2, (south + north) / 2)
+    
+    def distance_to_center(self, easting: float, northing: float) -> float:
+        """Calculate distance from a point to this layer's center."""
+        cx, cy = self.get_center()
+        return math.sqrt((easting - cx) ** 2 + (northing - cy) ** 2)
 
 
 class MapCanvas(QGraphicsView):
     """Canvas widget for displaying geospatial raster layers with tiling."""
     
-    # Signal emitted when mouse moves: (longitude, latitude)
-    coordinates_changed = pyqtSignal(float, float)
+    # Signal emitted when mouse moves: (longitude, latitude, layer_name, group_path)
+    coordinates_changed = pyqtSignal(float, float, str, str)
     
     def __init__(self):
         super().__init__()
@@ -327,6 +348,11 @@ class MapCanvas(QGraphicsView):
             if layer_id in self._layer_order:
                 self._layer_order.remove(layer_id)
     
+    def set_layer_group(self, layer_id: str, group_path: str):
+        """Set the group path for a layer."""
+        if layer_id in self._layers:
+            self._layers[layer_id].group_path = group_path
+    
     def zoom_to_layer(self, layer_id: str):
         """Zoom the view to fit a specific layer's bounds."""
         if layer_id not in self._layers:
@@ -366,7 +392,8 @@ class MapCanvas(QGraphicsView):
         northing = -scene_pos.y()
         
         lon, lat = self._web_mercator_to_wgs84(easting, northing)
-        self.coordinates_changed.emit(lon, lat)
+        layer_name, group_path = self._get_layer_at_position(easting, northing)
+        self.coordinates_changed.emit(lon, lat, layer_name, group_path)
     
     def _web_mercator_to_wgs84(self, x: float, y: float) -> tuple[float, float]:
         """Convert Web Mercator (EPSG:3857) to WGS84 (EPSG:4326)."""
@@ -374,3 +401,42 @@ class MapCanvas(QGraphicsView):
         lon = math.degrees(x / R)
         lat = math.degrees(2 * math.atan(math.exp(y / R)) - math.pi / 2)
         return lon, lat
+    
+    def _get_layer_at_position(self, easting: float, northing: float) -> tuple[str, str]:
+        """Get the name and group of the layer at the given position.
+        
+        First checks if cursor is within any layer bounds (returns topmost visible layer).
+        If not within any bounds, returns the layer whose center is closest.
+        
+        Returns:
+            Tuple of (layer_name, group_path). Layer name prefixed with ~ if showing nearest.
+        """
+        # Check layers in reverse z-order (top to bottom)
+        layers_in_bounds = []
+        for layer_id in reversed(self._layer_order):
+            if layer_id not in self._layers:
+                continue
+            layer = self._layers[layer_id]
+            if layer.visible and layer.contains_point(easting, northing):
+                layers_in_bounds.append(layer)
+        
+        # If cursor is within one or more layers, return the topmost one
+        if layers_in_bounds:
+            return (layers_in_bounds[0].name, layers_in_bounds[0].group_path)
+        
+        # Otherwise, find the layer with closest center
+        closest_layer = None
+        min_distance = float('inf')
+        
+        for layer_id, layer in self._layers.items():
+            if not layer.visible:
+                continue
+            dist = layer.distance_to_center(easting, northing)
+            if dist < min_distance:
+                min_distance = dist
+                closest_layer = layer
+        
+        if closest_layer:
+            return (f"~{closest_layer.name}", closest_layer.group_path)  # Prefix with ~ to indicate "closest to"
+        
+        return ("", "")
