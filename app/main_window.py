@@ -83,6 +83,7 @@ class MainWindow(QMainWindow):
         self.canvas.label_unlinked.connect(self._on_label_unlinked)
         self.canvas.show_linked_requested.connect(self._on_show_linked)
         self.canvas.link_mode_changed.connect(self._on_link_mode_changed)
+        self.canvas.hide_layers_outside_view.connect(self.layer_panel.uncheck_layers)
     
     def _setup_menu(self):
         """Set up the menu bar."""

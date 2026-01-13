@@ -261,6 +261,28 @@ class LayerPanel(QWidget):
             for i in range(item.childCount()):
                 self._collect_layer_ids(item.child(i), layer_ids)
     
+    def uncheck_layers(self, layer_ids: list[str]):
+        """Uncheck (hide) layers by their IDs.
+        
+        Args:
+            layer_ids: List of layer IDs to uncheck
+        """
+        def find_and_uncheck(parent=None):
+            if parent is None:
+                count = self.tree.topLevelItemCount()
+                for i in range(count):
+                    find_and_uncheck(self.tree.topLevelItem(i))
+            else:
+                item_type = parent.data(0, Qt.UserRole + 1)
+                if item_type == "layer":
+                    if parent.data(0, Qt.UserRole) in layer_ids:
+                        parent.setCheckState(0, Qt.Unchecked)
+                else:
+                    for i in range(parent.childCount()):
+                        find_and_uncheck(parent.child(i))
+        
+        find_and_uncheck()
+    
     def clear(self):
         """Clear all items from the tree."""
         self.tree.clear()
