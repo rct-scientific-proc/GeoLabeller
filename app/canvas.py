@@ -1,10 +1,14 @@
 """Map canvas for displaying GeoTIFF images with tiled rendering."""
 import math
 from pathlib import Path
+from enum import Enum, auto
 
 import numpy as np
-from PyQt5.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
-from PyQt5.QtGui import QImage, QPixmap, QWheelEvent, QTransform
+from PyQt5.QtWidgets import (
+    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
+    QGraphicsEllipseItem, QGraphicsTextItem
+)
+from PyQt5.QtGui import QImage, QPixmap, QWheelEvent, QTransform, QPen, QBrush, QColor, QFont
 from PyQt5.QtCore import Qt, pyqtSignal, QRectF, QTimer
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
@@ -14,6 +18,12 @@ from rasterio.crs import CRS
 # Web Mercator CRS
 WEB_MERCATOR = CRS.from_epsg(3857)
 TILE_SIZE = 512  # Pixels per tile
+
+
+class CanvasMode(Enum):
+    """Canvas interaction modes."""
+    PAN = auto()      # Default pan/zoom mode
+    LABEL = auto()    # Point labeling mode
 
 
 class TiledLayer:
@@ -27,6 +37,12 @@ class TiledLayer:
         self.bounds = None  # (west, south, east, north) in Web Mercator
         self.tiles: dict[tuple[int, int], QGraphicsPixmapItem] = {}
         self.z_value = 0
+        
+        # Original image info for coordinate transforms
+        self._src_crs = None  # Original CRS
+        self._src_transform = None  # Original geotransform
+        self._src_width = 0
+        self._src_height = 0
         
         # Image data (kept in memory after reprojection)
         self._rgba_data: np.ndarray | None = None
@@ -44,6 +60,12 @@ class TiledLayer:
     def _load_and_reproject(self):
         """Load GeoTIFF and reproject to Web Mercator."""
         with rasterio.open(self.file_path) as src:
+            # Store original image info for coordinate transforms
+            self._src_crs = src.crs
+            self._src_transform = src.transform
+            self._src_width = src.width
+            self._src_height = src.height
+            
             dst_crs = WEB_MERCATOR
             transform, width, height = calculate_default_transform(
                 src.crs, dst_crs, src.width, src.height, *src.bounds
@@ -205,6 +227,31 @@ class TiledLayer:
         """Calculate distance from a point to this layer's center."""
         cx, cy = self.get_center()
         return math.sqrt((easting - cx) ** 2 + (northing - cy) ** 2)
+    
+    def latlon_to_pixel(self, lon: float, lat: float) -> tuple[float, float]:
+        """Convert WGS84 lat/lon to pixel coordinates in the original image.
+        
+        Args:
+            lon: Longitude in degrees (WGS84)
+            lat: Latitude in degrees (WGS84)
+            
+        Returns:
+            Tuple of (pixel_x, pixel_y) where pixel_x is column and pixel_y is row.
+            Values are floats for sub-pixel precision.
+        """
+        from rasterio.warp import transform as transform_coords
+        from rasterio.crs import CRS
+        
+        # Transform from WGS84 to the image's native CRS
+        wgs84 = CRS.from_epsg(4326)
+        xs, ys = transform_coords(wgs84, self._src_crs, [lon], [lat])
+        x_native, y_native = xs[0], ys[0]
+        
+        # Use inverse of geotransform to get pixel coordinates
+        # ~transform gives the inverse transform
+        col, row = ~self._src_transform * (x_native, y_native)
+        
+        return (col, row)
 
 
 class MapCanvas(QGraphicsView):
@@ -212,6 +259,9 @@ class MapCanvas(QGraphicsView):
     
     # Signal emitted when mouse moves: (longitude, latitude, layer_name, group_path)
     coordinates_changed = pyqtSignal(float, float, str, str)
+    
+    # Signal emitted when a label is placed: (pixel_x, pixel_y, lon, lat, image_name, image_group, image_path)
+    label_placed = pyqtSignal(float, float, float, float, str, str, str)
     
     def __init__(self):
         super().__init__()
@@ -227,6 +277,14 @@ class MapCanvas(QGraphicsView):
         # Set background and allow dragging on empty space
         self.setBackgroundBrush(Qt.darkGray)
         self.setSceneRect(-1e10, -1e10, 2e10, 2e10)
+        
+        # Canvas mode
+        self._mode = CanvasMode.PAN
+        self._current_class = ""  # Currently selected class for labeling
+        
+        # Label graphics items: label_id -> (ellipse_item, text_item)
+        self._label_items: dict[int, tuple[QGraphicsEllipseItem, QGraphicsTextItem]] = {}
+        self._label_z_base = 1000  # Z-value for labels (above all tiles)
         
         # Layer storage
         self._layers: dict[str, TiledLayer] = {}
@@ -348,10 +406,23 @@ class MapCanvas(QGraphicsView):
             if layer_id in self._layer_order:
                 self._layer_order.remove(layer_id)
     
+    def clear_layers(self):
+        """Remove all layers from the canvas."""
+        for layer_id in list(self._layers.keys()):
+            self._layers[layer_id].remove_from_scene(self._scene)
+        self._layers.clear()
+        self._layer_order.clear()
+    
     def set_layer_group(self, layer_id: str, group_path: str):
         """Set the group path for a layer."""
         if layer_id in self._layers:
             self._layers[layer_id].group_path = group_path
+    
+    def get_layer_file_path(self, layer_id: str) -> str | None:
+        """Get the file path for a layer."""
+        if layer_id in self._layers:
+            return self._layers[layer_id].file_path
+        return None
     
     def zoom_to_layer(self, layer_id: str):
         """Zoom the view to fit a specific layer's bounds."""
@@ -372,6 +443,7 @@ class MapCanvas(QGraphicsView):
         else:
             self.scale(1 / factor, 1 / factor)
         self._schedule_tile_update()
+        self.update_label_markers_scale()
     
     def scrollContentsBy(self, dx: int, dy: int):
         """Called when view is scrolled (panned)."""
@@ -383,6 +455,50 @@ class MapCanvas(QGraphicsView):
         super().resizeEvent(event)
         self._schedule_tile_update()
     
+    def set_mode(self, mode: CanvasMode):
+        """Set the canvas interaction mode."""
+        self._mode = mode
+        if mode == CanvasMode.PAN:
+            self.setDragMode(QGraphicsView.ScrollHandDrag)
+            self.setCursor(Qt.ArrowCursor)
+        elif mode == CanvasMode.LABEL:
+            self.setDragMode(QGraphicsView.NoDrag)
+            self.setCursor(Qt.CrossCursor)
+    
+    def set_current_class(self, class_name: str):
+        """Set the current class for labeling."""
+        self._current_class = class_name
+    
+    def get_current_class(self) -> str:
+        """Get the current class for labeling."""
+        return self._current_class
+    
+    def mousePressEvent(self, event):
+        """Handle mouse press for labeling."""
+        if self._mode == CanvasMode.LABEL and event.button() == Qt.LeftButton:
+            if not self._current_class:
+                return  # No class selected
+            
+            scene_pos = self.mapToScene(event.pos())
+            easting = scene_pos.x()
+            northing = -scene_pos.y()
+            
+            # Get image at this position and the layer object
+            layer, layer_name, group_path = self._get_layer_and_info_at_position(easting, northing)
+            
+            # Only allow labeling on actual images (not "nearest" ones)
+            if layer and layer_name and not layer_name.startswith("~"):
+                lon, lat = self._web_mercator_to_wgs84(easting, northing)
+                # Convert lat/lon to pixel coordinates in the original image
+                pixel_x, pixel_y = layer.latlon_to_pixel(lon, lat)
+                self.label_placed.emit(pixel_x, pixel_y, lon, lat, layer_name, group_path, layer.file_path)
+        else:
+            super().mousePressEvent(event)
+    
+    def mouseReleaseEvent(self, event):
+        """Handle mouse release."""
+        super().mouseReleaseEvent(event)
+
     def mouseMoveEvent(self, event):
         """Track mouse position and emit lat/lon coordinates."""
         super().mouseMoveEvent(event)
@@ -401,6 +517,13 @@ class MapCanvas(QGraphicsView):
         lon = math.degrees(x / R)
         lat = math.degrees(2 * math.atan(math.exp(y / R)) - math.pi / 2)
         return lon, lat
+    
+    def _wgs84_to_web_mercator(self, lon: float, lat: float) -> tuple[float, float]:
+        """Convert WGS84 (EPSG:4326) to Web Mercator (EPSG:3857)."""
+        R = 6378137.0
+        x = math.radians(lon) * R
+        y = math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)) * R
+        return x, y
     
     def _get_layer_at_position(self, easting: float, northing: float) -> tuple[str, str]:
         """Get the name and group of the layer at the given position.
@@ -440,3 +563,115 @@ class MapCanvas(QGraphicsView):
             return (f"~{closest_layer.name}", closest_layer.group_path)  # Prefix with ~ to indicate "closest to"
         
         return ("", "")
+    
+    def _get_layer_and_info_at_position(self, easting: float, northing: float) -> tuple:
+        """Get the layer object and its info at the given position.
+        
+        Returns:
+            Tuple of (layer, layer_name, group_path). Layer is None if not found.
+            Layer name prefixed with ~ if showing nearest.
+        """
+        # Check layers in reverse z-order (top to bottom)
+        for layer_id in reversed(self._layer_order):
+            if layer_id not in self._layers:
+                continue
+            layer = self._layers[layer_id]
+            if layer.visible and layer.contains_point(easting, northing):
+                return (layer, layer.name, layer.group_path)
+        
+        # Not within any layer bounds
+        return (None, "", "")
+    
+    def _get_layer_by_name_and_group(self, name: str, group_path: str):
+        """Find a layer by its name and group path."""
+        for layer in self._layers.values():
+            if layer.name == name and layer.group_path == group_path:
+                return layer
+        return None
+    
+    def add_label_marker(self, label_id: int, lon: float, lat: float, 
+                         image_name: str, image_group: str,
+                         class_name: str, color: QColor = None):
+        """Add a visual marker for a label on the canvas.
+        
+        Args:
+            label_id: Unique ID of the label
+            lon: Longitude (WGS84)
+            lat: Latitude (WGS84)
+            image_name: Name of the image the label belongs to
+            image_group: Group path of the image
+            class_name: Class name to display
+            color: Optional color for the marker
+        """
+        if color is None:
+            color = QColor(255, 50, 50)  # Default red
+        
+        # Convert lat/lon to Web Mercator for scene positioning
+        x, y = self._wgs84_to_web_mercator(lon, lat)
+        
+        # Get current view scale to size markers appropriately
+        view_scale = self.transform().m11()  # Horizontal scale factor
+        
+        # Marker size in scene coordinates (appears ~10 pixels on screen)
+        marker_size = 10 / view_scale if view_scale > 0 else 10
+        
+        # Create ellipse marker
+        ellipse = QGraphicsEllipseItem(
+            -marker_size / 2, -marker_size / 2,
+            marker_size, marker_size
+        )
+        ellipse.setPos(x, -y)  # Y is flipped in scene coords
+        ellipse.setPen(QPen(color.darker(150), marker_size / 5))
+        ellipse.setBrush(QBrush(color))
+        ellipse.setZValue(self._label_z_base)
+        
+        # Create text label
+        text = QGraphicsTextItem(class_name)
+        text.setDefaultTextColor(Qt.white)
+        font = QFont("Arial", 8)
+        font.setBold(True)
+        text.setFont(font)
+        text.setScale(1 / view_scale if view_scale > 0 else 1)
+        text.setPos(x + marker_size / 2, -y - marker_size / 2)
+        text.setZValue(self._label_z_base + 1)
+        
+        self._scene.addItem(ellipse)
+        self._scene.addItem(text)
+        
+        self._label_items[label_id] = (ellipse, text)
+    
+    def remove_label_marker(self, label_id: int):
+        """Remove a label marker from the canvas."""
+        if label_id in self._label_items:
+            ellipse, text = self._label_items[label_id]
+            self._scene.removeItem(ellipse)
+            self._scene.removeItem(text)
+            del self._label_items[label_id]
+    
+    def clear_label_markers(self):
+        """Remove all label markers from the canvas."""
+        for label_id in list(self._label_items.keys()):
+            self.remove_label_marker(label_id)
+    
+    def update_label_markers_scale(self):
+        """Update label marker sizes based on current zoom level."""
+        view_scale = self.transform().m11()
+        if view_scale <= 0:
+            return
+        
+        marker_size = 10 / view_scale
+        
+        for ellipse, text in self._label_items.values():
+            # Update ellipse size
+            ellipse.setRect(
+                -marker_size / 2, -marker_size / 2,
+                marker_size, marker_size
+            )
+            pen = ellipse.pen()
+            pen.setWidthF(marker_size / 5)
+            ellipse.setPen(pen)
+            
+            # Update text scale and position
+            text.setScale(1 / view_scale)
+            pos = ellipse.pos()
+            text.setPos(pos.x() + marker_size / 2, pos.y() - marker_size / 2)

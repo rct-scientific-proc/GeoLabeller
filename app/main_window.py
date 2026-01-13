@@ -1,13 +1,31 @@
 """Main application window."""
+from pathlib import Path
+
 from PyQt5.QtWidgets import (
     QMainWindow, QSplitter, QMenuBar, QMenu, QAction, QFileDialog,
-    QStatusBar, QLabel
+    QStatusBar, QLabel, QToolBar, QComboBox, QMessageBox
 )
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QColor
 
-from .canvas import MapCanvas
+from .canvas import MapCanvas, CanvasMode
 from .layer_panel import LayerPanel
 from .axis_ruler import MapCanvasWithAxes
+from .labels import LabelProject
+from .class_editor import ClassEditorDialog
+
+
+# Colors for different classes (cycles through these)
+CLASS_COLORS = [
+    QColor(255, 50, 50),    # Red
+    QColor(50, 255, 50),    # Green
+    QColor(50, 50, 255),    # Blue
+    QColor(255, 255, 50),   # Yellow
+    QColor(255, 50, 255),   # Magenta
+    QColor(50, 255, 255),   # Cyan
+    QColor(255, 128, 0),    # Orange
+    QColor(128, 0, 255),    # Purple
+]
 
 
 class MainWindow(QMainWindow):
@@ -18,8 +36,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("GeoLabel")
         self.setMinimumSize(1024, 768)
         
+        # Label project
+        self.project = LabelProject()
+        self._project_path: Path | None = None
+        
         self._setup_ui()
         self._setup_menu()
+        self._setup_toolbar()
     
     def _setup_ui(self):
         """Set up the main UI layout."""
@@ -49,10 +72,11 @@ class MainWindow(QMainWindow):
         # Connect signals
         self.layer_panel.layer_visibility_changed.connect(self.canvas.set_layer_visibility)
         self.layer_panel.layers_reordered.connect(self.canvas.update_layer_order)
-        self.layer_panel.layer_group_changed.connect(self.canvas.set_layer_group)
+        self.layer_panel.layer_group_changed.connect(self._on_layer_group_changed)
         self.layer_panel.zoom_to_layer_requested.connect(self.canvas.zoom_to_layer)
         self.layer_panel.layer_removed.connect(self.canvas.remove_layer)
         self.canvas.coordinates_changed.connect(self._update_coordinates)
+        self.canvas.label_placed.connect(self._on_label_placed)
     
     def _setup_menu(self):
         """Set up the menu bar."""
@@ -60,6 +84,32 @@ class MainWindow(QMainWindow):
         
         # File menu
         file_menu = menubar.addMenu("&File")
+        
+        # New Project
+        new_project_action = QAction("&New Project", self)
+        new_project_action.setShortcut("Ctrl+N")
+        new_project_action.triggered.connect(self._new_project)
+        file_menu.addAction(new_project_action)
+        
+        # Open Project
+        open_project_action = QAction("&Open Project...", self)
+        open_project_action.setShortcut("Ctrl+Shift+P")
+        open_project_action.triggered.connect(self._open_project)
+        file_menu.addAction(open_project_action)
+        
+        # Save Project
+        save_project_action = QAction("&Save Project", self)
+        save_project_action.setShortcut("Ctrl+S")
+        save_project_action.triggered.connect(self._save_project)
+        file_menu.addAction(save_project_action)
+        
+        # Save Project As
+        save_as_action = QAction("Save Project &As...", self)
+        save_as_action.setShortcut("Ctrl+Shift+S")
+        save_as_action.triggered.connect(self._save_project_as)
+        file_menu.addAction(save_as_action)
+        
+        file_menu.addSeparator()
         
         # Add GeoTIFF action
         add_action = QAction("&Add GeoTIFF...", self)
@@ -80,6 +130,306 @@ class MainWindow(QMainWindow):
         exit_action.setShortcut("Ctrl+Q")
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
+        
+        # Labels menu
+        labels_menu = menubar.addMenu("&Labels")
+        
+        # Edit Classes
+        edit_classes_action = QAction("Edit &Classes...", self)
+        edit_classes_action.triggered.connect(self._edit_classes)
+        labels_menu.addAction(edit_classes_action)
+        
+        labels_menu.addSeparator()
+        
+        # Clear all labels
+        clear_labels_action = QAction("Clear All Labels", self)
+        clear_labels_action.triggered.connect(self._clear_all_labels)
+        labels_menu.addAction(clear_labels_action)
+    
+    def _setup_toolbar(self):
+        """Set up the toolbar for labeling."""
+        toolbar = QToolBar("Labeling")
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
+        
+        # Mode selector
+        toolbar.addWidget(QLabel(" Mode: "))
+        
+        self.pan_action = QAction("Pan", self)
+        self.pan_action.setCheckable(True)
+        self.pan_action.setChecked(True)
+        self.pan_action.setShortcut("P")
+        self.pan_action.triggered.connect(lambda: self._set_mode(CanvasMode.PAN))
+        toolbar.addAction(self.pan_action)
+        
+        self.label_action = QAction("Label", self)
+        self.label_action.setCheckable(True)
+        self.label_action.setShortcut("L")
+        self.label_action.triggered.connect(lambda: self._set_mode(CanvasMode.LABEL))
+        toolbar.addAction(self.label_action)
+        
+        toolbar.addSeparator()
+        
+        # Class selector
+        toolbar.addWidget(QLabel(" Class: "))
+        self.class_combo = QComboBox()
+        self.class_combo.setMinimumWidth(150)
+        self.class_combo.currentTextChanged.connect(self._on_class_changed)
+        toolbar.addWidget(self.class_combo)
+    
+    def _set_mode(self, mode: CanvasMode):
+        """Set the canvas interaction mode."""
+        self.canvas.set_mode(mode)
+        self.pan_action.setChecked(mode == CanvasMode.PAN)
+        self.label_action.setChecked(mode == CanvasMode.LABEL)
+    
+    def _on_class_changed(self, class_name: str):
+        """Handle class selection change."""
+        self.canvas.set_current_class(class_name)
+    
+    def _update_class_combo(self):
+        """Update the class combo box with current classes."""
+        current = self.class_combo.currentText()
+        self.class_combo.clear()
+        self.class_combo.addItems(self.project.classes)
+        
+        # Restore selection if possible
+        if current in self.project.classes:
+            self.class_combo.setCurrentText(current)
+        elif self.project.classes:
+            self.class_combo.setCurrentIndex(0)
+    
+    def _get_class_color(self, class_name: str) -> QColor:
+        """Get the color for a class."""
+        if class_name in self.project.classes:
+            idx = self.project.classes.index(class_name)
+            return CLASS_COLORS[idx % len(CLASS_COLORS)]
+        return CLASS_COLORS[0]
+    
+    def _on_label_placed(self, pixel_x: float, pixel_y: float, lon: float, lat: float, 
+                         image_name: str, image_group: str, image_path: str):
+        """Handle a new label being placed."""
+        class_name = self.canvas.get_current_class()
+        if not class_name:
+            self.statusBar.showMessage("No class selected", 3000)
+            return
+        
+        # Add to project
+        label = self.project.add_label(
+            class_name=class_name,
+            pixel_x=pixel_x, pixel_y=pixel_y,
+            lon=lon, lat=lat,
+            image_name=image_name,
+            image_group=image_group,
+            image_path=image_path
+        )
+        
+        # Add visual marker
+        color = self._get_class_color(class_name)
+        self.canvas.add_label_marker(
+            label.id, lon, lat, image_name, image_group, class_name, color
+        )
+        
+        self.statusBar.showMessage(
+            f"Added label: {class_name} at ({lon:.6f}, {lat:.6f}) on {image_name}", 
+            3000
+        )
+    
+    def _refresh_label_markers(self):
+        """Refresh all label markers on the canvas."""
+        self.canvas.clear_label_markers()
+        for image, label in self.project.get_all_labels():
+            color = self._get_class_color(label.class_name)
+            self.canvas.add_label_marker(
+                label.id, label.lon, label.lat, 
+                image.name, image.group,
+                label.class_name, color
+            )
+    
+    def _edit_classes(self):
+        """Open the class editor dialog."""
+        dialog = ClassEditorDialog(self.project.classes, self)
+        if dialog.exec_():
+            new_classes = dialog.get_classes()
+            
+            # Find removed classes
+            removed = set(self.project.classes) - set(new_classes)
+            if removed:
+                # Warn about label deletion
+                count = sum(1 for l in self.project.labels if l.class_name in removed)
+                if count > 0:
+                    reply = QMessageBox.question(
+                        self,
+                        "Remove Classes",
+                        f"Removing classes will delete {count} labels. Continue?",
+                        QMessageBox.Yes | QMessageBox.No
+                    )
+                    if reply == QMessageBox.No:
+                        return
+            
+            # Update classes
+            self.project.classes = new_classes
+            
+            # Remove labels for deleted classes
+            for class_name in removed:
+                self.project.remove_class(class_name)
+            
+            self._update_class_combo()
+            self._refresh_label_markers()
+    
+    def _clear_all_labels(self):
+        """Clear all labels after confirmation."""
+        if self.project.label_count == 0:
+            return
+        
+        reply = QMessageBox.question(
+            self,
+            "Clear Labels",
+            f"Delete all {self.project.label_count} labels?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.project.clear()
+            self.canvas.clear_label_markers()
+            self.statusBar.showMessage("All labels cleared", 3000)
+    
+    def _new_project(self):
+        """Create a new project."""
+        if self.project.label_count > 0 or self.project.images:
+            reply = QMessageBox.question(
+                self,
+                "New Project",
+                "Discard current project and labels?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+        
+        self.project = LabelProject()
+        self._project_path = None
+        self.canvas.clear_label_markers()
+        self.canvas.clear_layers()
+        self.layer_panel.clear()
+        self._update_class_combo()
+        self.setWindowTitle("GeoLabel")
+        self.statusBar.showMessage("New project created", 3000)
+    
+    def _open_project(self):
+        """Open a project file."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Project",
+            "",
+            "GeoLabel Project (*.geolabel);;All Files (*)"
+        )
+        if file_path:
+            try:
+                # Clear existing state
+                self.canvas.clear_label_markers()
+                self.canvas.clear_layers()
+                self.layer_panel.clear()
+                
+                self.project = LabelProject.load(file_path)
+                self._project_path = Path(file_path)
+                
+                # Load images from the project
+                self._load_project_images()
+                
+                self._update_class_combo()
+                self._refresh_label_markers()
+                self.setWindowTitle(f"GeoLabel - {self._project_path.name}")
+                self.statusBar.showMessage(f"Opened project with {self.project.label_count} labels", 3000)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                QMessageBox.critical(self, "Error", f"Failed to open project: {e}")
+    
+    def _load_project_images(self):
+        """Load images stored in the project and recreate group structure."""
+        import os
+        
+        loaded = 0
+        missing = []
+        
+        # Group cache for recreating hierarchy
+        group_cache: dict[str, any] = {}
+        
+        def get_or_create_group(group_path: str):
+            """Get or create group hierarchy for a group path."""
+            if not group_path:
+                return None
+            
+            if group_path in group_cache:
+                return group_cache[group_path]
+            
+            # Split path and create hierarchy
+            parts = group_path.replace("\\", "/").split("/")
+            parent = None
+            current_path = ""
+            
+            for part in parts:
+                current_path = f"{current_path}/{part}" if current_path else part
+                if current_path not in group_cache:
+                    group = self.layer_panel.add_group(part, parent)
+                    group_cache[current_path] = group
+                parent = group_cache[current_path]
+            
+            return parent
+        
+        for image in self.project.images.values():
+            if os.path.exists(image.path):
+                layer_id = self.canvas.add_layer(image.path)
+                if layer_id:
+                    # Recreate group structure
+                    parent_group = get_or_create_group(image.group)
+                    self.layer_panel.add_layer(layer_id, image.path, parent_group)
+                    # Set the group path on the canvas layer
+                    self.canvas.set_layer_group(layer_id, image.group)
+                    loaded += 1
+            else:
+                missing.append(image.path)
+        
+        # Expand all groups
+        self.layer_panel.tree.expandAll()
+        
+        if missing:
+            QMessageBox.warning(
+                self,
+                "Missing Images",
+                f"Could not find {len(missing)} image(s):\n" + 
+                "\n".join(missing[:5]) +
+                ("\n..." if len(missing) > 5 else "")
+            )
+    
+    def _save_project(self):
+        """Save the current project."""
+        if self._project_path:
+            self._do_save(self._project_path)
+        else:
+            self._save_project_as()
+    
+    def _save_project_as(self):
+        """Save the project to a new file."""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Project",
+            "",
+            "GeoLabel Project (*.geolabel)"
+        )
+        if file_path:
+            if not file_path.endswith('.geolabel'):
+                file_path += '.geolabel'
+            self._do_save(Path(file_path))
+    
+    def _do_save(self, path: Path):
+        """Perform the actual save operation."""
+        try:
+            self.project.save(path)
+            self._project_path = path
+            self.setWindowTitle(f"GeoLabel - {path.name}")
+            self.statusBar.showMessage(f"Saved {self.project.label_count} labels to {path.name}", 3000)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save project: {e}")
     
     def _add_geotiff(self):
         """Open file dialog to add a GeoTIFF."""
@@ -94,6 +444,9 @@ class MainWindow(QMainWindow):
             layer_id = self.canvas.add_layer(file_path)
             if layer_id:
                 self.layer_panel.add_layer(layer_id, file_path)
+                # Track the loaded image
+                name = Path(file_path).stem
+                self.project.add_image(file_path, name, "")
     
     def _add_directory(self):
         """Open directory dialog and load all GeoTIFFs preserving directory structure."""
@@ -157,6 +510,10 @@ class MainWindow(QMainWindow):
                 # Set the group path for display (convert Path to forward-slash string)
                 group_path_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
                 self.canvas.set_layer_group(layer_id, group_path_str)
+                # Track the loaded image in project
+                file_path_str = str(file_path)
+                name = file_path.stem
+                self.project.add_image(file_path_str, name, group_path_str)
                 loaded_count += 1
         
         # Expand all groups
@@ -181,3 +538,14 @@ class MainWindow(QMainWindow):
                 self.coord_label.setText(f"Lon: {lon:.6f}°  Lat: {lat:.6f}°  |  Image: {display_name}")
         else:
             self.coord_label.setText(f"Lon: {lon:.6f}°  Lat: {lat:.6f}°")
+    
+    def _on_layer_group_changed(self, layer_id: str, group_path: str):
+        """Handle layer group change - update both canvas and project."""
+        # Update canvas
+        self.canvas.set_layer_group(layer_id, group_path)
+        
+        # Update project
+        file_path = self.canvas.get_layer_file_path(layer_id)
+        if file_path:
+            self.project.update_image_group(file_path, group_path)
+

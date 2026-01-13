@@ -230,3 +230,7 @@ class LayerPanel(QWidget):
         else:
             for i in range(item.childCount()):
                 self._collect_layer_ids(item.child(i), layer_ids)
+    
+    def clear(self):
+        """Clear all items from the tree."""
+        self.tree.clear()
