@@ -2,9 +2,10 @@
 import os
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QTreeWidget, QTreeWidgetItem,
-    QMenu, QInputDialog, QMessageBox
+    QMenu, QInputDialog, QMessageBox, QStyle, QApplication
 )
 from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QFont, QColor
 
 
 class LayerTreeWidget(QTreeWidget):
@@ -67,6 +68,10 @@ class LayerPanel(QWidget):
         item.setCheckState(0, Qt.Checked)
         item.setToolTip(0, file_path)
         
+        # Set image icon for layers
+        style = QApplication.style()
+        item.setIcon(0, style.standardIcon(QStyle.SP_FileIcon))
+        
         if parent:
             parent.addChild(item)
         else:
@@ -84,6 +89,14 @@ class LayerPanel(QWidget):
         item.setData(0, Qt.UserRole + 1, "group")
         item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
         item.setCheckState(0, Qt.Checked)
+        
+        # Set folder icon and bold font for groups
+        style = QApplication.style()
+        item.setIcon(0, style.standardIcon(QStyle.SP_DirIcon))
+        font = item.font(0)
+        font.setBold(True)
+        item.setFont(0, font)
+        item.setForeground(0, QColor(70, 130, 180))  # Steel blue color
         
         if parent:
             parent.addChild(item)

@@ -4,7 +4,8 @@ from pathlib import Path
 import numpy as np
 from PyQt5.QtWidgets import (
     QMainWindow, QSplitter, QMenuBar, QMenu, QAction, QFileDialog,
-    QStatusBar, QLabel, QToolBar, QComboBox, QMessageBox
+    QStatusBar, QLabel, QToolBar, QComboBox, QMessageBox, QProgressDialog,
+    QApplication
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
@@ -797,9 +798,31 @@ class MainWindow(QMainWindow):
             group_cache[rel_dir] = group
             return group
         
+        # Create progress dialog
+        progress = QProgressDialog(
+            "Loading GeoTIFF files...",
+            "Cancel",
+            0,
+            len(tiff_files),
+            self
+        )
+        progress.setWindowTitle("Loading Images")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)  # Show immediately
+        progress.setValue(0)
+        
         # Load each file into appropriate group
         loaded_count = 0
-        for file_path in tiff_files:
+        for i, file_path in enumerate(tiff_files):
+            # Check if user cancelled
+            if progress.wasCanceled():
+                break
+            
+            # Update progress dialog
+            progress.setValue(i)
+            progress.setLabelText(f"Loading {file_path.name}...\n({i + 1} of {len(tiff_files)})")
+            QApplication.processEvents()  # Keep UI responsive
+            
             # Get relative path from root
             rel_path = file_path.relative_to(root_path)
             rel_dir = rel_path.parent
@@ -820,11 +843,17 @@ class MainWindow(QMainWindow):
                 self.project.add_image(file_path_str, name, group_path_str)
                 loaded_count += 1
         
+        # Close progress dialog
+        progress.setValue(len(tiff_files))
+        
         # Expand all groups
         self.layer_panel.tree.expandAll()
         
         # Show status message
-        self.statusBar.showMessage(f"Loaded {loaded_count} of {len(tiff_files)} GeoTIFF files", 5000)
+        if progress.wasCanceled():
+            self.statusBar.showMessage(f"Loading cancelled. Loaded {loaded_count} of {len(tiff_files)} GeoTIFF files", 5000)
+        else:
+            self.statusBar.showMessage(f"Loaded {loaded_count} of {len(tiff_files)} GeoTIFF files", 5000)
     
     def _update_coordinates(self, lon: float, lat: float, layer_name: str, group_path: str):
         """Update the coordinate display in the status bar."""
