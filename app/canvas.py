@@ -314,7 +314,15 @@ class MapCanvas(QGraphicsView):
         
         # Set background and allow dragging on empty space
         self.setBackgroundBrush(Qt.darkGray)
-        self.setSceneRect(-1e10, -1e10, 2e10, 2e10)
+        # Web Mercator bounds: approximately -20037508 to +20037508 meters
+        # Add some padding but keep it reasonable
+        WEB_MERCATOR_MAX = 20037508.34  # meters (at 180° longitude)
+        self.setSceneRect(
+            -WEB_MERCATOR_MAX * 1.1,  # left (west)
+            -WEB_MERCATOR_MAX * 1.1,  # top (remember Y is flipped: -north)
+            WEB_MERCATOR_MAX * 2.2,   # width
+            WEB_MERCATOR_MAX * 2.2    # height
+        )
         
         # Canvas mode
         self._mode = CanvasMode.PAN
