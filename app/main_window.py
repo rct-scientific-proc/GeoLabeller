@@ -78,6 +78,10 @@ class MainWindow(QMainWindow):
         self.canvas.coordinates_changed.connect(self._update_coordinates)
         self.canvas.label_placed.connect(self._on_label_placed)
         self.canvas.label_removed.connect(self._on_label_removed)
+        self.canvas.labels_linked.connect(self._on_labels_linked)
+        self.canvas.label_unlinked.connect(self._on_label_unlinked)
+        self.canvas.show_linked_requested.connect(self._on_show_linked)
+        self.canvas.link_mode_changed.connect(self._on_link_mode_changed)
     
     def _setup_menu(self):
         """Set up the menu bar."""
@@ -246,6 +250,64 @@ class MainWindow(QMainWindow):
         
         self.statusBar.showMessage(f"Removed label", 3000)
     
+    def _on_labels_linked(self, label_id1: int, label_id2: int):
+        """Handle two labels being linked."""
+        object_id = self.project.link_labels(label_id1, label_id2)
+        
+        if object_id:
+            # Update the linked status for all labels with this object_id
+            linked_labels = self.project.get_linked_labels(label_id1)
+            for _, label in linked_labels:
+                self.canvas.set_label_linked(label.id, True)
+            
+            count = len(linked_labels)
+            self.statusBar.showMessage(
+                f"Linked labels (object has {count} labels)", 3000
+            )
+        else:
+            self.statusBar.showMessage("Failed to link labels", 3000)
+    
+    def _on_label_unlinked(self, label_id: int):
+        """Handle a label being unlinked from its object group."""
+        # First get the labels that were linked before unlinking
+        old_linked = self.project.get_linked_labels(label_id)
+        
+        self.project.unlink_label(label_id)
+        
+        # Update the unlinked label
+        self.canvas.set_label_linked(label_id, False)
+        
+        # Update remaining linked labels (if only 1 left, it's no longer "linked")
+        remaining = [l for _, l in old_linked if l.id != label_id]
+        if len(remaining) == 1:
+            self.canvas.set_label_linked(remaining[0].id, False)
+        
+        self.statusBar.showMessage("Label unlinked from object", 3000)
+    
+    def _on_show_linked(self, label_id: int):
+        """Highlight all labels linked to the given label."""
+        linked_labels = self.project.get_linked_labels(label_id)
+        
+        if linked_labels:
+            # First, clear any existing highlights
+            all_label_ids = [label.id for _, label in self.project.get_all_labels()]
+            self.canvas.highlight_labels(all_label_ids, highlight=False)
+            
+            # Highlight linked labels
+            linked_ids = [label.id for _, label in linked_labels]
+            self.canvas.highlight_labels(linked_ids, highlight=True)
+            
+            self.statusBar.showMessage(
+                f"Showing {len(linked_labels)} linked labels (click anywhere to clear)", 3000
+            )
+    
+    def _on_link_mode_changed(self, is_active: bool, message: str):
+        """Handle link mode state changes."""
+        if is_active:
+            self.statusBar.showMessage(message, 0)  # 0 = no timeout
+        else:
+            self.statusBar.clearMessage()
+    
     def _refresh_label_markers(self):
         """Refresh all label markers on the canvas."""
         self.canvas.clear_label_markers()
@@ -256,6 +318,9 @@ class MainWindow(QMainWindow):
                 image.name, image.group, image.path,
                 label.class_name, color
             )
+            # Check if label is linked to others
+            linked_labels = self.project.get_linked_labels(label.id)
+            self.canvas.set_label_linked(label.id, len(linked_labels) > 1)
     
     def _edit_classes(self):
         """Open the class editor dialog."""

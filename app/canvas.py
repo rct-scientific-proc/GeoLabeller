@@ -266,6 +266,18 @@ class MapCanvas(QGraphicsView):
     # Signal emitted when a label is removed: (label_id, image_path)
     label_removed = pyqtSignal(int, str)
     
+    # Signal emitted when two labels are linked: (label_id1, label_id2)
+    labels_linked = pyqtSignal(int, int)
+    
+    # Signal emitted when a label is unlinked: (label_id)
+    label_unlinked = pyqtSignal(int)
+    
+    # Signal emitted when user wants to highlight linked labels: (label_id)
+    show_linked_requested = pyqtSignal(int)
+    
+    # Signal emitted when link mode state changes: (is_active, message)
+    link_mode_changed = pyqtSignal(bool, str)
+    
     def __init__(self):
         super().__init__()
         self._scene = QGraphicsScene()
@@ -284,6 +296,10 @@ class MapCanvas(QGraphicsView):
         # Canvas mode
         self._mode = CanvasMode.PAN
         self._current_class = ""  # Currently selected class for labeling
+        
+        # Link mode state
+        self._link_mode_active = False
+        self._link_source_label_id: int | None = None
         
         # Label graphics items: label_id -> (ellipse_item, text_item)
         self._label_items: dict[int, tuple[QGraphicsEllipseItem, QGraphicsTextItem]] = {}
@@ -479,6 +495,16 @@ class MapCanvas(QGraphicsView):
     def mousePressEvent(self, event):
         """Handle mouse press for labeling."""
         if self._mode == CanvasMode.LABEL and event.button() == Qt.LeftButton:
+            # Check if we're in link mode
+            if self._link_mode_active:
+                label_id, image_path = self._get_label_at_position(event.pos())
+                if label_id is not None and label_id != self._link_source_label_id:
+                    # Link the two labels
+                    self.labels_linked.emit(self._link_source_label_id, label_id)
+                # Exit link mode regardless
+                self._exit_link_mode()
+                return
+            
             if not self._current_class:
                 return  # No class selected
             
@@ -496,14 +522,24 @@ class MapCanvas(QGraphicsView):
                 pixel_x, pixel_y = layer.latlon_to_pixel(lon, lat)
                 self.label_placed.emit(pixel_x, pixel_y, lon, lat, layer_name, group_path, layer.file_path)
         elif self._mode == CanvasMode.LABEL and event.button() == Qt.RightButton:
-            # Right-click in label mode - check if we're on a label
-            self._show_label_context_menu(event.pos())
+            # Right-click in label mode - exit link mode if active, otherwise show context menu
+            if self._link_mode_active:
+                self._exit_link_mode()
+            else:
+                self._show_label_context_menu(event.pos())
         else:
             super().mousePressEvent(event)
     
     def mouseReleaseEvent(self, event):
         """Handle mouse release."""
         super().mouseReleaseEvent(event)
+    
+    def keyPressEvent(self, event):
+        """Handle key press events."""
+        if event.key() == Qt.Key_Escape and self._link_mode_active:
+            self._exit_link_mode()
+        else:
+            super().keyPressEvent(event)
 
     def mouseMoveEvent(self, event):
         """Track mouse position and emit lat/lon coordinates."""
@@ -724,10 +760,95 @@ class MapCanvas(QGraphicsView):
         
         if label_id is not None:
             menu = QMenu(self)
+            
+            # Link option - always available
+            link_action = menu.addAction("Link with...")
+            
+            # Check if label is linked (data slot 1 stores True if linked to others)
+            ellipse, _ = self._label_items.get(label_id, (None, None))
+            is_linked = ellipse and ellipse.data(1) == True
+            
+            # Unlink and Show linked options (only if label is linked to others)
+            unlink_action = None
+            show_linked_action = None
+            if is_linked:
+                unlink_action = menu.addAction("Unlink")
+                show_linked_action = menu.addAction("Show Linked")
+            
+            menu.addSeparator()
             remove_action = menu.addAction("Remove Label")
             
             action = menu.exec_(self.mapToGlobal(view_pos))
             
             if action == remove_action:
                 self.label_removed.emit(label_id, image_path)
+            elif action == link_action:
+                self._enter_link_mode(label_id)
+            elif action == unlink_action:
+                self.label_unlinked.emit(label_id)
+            elif action == show_linked_action:
+                self.show_linked_requested.emit(label_id)
+    
+    def _enter_link_mode(self, source_label_id: int):
+        """Enter link mode with the given label as the source."""
+        self._link_mode_active = True
+        self._link_source_label_id = source_label_id
+        self.setCursor(Qt.CrossCursor)
+        
+        # Highlight the source label
+        if source_label_id in self._label_items:
+            ellipse, _ = self._label_items[source_label_id]
+            ellipse.setData(2, ellipse.pen())  # Store original pen in data slot 2
+            highlight_pen = QPen(QColor(255, 255, 0), ellipse.pen().widthF() * 2)
+            ellipse.setPen(highlight_pen)
+        
+        self.link_mode_changed.emit(True, "Link mode: Click another label to link, or right-click/Escape to cancel")
+    
+    def _exit_link_mode(self):
+        """Exit link mode and restore normal state."""
+        # Restore source label appearance
+        if self._link_source_label_id and self._link_source_label_id in self._label_items:
+            ellipse, _ = self._label_items[self._link_source_label_id]
+            original_pen = ellipse.data(2)
+            if original_pen:
+                ellipse.setPen(original_pen)
+        
+        self._link_mode_active = False
+        self._link_source_label_id = None
+        
+        # Restore cursor based on mode
+        if self._mode == CanvasMode.LABEL:
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+        
+        self.link_mode_changed.emit(False, "")
+    
+    def is_link_mode_active(self) -> bool:
+        """Check if link mode is currently active."""
+        return self._link_mode_active
+    
+    def set_label_linked(self, label_id: int, is_linked: bool):
+        """Update whether a label is linked to other labels."""
+        if label_id in self._label_items:
+            ellipse, _ = self._label_items[label_id]
+            ellipse.setData(1, is_linked)  # Store linked status in data slot 1
+    
+    def highlight_labels(self, label_ids: list[int], highlight: bool = True):
+        """Highlight or unhighlight a set of label markers."""
+        for label_id in label_ids:
+            if label_id in self._label_items:
+                ellipse, text = self._label_items[label_id]
+                if highlight:
+                    # Store original pen and apply highlight
+                    if ellipse.data(3) is None:  # data slot 3 for highlight state
+                        ellipse.setData(3, ellipse.pen())
+                    highlight_pen = QPen(QColor(0, 255, 255), ellipse.pen().widthF() * 1.5)
+                    ellipse.setPen(highlight_pen)
+                else:
+                    # Restore original pen
+                    original_pen = ellipse.data(3)
+                    if original_pen:
+                        ellipse.setPen(original_pen)
+                        ellipse.setData(3, None)
 

@@ -1,5 +1,6 @@
 """Label data model and storage for point annotations."""
 import json
+import uuid
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
@@ -23,6 +24,10 @@ class PointLabel:
     lon: float
     lat: float
     
+    # Object ID for linking labels across images (UUID v4)
+    # Every label has a unique object_id; linked labels share the same one
+    object_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization."""
         return {
@@ -31,7 +36,8 @@ class PointLabel:
             "pixel_x": self.pixel_x,
             "pixel_y": self.pixel_y,
             "lon": self.lon,
-            "lat": self.lat
+            "lat": self.lat,
+            "object_id": self.object_id
         }
     
     @classmethod
@@ -43,7 +49,9 @@ class PointLabel:
             pixel_x=data.get("pixel_x", data.get("x", 0)),
             pixel_y=data.get("pixel_y", data.get("y", 0)),
             lon=data["lon"],
-            lat=data["lat"]
+            lat=data["lat"],
+            # Generate UUID if not present (backwards compatibility)
+            object_id=data.get("object_id") or str(uuid.uuid4())
         )
 
 
@@ -177,6 +185,73 @@ class LabelProject:
                 if label.class_name == class_name:
                     result.append((image, label))
         return result
+    
+    def get_label_by_id(self, label_id: int) -> tuple["ImageData", PointLabel] | tuple[None, None]:
+        """Get a label and its image by label ID."""
+        for image in self.images.values():
+            for label in image.labels:
+                if label.id == label_id:
+                    return image, label
+        return None, None
+    
+    def link_labels(self, label_id1: int, label_id2: int) -> str | None:
+        """Link two labels with the same object_id.
+        
+        If either label already has an object_id, both labels get that ID.
+        If neither has one, a new UUID v4 is generated.
+        
+        Returns the object_id used, or None if either label wasn't found.
+        """
+        _, label1 = self.get_label_by_id(label_id1)
+        _, label2 = self.get_label_by_id(label_id2)
+        
+        if not label1 or not label2:
+            return None
+        
+        # Determine which object_id to use
+        if label1.object_id:
+            object_id = label1.object_id
+        elif label2.object_id:
+            object_id = label2.object_id
+        else:
+            object_id = str(uuid.uuid4())
+        
+        # If both have different object_ids, merge them (all labels with label2's id get label1's id)
+        if label1.object_id and label2.object_id and label1.object_id != label2.object_id:
+            old_id = label2.object_id
+            for image in self.images.values():
+                for label in image.labels:
+                    if label.object_id == old_id:
+                        label.object_id = object_id
+        else:
+            label1.object_id = object_id
+            label2.object_id = object_id
+        
+        return object_id
+    
+    def unlink_label(self, label_id: int):
+        """Remove a label from its object group by giving it a new unique UUID."""
+        _, label = self.get_label_by_id(label_id)
+        if label:
+            label.object_id = str(uuid.uuid4())
+    
+    def get_linked_labels(self, label_id: int) -> list[tuple["ImageData", PointLabel]]:
+        """Get all labels linked to the given label (same object_id).
+        
+        Returns labels only if there are 2 or more with the same object_id.
+        """
+        _, source_label = self.get_label_by_id(label_id)
+        if not source_label or not source_label.object_id:
+            return []
+        
+        result = []
+        for image in self.images.values():
+            for label in image.labels:
+                if label.object_id == source_label.object_id:
+                    result.append((image, label))
+        
+        # Only return if there are actually linked labels (more than 1)
+        return result if len(result) > 1 else []
     
     @property
     def label_count(self) -> int:
