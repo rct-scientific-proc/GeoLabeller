@@ -150,6 +150,14 @@ class MainWindow(QMainWindow):
         clear_labels_action = QAction("Clear All Labels", self)
         clear_labels_action.triggered.connect(self._clear_all_labels)
         labels_menu.addAction(clear_labels_action)
+        
+        # Export menu
+        export_menu = menubar.addMenu("&Export")
+        
+        # Export Ground Truth
+        export_gt_action = QAction("&Ground Truth...", self)
+        export_gt_action.triggered.connect(self._export_ground_truth)
+        export_menu.addAction(export_gt_action)
     
     def _setup_toolbar(self):
         """Set up the toolbar for labeling."""
@@ -277,10 +285,15 @@ class MainWindow(QMainWindow):
         # Update the unlinked label
         self.canvas.set_label_linked(label_id, False)
         
+        # Clear highlight from the unlinked label
+        self.canvas.highlight_labels([label_id], highlight=False)
+        
         # Update remaining linked labels (if only 1 left, it's no longer "linked")
         remaining = [l for _, l in old_linked if l.id != label_id]
         if len(remaining) == 1:
             self.canvas.set_label_linked(remaining[0].id, False)
+            # Also clear highlight since it's no longer part of a group
+            self.canvas.highlight_labels([remaining[0].id], highlight=False)
         
         self.statusBar.showMessage("Label unlinked from object", 3000)
     
@@ -507,6 +520,27 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save project: {e}")
     
+    def _export_ground_truth(self):
+        """Export ground truth labels to a JSON file."""
+        if self.project.label_count == 0:
+            QMessageBox.information(self, "Export", "No labels to export.")
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Ground Truth",
+            "",
+            "JSON Files (*.json)"
+        )
+        if file_path:
+            if not file_path.endswith('.json'):
+                file_path += '.json'
+            try:
+                self.project.save(file_path)
+                self.statusBar.showMessage(f"Exported {self.project.label_count} labels to {file_path}", 3000)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to export ground truth: {e}")
+
     def _add_geotiff(self):
         """Open file dialog to add a GeoTIFF."""
         file_paths, _ = QFileDialog.getOpenFileNames(
