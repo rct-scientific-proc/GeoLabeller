@@ -709,9 +709,8 @@ class MainWindow(QMainWindow):
                     class_dir = output_path / label.class_name
                     class_dir.mkdir(parents=True, exist_ok=True)
                     
-                    # Generate unique filename
-                    image_stem = Path(image_path).stem
-                    out_filename = f"{image_stem}_label{label.id}.png"
+                    # Generate unique filename: {object_id}_{label_id:06d}.png
+                    out_filename = f"{label.object_id}_{label.id:06d}.png"
                     out_path = class_dir / out_filename
                     
                     # Save as PNG
