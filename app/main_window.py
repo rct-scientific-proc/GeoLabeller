@@ -11,7 +11,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
 
 from .canvas import MapCanvas, CanvasMode
-from .layer_panel import LayerPanel
+from .layer_panel import CombinedLayerPanel
 from .axis_ruler import MapCanvasWithAxes
 from .labels import LabelProject
 from .class_editor import ClassEditorDialog
@@ -51,8 +51,8 @@ class MainWindow(QMainWindow):
         # Create splitter for resizable panels
         splitter = QSplitter(Qt.Horizontal)
         
-        # Layer panel on the left
-        self.layer_panel = LayerPanel()
+        # Combined layer panel on the left (includes labeled images panel)
+        self.layer_panel = CombinedLayerPanel()
         splitter.addWidget(self.layer_panel)
         
         # Map canvas with axes on the right
@@ -265,6 +265,9 @@ class MainWindow(QMainWindow):
             label.id, lon, lat, image_name, image_group, image_path, class_name, color
         )
         
+        # Refresh labeled images panel
+        self.layer_panel.refresh_labeled_panel(self.project)
+        
         self.statusBar.showMessage(
             f"Added label: {class_name} at ({lon:.6f}, {lat:.6f}) on {image_name}", 
             3000
@@ -278,6 +281,9 @@ class MainWindow(QMainWindow):
         # Remove visual marker
         self.canvas.remove_label_marker(label_id)
         
+        # Refresh labeled images panel
+        self.layer_panel.refresh_labeled_panel(self.project)
+        
         self.statusBar.showMessage(f"Removed label", 3000)
     
     def _on_labels_linked(self, label_id1: int, label_id2: int):
@@ -289,6 +295,9 @@ class MainWindow(QMainWindow):
             linked_labels = self.project.get_linked_labels(label_id1)
             for _, label in linked_labels:
                 self.canvas.set_label_linked(label.id, True)
+            
+            # Refresh labeled images panel (grouping may have changed)
+            self.layer_panel.refresh_labeled_panel(self.project)
             
             count = len(linked_labels)
             self.statusBar.showMessage(
@@ -316,6 +325,9 @@ class MainWindow(QMainWindow):
             self.canvas.set_label_linked(remaining[0].id, False)
             # Also clear highlight since it's no longer part of a group
             self.canvas.highlight_labels([remaining[0].id], highlight=False)
+        
+        # Refresh labeled images panel (grouping may have changed)
+        self.layer_panel.refresh_labeled_panel(self.project)
         
         self.statusBar.showMessage("Label unlinked from object", 3000)
     
@@ -356,6 +368,9 @@ class MainWindow(QMainWindow):
             # Check if label is linked to others
             linked_labels = self.project.get_linked_labels(label.id)
             self.canvas.set_label_linked(label.id, len(linked_labels) > 1)
+        
+        # Refresh labeled images panel
+        self.layer_panel.refresh_labeled_panel(self.project)
     
     def _edit_classes(self):
         """Open the class editor dialog."""
@@ -402,6 +417,8 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.Yes:
             self.project.clear()
             self.canvas.clear_label_markers()
+            # Refresh labeled images panel (now empty)
+            self.layer_panel.refresh_labeled_panel(self.project)
             self.statusBar.showMessage("All labels cleared", 3000)
     
     def _new_project(self):
