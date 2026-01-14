@@ -564,12 +564,13 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Error", f"Failed to export ground truth: {e}")
 
     def _export_subimages(self):
-        """Export sub-images centered on labels for use with PyTorch ImageFolder."""
+        """Export sub-images centered on labels as GeoTIFFs with WGS84 CRS."""
         from PyQt5.QtWidgets import QInputDialog, QProgressDialog
         from PyQt5.QtCore import Qt as QtCore_Qt
         import rasterio
+        from rasterio.crs import CRS
+        from rasterio.warp import calculate_default_transform, reproject, Resampling
         import os
-        from PIL import Image
         
         if self.project.label_count == 0:
             QMessageBox.information(self, "Export", "No labels to export.")
@@ -713,25 +714,64 @@ class MainWindow(QMainWindow):
                     # Use boundless=False to ensure we stay within image bounds
                     data = src.read(window=window, boundless=False)
                     
-                    # Convert to RGB image
-                    if data.shape[0] >= 3:
-                        rgb = data[:3].transpose(1, 2, 0)
-                    else:
-                        rgb = np.stack([data[0]] * 3, axis=-1)
-                    
-                    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
-                    
                     # Create output directory for this class
                     class_dir = output_path / label.class_name
                     class_dir.mkdir(parents=True, exist_ok=True)
                     
-                    # Generate unique filename: {object_id}_{label_id:06d}.png
-                    out_filename = f"{label.object_id}_{label.id:06d}.png"
+                    # Generate unique filename: {object_id}_{label_id:06d}.tif
+                    out_filename = f"{label.object_id}_{label.id:06d}.tif"
                     out_path = class_dir / out_filename
                     
-                    # Save as PNG
-                    img = Image.fromarray(rgb)
-                    img.save(out_path)
+                    # Calculate the transform for the sub-image window
+                    window_transform = rasterio.windows.transform(window, src.transform)
+                    
+                    # Define target CRS as WGS84
+                    dst_crs = CRS.from_epsg(4326)
+                    
+                    # Calculate the transform for reprojection to WGS84
+                    dst_transform, dst_width, dst_height = calculate_default_transform(
+                        src.crs, dst_crs, 
+                        window_width, window_height,
+                        *rasterio.windows.bounds(window, src.transform)
+                    )
+                    
+                    # Prepare destination array
+                    num_bands = min(data.shape[0], 3)  # Use up to 3 bands
+                    dst_data = np.zeros((num_bands, dst_height, dst_width), dtype=np.uint8)
+                    
+                    # Reproject each band to WGS84
+                    for band_idx in range(num_bands):
+                        band_data = np.clip(data[band_idx], 0, 255).astype(np.uint8)
+                        reproject(
+                            source=band_data,
+                            destination=dst_data[band_idx],
+                            src_transform=window_transform,
+                            src_crs=src.crs,
+                            dst_transform=dst_transform,
+                            dst_crs=dst_crs,
+                            resampling=Resampling.bilinear
+                        )
+                    
+                    # Handle single-band images by replicating to 3 bands
+                    if data.shape[0] < 3:
+                        dst_data = np.stack([dst_data[0]] * 3, axis=0)
+                        num_bands = 3
+                    
+                    # Save as GeoTIFF with WGS84 CRS
+                    with rasterio.open(
+                        out_path,
+                        'w',
+                        driver='GTiff',
+                        height=dst_height,
+                        width=dst_width,
+                        count=num_bands,
+                        dtype=np.uint8,
+                        crs=dst_crs,
+                        transform=dst_transform,
+                        compress='lzw'
+                    ) as dst:
+                        dst.write(dst_data)
+                    
                     exported += 1
                     
             except Exception as e:
