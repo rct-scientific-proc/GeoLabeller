@@ -11,6 +11,16 @@ A PyQt5-based desktop application for viewing GeoTIFF images and creating point 
 - Zoom to specific layers
 - Pan and zoom navigation with mouse wheel
 - Real-time coordinate display (WGS84) with nearest image info in status bar
+- **Scale bar** in the top-right corner showing distance at current zoom level
+- **Duplicate detection** prevents loading the same image file twice
+
+### Labeled Images Panel
+- Separate panel below the layer panel showing all labeled images
+- Labels grouped by **object ID** (linked labels appear together)
+- Individual labels displayed with their unique label IDs
+- Click to zoom directly to any label location
+- Synchronized visibility toggle with main layer panel
+- Right-click context menu for quick navigation
 
 ### Point Labeling
 - Create custom label classes with distinct colors
