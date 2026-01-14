@@ -363,11 +363,12 @@ class LayerPanel(QWidget):
 
 
 class LabeledLayerPanel(QWidget):
-    """Panel showing images that have labels, grouped by object_id."""
+    """Panel showing labels grouped by object_id, with individual label entries."""
     
     # Signals
     layer_visibility_changed = pyqtSignal(str, bool)  # layer_id, visible
     zoom_to_layer_requested = pyqtSignal(str)  # layer_id
+    zoom_to_label_requested = pyqtSignal(float, float)  # lon, lat - zoom to specific coordinates
     
     def __init__(self):
         super().__init__()
@@ -410,7 +411,7 @@ class LabeledLayerPanel(QWidget):
         return self._layer_id_map.get(file_path)
     
     def refresh(self, project):
-        """Refresh the tree with current labeled images from the project.
+        """Refresh the tree with current labels from the project.
         
         Args:
             project: The LabelProject containing images and labels
@@ -418,108 +419,70 @@ class LabeledLayerPanel(QWidget):
         self.tree.blockSignals(True)
         self.tree.clear()
         
-        # Group images by object_id
-        # object_id -> list of (image_path, image_name, label_count_for_this_object)
-        object_groups: dict[str, list[tuple[str, str, int]]] = {}
-        
-        # Also track total labels per image for display
-        image_total_labels: dict[str, int] = {}
+        # Group labels by object_id
+        # object_id -> list of (label_id, image_name, image_path, lon, lat, class_name)
+        object_groups: dict[str, list[tuple[int, str, str, float, float, str]]] = {}
         
         for image in project.images.values():
             if not image.labels:
                 continue
             
-            # Count total labels per image
-            image_total_labels[image.path] = len(image.labels)
-            
-            # Get unique object_ids for this image
             for label in image.labels:
                 object_id = label.object_id
                 if object_id not in object_groups:
                     object_groups[object_id] = []
                 
-                # Check if this image is already in the group for this object_id
-                existing = [x for x in object_groups[object_id] if x[0] == image.path]
-                if not existing:
-                    object_groups[object_id].append((image.path, image.name, 1))
-                else:
-                    # Update label count for this object_id
-                    idx = object_groups[object_id].index(existing[0])
-                    path, name, count = object_groups[object_id][idx]
-                    object_groups[object_id][idx] = (path, name, count + 1)
+                object_groups[object_id].append((
+                    label.id,
+                    image.name,
+                    image.path,
+                    label.lon,
+                    label.lat,
+                    label.class_name
+                ))
         
         # Create tree items
         style = QApplication.style()
         
-        for object_id, images in object_groups.items():
-            if len(images) > 1:
-                # Multiple images share this object_id - create a group
-                group_item = QTreeWidgetItem()
-                short_id = object_id[:8] + "..."  # Truncate UUID for display
-                group_item.setText(0, f"Object: {short_id}")
-                group_item.setData(0, Qt.UserRole, object_id)
-                group_item.setData(0, Qt.UserRole + 1, "group")
-                group_item.setFlags(group_item.flags() | Qt.ItemIsUserCheckable)
-                group_item.setCheckState(0, Qt.Checked)
-                group_item.setIcon(0, style.standardIcon(QStyle.SP_DirIcon))
-                
-                # Bold font for groups
-                font = group_item.font(0)
-                font.setBold(True)
-                group_item.setFont(0, font)
-                group_item.setForeground(0, QColor(70, 130, 180))
-                
-                self.tree.addTopLevelItem(group_item)
-                
-                for file_path, name, label_count in images:
-                    # Show total labels on this image, not just for this object_id
-                    total_labels = image_total_labels.get(file_path, label_count)
-                    layer_item = QTreeWidgetItem()
-                    layer_item.setText(0, f"{name} ({total_labels})")
-                    layer_item.setData(0, Qt.UserRole, file_path)
-                    layer_item.setData(0, Qt.UserRole + 1, "layer")
-                    layer_item.setFlags(layer_item.flags() | Qt.ItemIsUserCheckable)
-                    layer_item.setCheckState(0, Qt.Checked)
-                    layer_item.setToolTip(0, file_path)
-                    layer_item.setIcon(0, style.standardIcon(QStyle.SP_FileIcon))
-                    group_item.addChild(layer_item)
-                
-                group_item.setExpanded(True)
+        for object_id, labels in object_groups.items():
+            # Create group for this object_id
+            group_item = QTreeWidgetItem()
+            short_id = object_id[:8] + "..."  # Truncate UUID for display
+            label_count = len(labels)
+            group_item.setText(0, f"Object: {short_id} ({label_count})")
+            group_item.setData(0, Qt.UserRole, object_id)
+            group_item.setData(0, Qt.UserRole + 1, "group")
+            group_item.setFlags(group_item.flags() | Qt.ItemIsUserCheckable)
+            group_item.setCheckState(0, Qt.Checked)
+            group_item.setIcon(0, style.standardIcon(QStyle.SP_DirIcon))
+            
+            # Bold font for groups, different colors based on link status
+            font = group_item.font(0)
+            font.setBold(True)
+            group_item.setFont(0, font)
+            if label_count > 1:
+                group_item.setForeground(0, QColor(70, 130, 180))  # Steel blue for linked
             else:
-                # Single image - still create a group for consistency
-                file_path, name, label_count = images[0]
-                
-                # Create group for this object_id
-                group_item = QTreeWidgetItem()
-                short_id = object_id[:8] + "..."  # Truncate UUID for display
-                group_item.setText(0, f"Object: {short_id}")
-                group_item.setData(0, Qt.UserRole, object_id)
-                group_item.setData(0, Qt.UserRole + 1, "group")
-                group_item.setFlags(group_item.flags() | Qt.ItemIsUserCheckable)
-                group_item.setCheckState(0, Qt.Checked)
-                group_item.setIcon(0, style.standardIcon(QStyle.SP_DirIcon))
-                
-                # Use different color for single-image groups
-                font = group_item.font(0)
-                font.setBold(True)
-                group_item.setFont(0, font)
-                group_item.setForeground(0, QColor(100, 149, 237))  # Cornflower blue
-                
-                self.tree.addTopLevelItem(group_item)
-                
-                # Add the layer as child - show total labels on this image
-                total_labels = image_total_labels.get(file_path, label_count)
-                layer_item = QTreeWidgetItem()
-                layer_item.setText(0, f"{name} ({total_labels})")
-                layer_item.setData(0, Qt.UserRole, file_path)
-                layer_item.setData(0, Qt.UserRole + 1, "layer")
-                layer_item.setFlags(layer_item.flags() | Qt.ItemIsUserCheckable)
-                layer_item.setCheckState(0, Qt.Checked)
-                layer_item.setToolTip(0, file_path)
-                layer_item.setIcon(0, style.standardIcon(QStyle.SP_FileIcon))
-                group_item.addChild(layer_item)
-                
-                group_item.setExpanded(True)
+                group_item.setForeground(0, QColor(100, 149, 237))  # Cornflower blue for single
+            
+            self.tree.addTopLevelItem(group_item)
+            
+            # Add each label as a child
+            for label_id, image_name, file_path, lon, lat, class_name in labels:
+                label_item = QTreeWidgetItem()
+                label_item.setText(0, f"#{label_id}: {image_name} [{class_name}]")
+                label_item.setData(0, Qt.UserRole, file_path)
+                label_item.setData(0, Qt.UserRole + 1, "label")
+                label_item.setData(0, Qt.UserRole + 2, label_id)
+                label_item.setData(0, Qt.UserRole + 3, lon)
+                label_item.setData(0, Qt.UserRole + 4, lat)
+                label_item.setFlags(label_item.flags() | Qt.ItemIsUserCheckable)
+                label_item.setCheckState(0, Qt.Checked)
+                label_item.setToolTip(0, f"Label #{label_id} on {file_path}\nLon: {lon:.6f}, Lat: {lat:.6f}")
+                label_item.setIcon(0, style.standardIcon(QStyle.SP_FileIcon))
+                group_item.addChild(label_item)
+            
+            group_item.setExpanded(True)
         
         self.tree.blockSignals(False)
     
@@ -528,7 +491,7 @@ class LabeledLayerPanel(QWidget):
         item_type = item.data(0, Qt.UserRole + 1)
         checked = item.checkState(0) == Qt.Checked
         
-        if item_type == "layer":
+        if item_type == "label":
             file_path = item.data(0, Qt.UserRole)
             layer_id = self._layer_id_map.get(file_path)
             if layer_id:
@@ -555,14 +518,32 @@ class LabeledLayerPanel(QWidget):
         menu = QMenu()
         item_type = item.data(0, Qt.UserRole + 1)
         
-        if item_type == "layer":
-            # Zoom to layer
-            zoom_action = menu.addAction("Zoom to Layer")
+        if item_type == "label":
+            # Get stored data
             file_path = item.data(0, Qt.UserRole)
+            lon = item.data(0, Qt.UserRole + 3)
+            lat = item.data(0, Qt.UserRole + 4)
+            
+            # Zoom to label (specific coordinates)
+            zoom_label_action = menu.addAction("Zoom to Label")
+            zoom_label_action.triggered.connect(lambda: self.zoom_to_label_requested.emit(lon, lat))
+            
+            # Zoom to layer
             layer_id = self._layer_id_map.get(file_path)
             if layer_id:
-                zoom_action.triggered.connect(lambda: self.zoom_to_layer_requested.emit(layer_id))
+                zoom_layer_action = menu.addAction("Zoom to Layer")
+                zoom_layer_action.triggered.connect(lambda: self.zoom_to_layer_requested.emit(layer_id))
         elif item_type == "group":
+            # Zoom to first label in this group
+            if item.childCount() > 0:
+                first_child = item.child(0)
+                lon = first_child.data(0, Qt.UserRole + 3)
+                lat = first_child.data(0, Qt.UserRole + 4)
+                zoom_label_action = menu.addAction("Zoom to Label")
+                zoom_label_action.triggered.connect(lambda: self.zoom_to_label_requested.emit(lon, lat))
+            
+            menu.addSeparator()
+            
             # Select/unselect all in group
             select_all_action = menu.addAction("Select all")
             select_all_action.triggered.connect(lambda: self._set_group_checked(item, True))
@@ -579,7 +560,7 @@ class LabeledLayerPanel(QWidget):
         # Children will be updated by _on_item_changed
     
     def set_layer_checked(self, file_path: str, checked: bool):
-        """Set the check state of a layer by file path without emitting signals.
+        """Set the check state of labels for a file path without emitting signals.
         
         Args:
             file_path: The file path of the layer
@@ -589,21 +570,17 @@ class LabeledLayerPanel(QWidget):
             if parent is None:
                 count = self.tree.topLevelItemCount()
                 for i in range(count):
-                    if find_and_set(self.tree.topLevelItem(i)):
-                        return True
+                    find_and_set(self.tree.topLevelItem(i))
             else:
                 item_type = parent.data(0, Qt.UserRole + 1)
-                if item_type == "layer":
+                if item_type == "label":
                     if parent.data(0, Qt.UserRole) == file_path:
                         self.tree.blockSignals(True)
                         parent.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
                         self.tree.blockSignals(False)
-                        return True
                 elif item_type == "group":
                     for i in range(parent.childCount()):
-                        if find_and_set(parent.child(i)):
-                            return True
-            return False
+                        find_and_set(parent.child(i))
         
         find_and_set()
     
@@ -620,6 +597,7 @@ class CombinedLayerPanel(QWidget):
     layers_reordered = pyqtSignal(list)
     layer_group_changed = pyqtSignal(str, str)
     zoom_to_layer_requested = pyqtSignal(str)
+    zoom_to_label_requested = pyqtSignal(float, float)  # lon, lat
     layer_removed = pyqtSignal(str)
     
     def __init__(self):
@@ -658,6 +636,7 @@ class CombinedLayerPanel(QWidget):
         # Forward signals from labeled panel
         self.labeled_panel.layer_visibility_changed.connect(self._on_labeled_visibility_changed)
         self.labeled_panel.zoom_to_layer_requested.connect(self.zoom_to_layer_requested)
+        self.labeled_panel.zoom_to_label_requested.connect(self.zoom_to_label_requested)
     
     def _on_main_visibility_changed(self, layer_id: str, visible: bool):
         """Handle visibility change from main panel."""

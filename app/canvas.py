@@ -340,6 +340,7 @@ class MapCanvas(QGraphicsView):
         # Layer storage
         self._layers: dict[str, TiledLayer] = {}
         self._layer_order: list[str] = []
+        self._path_to_layer: dict[str, str] = {}  # file_path -> layer_id for duplicate detection
         self._next_id = 1
         
         # Tile update timer (debounce rapid view changes)
@@ -348,7 +349,11 @@ class MapCanvas(QGraphicsView):
         self._tile_update_timer.timeout.connect(self._update_visible_tiles)
     
     def add_layer(self, file_path: str) -> str | None:
-        """Add a GeoTIFF layer to the canvas."""
+        """Add a GeoTIFF layer to the canvas. Returns existing layer_id if already loaded."""
+        # Check if this file is already loaded
+        if file_path in self._path_to_layer:
+            return self._path_to_layer[file_path]
+        
         try:
             layer = TiledLayer(file_path)
             
@@ -357,6 +362,7 @@ class MapCanvas(QGraphicsView):
             
             self._layers[layer_id] = layer
             self._layer_order.append(layer_id)
+            self._path_to_layer[file_path] = layer_id
             self._update_z_order()
             
             # Load visible tiles
@@ -467,8 +473,11 @@ class MapCanvas(QGraphicsView):
     def remove_layer(self, layer_id: str):
         """Remove a layer from the canvas."""
         if layer_id in self._layers:
+            file_path = self._layers[layer_id].file_path
             self._layers[layer_id].remove_from_scene(self._scene)
             del self._layers[layer_id]
+            if file_path in self._path_to_layer:
+                del self._path_to_layer[file_path]
             if layer_id in self._layer_order:
                 self._layer_order.remove(layer_id)
     
@@ -483,6 +492,10 @@ class MapCanvas(QGraphicsView):
         """Set the group path for a layer."""
         if layer_id in self._layers:
             self._layers[layer_id].group_path = group_path
+    
+    def is_path_loaded(self, file_path: str) -> bool:
+        """Check if a file path is already loaded as a layer."""
+        return file_path in self._path_to_layer
     
     def get_layer_file_path(self, layer_id: str) -> str | None:
         """Get the file path for a layer."""
@@ -500,6 +513,31 @@ class MapCanvas(QGraphicsView):
         rect = QRectF(west, -north, east - west, north - south)
         self.fitInView(rect, Qt.KeepAspectRatio)
         self._schedule_tile_update()
+    
+    def zoom_to_point(self, lon: float, lat: float, size_meters: float = 10.0):
+        """Zoom the view to center on a point with a given extent in meters.
+        
+        Args:
+            lon: Longitude (WGS84)
+            lat: Latitude (WGS84)
+            size_meters: The width/height of the view in meters (default 10m)
+        """
+        # Convert point to Web Mercator
+        center_x, center_y = self._wgs84_to_web_mercator(lon, lat)
+        
+        # In Web Mercator, units are meters, so size_meters directly gives the extent
+        half_size = size_meters / 2
+        
+        west = center_x - half_size
+        east = center_x + half_size
+        south = center_y - half_size
+        north = center_y + half_size
+        
+        # Create rect (Y is flipped in scene coordinates)
+        rect = QRectF(west, -north, east - west, north - south)
+        self.fitInView(rect, Qt.KeepAspectRatio)
+        self._schedule_tile_update()
+        self.update_label_markers_scale()
     
     def wheelEvent(self, event: QWheelEvent):
         """Zoom in/out with mouse wheel."""

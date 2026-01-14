@@ -76,6 +76,7 @@ class MainWindow(QMainWindow):
         self.layer_panel.layers_reordered.connect(self.canvas.update_layer_order)
         self.layer_panel.layer_group_changed.connect(self._on_layer_group_changed)
         self.layer_panel.zoom_to_layer_requested.connect(self.canvas.zoom_to_layer)
+        self.layer_panel.zoom_to_label_requested.connect(self._on_zoom_to_label)
         self.layer_panel.layer_removed.connect(self.canvas.remove_layer)
         self.canvas.coordinates_changed.connect(self._update_coordinates)
         self.canvas.label_placed.connect(self._on_label_placed)
@@ -354,6 +355,13 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage(message, 0)  # 0 = no timeout
         else:
             self.statusBar.clearMessage()
+    
+    def _on_zoom_to_label(self, lon: float, lat: float):
+        """Zoom to a label by its coordinates."""
+        self.canvas.zoom_to_point(lon, lat, size_meters=10.0)
+        self.statusBar.showMessage(
+            f"Zoomed to label at ({lon:.6f}, {lat:.6f})", 3000
+        )
     
     def _refresh_label_markers(self):
         """Refresh all label markers on the canvas."""
@@ -799,13 +807,22 @@ class MainWindow(QMainWindow):
             "GeoTIFF Files (*.tif *.tiff);;All Files (*)"
         )
         
+        skipped = 0
         for file_path in file_paths:
+            # Check if already loaded
+            if self.canvas.is_path_loaded(file_path):
+                skipped += 1
+                continue
+            
             layer_id = self.canvas.add_layer(file_path)
             if layer_id:
                 self.layer_panel.add_layer(layer_id, file_path)
                 # Track the loaded image
                 name = Path(file_path).stem
                 self.project.add_image(file_path, name, "")
+        
+        if skipped > 0:
+            self.statusBar.showMessage(f"Skipped {skipped} already loaded image(s)", 3000)
     
     def _add_directory(self):
         """Open directory dialog and load all GeoTIFFs preserving directory structure."""
@@ -884,15 +901,18 @@ class MainWindow(QMainWindow):
             # Get or create the group for this directory
             parent_group = get_or_create_group(rel_dir)
             
-            # Load the layer
-            layer_id = self.canvas.add_layer(str(file_path))
+            # Load the layer (skip if already loaded)
+            file_path_str = str(file_path)
+            if self.canvas.is_path_loaded(file_path_str):
+                continue  # Already loaded, skip
+            
+            layer_id = self.canvas.add_layer(file_path_str)
             if layer_id:
-                self.layer_panel.add_layer(layer_id, str(file_path), parent_group)
+                self.layer_panel.add_layer(layer_id, file_path_str, parent_group)
                 # Set the group path for display (convert Path to forward-slash string)
                 group_path_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
                 self.canvas.set_layer_group(layer_id, group_path_str)
                 # Track the loaded image in project
-                file_path_str = str(file_path)
                 name = file_path.stem
                 self.project.add_image(file_path_str, name, group_path_str)
                 loaded_count += 1
