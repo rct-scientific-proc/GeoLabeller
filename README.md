@@ -48,7 +48,7 @@ conda env create -f environment.yml
 conda activate geolabel
 
 # Or install dependencies manually
-pip install PyQt5 rasterio numpy
+pip install PyQt5 rasterio numpy pillow
 ```
 
 ## Usage
