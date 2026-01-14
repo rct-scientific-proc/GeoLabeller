@@ -334,7 +334,8 @@ class MapCanvas(QGraphicsView):
         
         # Label graphics items: label_id -> (ellipse_item, text_item)
         self._label_items: dict[int, tuple[QGraphicsEllipseItem, QGraphicsTextItem]] = {}
-        self._label_z_base = 1000  # Z-value for labels (above all tiles)
+        # Z-value offset for labels (added to max layer z-value to ensure labels are always on top)
+        self._label_z_offset = 1000
         
         # Layer storage
         self._layers: dict[str, TiledLayer] = {}
@@ -447,6 +448,21 @@ class MapCanvas(QGraphicsView):
         for i, layer_id in enumerate(self._layer_order):
             if layer_id in self._layers:
                 self._layers[layer_id].set_z_value(i)
+        # Update label z-values to ensure they remain above all layers
+        self._update_label_z_values()
+    
+    def _get_label_z_base(self) -> float:
+        """Get the base z-value for labels, ensuring it's always above all layers."""
+        # Labels should be above all layers (layer z-values are 0, 1, 2, ...)
+        max_layer_z = len(self._layer_order)
+        return max_layer_z + self._label_z_offset
+    
+    def _update_label_z_values(self):
+        """Update all label markers to ensure they stay above all layers."""
+        label_z = self._get_label_z_base()
+        for ellipse, text in self._label_items.values():
+            ellipse.setZValue(label_z)
+            text.setZValue(label_z + 1)
     
     def remove_layer(self, layer_id: str):
         """Remove a layer from the canvas."""
@@ -700,7 +716,7 @@ class MapCanvas(QGraphicsView):
         ellipse.setPos(x, -y)  # Y is flipped in scene coords
         ellipse.setPen(QPen(color.darker(150), marker_size / 5))
         ellipse.setBrush(QBrush(color))
-        ellipse.setZValue(self._label_z_base)
+        ellipse.setZValue(self._get_label_z_base())
         ellipse.setData(0, image_path)  # Store image_path for later retrieval
         
         # Create text label
@@ -711,7 +727,7 @@ class MapCanvas(QGraphicsView):
         text.setFont(font)
         text.setScale(1 / view_scale if view_scale > 0 else 1)
         text.setPos(x + marker_size / 2, -y - marker_size / 2)
-        text.setZValue(self._label_z_base + 1)
+        text.setZValue(self._get_label_z_base() + 1)
         
         self._scene.addItem(ellipse)
         self._scene.addItem(text)
