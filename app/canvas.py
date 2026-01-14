@@ -6,9 +6,9 @@ from enum import Enum, auto
 import numpy as np
 from PyQt5.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
-    QGraphicsEllipseItem, QGraphicsTextItem, QMenu
+    QGraphicsEllipseItem, QGraphicsTextItem, QMenu, QWidget, QLabel
 )
-from PyQt5.QtGui import QImage, QPixmap, QWheelEvent, QTransform, QPen, QBrush, QColor, QFont
+from PyQt5.QtGui import QImage, QPixmap, QWheelEvent, QTransform, QPen, QBrush, QColor, QFont, QPainter
 from PyQt5.QtCore import Qt, pyqtSignal, QRectF, QTimer
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
@@ -274,6 +274,95 @@ class TiledLayer:
         return (col, row)
 
 
+class ScaleBarWidget(QWidget):
+    """Overlay widget showing a distance scale bar."""
+    
+    # Nice round numbers for scale bar distances (in meters)
+    NICE_DISTANCES = [
+        1, 2, 5, 10, 20, 50, 100, 200, 500,
+        1000, 2000, 5000, 10000, 20000, 50000, 100000,
+        200000, 500000, 1000000
+    ]
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._distance_meters = 100  # Current scale bar distance
+        self._bar_width_pixels = 100  # Current bar width in pixels
+        self.setFixedSize(150, 40)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)  # Don't intercept mouse events
+        
+    def set_scale(self, meters_per_pixel: float):
+        """Update the scale bar based on meters per pixel."""
+        if meters_per_pixel <= 0:
+            return
+        
+        # Target bar width: 80-120 pixels
+        target_width = 100
+        target_meters = target_width * meters_per_pixel
+        
+        # Find the best nice distance
+        best_distance = self.NICE_DISTANCES[0]
+        for d in self.NICE_DISTANCES:
+            if d <= target_meters * 1.5:
+                best_distance = d
+            else:
+                break
+        
+        self._distance_meters = best_distance
+        self._bar_width_pixels = int(best_distance / meters_per_pixel)
+        self._bar_width_pixels = max(30, min(140, self._bar_width_pixels))  # Clamp width
+        self.update()
+    
+    def _format_distance(self, meters: float) -> str:
+        """Format distance with appropriate units."""
+        if meters >= 1000:
+            km = meters / 1000
+            if km == int(km):
+                return f"{int(km)} km"
+            return f"{km:.1f} km"
+        else:
+            if meters == int(meters):
+                return f"{int(meters)} m"
+            return f"{meters:.1f} m"
+    
+    def paintEvent(self, event):
+        """Draw the scale bar."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # Semi-transparent background
+        painter.setBrush(QColor(255, 255, 255, 200))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(0, 0, self.width(), self.height(), 5, 5)
+        
+        # Draw scale bar
+        bar_height = 6
+        bar_y = 25
+        bar_x = 10
+        
+        painter.setPen(QPen(QColor(0, 0, 0), 2))
+        painter.setBrush(QColor(0, 0, 0))
+        
+        # Main bar
+        painter.drawRect(bar_x, bar_y, self._bar_width_pixels, bar_height)
+        
+        # End caps (vertical lines)
+        cap_height = 10
+        painter.drawLine(bar_x, bar_y - 2, bar_x, bar_y + bar_height + 2)
+        painter.drawLine(bar_x + self._bar_width_pixels, bar_y - 2, 
+                        bar_x + self._bar_width_pixels, bar_y + bar_height + 2)
+        
+        # Draw distance text
+        painter.setPen(QColor(0, 0, 0))
+        font = QFont("Arial", 10, QFont.Bold)
+        painter.setFont(font)
+        text = self._format_distance(self._distance_meters)
+        painter.drawText(bar_x, 5, self._bar_width_pixels + 20, 18, 
+                        Qt.AlignLeft | Qt.AlignVCenter, text)
+        
+        painter.end()
+
+
 class MapCanvas(QGraphicsView):
     """Canvas widget for displaying geospatial raster layers with tiling."""
     
@@ -347,6 +436,10 @@ class MapCanvas(QGraphicsView):
         self._tile_update_timer = QTimer()
         self._tile_update_timer.setSingleShot(True)
         self._tile_update_timer.timeout.connect(self._update_visible_tiles)
+        
+        # Scale bar overlay widget
+        self._scale_bar = ScaleBarWidget(self)
+        self._scale_bar.move(10, 10)  # Will be repositioned in resizeEvent
     
     def add_layer(self, file_path: str) -> str | None:
         """Add a GeoTIFF layer to the canvas. Returns existing layer_id if already loaded."""
@@ -373,6 +466,7 @@ class MapCanvas(QGraphicsView):
                 west, south, east, north = layer.bounds
                 rect = QRectF(west, -north, east - west, north - south)
                 self.fitInView(rect, Qt.KeepAspectRatio)
+                self._update_scale_bar()
             
             return layer_id
             
@@ -513,6 +607,7 @@ class MapCanvas(QGraphicsView):
         rect = QRectF(west, -north, east - west, north - south)
         self.fitInView(rect, Qt.KeepAspectRatio)
         self._schedule_tile_update()
+        self._update_scale_bar()
     
     def zoom_to_point(self, lon: float, lat: float, size_meters: float = 10.0):
         """Zoom the view to center on a point with a given extent in meters.
@@ -538,6 +633,7 @@ class MapCanvas(QGraphicsView):
         self.fitInView(rect, Qt.KeepAspectRatio)
         self._schedule_tile_update()
         self.update_label_markers_scale()
+        self._update_scale_bar()
     
     def wheelEvent(self, event: QWheelEvent):
         """Zoom in/out with mouse wheel."""
@@ -548,6 +644,7 @@ class MapCanvas(QGraphicsView):
             self.scale(1 / factor, 1 / factor)
         self._schedule_tile_update()
         self.update_label_markers_scale()
+        self._update_scale_bar()
     
     def scrollContentsBy(self, dx: int, dy: int):
         """Called when view is scrolled (panned)."""
@@ -558,6 +655,26 @@ class MapCanvas(QGraphicsView):
         """Called when view is resized."""
         super().resizeEvent(event)
         self._schedule_tile_update()
+        self._position_scale_bar()
+        self._update_scale_bar()
+    
+    def _position_scale_bar(self):
+        """Position the scale bar in the top-right corner."""
+        margin = 10
+        x = self.viewport().width() - self._scale_bar.width() - margin
+        y = margin
+        self._scale_bar.move(x, y)
+    
+    def _update_scale_bar(self):
+        """Update scale bar based on current zoom level."""
+        # Get meters per pixel from current transform
+        # In Web Mercator, scene units are meters
+        transform = self.transform()
+        # m11() gives the horizontal scale factor (scene units per pixel)
+        # Since we're in Web Mercator, this is meters per pixel (inverted because of scaling)
+        if transform.m11() != 0:
+            meters_per_pixel = 1.0 / abs(transform.m11())
+            self._scale_bar.set_scale(meters_per_pixel)
     
     def set_mode(self, mode: CanvasMode):
         """Set the canvas interaction mode."""
