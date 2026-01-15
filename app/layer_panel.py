@@ -297,6 +297,28 @@ class LayerPanel(QWidget):
         
         find_and_uncheck()
     
+    def check_layers(self, layer_ids: list[str]):
+        """Check (show) layers by their IDs.
+        
+        Args:
+            layer_ids: List of layer IDs to check
+        """
+        def find_and_check(parent=None):
+            if parent is None:
+                count = self.tree.topLevelItemCount()
+                for i in range(count):
+                    find_and_check(self.tree.topLevelItem(i))
+            else:
+                item_type = parent.data(0, Qt.UserRole + 1)
+                if item_type == "layer":
+                    if parent.data(0, Qt.UserRole) in layer_ids:
+                        parent.setCheckState(0, Qt.Checked)
+                else:
+                    for i in range(parent.childCount()):
+                        find_and_check(parent.child(i))
+        
+        find_and_check()
+    
     def clear(self):
         """Clear all items from the tree."""
         self.tree.clear()
@@ -696,6 +718,15 @@ class CombinedLayerPanel(QWidget):
             file_path = self._get_file_path_for_layer_id(layer_id)
             if file_path:
                 self.labeled_panel.set_layer_checked(file_path, False)
+    
+    def check_layers(self, layer_ids: list[str]):
+        """Check layers by their IDs in both panels."""
+        self.main_panel.check_layers(layer_ids)
+        # Also update labeled panel
+        for layer_id in layer_ids:
+            file_path = self._get_file_path_for_layer_id(layer_id)
+            if file_path:
+                self.labeled_panel.set_layer_checked(file_path, True)
     
     def clear(self):
         """Clear all items from both trees."""

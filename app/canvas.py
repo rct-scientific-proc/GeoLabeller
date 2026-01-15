@@ -390,6 +390,9 @@ class MapCanvas(QGraphicsView):
     # Signal emitted when user requests to hide layers outside view: (list of layer_ids to hide)
     hide_layers_outside_view = pyqtSignal(list)
     
+    # Signal emitted when user requests to show layers inside view: (list of layer_ids to show)
+    show_layers_in_view = pyqtSignal(list)
+    
     def __init__(self):
         super().__init__()
         self._scene = QGraphicsScene()
@@ -998,11 +1001,14 @@ class MapCanvas(QGraphicsView):
         """Show context menu for pan mode."""
         menu = QMenu(self)
         
+        show_in_view_action = menu.addAction("Select layers in view")
         hide_outside_action = menu.addAction("Unselect layers outside view")
         
         action = menu.exec_(self.mapToGlobal(view_pos))
         
-        if action == hide_outside_action:
+        if action == show_in_view_action:
+            self._show_layers_in_view()
+        elif action == hide_outside_action:
             self._hide_layers_outside_view()
     
     def _hide_layers_outside_view(self):
@@ -1031,6 +1037,33 @@ class MapCanvas(QGraphicsView):
         
         if layers_to_hide:
             self.hide_layers_outside_view.emit(layers_to_hide)
+    
+    def _show_layers_in_view(self):
+        """Find layers that intersect the current view and emit signal to show them."""
+        view_bounds = self._get_view_bounds()
+        view_west, view_south, view_east, view_north = view_bounds
+        
+        layers_to_show = []
+        
+        for layer_id, layer in self._layers.items():
+            if layer.bounds is None:
+                continue
+            
+            layer_west, layer_south, layer_east, layer_north = layer.bounds
+            
+            # Check if layer bounds intersect with view bounds
+            intersects = not (
+                layer_east < view_west or   # layer is entirely to the left
+                layer_west > view_east or   # layer is entirely to the right
+                layer_north < view_south or # layer is entirely below
+                layer_south > view_north    # layer is entirely above
+            )
+            
+            if intersects:
+                layers_to_show.append(layer_id)
+        
+        if layers_to_show:
+            self.show_layers_in_view.emit(layers_to_show)
     
     def _enter_link_mode(self, source_label_id: int):
         """Enter link mode with the given label as the source."""
