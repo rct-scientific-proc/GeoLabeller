@@ -551,6 +551,10 @@ class MainWindow(QMainWindow):
             
             # Update progress indicator
             self._update_progress(idx + 1)
+            
+            # Periodically update UI to show tree changes during import
+            if (idx + 1) % 10 == 0:
+                QApplication.processEvents()
         
         # Expand all groups
         self.layer_panel.tree.expandAll()
@@ -1054,6 +1058,10 @@ class MainWindow(QMainWindow):
             name = Path(file_path).stem
             self.project.add_image(file_path, name, group_path)
             self._async_loaded_count += 1
+            
+            # Periodically update UI to show tree changes during import
+            if self._async_loaded_count % 5 == 0:
+                QApplication.processEvents()
     
     def _on_async_file_error(self, file_path: str, error: str):
         """Handle a file failing to load."""
@@ -1065,6 +1073,8 @@ class MainWindow(QMainWindow):
         self.statusBar.showMessage(
             f"Loading files: {processed}/{total} ({self._async_loaded_count} added)..."
         )
+        # Force UI update to show tree changes
+        QApplication.processEvents()
     
     def _on_async_batch_complete(self, loaded: int, errors: int):
         """Handle async loading completion."""
