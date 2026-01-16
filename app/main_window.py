@@ -42,6 +42,19 @@ class MainWindow(QMainWindow):
         self.project = LabelProject()
         self._project_path: Path | None = None
         
+        # Async loading state (initialized here to avoid AttributeError)
+        self._async_root_path = None
+        self._async_group_cache: dict[Path, any] = {}
+        self._async_loaded_count = 0
+        self._async_total_files = 0
+        self._async_loader = None
+        self._async_pending_files: list[tuple[str, dict]] = []  # Queue for pending file loads
+        
+        # Timer for safe UI updates during async loading (avoids reentrancy issues)
+        self._async_ui_timer = QTimer()
+        self._async_ui_timer.setInterval(100)  # Update UI every 100ms
+        self._async_ui_timer.timeout.connect(self._process_pending_async_files)
+        
         self._setup_ui()
         self._setup_menu()
         self._setup_toolbar()
@@ -490,20 +503,127 @@ class MainWindow(QMainWindow):
                 num_images = len(self.project.images)
                 if num_images > 0:
                     self._show_progress(num_images, "Loading project")
-                
-                # Load images from the project
-                self._load_project_images()
-                
-                self._hide_progress()
-                self._update_class_combo()
-                self._refresh_label_markers()
-                self.setWindowTitle(f"GeoLabel - {self._project_path.name}")
-                self.statusBar.showMessage(f"Opened project with {self.project.label_count} labels", 3000)
+                    # Start async project loading
+                    self._start_project_image_loading()
+                else:
+                    self._update_class_combo()
+                    self._refresh_label_markers()
+                    self.setWindowTitle(f"GeoLabel - {self._project_path.name}")
+                    self.statusBar.showMessage(f"Opened project with {self.project.label_count} labels", 3000)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
                 QMessageBox.critical(self, "Error", f"Failed to open project: {e}")
     
+    def _start_project_image_loading(self):
+        """Start async loading of project images using timer-based approach."""
+        import os
+        
+        # Initialize state for project loading
+        self._project_images_to_load = list(self.project.images.values())
+        self._project_load_index = 0
+        self._project_loaded_count = 0
+        self._project_missing = []
+        self._project_group_cache: dict[str, any] = {}
+        
+        # Start the timer for progressive loading
+        self._project_load_timer = QTimer()
+        self._project_load_timer.setInterval(1)  # Process quickly but yield to UI
+        self._project_load_timer.timeout.connect(self._process_project_image_batch)
+        self._project_load_timer.start()
+        
+        self.statusBar.showMessage(f"Loading project images...")
+    
+    def _process_project_image_batch(self):
+        """Process a batch of project images. Called by timer."""
+        import os
+        
+        # Process a batch of images per timer tick
+        batch_size = 10
+        end_index = min(self._project_load_index + batch_size, len(self._project_images_to_load))
+        
+        for idx in range(self._project_load_index, end_index):
+            image = self._project_images_to_load[idx]
+            
+            if os.path.exists(image.path):
+                # Add layer with visibility off by default
+                layer_id = self.canvas.add_layer(image.path, visible=False)
+                if layer_id:
+                    # Recreate group structure
+                    parent_group = self._get_or_create_project_group(image.group)
+                    self.layer_panel.add_layer(layer_id, image.path, parent_group, visible=False)
+                    # Set the group path on the canvas layer
+                    self.canvas.set_layer_group(layer_id, image.group)
+                    self._project_loaded_count += 1
+            else:
+                self._project_missing.append(image.path)
+        
+        self._project_load_index = end_index
+        
+        # Update progress
+        self._update_progress(self._project_load_index)
+        self.statusBar.showMessage(
+            f"Loading project: {self._project_load_index}/{len(self._project_images_to_load)} images..."
+        )
+        
+        # Check if done
+        if self._project_load_index >= len(self._project_images_to_load):
+            self._finish_project_loading()
+    
+    def _get_or_create_project_group(self, group_path: str):
+        """Get or create group hierarchy for project loading."""
+        if not group_path:
+            return None
+        
+        if group_path in self._project_group_cache:
+            return self._project_group_cache[group_path]
+        
+        # Split path and create hierarchy
+        parts = group_path.replace("\\", "/").split("/")
+        parent = None
+        current_path = ""
+        
+        for part in parts:
+            current_path = f"{current_path}/{part}" if current_path else part
+            if current_path not in self._project_group_cache:
+                group = self.layer_panel.add_group(part, parent, visible=False)
+                self._project_group_cache[current_path] = group
+            parent = self._project_group_cache[current_path]
+        
+        return parent
+    
+    def _finish_project_loading(self):
+        """Complete project loading after all images are processed."""
+        # Stop the timer
+        self._project_load_timer.stop()
+        
+        # Hide progress
+        self._hide_progress()
+        
+        # Expand all groups
+        self.layer_panel.tree.expandAll()
+        
+        # Update UI
+        self._update_class_combo()
+        self._refresh_label_markers()
+        self.setWindowTitle(f"GeoLabel - {self._project_path.name}")
+        self.statusBar.showMessage(f"Opened project with {self.project.label_count} labels", 3000)
+        
+        # Show warning for missing images
+        if self._project_missing:
+            QMessageBox.warning(
+                self,
+                "Missing Images",
+                f"Could not find {len(self._project_missing)} image(s):\n" + 
+                "\n".join(self._project_missing[:5]) +
+                ("\n..." if len(self._project_missing) > 5 else "")
+            )
+        
+        # Clean up
+        del self._project_images_to_load
+        del self._project_group_cache
+        del self._project_missing
+
     def _load_project_images(self):
         """Load images stored in the project and recreate group structure."""
         import os
@@ -549,12 +669,8 @@ class MainWindow(QMainWindow):
             else:
                 missing.append(image.path)
             
-            # Update progress indicator
+            # Update progress indicator (progress bar repaints itself)
             self._update_progress(idx + 1)
-            
-            # Periodically update UI to show tree changes during import
-            if (idx + 1) % 10 == 0:
-                QApplication.processEvents()
         
         # Expand all groups
         self.layer_panel.tree.expandAll()
@@ -1009,6 +1125,9 @@ class MainWindow(QMainWindow):
         # Show progress indicator and status
         self._show_progress(len(tiff_files), "Loading dir")
         self.statusBar.showMessage(f"Loading {len(tiff_files)} files in background... (layers hidden by default)")
+        
+        # Start the UI update timer
+        self._async_ui_timer.start()
         self._async_loader.start()
     
     def _get_or_create_group_async(self, group_path: str):
@@ -1040,28 +1159,48 @@ class MainWindow(QMainWindow):
         return parent
     
     def _on_async_file_loaded(self, file_path: str, layer_data: dict):
-        """Handle a file being loaded asynchronously."""
+        """Handle a file being loaded asynchronously.
+        
+        Queues the file for processing - actual tree updates happen via timer
+        to avoid reentrancy issues when user interacts with UI during loading.
+        """
         if self.canvas.is_path_loaded(file_path):
             return
         
-        group_path = layer_data['group_path']
-        parent_group = self._get_or_create_group_async(group_path)
+        # Queue the file for processing
+        self._async_pending_files.append((file_path, layer_data))
+    
+    def _process_pending_async_files(self):
+        """Process queued async files and update UI.
         
-        # Add layer with lazy loading and hidden by default
-        layer_id = self.canvas.add_layer(file_path, lazy=True, visible=False)
-        if layer_id:
-            # Add to tree as hidden (unchecked)
-            self.layer_panel.add_layer(layer_id, file_path, parent_group, visible=False)
-            self.canvas.set_layer_group(layer_id, group_path)
+        Called by timer to safely update the tree without reentrancy issues.
+        """
+        if not self._async_pending_files:
+            return
+        
+        # Process a batch of pending files
+        batch_size = min(20, len(self._async_pending_files))
+        batch = self._async_pending_files[:batch_size]
+        self._async_pending_files = self._async_pending_files[batch_size:]
+        
+        for file_path, layer_data in batch:
+            if self.canvas.is_path_loaded(file_path):
+                continue
             
-            # Track in project
-            name = Path(file_path).stem
-            self.project.add_image(file_path, name, group_path)
-            self._async_loaded_count += 1
+            group_path = layer_data['group_path']
+            parent_group = self._get_or_create_group_async(group_path)
             
-            # Periodically update UI to show tree changes during import
-            if self._async_loaded_count % 5 == 0:
-                QApplication.processEvents()
+            # Add layer with lazy loading and hidden by default
+            layer_id = self.canvas.add_layer(file_path, lazy=True, visible=False)
+            if layer_id:
+                # Add to tree as hidden (unchecked)
+                self.layer_panel.add_layer(layer_id, file_path, parent_group, visible=False)
+                self.canvas.set_layer_group(layer_id, group_path)
+                
+                # Track in project
+                name = Path(file_path).stem
+                self.project.add_image(file_path, name, group_path)
+                self._async_loaded_count += 1
     
     def _on_async_file_error(self, file_path: str, error: str):
         """Handle a file failing to load."""
@@ -1073,11 +1212,16 @@ class MainWindow(QMainWindow):
         self.statusBar.showMessage(
             f"Loading files: {processed}/{total} ({self._async_loaded_count} added)..."
         )
-        # Force UI update to show tree changes
-        QApplication.processEvents()
     
     def _on_async_batch_complete(self, loaded: int, errors: int):
         """Handle async loading completion."""
+        # Stop the UI update timer
+        self._async_ui_timer.stop()
+        
+        # Process any remaining pending files
+        while self._async_pending_files:
+            self._process_pending_async_files()
+        
         # Hide progress indicator
         self._hide_progress()
         
