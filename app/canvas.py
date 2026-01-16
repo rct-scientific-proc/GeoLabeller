@@ -735,6 +735,8 @@ class MapCanvas(QGraphicsView):
             self._layers[layer_id].set_visibility(visible)
             if visible:
                 self._update_visible_tiles()
+            # Force viewport update to ensure cursor appears on top of tiles
+            self.viewport().update()
     
     def update_layer_order(self, layer_order: list[str]):
         """Update the rendering order of layers."""

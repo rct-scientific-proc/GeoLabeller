@@ -1,0 +1,29 @@
+name: geolabel-cpp
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  # Build tools
+  - cmake
+  - ninja
+  - cxx-compiler
+  
+  # Qt framework (GUI)
+  - qt-main=5
+  
+  # Geospatial (replaces rasterio)
+  - gdal
+  
+  # Linear algebra / arrays (replaces numpy)
+  - eigen
+  - xtensor
+  
+  # Optimized BLAS/LAPACK backend
+  - openblas
+  - lapack
+  
+  # Image processing (replaces pillow)
+  - opencv
+  
+  # Optional: debugging and testing
+  - gtest
