@@ -87,6 +87,7 @@ class MainWindow(QMainWindow):
         self.canvas.link_mode_changed.connect(self._on_link_mode_changed)
         self.canvas.hide_layers_outside_view.connect(self.layer_panel.uncheck_layers)
         self.canvas.show_layers_in_view.connect(self.layer_panel.check_layers)
+        self.canvas.toggle_layer_visibility_requested.connect(self.layer_panel.toggle_layer_visibility)
     
     def _setup_menu(self):
         """Set up the menu bar."""
@@ -749,31 +750,50 @@ class MainWindow(QMainWindow):
                     # Calculate the transform for the sub-image window (preserves original CRS)
                     window_transform = rasterio.windows.transform(window, src.transform)
                     
-                    # Prepare output data - preserve original pixel values without reprojection
+                    # Convert to grayscale and normalize
                     num_bands = data.shape[0]
                     
-                    # Handle single-band images by replicating to 3 bands for consistent output
+                    # Convert to grayscale using luminance weights (or average if single band)
                     if num_bands == 1:
-                        out_data = np.stack([data[0]] * 3, axis=0)
-                        num_bands = 3
+                        gray = data[0].astype(np.float32)
                     elif num_bands >= 3:
-                        # Use first 3 bands
-                        out_data = data[:3]
-                        num_bands = 3
+                        # Standard luminance weights: 0.299*R + 0.587*G + 0.114*B
+                        gray = (0.299 * data[0].astype(np.float32) + 
+                                0.587 * data[1].astype(np.float32) + 
+                                0.114 * data[2].astype(np.float32))
                     else:
-                        out_data = data
+                        # 2 bands - just average them
+                        gray = np.mean(data.astype(np.float32), axis=0)
                     
-                    # Clip to uint8 range
-                    out_data = np.clip(out_data, 0, 255).astype(np.uint8)
+                    # Normalize to [0, 1]
+                    gray = gray / 255.0
                     
-                    # Save as GeoTIFF with original CRS and transform (no reprojection)
+                    # Apply mean/std normalization: shift mean to 0.4, std to 0.2
+                    current_mean = np.mean(gray)
+                    current_std = np.std(gray)
+                    
+                    if current_std > 1e-6:  # Avoid division by zero
+                        # Standardize (zero mean, unit std), then apply target mean/std
+                        gray = (gray - current_mean) / current_std
+                        gray = gray * 0.2 + 0.4
+                    else:
+                        # Flat image - just set to target mean
+                        gray = np.full_like(gray, 0.4)
+                    
+                    # Scale to [0, 255] and clip
+                    out_data = np.clip(gray * 255.0, 0, 255).astype(np.uint8)
+                    
+                    # Reshape for rasterio (1 band)
+                    out_data = out_data[np.newaxis, :, :]
+                    
+                    # Save as grayscale GeoTIFF with original CRS and transform
                     with rasterio.open(
                         out_path,
                         'w',
                         driver='GTiff',
                         height=window_height,
                         width=window_width,
-                        count=num_bands,
+                        count=1,
                         dtype=np.uint8,
                         crs=src.crs,
                         transform=window_transform,

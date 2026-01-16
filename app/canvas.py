@@ -393,6 +393,9 @@ class MapCanvas(QGraphicsView):
     # Signal emitted when user requests to show layers inside view: (list of layer_ids to show)
     show_layers_in_view = pyqtSignal(list)
     
+    # Signal emitted when user requests to toggle layer visibility: (layer_id)
+    toggle_layer_visibility_requested = pyqtSignal(str)
+    
     def __init__(self):
         super().__init__()
         self._scene = QGraphicsScene()
@@ -984,6 +987,11 @@ class MapCanvas(QGraphicsView):
                 show_linked_action = menu.addAction("Show Linked")
             
             menu.addSeparator()
+            
+            # Toggle layer visibility option
+            toggle_layer_action = menu.addAction("Toggle Image Visibility")
+            
+            menu.addSeparator()
             remove_action = menu.addAction("Remove Label")
             
             action = menu.exec_(self.mapToGlobal(view_pos))
@@ -996,6 +1004,11 @@ class MapCanvas(QGraphicsView):
                 self.label_unlinked.emit(label_id)
             elif action == show_linked_action:
                 self.show_linked_requested.emit(label_id)
+            elif action == toggle_layer_action:
+                # Get the layer_id from the image_path and emit toggle signal
+                if image_path in self._path_to_layer:
+                    layer_id = self._path_to_layer[image_path]
+                    self.toggle_layer_visibility_requested.emit(layer_id)
     
     def _show_pan_context_menu(self, view_pos):
         """Show context menu for pan mode."""

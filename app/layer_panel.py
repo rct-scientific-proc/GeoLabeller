@@ -382,6 +382,35 @@ class LayerPanel(QWidget):
             return None
         
         return find_layer()
+    
+    def toggle_layer_visibility(self, layer_id: str):
+        """Toggle the visibility of a layer by its ID.
+        
+        Args:
+            layer_id: The layer ID to toggle
+        """
+        def find_and_toggle(parent=None):
+            if parent is None:
+                count = self.tree.topLevelItemCount()
+                for i in range(count):
+                    if find_and_toggle(self.tree.topLevelItem(i)):
+                        return True
+            else:
+                item_type = parent.data(0, Qt.UserRole + 1)
+                if item_type == "layer":
+                    if parent.data(0, Qt.UserRole) == layer_id:
+                        # Toggle the check state
+                        current_state = parent.checkState(0)
+                        new_state = Qt.Unchecked if current_state == Qt.Checked else Qt.Checked
+                        parent.setCheckState(0, new_state)
+                        return True
+                else:
+                    for i in range(parent.childCount()):
+                        if find_and_toggle(parent.child(i)):
+                            return True
+            return False
+        
+        find_and_toggle()
 
 
 class LabeledLayerPanel(QWidget):
@@ -606,6 +635,32 @@ class LabeledLayerPanel(QWidget):
         
         find_and_set()
     
+    def toggle_layer_checked(self, file_path: str):
+        """Toggle the check state of labels for a file path.
+        
+        Args:
+            file_path: The file path of the layer to toggle
+        """
+        def find_and_toggle(parent=None):
+            if parent is None:
+                count = self.tree.topLevelItemCount()
+                for i in range(count):
+                    find_and_toggle(self.tree.topLevelItem(i))
+            else:
+                item_type = parent.data(0, Qt.UserRole + 1)
+                if item_type == "label":
+                    if parent.data(0, Qt.UserRole) == file_path:
+                        self.tree.blockSignals(True)
+                        current_state = parent.checkState(0)
+                        new_state = Qt.Unchecked if current_state == Qt.Checked else Qt.Checked
+                        parent.setCheckState(0, new_state)
+                        self.tree.blockSignals(False)
+                elif item_type == "group":
+                    for i in range(parent.childCount()):
+                        find_and_toggle(parent.child(i))
+        
+        find_and_toggle()
+    
     def clear(self):
         """Clear all items from the tree."""
         self.tree.clear()
@@ -727,6 +782,16 @@ class CombinedLayerPanel(QWidget):
             file_path = self._get_file_path_for_layer_id(layer_id)
             if file_path:
                 self.labeled_panel.set_layer_checked(file_path, True)
+    
+    def toggle_layer_visibility(self, layer_id: str):
+        """Toggle the visibility of a layer by its ID in both panels."""
+        self.main_panel.toggle_layer_visibility(layer_id)
+        # Also update labeled panel
+        file_path = self._get_file_path_for_layer_id(layer_id)
+        if file_path:
+            # We need to get the new state after toggle - check the main panel
+            # The toggle already happened, so we sync the labeled panel
+            self.labeled_panel.toggle_layer_checked(file_path)
     
     def clear(self):
         """Clear all items from both trees."""
