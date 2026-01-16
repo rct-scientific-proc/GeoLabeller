@@ -30,6 +30,11 @@ class LayerPanel(QWidget):
     zoom_to_layer_requested = pyqtSignal(str)  # layer_id
     layer_removed = pyqtSignal(str)  # layer_id
     
+    # Batch progress signals for group toggle operations
+    batch_visibility_started = pyqtSignal(int)  # total items to process
+    batch_visibility_progress = pyqtSignal(int)  # current progress
+    batch_visibility_finished = pyqtSignal()  # batch complete
+    
     def __init__(self):
         super().__init__()
         self._batch_mode = False  # When True, suppress signals during batch operations
@@ -136,10 +141,53 @@ class LayerPanel(QWidget):
             layer_id = item.data(0, Qt.UserRole)
             self.layer_visibility_changed.emit(layer_id, checked)
         elif item_type == "group":
-            # Toggle all children
-            for i in range(item.childCount()):
-                child = item.child(i)
-                child.setCheckState(0, item.checkState(0))
+            # Count all descendant layers for progress tracking
+            layer_count = self._count_descendant_layers(item)
+            use_progress = layer_count >= 10  # Only show progress for 10+ items
+            
+            if use_progress:
+                self.batch_visibility_started.emit(layer_count)
+            
+            # Toggle all children with progress tracking
+            self._toggle_group_children(item, checked, use_progress)
+            
+            if use_progress:
+                self.batch_visibility_finished.emit()
+    
+    def _count_descendant_layers(self, item: QTreeWidgetItem) -> int:
+        """Count all layer items that are descendants of this item."""
+        count = 0
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child_type = child.data(0, Qt.UserRole + 1)
+            if child_type == "layer":
+                count += 1
+            elif child_type == "group":
+                count += self._count_descendant_layers(child)
+        return count
+    
+    def _toggle_group_children(self, item: QTreeWidgetItem, checked: bool, emit_progress: bool):
+        """Toggle all children of a group item, optionally emitting progress."""
+        check_state = Qt.Checked if checked else Qt.Unchecked
+        progress_count = [0]  # Use list for mutable closure
+        
+        def process_item(parent: QTreeWidgetItem):
+            for i in range(parent.childCount()):
+                child = parent.child(i)
+                child.setCheckState(0, check_state)
+                child_type = child.data(0, Qt.UserRole + 1)
+                
+                if child_type == "layer":
+                    progress_count[0] += 1
+                    if emit_progress:
+                        self.batch_visibility_progress.emit(progress_count[0])
+                        # Allow UI to update periodically
+                        if progress_count[0] % 5 == 0:
+                            QApplication.processEvents()
+                elif child_type == "group":
+                    process_item(child)
+        
+        process_item(item)
     
     def _on_rows_moved(self):
         """Handle drag-drop reordering."""
@@ -699,6 +747,11 @@ class CombinedLayerPanel(QWidget):
     zoom_to_label_requested = pyqtSignal(float, float)  # lon, lat
     layer_removed = pyqtSignal(str)
     
+    # Batch progress signals
+    batch_visibility_started = pyqtSignal(int)  # total items
+    batch_visibility_progress = pyqtSignal(int)  # current progress
+    batch_visibility_finished = pyqtSignal()
+    
     def __init__(self):
         super().__init__()
         self._syncing = False  # Prevent infinite recursion during sync
@@ -731,6 +784,11 @@ class CombinedLayerPanel(QWidget):
         self.main_panel.layer_group_changed.connect(self.layer_group_changed)
         self.main_panel.zoom_to_layer_requested.connect(self.zoom_to_layer_requested)
         self.main_panel.layer_removed.connect(self.layer_removed)
+        
+        # Forward batch progress signals
+        self.main_panel.batch_visibility_started.connect(self.batch_visibility_started)
+        self.main_panel.batch_visibility_progress.connect(self.batch_visibility_progress)
+        self.main_panel.batch_visibility_finished.connect(self.batch_visibility_finished)
         
         # Forward signals from labeled panel
         self.labeled_panel.layer_visibility_changed.connect(self._on_labeled_visibility_changed)

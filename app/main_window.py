@@ -5,7 +5,7 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QMainWindow, QSplitter, QMenuBar, QMenu, QAction, QFileDialog,
     QStatusBar, QLabel, QToolBar, QComboBox, QMessageBox, QProgressDialog,
-    QApplication
+    QApplication, QProgressBar
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor
@@ -68,6 +68,16 @@ class MainWindow(QMainWindow):
         # Set up status bar
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
+        
+        # Progress indicator for async operations
+        self.progress_indicator = QProgressBar()
+        self.progress_indicator.setMaximumWidth(150)
+        self.progress_indicator.setMaximumHeight(16)
+        self.progress_indicator.setTextVisible(True)
+        self.progress_indicator.setFormat("%p% (%v/%m)")
+        self.progress_indicator.hide()  # Hidden by default
+        self.statusBar.addPermanentWidget(self.progress_indicator)
+        
         self.coord_label = QLabel("")
         self.statusBar.addPermanentWidget(self.coord_label)
         
@@ -78,6 +88,12 @@ class MainWindow(QMainWindow):
         self.layer_panel.zoom_to_layer_requested.connect(self.canvas.zoom_to_layer)
         self.layer_panel.zoom_to_label_requested.connect(self._on_zoom_to_label)
         self.layer_panel.layer_removed.connect(self.canvas.remove_layer)
+        
+        # Connect batch visibility progress signals for group toggle
+        self.layer_panel.batch_visibility_started.connect(self._on_batch_visibility_started)
+        self.layer_panel.batch_visibility_progress.connect(self._update_progress)
+        self.layer_panel.batch_visibility_finished.connect(self._hide_progress)
+        
         self.canvas.coordinates_changed.connect(self._update_coordinates)
         self.canvas.label_placed.connect(self._on_label_placed)
         self.canvas.label_removed.connect(self._on_label_removed)
@@ -470,9 +486,15 @@ class MainWindow(QMainWindow):
                 self.project = LabelProject.load(file_path)
                 self._project_path = Path(file_path)
                 
+                # Show progress for loading images
+                num_images = len(self.project.images)
+                if num_images > 0:
+                    self._show_progress(num_images, "Loading project")
+                
                 # Load images from the project
                 self._load_project_images()
                 
+                self._hide_progress()
                 self._update_class_combo()
                 self._refresh_label_markers()
                 self.setWindowTitle(f"GeoLabel - {self._project_path.name}")
@@ -514,7 +536,7 @@ class MainWindow(QMainWindow):
             
             return parent
         
-        for image in self.project.images.values():
+        for idx, image in enumerate(self.project.images.values()):
             if os.path.exists(image.path):
                 layer_id = self.canvas.add_layer(image.path)
                 if layer_id:
@@ -526,6 +548,9 @@ class MainWindow(QMainWindow):
                     loaded += 1
             else:
                 missing.append(image.path)
+            
+            # Update progress indicator
+            self._update_progress(idx + 1)
         
         # Expand all groups
         self.layer_panel.tree.expandAll()
@@ -977,7 +1002,8 @@ class MainWindow(QMainWindow):
         self._async_loader.batch_complete.connect(self._on_async_batch_complete)
         self._async_loader.progress_update.connect(self._on_async_progress)
         
-        # Show status and start loading
+        # Show progress indicator and status
+        self._show_progress(len(tiff_files), "Loading dir")
         self.statusBar.showMessage(f"Loading {len(tiff_files)} files in background... (layers hidden by default)")
         self._async_loader.start()
     
@@ -1035,12 +1061,16 @@ class MainWindow(QMainWindow):
     
     def _on_async_progress(self, processed: int, total: int):
         """Handle progress updates during async loading."""
+        self._update_progress(processed)
         self.statusBar.showMessage(
             f"Loading files: {processed}/{total} ({self._async_loaded_count} added)..."
         )
     
     def _on_async_batch_complete(self, loaded: int, errors: int):
         """Handle async loading completion."""
+        # Hide progress indicator
+        self._hide_progress()
+        
         # Expand all groups
         self.layer_panel.tree.expandAll()
         
@@ -1055,6 +1085,26 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_async_loader'):
             self._async_loader.deleteLater()
             del self._async_loader
+    
+    def _on_batch_visibility_started(self, total: int):
+        """Handle start of batch visibility change (e.g., group toggle)."""
+        self._show_progress(total, "Toggling")
+    
+    def _show_progress(self, maximum: int, label: str = "Loading"):
+        """Show the progress indicator with a maximum value."""
+        self.progress_indicator.setMaximum(maximum)
+        self.progress_indicator.setValue(0)
+        self.progress_indicator.setFormat(f"{label}: %p% (%v/%m)")
+        self.progress_indicator.show()
+    
+    def _update_progress(self, value: int):
+        """Update the progress indicator value."""
+        self.progress_indicator.setValue(value)
+    
+    def _hide_progress(self):
+        """Hide the progress indicator."""
+        self.progress_indicator.hide()
+        self.progress_indicator.setValue(0)
     
     def _update_coordinates(self, lon: float, lat: float, layer_name: str, group_path: str):
         """Update the coordinate display in the status bar."""
