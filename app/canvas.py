@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QGraphicsEllipseItem, QGraphicsTextItem, QMenu, QWidget, QLabel
 )
 from PyQt5.QtGui import QImage, QPixmap, QWheelEvent, QTransform, QPen, QBrush, QColor, QFont, QPainter
-from PyQt5.QtCore import Qt, pyqtSignal, QRectF, QTimer
+from PyQt5.QtCore import Qt, pyqtSignal, QRectF, QTimer, QThread, QObject
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterio.crs import CRS
@@ -27,9 +27,19 @@ class CanvasMode(Enum):
 
 
 class TiledLayer:
-    """Manages tiled rendering for a single raster layer."""
+    """Manages tiled rendering for a single raster layer.
     
-    def __init__(self, file_path: str):
+    Supports lazy loading - only loads bounds quickly, full raster data is loaded
+    on demand when the layer becomes visible.
+    """
+    
+    def __init__(self, file_path: str, lazy: bool = False):
+        """Initialize a tiled layer.
+        
+        Args:
+            file_path: Path to the GeoTIFF file
+            lazy: If True, only load bounds initially, defer full data loading
+        """
         self.file_path = file_path
         self.name = Path(file_path).stem  # File name without extension
         self.group_path = ""  # Group hierarchy (e.g., "folder/subfolder")
@@ -55,7 +65,59 @@ class TiledLayer:
         self._tile_world_width = 0
         self._tile_world_height = 0
         
-        self._load_and_reproject()
+        # Lazy loading state
+        self._lazy = lazy
+        self._fully_loaded = False
+        
+        if lazy:
+            self._load_bounds_only()
+        else:
+            self._load_and_reproject()
+            self._fully_loaded = True
+    
+    def _load_bounds_only(self):
+        """Load only the bounds and metadata, not the full raster data.
+        
+        This is much faster than full loading and sufficient for:
+        - Determining layer extents
+        - Showing the layer in the tree
+        - Zoom-to-layer calculations
+        """
+        with rasterio.open(self.file_path) as src:
+            # Store original image info
+            self._src_crs = src.crs
+            self._src_transform = src.transform
+            self._src_width = src.width
+            self._src_height = src.height
+            
+            # Calculate bounds in Web Mercator without loading pixel data
+            dst_crs = WEB_MERCATOR
+            transform, width, height = calculate_default_transform(
+                src.crs, dst_crs, src.width, src.height, *src.bounds
+            )
+            
+            self._width = width
+            self._height = height
+            
+            # Store bounds in Web Mercator
+            self.bounds = rasterio.transform.array_bounds(height, width, transform)
+            west, south, east, north = self.bounds
+            
+            # Calculate tile grid
+            self._n_tiles_x = math.ceil(width / TILE_SIZE)
+            self._n_tiles_y = math.ceil(height / TILE_SIZE)
+            self._tile_world_width = (east - west) / self._n_tiles_x
+            self._tile_world_height = (north - south) / self._n_tiles_y
+    
+    def ensure_loaded(self):
+        """Ensure the full raster data is loaded. Call before accessing pixel data."""
+        if not self._fully_loaded:
+            self._load_and_reproject()
+            self._fully_loaded = True
+    
+    def is_fully_loaded(self) -> bool:
+        """Check if full raster data has been loaded."""
+        return self._fully_loaded
     
     def _load_and_reproject(self):
         """Load GeoTIFF and reproject to Web Mercator."""
@@ -190,6 +252,9 @@ class TiledLayer:
     
     def create_tile_pixmap(self, tx: int, ty: int) -> QPixmap | None:
         """Create a QPixmap for a specific tile."""
+        # Ensure full data is loaded before accessing pixels
+        self.ensure_loaded()
+        
         if self._rgba_data is None:
             return None
         
@@ -272,6 +337,125 @@ class TiledLayer:
         col, row = ~self._src_transform * (x_native, y_native)
         
         return (col, row)
+
+
+class AsyncFileLoader(QObject):
+    """Worker object for loading GeoTIFF files asynchronously in a background thread.
+    
+    Emits signals as files are loaded, allowing the UI to update progressively.
+    """
+    
+    # Emitted when a file is successfully loaded: (file_path, layer_data_dict)
+    file_loaded = pyqtSignal(str, dict)
+    
+    # Emitted when a file fails to load: (file_path, error_message)
+    file_error = pyqtSignal(str, str)
+    
+    # Emitted when a batch of files is complete: (loaded_count, error_count)
+    batch_complete = pyqtSignal(int, int)
+    
+    # Emitted periodically during loading: (files_processed, total_files)
+    progress_update = pyqtSignal(int, int)
+    
+    def __init__(self):
+        super().__init__()
+        self._files_to_load: list[tuple[str, str]] = []  # (file_path, group_path)
+        self._cancelled = False
+    
+    def set_files(self, files: list[tuple[str, str]]):
+        """Set the list of files to load.
+        
+        Args:
+            files: List of (file_path, group_path) tuples
+        """
+        self._files_to_load = files
+        self._cancelled = False
+    
+    def cancel(self):
+        """Cancel the loading operation."""
+        self._cancelled = True
+    
+    def process(self):
+        """Process all files in the queue. Run this in a worker thread."""
+        loaded_count = 0
+        error_count = 0
+        total = len(self._files_to_load)
+        
+        for i, (file_path, group_path) in enumerate(self._files_to_load):
+            if self._cancelled:
+                break
+            
+            try:
+                # Load just the bounds (fast operation)
+                with rasterio.open(file_path) as src:
+                    src_crs = src.crs
+                    src_transform = src.transform
+                    src_width = src.width
+                    src_height = src.height
+                    
+                    # Calculate bounds in Web Mercator
+                    dst_crs = WEB_MERCATOR
+                    transform, width, height = calculate_default_transform(
+                        src.crs, dst_crs, src.width, src.height, *src.bounds
+                    )
+                    bounds = rasterio.transform.array_bounds(height, width, transform)
+                
+                # Emit the loaded data
+                layer_data = {
+                    'file_path': file_path,
+                    'group_path': group_path,
+                    'bounds': bounds,
+                    'width': width,
+                    'height': height,
+                    'src_crs': src_crs,
+                    'src_transform': src_transform,
+                    'src_width': src_width,
+                    'src_height': src_height,
+                }
+                self.file_loaded.emit(file_path, layer_data)
+                loaded_count += 1
+                
+            except Exception as e:
+                self.file_error.emit(file_path, str(e))
+                error_count += 1
+            
+            # Emit progress every 10 files or at the end
+            if (i + 1) % 10 == 0 or i == total - 1:
+                self.progress_update.emit(i + 1, total)
+        
+        self.batch_complete.emit(loaded_count, error_count)
+
+
+class AsyncFileLoaderThread(QThread):
+    """Thread wrapper for AsyncFileLoader."""
+    
+    # Forward signals from the loader
+    file_loaded = pyqtSignal(str, dict)
+    file_error = pyqtSignal(str, str)
+    batch_complete = pyqtSignal(int, int)
+    progress_update = pyqtSignal(int, int)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loader = AsyncFileLoader()
+        
+        # Connect internal signals to forwarded signals
+        self._loader.file_loaded.connect(self.file_loaded.emit)
+        self._loader.file_error.connect(self.file_error.emit)
+        self._loader.batch_complete.connect(self.batch_complete.emit)
+        self._loader.progress_update.connect(self.progress_update.emit)
+    
+    def set_files(self, files: list[tuple[str, str]]):
+        """Set files to load."""
+        self._loader.set_files(files)
+    
+    def cancel(self):
+        """Cancel loading."""
+        self._loader.cancel()
+    
+    def run(self):
+        """Run the loading in the background thread."""
+        self._loader.process()
 
 
 class ScaleBarWidget(QWidget):
@@ -447,14 +631,21 @@ class MapCanvas(QGraphicsView):
         self._scale_bar = ScaleBarWidget(self)
         self._scale_bar.move(10, 10)  # Will be repositioned in resizeEvent
     
-    def add_layer(self, file_path: str) -> str | None:
-        """Add a GeoTIFF layer to the canvas. Returns existing layer_id if already loaded."""
+    def add_layer(self, file_path: str, lazy: bool = False, visible: bool = True) -> str | None:
+        """Add a GeoTIFF layer to the canvas. Returns existing layer_id if already loaded.
+        
+        Args:
+            file_path: Path to the GeoTIFF file
+            lazy: If True, only load bounds initially (faster for bulk imports)
+            visible: Whether the layer should be visible initially
+        """
         # Check if this file is already loaded
         if file_path in self._path_to_layer:
             return self._path_to_layer[file_path]
         
         try:
-            layer = TiledLayer(file_path)
+            layer = TiledLayer(file_path, lazy=lazy)
+            layer.visible = visible
             
             layer_id = f"layer_{self._next_id}"
             self._next_id += 1
@@ -464,8 +655,9 @@ class MapCanvas(QGraphicsView):
             self._path_to_layer[file_path] = layer_id
             self._update_z_order()
             
-            # Load visible tiles
-            self._update_visible_tiles()
+            # Only update tiles if visible (skip for hidden layers)
+            if visible:
+                self._update_visible_tiles()
             
             # Fit view on first layer
             if len(self._layers) == 1:

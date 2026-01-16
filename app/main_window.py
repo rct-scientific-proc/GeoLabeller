@@ -7,10 +7,10 @@ from PyQt5.QtWidgets import (
     QStatusBar, QLabel, QToolBar, QComboBox, QMessageBox, QProgressDialog,
     QApplication
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor
 
-from .canvas import MapCanvas, CanvasMode
+from .canvas import MapCanvas, CanvasMode, AsyncFileLoaderThread
 from .layer_panel import CombinedLayerPanel
 from .axis_ruler import MapCanvasWithAxes
 from .labels import LabelProject
@@ -846,7 +846,14 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage(f"Skipped {skipped} already loaded image(s)", 3000)
     
     def _add_directory(self):
-        """Open directory dialog and load all GeoTIFFs preserving directory structure."""
+        """Open directory dialog and load all GeoTIFFs preserving directory structure.
+        
+        Uses async loading for better performance with large directories:
+        - Files are discovered and tree structure is built immediately
+        - Actual file loading happens in background
+        - Layers default to hidden (unchecked) during import
+        - User can start working while files continue loading
+        """
         from pathlib import Path
         
         dir_path = QFileDialog.getExistingDirectory(
@@ -870,22 +877,25 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage("No GeoTIFF files found in directory", 5000)
             return
         
+        # Check for large import - use async for better UX
+        use_async = len(tiff_files) > 50
+        
+        if use_async:
+            self._add_directory_async(root_path, tiff_files)
+        else:
+            self._add_directory_sync(root_path, tiff_files)
+    
+    def _add_directory_sync(self, root_path: Path, tiff_files: list):
+        """Synchronous directory loading for smaller imports."""
         # Build directory structure with groups
-        # Maps relative directory path -> group item
         group_cache: dict[Path, any] = {}
         
         def get_or_create_group(rel_dir: Path):
-            """Get or create group hierarchy for a relative directory path."""
             if rel_dir == Path("."):
                 return None
-            
             if rel_dir in group_cache:
                 return group_cache[rel_dir]
-            
-            # Get or create parent group first
             parent_group = get_or_create_group(rel_dir.parent)
-            
-            # Create this group
             group = self.layer_panel.add_group(rel_dir.name, parent_group)
             group_cache[rel_dir] = group
             return group
@@ -900,55 +910,151 @@ class MainWindow(QMainWindow):
         )
         progress.setWindowTitle("Loading Images")
         progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)  # Show immediately
+        progress.setMinimumDuration(0)
         progress.setValue(0)
         
-        # Load each file into appropriate group
         loaded_count = 0
         for i, file_path in enumerate(tiff_files):
-            # Check if user cancelled
             if progress.wasCanceled():
                 break
             
-            # Update progress dialog
             progress.setValue(i)
             progress.setLabelText(f"Loading {file_path.name}...\n({i + 1} of {len(tiff_files)})")
-            QApplication.processEvents()  # Keep UI responsive
+            QApplication.processEvents()
             
-            # Get relative path from root
             rel_path = file_path.relative_to(root_path)
             rel_dir = rel_path.parent
-            
-            # Get or create the group for this directory
             parent_group = get_or_create_group(rel_dir)
             
-            # Load the layer (skip if already loaded)
             file_path_str = str(file_path)
             if self.canvas.is_path_loaded(file_path_str):
-                continue  # Already loaded, skip
+                continue
             
             layer_id = self.canvas.add_layer(file_path_str)
             if layer_id:
                 self.layer_panel.add_layer(layer_id, file_path_str, parent_group)
-                # Set the group path for display (convert Path to forward-slash string)
                 group_path_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
                 self.canvas.set_layer_group(layer_id, group_path_str)
-                # Track the loaded image in project
                 name = file_path.stem
                 self.project.add_image(file_path_str, name, group_path_str)
                 loaded_count += 1
         
-        # Close progress dialog
         progress.setValue(len(tiff_files))
-        
-        # Expand all groups
         self.layer_panel.tree.expandAll()
         
-        # Show status message
         if progress.wasCanceled():
             self.statusBar.showMessage(f"Loading cancelled. Loaded {loaded_count} of {len(tiff_files)} GeoTIFF files", 5000)
         else:
             self.statusBar.showMessage(f"Loaded {loaded_count} of {len(tiff_files)} GeoTIFF files", 5000)
+    
+    def _add_directory_async(self, root_path: Path, tiff_files: list):
+        """Asynchronous directory loading for large imports.
+        
+        Layers are added with lazy loading (only bounds read initially) and 
+        default to hidden. The tree updates progressively as files are discovered.
+        """
+        # Store state for the async operation
+        self._async_root_path = root_path
+        self._async_group_cache: dict[Path, any] = {}
+        self._async_loaded_count = 0
+        self._async_total_files = len(tiff_files)
+        
+        # Prepare file list with group paths
+        files_with_groups = []
+        for file_path in tiff_files:
+            rel_path = file_path.relative_to(root_path)
+            rel_dir = rel_path.parent
+            group_path_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
+            files_with_groups.append((str(file_path), group_path_str))
+        
+        # Create and start the async loader
+        self._async_loader = AsyncFileLoaderThread(self)
+        self._async_loader.set_files(files_with_groups)
+        
+        # Connect signals
+        self._async_loader.file_loaded.connect(self._on_async_file_loaded)
+        self._async_loader.file_error.connect(self._on_async_file_error)
+        self._async_loader.batch_complete.connect(self._on_async_batch_complete)
+        self._async_loader.progress_update.connect(self._on_async_progress)
+        
+        # Show status and start loading
+        self.statusBar.showMessage(f"Loading {len(tiff_files)} files in background... (layers hidden by default)")
+        self._async_loader.start()
+    
+    def _get_or_create_group_async(self, group_path: str):
+        """Get or create group hierarchy for async loading."""
+        if not group_path:
+            return None
+        
+        # Convert to Path for consistency
+        rel_dir = Path(group_path.replace("/", "\\"))
+        
+        if rel_dir in self._async_group_cache:
+            return self._async_group_cache[rel_dir]
+        
+        # Build path parts
+        parts = group_path.split("/")
+        parent = None
+        current_path = ""
+        
+        for part in parts:
+            current_path = f"{current_path}/{part}" if current_path else part
+            current_key = Path(current_path.replace("/", "\\"))
+            
+            if current_key not in self._async_group_cache:
+                # Create group with visible=False for async imports
+                group = self.layer_panel.add_group(part, parent, visible=False)
+                self._async_group_cache[current_key] = group
+            parent = self._async_group_cache[current_key]
+        
+        return parent
+    
+    def _on_async_file_loaded(self, file_path: str, layer_data: dict):
+        """Handle a file being loaded asynchronously."""
+        if self.canvas.is_path_loaded(file_path):
+            return
+        
+        group_path = layer_data['group_path']
+        parent_group = self._get_or_create_group_async(group_path)
+        
+        # Add layer with lazy loading and hidden by default
+        layer_id = self.canvas.add_layer(file_path, lazy=True, visible=False)
+        if layer_id:
+            # Add to tree as hidden (unchecked)
+            self.layer_panel.add_layer(layer_id, file_path, parent_group, visible=False)
+            self.canvas.set_layer_group(layer_id, group_path)
+            
+            # Track in project
+            name = Path(file_path).stem
+            self.project.add_image(file_path, name, group_path)
+            self._async_loaded_count += 1
+    
+    def _on_async_file_error(self, file_path: str, error: str):
+        """Handle a file failing to load."""
+        print(f"Failed to load {file_path}: {error}")
+    
+    def _on_async_progress(self, processed: int, total: int):
+        """Handle progress updates during async loading."""
+        self.statusBar.showMessage(
+            f"Loading files: {processed}/{total} ({self._async_loaded_count} added)..."
+        )
+    
+    def _on_async_batch_complete(self, loaded: int, errors: int):
+        """Handle async loading completion."""
+        # Expand all groups
+        self.layer_panel.tree.expandAll()
+        
+        # Show completion message
+        msg = f"Loaded {self._async_loaded_count} GeoTIFF files"
+        if errors > 0:
+            msg += f" ({errors} errors)"
+        msg += ". Check layers to display."
+        self.statusBar.showMessage(msg, 10000)
+        
+        # Clean up
+        if hasattr(self, '_async_loader'):
+            self._async_loader.deleteLater()
+            del self._async_loader
     
     def _update_coordinates(self, lon: float, lat: float, layer_name: str, group_path: str):
         """Update the coordinate display in the status bar."""

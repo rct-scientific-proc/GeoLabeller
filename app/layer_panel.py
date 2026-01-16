@@ -32,6 +32,7 @@ class LayerPanel(QWidget):
     
     def __init__(self):
         super().__init__()
+        self._batch_mode = False  # When True, suppress signals during batch operations
         self._setup_ui()
     
     def _setup_ui(self):
@@ -46,6 +47,9 @@ class LayerPanel(QWidget):
         self.tree.setSelectionMode(QTreeWidget.ExtendedSelection)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         
+        # Optimize tree widget for large datasets
+        self.tree.setUniformRowHeights(True)  # Faster scrolling with many items
+        
         # Connect signals
         self.tree.itemChanged.connect(self._on_item_changed)
         self.tree.customContextMenuRequested.connect(self._show_context_menu)
@@ -53,20 +57,37 @@ class LayerPanel(QWidget):
         
         layout.addWidget(self.tree)
     
-    def add_layer(self, layer_id: str, file_path: str, parent: QTreeWidgetItem = None):
+    def begin_batch_update(self):
+        """Begin a batch update - suppresses signals and tree updates.
+        
+        Call this before adding many items, then call end_batch_update() when done.
+        """
+        self._batch_mode = True
+        self.tree.setUpdatesEnabled(False)
+        self.tree.blockSignals(True)
+    
+    def end_batch_update(self):
+        """End a batch update - re-enables signals and refreshes the tree."""
+        self._batch_mode = False
+        self.tree.blockSignals(False)
+        self.tree.setUpdatesEnabled(True)
+        self.tree.update()
+    
+    def add_layer(self, layer_id: str, file_path: str, parent: QTreeWidgetItem = None, visible: bool = True):
         """Add a layer item to the tree.
         
         Args:
             layer_id: Unique identifier for the layer
             file_path: Path to the GeoTIFF file
             parent: Optional parent group item. If None, adds to top level.
+            visible: Whether the layer should be visible (checked) initially.
         """
         item = QTreeWidgetItem()
         item.setText(0, os.path.basename(file_path))
         item.setData(0, Qt.UserRole, layer_id)
         item.setData(0, Qt.UserRole + 1, "layer")
         item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-        item.setCheckState(0, Qt.Checked)
+        item.setCheckState(0, Qt.Checked if visible else Qt.Unchecked)
         item.setToolTip(0, file_path)
         
         # Set image icon for layers
@@ -78,18 +99,19 @@ class LayerPanel(QWidget):
         else:
             self.tree.addTopLevelItem(item)
     
-    def add_group(self, name: str, parent: QTreeWidgetItem = None):
+    def add_group(self, name: str, parent: QTreeWidgetItem = None, visible: bool = True):
         """Add a group to the tree.
         
         Args:
             name: Display name for the group
             parent: Optional parent group item. If None, adds to top level.
+            visible: Whether the group should be visible (checked) initially.
         """
         item = QTreeWidgetItem()
         item.setText(0, name)
         item.setData(0, Qt.UserRole + 1, "group")
         item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-        item.setCheckState(0, Qt.Checked)
+        item.setCheckState(0, Qt.Checked if visible else Qt.Unchecked)
         
         # Set folder icon and bold font for groups
         style = QApplication.style()
@@ -755,15 +777,36 @@ class CombinedLayerPanel(QWidget):
         return None
     
     # Delegate methods to main panel
-    def add_layer(self, layer_id: str, file_path: str, parent: QTreeWidgetItem = None):
-        """Add a layer item to the main tree."""
-        self.main_panel.add_layer(layer_id, file_path, parent)
+    def add_layer(self, layer_id: str, file_path: str, parent: QTreeWidgetItem = None, visible: bool = True):
+        """Add a layer item to the main tree.
+        
+        Args:
+            layer_id: Unique identifier for the layer
+            file_path: Path to the GeoTIFF file
+            parent: Optional parent group item
+            visible: Whether the layer should be visible (checked) initially
+        """
+        self.main_panel.add_layer(layer_id, file_path, parent, visible)
         # Register mapping in labeled panel
         self.labeled_panel.set_layer_id_map(file_path, layer_id)
     
-    def add_group(self, name: str, parent: QTreeWidgetItem = None):
-        """Add a group to the main tree."""
-        return self.main_panel.add_group(name, parent)
+    def add_group(self, name: str, parent: QTreeWidgetItem = None, visible: bool = True):
+        """Add a group to the main tree.
+        
+        Args:
+            name: Display name for the group
+            parent: Optional parent group item
+            visible: Whether the group should be visible (checked) initially
+        """
+        return self.main_panel.add_group(name, parent, visible)
+    
+    def begin_batch_update(self):
+        """Begin a batch update - suppresses signals and tree updates."""
+        self.main_panel.begin_batch_update()
+    
+    def end_batch_update(self):
+        """End a batch update - re-enables signals and refreshes the tree."""
+        self.main_panel.end_batch_update()
     
     def uncheck_layers(self, layer_ids: list[str]):
         """Uncheck layers by their IDs in both panels."""
