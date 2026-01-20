@@ -165,6 +165,13 @@ class MainWindow(QMainWindow):
         
         file_menu.addSeparator()
         
+        # Combine Projects
+        combine_action = QAction("&Combine Projects...", self)
+        combine_action.triggered.connect(self._combine_projects)
+        file_menu.addAction(combine_action)
+        
+        file_menu.addSeparator()
+        
         # Exit action
         exit_action = QAction("E&xit", self)
         exit_action.setShortcut("Ctrl+Q")
@@ -713,6 +720,107 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage(f"Saved {self.project.label_count} labels to {path.name}", 3000)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save project: {e}")
+    
+    def _combine_projects(self):
+        """Combine two .geolabel project files into a new project file."""
+        # Select first project file
+        file1, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select First Project to Combine",
+            "",
+            "GeoLabel Project (*.geolabel);;All Files (*)"
+        )
+        if not file1:
+            return
+        
+        # Select second project file
+        file2, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Second Project to Combine",
+            "",
+            "GeoLabel Project (*.geolabel);;All Files (*)"
+        )
+        if not file2:
+            return
+        
+        # Select output file
+        output_file, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Combined Project As",
+            "",
+            "GeoLabel Project (*.geolabel)"
+        )
+        if not output_file:
+            return
+        
+        if not output_file.endswith('.geolabel'):
+            output_file += '.geolabel'
+        
+        try:
+            # Load both projects
+            project1 = LabelProject.load(file1)
+            project2 = LabelProject.load(file2)
+            
+            # Combine classes (deduplicate using set, preserve order with list)
+            combined_classes = list(dict.fromkeys(project1.classes + project2.classes))
+            
+            # Find the max label ID in project1 to offset project2 IDs
+            max_id_project1 = 0
+            for image in project1.images.values():
+                for label in image.labels:
+                    if label.id > max_id_project1:
+                        max_id_project1 = label.id
+            
+            # Offset project2 label IDs to avoid overlap
+            id_offset = max_id_project1
+            for image in project2.images.values():
+                for label in image.labels:
+                    label.id += id_offset
+            
+            # Create combined project
+            combined = LabelProject()
+            combined.classes = combined_classes
+            
+            # Add all images from project1
+            for path, image in project1.images.items():
+                combined.images[path] = image
+            
+            # Add/merge images from project2
+            for path, image in project2.images.items():
+                if path in combined.images:
+                    # Image exists in both - merge labels
+                    combined.images[path].labels.extend(image.labels)
+                else:
+                    combined.images[path] = image
+            
+            # Set _next_id to be one greater than the max ID in combined project
+            max_combined_id = 0
+            for image in combined.images.values():
+                for label in image.labels:
+                    if label.id > max_combined_id:
+                        max_combined_id = label.id
+            combined._next_id = max_combined_id + 1
+            
+            # Save combined project
+            combined.save(output_file)
+            
+            # Show summary
+            QMessageBox.information(
+                self,
+                "Projects Combined",
+                f"Successfully combined projects:\n\n"
+                f"• Classes: {len(combined_classes)}\n"
+                f"• Images: {len(combined.images)}\n"
+                f"• Labels: {combined.label_count}\n\n"
+                f"Saved to: {Path(output_file).name}"
+            )
+            
+            self.statusBar.showMessage(f"Combined projects saved to {Path(output_file).name}", 5000)
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Error", f"Failed to combine projects: {e}")
     
     def _export_ground_truth(self):
         """Export ground truth labels to a JSON file."""

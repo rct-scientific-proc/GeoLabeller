@@ -1,0 +1,131 @@
+{
+  "version": "2.0",
+  "classes": [
+    "box",
+    "circle",
+    "triangle",
+    "banana",
+    "car"
+  ],
+  "images": [
+    {
+      "path": "C:\\Users\\ryant\\code\\geolabel\\tests\\data\\sub_group\\brooklyn_noise.tif",
+      "name": "brooklyn_noise",
+      "group": "",
+      "labels": [
+        {
+          "id": 1,
+          "class_name": "box",
+          "pixel_x": 205.28939034312498,
+          "pixel_y": 179.14923352526966,
+          "lon": -73.95990441594861,
+          "lat": 40.67550694072897,
+          "object_id": "80991f75-67c1-455f-bdf5-6754b012cf2d"
+        },
+        {
+          "id": 5,
+          "class_name": "triangle",
+          "pixel_x": 413.2183435373008,
+          "pixel_y": 266.66255421261303,
+          "lon": -73.91929329227787,
+          "lat": 40.66354222891625,
+          "object_id": "eb5c0099-f33c-42d8-8a63-b7c64f5b44a0"
+        },
+        {
+          "id": 9,
+          "class_name": "car",
+          "pixel_x": 394.0451028291136,
+          "pixel_y": 259.74124829872744,
+          "lon": -73.92303806585369,
+          "lat": 40.66448850120916,
+          "object_id": "c532004f-7466-449c-a001-82bae29f704f"
+        }
+      ]
+    },
+    {
+      "path": "C:\\Users\\ryant\\code\\geolabel\\tests\\data\\sub_group\\manhattan_gradient.tif",
+      "name": "manhattan_gradient",
+      "group": "",
+      "labels": [
+        {
+          "id": 4,
+          "class_name": "circle",
+          "pixel_x": 134.22087246843148,
+          "pixel_y": 439.3644600212865,
+          "lon": -74.006892492923,
+          "lat": 40.71418662890209,
+          "object_id": "0d1c0756-c1ec-4ab5-9fe6-9cd9130b1d3d"
+        },
+        {
+          "id": 7,
+          "class_name": "banana",
+          "pixel_x": 86.10508164647035,
+          "pixel_y": 28.017754185537342,
+          "lon": -74.01159130062045,
+          "lat": 40.794527782385636,
+          "object_id": "691893bf-622d-4a0a-bd1c-d17cd6a622e6"
+        },
+        {
+          "id": 10,
+          "class_name": "box",
+          "pixel_x": 129.65442297095433,
+          "pixel_y": 456.4944763125677,
+          "lon": -74.00733843525674,
+          "lat": 40.7108409225952,
+          "object_id": "661f08f6-4047-4648-98e9-5d0a8b93e278"
+        }
+      ]
+    },
+    {
+      "path": "C:\\Users\\ryant\\code\\geolabel\\tests\\data\\sub_group\\nyc_rotated.tif",
+      "name": "nyc_rotated",
+      "group": "",
+      "labels": [
+        {
+          "id": 3,
+          "class_name": "circle",
+          "pixel_x": 222.1001310396823,
+          "pixel_y": 246.05847031902522,
+          "lon": -73.9884328912545,
+          "lat": 40.757165968277604,
+          "object_id": "fa349e4f-18ef-48c8-82ff-0ea1108a7301"
+        },
+        {
+          "id": 8,
+          "class_name": "banana",
+          "pixel_x": 357.2238150051562,
+          "pixel_y": 159.69419773318805,
+          "lon": -73.98104905058709,
+          "lat": 40.771401517879745,
+          "object_id": "ab9ba228-a020-4559-ad24-b8c2aab0e619"
+        }
+      ]
+    },
+    {
+      "path": "C:\\Users\\ryant\\code\\geolabel\\tests\\data\\sub_group\\overlap_test.tif",
+      "name": "overlap_test",
+      "group": "",
+      "labels": [
+        {
+          "id": 2,
+          "class_name": "box",
+          "pixel_x": 193.96570868446724,
+          "pixel_y": 156.46328711352544,
+          "lon": -73.94211607252258,
+          "lat": 40.73555261138851,
+          "object_id": "8a3ccd7e-43f0-4b52-8bd8-2d1e17496a4f"
+        },
+        {
+          "id": 6,
+          "class_name": "triangle",
+          "pixel_x": 114.91833804867929,
+          "pixel_y": 166.22913754641195,
+          "lon": -73.95755501209987,
+          "lat": 40.73402669725837,
+          "object_id": "cd22d327-0343-4fde-9f51-1d6ea83b578a"
+        }
+      ]
+    }
+  ],
+  "_next_id": 11
+}

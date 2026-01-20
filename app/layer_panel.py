@@ -252,7 +252,27 @@ class LayerPanel(QWidget):
         add_group_action = menu.addAction("New Group")
         add_group_action.triggered.connect(self._create_group)
         
-        # If item selected, show options
+        # If multiple items are selected, offer batch visibility toggles
+        selected = self.tree.selectedItems()
+        if len(selected) > 1:
+            # Collect only layer IDs from selection
+            layer_ids = [it.data(0, Qt.UserRole) for it in selected if it.data(0, Qt.UserRole + 1) == "layer"]
+            if layer_ids:
+                menu.addSeparator()
+                turn_on_action = menu.addAction("Turn on layers")
+                turn_on_action.triggered.connect(lambda _, ids=layer_ids: self.check_layers(ids))
+
+                turn_off_action = menu.addAction("Turn off layers")
+                turn_off_action.triggered.connect(lambda _, ids=layer_ids: self.uncheck_layers(ids))
+
+                menu.addSeparator()
+                remove_action = menu.addAction("Remove")
+                remove_action.triggered.connect(lambda _, items=selected: [self._remove_item(it) for it in items])
+
+                menu.exec_(self.tree.mapToGlobal(position))
+                return
+
+        # If single item under cursor, show options for that item
         item = self.tree.itemAt(position)
         if item:
             item_type = item.data(0, Qt.UserRole + 1)

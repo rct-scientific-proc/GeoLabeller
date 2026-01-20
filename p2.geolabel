@@ -1,0 +1,55 @@
+{
+  "version": "2.0",
+  "classes": [
+    "car",
+    "box",
+    "circle"
+  ],
+  "images": [
+    {
+      "path": "C:\\Users\\ryant\\code\\geolabel\\tests\\data\\sub_group\\brooklyn_noise.tif",
+      "name": "brooklyn_noise",
+      "group": "",
+      "labels": [
+        {
+          "id": 1,
+          "class_name": "car",
+          "pixel_x": 394.0451028291136,
+          "pixel_y": 259.74124829872744,
+          "lon": -73.92303806585369,
+          "lat": 40.66448850120916,
+          "object_id": "c532004f-7466-449c-a001-82bae29f704f"
+        }
+      ]
+    },
+    {
+      "path": "C:\\Users\\ryant\\code\\geolabel\\tests\\data\\sub_group\\manhattan_gradient.tif",
+      "name": "manhattan_gradient",
+      "group": "",
+      "labels": [
+        {
+          "id": 2,
+          "class_name": "box",
+          "pixel_x": 129.65442297095433,
+          "pixel_y": 456.4944763125677,
+          "lon": -74.00733843525674,
+          "lat": 40.7108409225952,
+          "object_id": "661f08f6-4047-4648-98e9-5d0a8b93e278"
+        }
+      ]
+    },
+    {
+      "path": "C:\\Users\\ryant\\code\\geolabel\\tests\\data\\sub_group\\nyc_rotated.tif",
+      "name": "nyc_rotated",
+      "group": "",
+      "labels": []
+    },
+    {
+      "path": "C:\\Users\\ryant\\code\\geolabel\\tests\\data\\sub_group\\overlap_test.tif",
+      "name": "overlap_test",
+      "group": "",
+      "labels": []
+    }
+  ],
+  "_next_id": 3
+}
