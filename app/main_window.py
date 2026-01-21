@@ -201,6 +201,11 @@ class MainWindow(QMainWindow):
         export_gt_action.triggered.connect(self._export_ground_truth)
         export_menu.addAction(export_gt_action)
         
+        # Export Ground Truth (Labeled Only)
+        export_gt_labeled_action = QAction("Ground Truth (Labeled Only)...", self)
+        export_gt_labeled_action.triggered.connect(self._export_ground_truth_labeled_only)
+        export_menu.addAction(export_gt_labeled_action)
+
         # Export Sub-images
         export_subimages_action = QAction("&Sub-images...", self)
         export_subimages_action.triggered.connect(self._export_subimages)
@@ -842,6 +847,51 @@ class MainWindow(QMainWindow):
                 self.statusBar.showMessage(f"Exported {self.project.label_count} labels to {file_path}", 3000)
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to export ground truth: {e}")
+
+    def _export_ground_truth_labeled_only(self):
+        """Export ground truth JSON but include only images that have labels."""
+        if self.project.label_count == 0:
+            QMessageBox.information(self, "Export", "No labels to export.")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Ground Truth (Labeled Only)",
+            "",
+            "JSON Files (*.json)"
+        )
+        if not file_path:
+            return
+        if not file_path.endswith('.json'):
+            file_path += '.json'
+
+        try:
+            import json
+
+            # Collect only images that have at least one label
+            images = [img.to_dict() for img in self.project.images.values() if img.labels]
+
+            if not images:
+                QMessageBox.information(self, "Export", "No labeled images to export.")
+                return
+
+            data = {
+                "version": "2.0",
+                "classes": self.project.classes,
+                "images": images,
+                "_next_id": self.project._next_id
+            }
+
+            with open(file_path, 'w') as f:
+                json.dump(data, f, indent=2)
+
+            total_labels = sum(len(img['labels']) for img in images)
+            self.statusBar.showMessage(
+                f"Exported {total_labels} labels from {len(images)} images to {file_path}",
+                3000
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to export ground truth: {e}")
 
     def _export_subimages(self):
         """Export sub-images centered on labels as GeoTIFFs preserving original pixels."""
