@@ -5,7 +5,7 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QMainWindow, QSplitter, QMenuBar, QMenu, QAction, QFileDialog,
     QStatusBar, QLabel, QToolBar, QComboBox, QMessageBox, QProgressDialog,
-    QApplication, QProgressBar, QSpinBox
+    QApplication, QProgressBar, QSpinBox, QLineEdit, QPushButton, QHBoxLayout, QWidget
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor
@@ -54,6 +54,11 @@ class MainWindow(QMainWindow):
         self._async_ui_timer = QTimer()
         self._async_ui_timer.setInterval(100)  # Update UI every 100ms
         self._async_ui_timer.timeout.connect(self._process_pending_async_files)
+        
+        # Custom reader state
+        self._custom_reader_script: str | None = None
+        self._custom_reader_func = None
+        self._custom_extension = "png"  # Default extension for custom files
         
         self._setup_ui()
         self._setup_menu()
@@ -165,6 +170,26 @@ class MainWindow(QMainWindow):
         
         file_menu.addSeparator()
         
+        # Custom Reader submenu
+        custom_menu = file_menu.addMenu("Custom &Reader")
+        
+        # Set Reader Script
+        set_reader_action = QAction("Set Reader &Script...", self)
+        set_reader_action.triggered.connect(self._set_custom_reader_script)
+        custom_menu.addAction(set_reader_action)
+        
+        # Add Custom File(s)
+        add_custom_action = QAction("Add Custom &File(s)...", self)
+        add_custom_action.triggered.connect(self._add_custom_files)
+        custom_menu.addAction(add_custom_action)
+        
+        # Add Custom Directory
+        add_custom_dir_action = QAction("Add Custom &Directory...", self)
+        add_custom_dir_action.triggered.connect(self._add_custom_directory)
+        custom_menu.addAction(add_custom_dir_action)
+        
+        file_menu.addSeparator()
+        
         # Combine Projects
         combine_action = QAction("&Combine Projects...", self)
         combine_action.triggered.connect(self._combine_projects)
@@ -267,6 +292,24 @@ class MainWindow(QMainWindow):
             "Decimation factor (1 = full resolution, higher = faster but lower quality)"
         )
         toolbar.addWidget(self.decimation_spin)
+        
+        toolbar.addSeparator()
+        
+        # Custom reader extension control
+        toolbar.addWidget(QLabel(" Custom Ext: "))
+        self.custom_ext_edit = QLineEdit()
+        self.custom_ext_edit.setPlaceholderText("png")
+        self.custom_ext_edit.setMaximumWidth(60)
+        self.custom_ext_edit.setToolTip(
+            "File extension to search for when using custom reader (without dot)"
+        )
+        self.custom_ext_edit.textChanged.connect(self._on_custom_ext_changed)
+        toolbar.addWidget(self.custom_ext_edit)
+        
+        # Reader status indicator
+        self.reader_status_label = QLabel(" Reader: None")
+        self.reader_status_label.setToolTip("No custom reader loaded. Use File > Custom Reader > Set Reader Script...")
+        toolbar.addWidget(self.reader_status_label)
     
     def _set_mode(self, mode: CanvasMode):
         """Set the canvas interaction mode."""
@@ -1525,4 +1568,203 @@ class MainWindow(QMainWindow):
             "<li>Ground truth export</li>"
             "</ul>"
         )
+    
+    # -------------------------------------------------------------------------
+    # Custom Reader Methods
+    # -------------------------------------------------------------------------
+    
+    def _on_custom_ext_changed(self, text: str):
+        """Handle custom extension text change."""
+        # Strip any leading dots and whitespace
+        ext = text.strip().lstrip('.')
+        self._custom_extension = ext if ext else "png"
+    
+    def _set_custom_reader_script(self):
+        """Open dialog to select a custom reader script."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Custom Reader Script",
+            "",
+            "Python Files (*.py);;All Files (*)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            from .custom_reader import load_reader_function
+            
+            self._custom_reader_func = load_reader_function(file_path)
+            self._custom_reader_script = file_path
+            
+            # Update status
+            script_name = Path(file_path).name
+            self.reader_status_label.setText(f" Reader: {script_name}")
+            self.reader_status_label.setToolTip(f"Custom reader loaded: {file_path}")
+            self.reader_status_label.setStyleSheet("color: green;")
+            
+            self.statusBar.showMessage(f"Custom reader loaded: {script_name}", 5000)
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Error Loading Reader",
+                f"Failed to load custom reader script:\n\n{e}"
+            )
+            self._custom_reader_func = None
+            self._custom_reader_script = None
+            self.reader_status_label.setText(" Reader: None")
+            self.reader_status_label.setToolTip("No custom reader loaded")
+            self.reader_status_label.setStyleSheet("")
+    
+    def _add_custom_files(self):
+        """Add files using the custom reader."""
+        if self._custom_reader_func is None:
+            QMessageBox.warning(
+                self,
+                "No Reader Loaded",
+                "Please load a custom reader script first.\n\n"
+                "Go to File > Custom Reader > Set Reader Script..."
+            )
+            return
+        
+        ext = self._custom_extension
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add Custom Files",
+            "",
+            f"Custom Files (*.{ext});;All Files (*)"
+        )
+        
+        if not file_paths:
+            return
+        
+        skipped = 0
+        loaded = 0
+        errors = []
+        
+        for file_path in file_paths:
+            if self.canvas.is_path_loaded(file_path):
+                skipped += 1
+                continue
+            
+            try:
+                layer_id = self.canvas.add_custom_layer(
+                    file_path,
+                    self._custom_reader_func,
+                    decimation=self.decimation_spin.value()
+                )
+                if layer_id:
+                    self.layer_panel.add_layer(layer_id, file_path)
+                    name = Path(file_path).stem
+                    self.project.add_image(file_path, name, "")
+                    loaded += 1
+            except Exception as e:
+                errors.append(f"{Path(file_path).name}: {e}")
+        
+        msg = f"Loaded {loaded} file(s)"
+        if skipped:
+            msg += f", skipped {skipped} already loaded"
+        if errors:
+            msg += f", {len(errors)} error(s)"
+            QMessageBox.warning(self, "Loading Complete", msg + "\n\nErrors:\n" + "\n".join(errors[:5]))
+        else:
+            self.statusBar.showMessage(msg, 5000)
+    
+    def _add_custom_directory(self):
+        """Add a directory of files using the custom reader."""
+        if self._custom_reader_func is None:
+            QMessageBox.warning(
+                self,
+                "No Reader Loaded",
+                "Please load a custom reader script first.\n\n"
+                "Go to File > Custom Reader > Set Reader Script..."
+            )
+            return
+        
+        dir_path = QFileDialog.getExistingDirectory(
+            self,
+            "Select Directory with Custom Files",
+            "",
+            QFileDialog.ShowDirsOnly
+        )
+        
+        if not dir_path:
+            return
+        
+        root_path = Path(dir_path)
+        ext = self._custom_extension
+        custom_files = list(root_path.rglob(f"*.{ext}"))
+        custom_files.sort()
+        
+        if not custom_files:
+            self.statusBar.showMessage(f"No .{ext} files found in directory", 5000)
+            return
+        
+        # Create progress dialog
+        progress = QProgressDialog(
+            f"Loading .{ext} files...",
+            "Cancel",
+            0,
+            len(custom_files),
+            self
+        )
+        progress.setWindowTitle("Loading Custom Files")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        
+        # Build group hierarchy cache
+        group_cache: dict[Path, any] = {}
+        
+        def get_or_create_group(rel_dir: Path):
+            if rel_dir == Path(".") or str(rel_dir) == ".":
+                return None
+            if rel_dir in group_cache:
+                return group_cache[rel_dir]
+            parent_group = get_or_create_group(rel_dir.parent)
+            group = self.layer_panel.add_group(rel_dir.name, parent_group)
+            group_cache[rel_dir] = group
+            return group
+        
+        loaded_count = 0
+        for i, file_path in enumerate(custom_files):
+            if progress.wasCanceled():
+                break
+            
+            progress.setValue(i)
+            progress.setLabelText(f"Loading {file_path.name}...\n({i + 1} of {len(custom_files)})")
+            QApplication.processEvents()
+            
+            file_path_str = str(file_path)
+            if self.canvas.is_path_loaded(file_path_str):
+                continue
+            
+            rel_path = file_path.relative_to(root_path)
+            rel_dir = rel_path.parent
+            parent_group = get_or_create_group(rel_dir)
+            
+            try:
+                layer_id = self.canvas.add_custom_layer(
+                    file_path_str,
+                    self._custom_reader_func,
+                    decimation=self.decimation_spin.value()
+                )
+                if layer_id:
+                    self.layer_panel.add_layer(layer_id, file_path_str, parent_group)
+                    group_path_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
+                    self.canvas.set_layer_group(layer_id, group_path_str)
+                    name = file_path.stem
+                    self.project.add_image(file_path_str, name, group_path_str)
+                    loaded_count += 1
+            except Exception as e:
+                print(f"Error loading {file_path}: {e}")
+        
+        progress.setValue(len(custom_files))
+        self.layer_panel.tree.expandAll()
+        
+        if progress.wasCanceled():
+            self.statusBar.showMessage(f"Loading cancelled. Loaded {loaded_count} of {len(custom_files)} files", 5000)
+        else:
+            self.statusBar.showMessage(f"Loaded {loaded_count} of {len(custom_files)} .{ext} files", 5000)
 

@@ -402,6 +402,293 @@ class TiledLayer:
         return (col, row)
 
 
+class CustomTiledLayer:
+    """Manages tiled rendering for an image loaded via custom reader with GCPs.
+    
+    Similar to TiledLayer but uses GCP-based affine transform instead of
+    rasterio reprojection. The image is already in RGBA format from PIL.
+    """
+    
+    def __init__(self, file_path: str, reader_func, lazy: bool = False, decimation: int = 1):
+        """Initialize a custom tiled layer.
+        
+        Args:
+            file_path: Path to the image file
+            reader_func: Callable that takes filename and returns GCPs
+            lazy: If True, only load bounds initially
+            decimation: Decimation factor for display (1 = full resolution)
+        """
+        from .custom_reader import load_image_with_reader, compute_bounds_from_affine, gcps_to_affine
+        
+        self.file_path = file_path
+        self.name = Path(file_path).stem
+        self.group_path = ""
+        self.visible = True
+        self.bounds = None  # (west, south, east, north) in Web Mercator
+        self.tiles: dict[tuple[int, int], QGraphicsPixmapItem] = {}
+        self.z_value = 0
+        
+        self._reader_func = reader_func
+        
+        # Original image info for coordinate transforms
+        self._src_crs = None
+        self._src_transform = None  # Affine from GCPs (pixel -> Web Mercator)
+        self._src_width = 0
+        self._src_height = 0
+        
+        # Image data
+        self._rgba_data: np.ndarray | None = None
+        self._width = 0
+        self._height = 0
+        self._decimation = max(1, int(decimation))
+        
+        # Tile grid info
+        self._n_tiles_x = 0
+        self._n_tiles_y = 0
+        self._tile_world_width = 0
+        self._tile_world_height = 0
+        
+        # Lazy loading state
+        self._lazy = lazy
+        self._fully_loaded = False
+        
+        if lazy:
+            self._load_bounds_only()
+        else:
+            self._load_full()
+            self._fully_loaded = True
+    
+    def _load_bounds_only(self):
+        """Load only bounds from GCPs without loading full image data.
+        
+        Note: Since the reader returns both image and GCPs, we must call the
+        reader even for bounds-only loading. The image data is discarded.
+        """
+        from .custom_reader import gcps_to_affine, compute_bounds_from_affine
+        
+        # Call reader to get image data and GCPs
+        result = self._reader_func(self.file_path)
+        if not isinstance(result, (list, tuple)) or len(result) != 2:
+            raise ValueError("Reader must return a tuple of (image_data, gcps)")
+        
+        image_data, gcps = result
+        
+        # Get dimensions from image data
+        self._src_height, self._src_width = image_data.shape[:2]
+        
+        # Compute transform from GCPs
+        self._src_transform, self._src_crs = gcps_to_affine(gcps, self._src_width, self._src_height)
+        
+        # Apply decimation to dimensions
+        width = self._src_width
+        height = self._src_height
+        transform = self._src_transform
+        
+        if self._decimation > 1:
+            factor = self._decimation
+            width = int(math.ceil(width / factor))
+            height = int(math.ceil(height / factor))
+            transform = Affine(transform.a * factor, transform.b, transform.c,
+                               transform.d, transform.e * factor, transform.f)
+        
+        self._width = width
+        self._height = height
+        
+        # Compute bounds
+        self.bounds = compute_bounds_from_affine(transform, width, height)
+        west, south, east, north = self.bounds
+        
+        # Calculate tile grid
+        self._n_tiles_x = math.ceil(width / TILE_SIZE)
+        self._n_tiles_y = math.ceil(height / TILE_SIZE)
+        self._tile_world_width = (east - west) / self._n_tiles_x
+        self._tile_world_height = (north - south) / self._n_tiles_y
+    
+    def _load_full(self):
+        """Load full image data using custom reader."""
+        from .custom_reader import load_image_with_reader, compute_bounds_from_affine
+        
+        rgba_array, affine, crs, width, height = load_image_with_reader(
+            self.file_path, self._reader_func
+        )
+        
+        self._src_crs = crs
+        self._src_transform = affine
+        self._src_width = width
+        self._src_height = height
+        
+        # Apply decimation if requested
+        if self._decimation > 1:
+            factor = self._decimation
+            new_width = int(math.ceil(width / factor))
+            new_height = int(math.ceil(height / factor))
+            
+            # Use bilinear resize
+            self._rgba_data = self._bilinear_resize(rgba_array, new_height, new_width)
+            
+            # Update transform
+            affine = Affine(affine.a * factor, affine.b, affine.c,
+                            affine.d, affine.e * factor, affine.f)
+            width = new_width
+            height = new_height
+        else:
+            self._rgba_data = rgba_array
+        
+        self._width = width
+        self._height = height
+        
+        # Compute bounds
+        self.bounds = compute_bounds_from_affine(affine, width, height)
+        west, south, east, north = self.bounds
+        
+        # Calculate tile grid
+        self._n_tiles_x = math.ceil(width / TILE_SIZE)
+        self._n_tiles_y = math.ceil(height / TILE_SIZE)
+        self._tile_world_width = (east - west) / self._n_tiles_x
+        self._tile_world_height = (north - south) / self._n_tiles_y
+    
+    @staticmethod
+    def _bilinear_resize(img: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+        """Bilinear resize for RGBA image."""
+        h, w = img.shape[0], img.shape[1]
+        if out_h == h and out_w == w:
+            return img
+        
+        ys = (np.arange(out_h) + 0.5) * (h / out_h) - 0.5
+        xs = (np.arange(out_w) + 0.5) * (w / out_w) - 0.5
+        y0 = np.floor(ys).astype(int)
+        x0 = np.floor(xs).astype(int)
+        y1 = np.clip(y0 + 1, 0, h - 1)
+        x1 = np.clip(x0 + 1, 0, w - 1)
+        y0 = np.clip(y0, 0, h - 1)
+        x0 = np.clip(x0, 0, w - 1)
+        
+        wy = (ys - y0)[:, None]
+        wx = (xs - x0)[None, :]
+        
+        c00 = img[y0[:, None], x0[None, :]]
+        c01 = img[y0[:, None], x1[None, :]]
+        c10 = img[y1[:, None], x0[None, :]]
+        c11 = img[y1[:, None], x1[None, :]]
+        
+        w00 = (1 - wy) * (1 - wx)
+        w01 = (1 - wy) * wx
+        w10 = wy * (1 - wx)
+        w11 = wy * wx
+        
+        out = (c00 * w00[..., None] + c01 * w01[..., None] +
+               c10 * w10[..., None] + c11 * w11[..., None])
+        return np.clip(out, 0, 255).astype(np.uint8)
+    
+    def ensure_loaded(self):
+        """Ensure the full image data is loaded."""
+        if not self._fully_loaded:
+            self._load_full()
+            self._fully_loaded = True
+    
+    def is_fully_loaded(self) -> bool:
+        return self._fully_loaded
+    
+    def get_tile_bounds(self, tx: int, ty: int) -> tuple[int, int, int, int, float, float, float, float]:
+        """Get pixel and world bounds for a tile."""
+        west, south, east, north = self.bounds
+        
+        px_left = tx * TILE_SIZE
+        px_top = ty * TILE_SIZE
+        px_right = min((tx + 1) * TILE_SIZE, self._width)
+        px_bottom = min((ty + 1) * TILE_SIZE, self._height)
+        
+        world_per_pixel_x = (east - west) / self._width
+        world_per_pixel_y = (north - south) / self._height
+        
+        tile_west = west + px_left * world_per_pixel_x
+        tile_east = west + px_right * world_per_pixel_x
+        tile_north = north - px_top * world_per_pixel_y
+        tile_south = north - px_bottom * world_per_pixel_y
+        
+        return px_left, px_top, px_right, px_bottom, tile_west, tile_south, tile_east, tile_north
+    
+    def get_visible_tile_indices(self, view_bounds: tuple[float, float, float, float]) -> list[tuple[int, int]]:
+        """Get list of tile indices that intersect with the view bounds."""
+        view_west, view_south, view_east, view_north = view_bounds
+        layer_west, layer_south, layer_east, layer_north = self.bounds
+        
+        if (view_east < layer_west or view_west > layer_east or
+            view_north < layer_south or view_south > layer_north):
+            return []
+        
+        visible = []
+        for ty in range(self._n_tiles_y):
+            for tx in range(self._n_tiles_x):
+                _, _, _, _, tile_west, tile_south, tile_east, tile_north = self.get_tile_bounds(tx, ty)
+                if (tile_east >= view_west and tile_west <= view_east and
+                    tile_north >= view_south and tile_south <= view_north):
+                    visible.append((tx, ty))
+        
+        return visible
+    
+    def create_tile_pixmap(self, tx: int, ty: int) -> QPixmap | None:
+        """Create a QPixmap for a specific tile."""
+        self.ensure_loaded()
+        
+        if self._rgba_data is None:
+            return None
+        
+        px_left, px_top, px_right, px_bottom, _, _, _, _ = self.get_tile_bounds(tx, ty)
+        tile_data = self._rgba_data[px_top:px_bottom, px_left:px_right].copy()
+        height, width = tile_data.shape[:2]
+        
+        if height == 0 or width == 0:
+            return None
+        
+        image = QImage(tile_data.data, width, height, width * 4, QImage.Format_RGBA8888)
+        return QPixmap.fromImage(image.copy())
+    
+    def set_visibility(self, visible: bool):
+        self.visible = visible
+        for item in self.tiles.values():
+            item.setVisible(visible)
+    
+    def set_z_value(self, z: float):
+        self.z_value = z
+        for item in self.tiles.values():
+            item.setZValue(z)
+    
+    def remove_from_scene(self, scene: QGraphicsScene):
+        for item in self.tiles.values():
+            scene.removeItem(item)
+        self.tiles.clear()
+    
+    def contains_point(self, easting: float, northing: float) -> bool:
+        if self.bounds is None:
+            return False
+        west, south, east, north = self.bounds
+        return west <= easting <= east and south <= northing <= north
+    
+    def get_center(self) -> tuple[float, float]:
+        if self.bounds is None:
+            return (0, 0)
+        west, south, east, north = self.bounds
+        return ((west + east) / 2, (south + north) / 2)
+    
+    def distance_to_center(self, easting: float, northing: float) -> float:
+        cx, cy = self.get_center()
+        return math.sqrt((easting - cx) ** 2 + (northing - cy) ** 2)
+    
+    def latlon_to_pixel(self, lon: float, lat: float) -> tuple[float, float]:
+        """Convert WGS84 lat/lon to pixel coordinates in the original image."""
+        from rasterio.warp import transform as transform_coords
+        
+        # Transform to Web Mercator
+        wgs84 = CRS.from_epsg(4326)
+        xs, ys = transform_coords(wgs84, self._src_crs, [lon], [lat])
+        x_mercator, y_mercator = xs[0], ys[0]
+        
+        # Use inverse of affine to get pixel coordinates
+        col, row = ~self._src_transform * (x_mercator, y_mercator)
+        return (col, row)
+
+
 class AsyncFileLoader(QObject):
     """Worker object for loading GeoTIFF files asynchronously in a background thread.
     
@@ -737,6 +1024,49 @@ class MapCanvas(QGraphicsView):
             traceback.print_exc()
             return None
     
+    def add_custom_layer(self, file_path: str, reader_func, lazy: bool = False, 
+                         visible: bool = True, decimation: int = 1) -> str | None:
+        """Add a layer using a custom reader function with GCPs.
+        
+        Args:
+            file_path: Path to the image file
+            reader_func: Function that takes filename and returns GCPs
+            lazy: If True, only load bounds initially
+            visible: Whether the layer should be visible initially
+            decimation: Decimation factor for display
+        """
+        if file_path in self._path_to_layer:
+            return self._path_to_layer[file_path]
+        
+        try:
+            layer = CustomTiledLayer(file_path, reader_func, lazy=lazy, decimation=decimation)
+            layer.visible = visible
+            
+            layer_id = f"layer_{self._next_id}"
+            self._next_id += 1
+            
+            self._layers[layer_id] = layer
+            self._layer_order.append(layer_id)
+            self._path_to_layer[file_path] = layer_id
+            self._update_z_order()
+            
+            if visible:
+                self._update_visible_tiles()
+            
+            if len(self._layers) == 1:
+                west, south, east, north = layer.bounds
+                rect = QRectF(west, -north, east - west, north - south)
+                self.fitInView(rect, Qt.KeepAspectRatio)
+                self._update_scale_bar()
+            
+            return layer_id
+            
+        except Exception as e:
+            print(f"Error loading custom layer {file_path}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     def _get_view_bounds(self) -> tuple[float, float, float, float]:
         """Get current view bounds in Web Mercator coordinates."""
         rect = self.mapToScene(self.viewport().rect()).boundingRect()
