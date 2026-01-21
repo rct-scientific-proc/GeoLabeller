@@ -13,6 +13,7 @@ from PyQt5.QtCore import Qt, pyqtSignal, QRectF, QTimer, QThread, QObject
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterio.crs import CRS
+from affine import Affine
 
 
 # Web Mercator CRS
@@ -33,7 +34,7 @@ class TiledLayer:
     on demand when the layer becomes visible.
     """
     
-    def __init__(self, file_path: str, lazy: bool = False):
+    def __init__(self, file_path: str, lazy: bool = False, decimation: int = 1):
         """Initialize a tiled layer.
         
         Args:
@@ -58,6 +59,9 @@ class TiledLayer:
         self._rgba_data: np.ndarray | None = None
         self._width = 0
         self._height = 0
+        # Decimation factor (integer >=1). If >1, image pixels are reduced
+        # by this factor using bilinear interpolation after reprojection.
+        self._decimation = max(1, int(decimation))
         
         # Tile grid info
         self._n_tiles_x = 0
@@ -95,10 +99,22 @@ class TiledLayer:
             transform, width, height = calculate_default_transform(
                 src.crs, dst_crs, src.width, src.height, *src.bounds
             )
-            
+
+            # If decimation is requested, adjust pixel dimensions and transform
+            if self._decimation > 1:
+                factor = self._decimation
+                # New pixel size is larger by factor; number of pixels reduced
+                new_width = int(math.ceil(width / factor))
+                new_height = int(math.ceil(height / factor))
+                # Scale the affine so that pixel->world mapping remains consistent
+                transform = Affine(transform.a * factor, transform.b, transform.c,
+                                   transform.d, transform.e * factor, transform.f)
+                width = new_width
+                height = new_height
+
             self._width = width
             self._height = height
-            
+
             # Store bounds in Web Mercator
             self.bounds = rasterio.transform.array_bounds(height, width, transform)
             west, south, east, north = self.bounds
@@ -132,14 +148,11 @@ class TiledLayer:
             transform, width, height = calculate_default_transform(
                 src.crs, dst_crs, src.width, src.height, *src.bounds
             )
-            
-            self._width = width
-            self._height = height
-            
+
             # Use a sentinel nodata value to identify padded pixels after reprojection
             # We use np.nan for float operations, then track the nodata mask
             NODATA_SENTINEL = np.nan
-            
+
             # Reproject each band using float32 to support nan as nodata
             bands = []
             for i in range(1, src.count + 1):
@@ -147,7 +160,7 @@ class TiledLayer:
                 # Handle source nodata - convert to nan
                 if src.nodata is not None:
                     src_band[src_band == src.nodata] = np.nan
-                
+
                 dst_band = np.full((height, width), NODATA_SENTINEL, dtype=np.float32)
                 reproject(
                     source=src_band,
@@ -161,38 +174,88 @@ class TiledLayer:
                     dst_nodata=NODATA_SENTINEL
                 )
                 bands.append(dst_band)
-            
-            # Store bounds in Web Mercator
-            self.bounds = rasterio.transform.array_bounds(height, width, transform)
-            west, south, east, north = self.bounds
-            
+
             # Create nodata mask - pixels are nodata if ALL bands are nan
             # This identifies padded areas from reprojection
             nodata_mask = np.all([np.isnan(b) for b in bands], axis=0)
-            
-            # Convert to RGBA
+
+            # Convert to RGBA (at full resolution)
             if len(bands) >= 3:
                 r, g, b = bands[0], bands[1], bands[2]
             else:
                 r = g = b = bands[0]
-            
+
             # Replace nan with 0 before converting to uint8, then clip
             r = np.nan_to_num(r, nan=0.0)
             g = np.nan_to_num(g, nan=0.0)
             b = np.nan_to_num(b, nan=0.0)
-            
+
             r = np.clip(r, 0, 255).astype(np.uint8)
             g = np.clip(g, 0, 255).astype(np.uint8)
             b = np.clip(b, 0, 255).astype(np.uint8)
-            
-            self._rgba_data = np.zeros((height, width, 4), dtype=np.uint8)
-            self._rgba_data[:, :, 0] = r
-            self._rgba_data[:, :, 1] = g
-            self._rgba_data[:, :, 2] = b
+
+            rgba_full = np.zeros((height, width, 4), dtype=np.uint8)
+            rgba_full[:, :, 0] = r
+            rgba_full[:, :, 1] = g
+            rgba_full[:, :, 2] = b
             # Set alpha to 0 for nodata/padded pixels, 255 for valid pixels
-            self._rgba_data[:, :, 3] = np.where(nodata_mask, 0, 255).astype(np.uint8)
-            
+            rgba_full[:, :, 3] = np.where(nodata_mask, 0, 255).astype(np.uint8)
+
+            # If decimation requested, downsample the rgba array using bilinear
+            if self._decimation > 1:
+                factor = self._decimation
+                new_width = int(math.ceil(width / factor))
+                new_height = int(math.ceil(height / factor))
+
+                def _bilinear_resize(img: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+                    h, w = img.shape[0], img.shape[1]
+                    if out_h == h and out_w == w:
+                        return img
+                    # compute source coordinates
+                    ys = (np.arange(out_h) + 0.5) * (h / out_h) - 0.5
+                    xs = (np.arange(out_w) + 0.5) * (w / out_w) - 0.5
+                    y0 = np.floor(ys).astype(int)
+                    x0 = np.floor(xs).astype(int)
+                    y1 = np.clip(y0 + 1, 0, h - 1)
+                    x1 = np.clip(x0 + 1, 0, w - 1)
+                    y0 = np.clip(y0, 0, h - 1)
+                    x0 = np.clip(x0, 0, w - 1)
+
+                    wy = (ys - y0)[:, None]
+                    wx = (xs - x0)[None, :]
+
+                    # Advanced indexing to gather corner pixels
+                    c00 = img[y0[:, None], x0[None, :]]
+                    c01 = img[y0[:, None], x1[None, :]]
+                    c10 = img[y1[:, None], x0[None, :]]
+                    c11 = img[y1[:, None], x1[None, :]]
+
+                    w00 = (1 - wy) * (1 - wx)
+                    w01 = (1 - wy) * wx
+                    w10 = wy * (1 - wx)
+                    w11 = wy * wx
+
+                    out = (c00 * w00[..., None] + c01 * w01[..., None] +
+                           c10 * w10[..., None] + c11 * w11[..., None])
+                    # Clip and convert back to uint8
+                    return np.clip(out, 0, 255).astype(np.uint8)
+
+                self._rgba_data = _bilinear_resize(rgba_full, new_height, new_width)
+                # Update transform so pixel->world mapping stays correct
+                transform = Affine(transform.a * factor, transform.b, transform.c,
+                                   transform.d, transform.e * factor, transform.f)
+                width = new_width
+                height = new_height
+            else:
+                self._rgba_data = rgba_full
+
+            # Store bounds in Web Mercator (after possible decimation)
+            self.bounds = rasterio.transform.array_bounds(height, width, transform)
+            west, south, east, north = self.bounds
+
             # Calculate tile grid
+            self._width = width
+            self._height = height
             self._n_tiles_x = math.ceil(width / TILE_SIZE)
             self._n_tiles_y = math.ceil(height / TILE_SIZE)
             self._tile_world_width = (east - west) / self._n_tiles_x
@@ -631,7 +694,7 @@ class MapCanvas(QGraphicsView):
         self._scale_bar = ScaleBarWidget(self)
         self._scale_bar.move(10, 10)  # Will be repositioned in resizeEvent
     
-    def add_layer(self, file_path: str, lazy: bool = False, visible: bool = True) -> str | None:
+    def add_layer(self, file_path: str, lazy: bool = False, visible: bool = True, decimation: int = 1) -> str | None:
         """Add a GeoTIFF layer to the canvas. Returns existing layer_id if already loaded.
         
         Args:
@@ -644,7 +707,7 @@ class MapCanvas(QGraphicsView):
             return self._path_to_layer[file_path]
         
         try:
-            layer = TiledLayer(file_path, lazy=lazy)
+            layer = TiledLayer(file_path, lazy=lazy, decimation=decimation)
             layer.visible = visible
             
             layer_id = f"layer_{self._next_id}"
