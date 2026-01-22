@@ -13,7 +13,7 @@ from PyQt5.QtGui import QColor
 from .canvas import MapCanvas, CanvasMode, AsyncFileLoaderThread
 from .layer_panel import CombinedLayerPanel
 from .axis_ruler import MapCanvasWithAxes
-from .labels import LabelProject
+from .labels import LabelProject, ImageData, PointLabel
 from .class_editor import ClassEditorDialog
 
 
@@ -820,50 +820,50 @@ class MainWindow(QMainWindow):
             # Load both projects
             project1 = LabelProject.load(file1)
             project2 = LabelProject.load(file2)
-            
-            # Combine classes (deduplicate using set, preserve order with list)
+
+            # Combine classes (deduplicate while preserving order)
             combined_classes = list(dict.fromkeys(project1.classes + project2.classes))
-            
-            # Find the max label ID in project1 to offset project2 IDs
-            max_id_project1 = 0
-            for image in project1.images.values():
-                for label in image.labels:
-                    if label.id > max_id_project1:
-                        max_id_project1 = label.id
-            
-            # Offset project2 label IDs to avoid overlap
-            id_offset = max_id_project1
-            for image in project2.images.values():
-                for label in image.labels:
-                    label.id += id_offset
-            
-            # Create combined project
+
+            # Create combined project and deep-copy images/labels from project1
             combined = LabelProject()
             combined.classes = combined_classes
-            
-            # Add all images from project1
+
+            # Helper: clone ImageData (and contained labels) to avoid mutating originals
+            def clone_image(image: ImageData) -> ImageData:
+                return ImageData.from_dict(image.to_dict())
+
+            # Track maximum label id
+            max_id = 0
+
             for path, image in project1.images.items():
-                combined.images[path] = image
-            
-            # Add/merge images from project2
+                new_img = clone_image(image)
+                combined.images[path] = new_img
+                for lbl in new_img.labels:
+                    if lbl.id > max_id:
+                        max_id = lbl.id
+
+            # Offset for project2 labels to ensure unique IDs
+            id_offset = max_id
+
+            # Merge images and labels from project2 (cloned, with remapped ids)
             for path, image in project2.images.items():
+                cloned = clone_image(image)
+                for lbl in cloned.labels:
+                    lbl.id = lbl.id + id_offset
+                    if lbl.id > max_id:
+                        max_id = lbl.id
+
                 if path in combined.images:
-                    # Image exists in both - merge labels
-                    combined.images[path].labels.extend(image.labels)
+                    combined.images[path].labels.extend(cloned.labels)
                 else:
-                    combined.images[path] = image
-            
-            # Set _next_id to be one greater than the max ID in combined project
-            max_combined_id = 0
-            for image in combined.images.values():
-                for label in image.labels:
-                    if label.id > max_combined_id:
-                        max_combined_id = label.id
-            combined._next_id = max_combined_id + 1
-            
+                    combined.images[path] = cloned
+
+            # Set next id
+            combined._next_id = max_id + 1
+
             # Save combined project
             combined.save(output_file)
-            
+
             # Show summary
             QMessageBox.information(
                 self,
@@ -874,9 +874,9 @@ class MainWindow(QMainWindow):
                 f"• Labels: {combined.label_count}\n\n"
                 f"Saved to: {Path(output_file).name}"
             )
-            
+
             self.statusBar.showMessage(f"Combined projects saved to {Path(output_file).name}", 5000)
-            
+
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1009,7 +1009,12 @@ class MainWindow(QMainWindow):
                     # For projected CRS, transform coefficients give pixel size directly
                     # For geographic CRS, we need to approximate
                     transform = src.transform
-                    
+
+                    # Handle missing CRS
+                    if src.crs is None:
+                        errors.append(f"Image has no CRS: {image_path}")
+                        continue
+
                     if src.crs.is_geographic:
                         # Approximate meters per degree at the label's latitude
                         import math
@@ -1088,12 +1093,12 @@ class MainWindow(QMainWindow):
                     
                     # Read the window using bounded reading
                     window = rasterio.windows.Window(
-                        col_off=col_start, 
+                        col_off=col_start,
                         row_off=row_start,
-                        width=window_width, 
+                        width=window_width,
                         height=window_height
                     )
-                    
+
                     # Use boundless=False to ensure we stay within image bounds
                     data = src.read(window=window, boundless=False)
                     
@@ -1110,21 +1115,25 @@ class MainWindow(QMainWindow):
                     
                     # Convert to grayscale and normalize
                     num_bands = data.shape[0]
-                    
+
+                    # Robust normalization across datatypes: convert to float in [0,1]
+                    dtype = data.dtype
+                    if np.issubdtype(dtype, np.integer):
+                        scale = float(np.iinfo(dtype).max)
+                        arr = data.astype(np.float32) / scale
+                    else:
+                        arr = data.astype(np.float32)
+                        # If float data appears to be in 0-255 range, normalize
+                        if arr.max() > 1.0:
+                            arr = arr / 255.0
+
                     # Convert to grayscale using luminance weights (or average if single band)
                     if num_bands == 1:
-                        gray = data[0].astype(np.float32)
+                        gray = arr[0]
                     elif num_bands >= 3:
-                        # Standard luminance weights: 0.299*R + 0.587*G + 0.114*B
-                        gray = (0.299 * data[0].astype(np.float32) + 
-                                0.587 * data[1].astype(np.float32) + 
-                                0.114 * data[2].astype(np.float32))
+                        gray = (0.299 * arr[0] + 0.587 * arr[1] + 0.114 * arr[2])
                     else:
-                        # 2 bands - just average them
-                        gray = np.mean(data.astype(np.float32), axis=0)
-                    
-                    # Normalize to [0, 1]
-                    gray = gray / 255.0
+                        gray = np.mean(arr, axis=0)
                     
                     # Apply mean/std normalization: shift mean to 0.4, std to 0.2
                     current_mean = np.mean(gray)
@@ -1196,9 +1205,10 @@ class MainWindow(QMainWindow):
             layer_id = self.canvas.add_layer(file_path, decimation=self.decimation_spin.value())
             if layer_id:
                 self.layer_panel.add_layer(layer_id, file_path)
-                # Track the loaded image
+                # Track the loaded image with original dimensions
                 name = Path(file_path).stem
-                self.project.add_image(file_path, name, "")
+                width, height = self.canvas.get_layer_source_dimensions(layer_id)
+                self.project.add_image(file_path, name, "", width, height)
         
         if skipped > 0:
             self.statusBar.showMessage(f"Skipped {skipped} already loaded image(s)", 3000)
@@ -1294,7 +1304,8 @@ class MainWindow(QMainWindow):
                 group_path_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
                 self.canvas.set_layer_group(layer_id, group_path_str)
                 name = file_path.stem
-                self.project.add_image(file_path_str, name, group_path_str)
+                width, height = self.canvas.get_layer_source_dimensions(layer_id)
+                self.project.add_image(file_path_str, name, group_path_str, width, height)
                 loaded_count += 1
         
         progress.setValue(len(tiff_files))
@@ -1411,9 +1422,10 @@ class MainWindow(QMainWindow):
                 self.layer_panel.add_layer(layer_id, file_path, parent_group, visible=False)
                 self.canvas.set_layer_group(layer_id, group_path)
                 
-                # Track in project
+                # Track in project with original dimensions
                 name = Path(file_path).stem
-                self.project.add_image(file_path, name, group_path)
+                width, height = self.canvas.get_layer_source_dimensions(layer_id)
+                self.project.add_image(file_path, name, group_path, width, height)
                 self._async_loaded_count += 1
     
     def _on_async_file_error(self, file_path: str, error: str):
@@ -1657,7 +1669,8 @@ class MainWindow(QMainWindow):
                 if layer_id:
                     self.layer_panel.add_layer(layer_id, file_path)
                     name = Path(file_path).stem
-                    self.project.add_image(file_path, name, "")
+                    width, height = self.canvas.get_layer_source_dimensions(layer_id)
+                    self.project.add_image(file_path, name, "", width, height)
                     loaded += 1
             except Exception as e:
                 errors.append(f"{Path(file_path).name}: {e}")
@@ -1755,7 +1768,8 @@ class MainWindow(QMainWindow):
                     group_path_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
                     self.canvas.set_layer_group(layer_id, group_path_str)
                     name = file_path.stem
-                    self.project.add_image(file_path_str, name, group_path_str)
+                    width, height = self.canvas.get_layer_source_dimensions(layer_id)
+                    self.project.add_image(file_path_str, name, group_path_str, width, height)
                     loaded_count += 1
             except Exception as e:
                 print(f"Error loading {file_path}: {e}")

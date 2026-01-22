@@ -71,13 +71,19 @@ class ImageData:
     # Labels on this image
     labels: list[PointLabel] = field(default_factory=list)
     
+    # Original image dimensions (as read from disk)
+    original_width: int = 0
+    original_height: int = 0
+    
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization."""
         return {
             "path": self.path,
             "name": self.name,
             "group": self.group,
-            "labels": [l.to_dict() for l in self.labels]
+            "labels": [l.to_dict() for l in self.labels],
+            "original_width": self.original_width,
+            "original_height": self.original_height
         }
     
     @classmethod
@@ -87,7 +93,9 @@ class ImageData:
             path=data["path"],
             name=data["name"],
             group=data.get("group", ""),
-            labels=[PointLabel.from_dict(l) for l in data.get("labels", [])]
+            labels=[PointLabel.from_dict(l) for l in data.get("labels", [])],
+            original_width=data.get("original_width", 0),
+            original_height=data.get("original_height", 0)
         )
 
 
@@ -119,10 +127,14 @@ class LabelProject:
             for image in self.images.values():
                 image.labels = [l for l in image.labels if l.class_name != class_name]
     
-    def add_image(self, path: str, name: str, group: str = "") -> ImageData:
+    def add_image(self, path: str, name: str, group: str = "", 
+                  original_width: int = 0, original_height: int = 0) -> ImageData:
         """Add an image to the project (or return existing one)."""
         if path not in self.images:
-            self.images[path] = ImageData(path=path, name=name, group=group)
+            self.images[path] = ImageData(
+                path=path, name=name, group=group,
+                original_width=original_width, original_height=original_height
+            )
         return self.images[path]
     
     def update_image_group(self, path: str, group: str):

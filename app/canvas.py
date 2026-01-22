@@ -1190,6 +1190,13 @@ class MapCanvas(QGraphicsView):
             return self._layers[layer_id].file_path
         return None
     
+    def get_layer_source_dimensions(self, layer_id: str) -> tuple[int, int]:
+        """Get the original source dimensions (width, height) for a layer."""
+        if layer_id in self._layers:
+            layer = self._layers[layer_id]
+            return layer._src_width, layer._src_height
+        return 0, 0
+    
     def zoom_to_layer(self, layer_id: str):
         """Zoom the view to fit a specific layer's bounds."""
         if layer_id not in self._layers:
