@@ -49,6 +49,9 @@ class MainWindow(QMainWindow):
         self._async_total_files = 0
         self._async_loader = None
         self._async_pending_files: list[tuple[str, dict]] = []  # Queue for pending file loads
+        self._async_mode: str = "directory"  # "directory" or "project" - controls post-load behavior
+        self._async_missing_files: list[str] = []  # Track files that couldn't be found
+        self._async_skip_project_add: bool = False  # Skip adding to project (for Open Project)
         
         # Timer for safe UI updates during async loading (avoids reentrancy issues)
         self._async_ui_timer = QTimer()
@@ -583,113 +586,34 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Error", f"Failed to open project: {e}")
     
     def _start_project_image_loading(self):
-        """Start async loading of project images using timer-based approach."""
+        """Start async loading of project images using the unified async loader."""
         import os
         
-        # Initialize state for project loading
-        self._project_images_to_load = list(self.project.images.values())
-        self._project_load_index = 0
-        self._project_loaded_count = 0
-        self._project_missing = []
-        self._project_group_cache: dict[str, any] = {}
+        # Prepare file list with group paths from project
+        files_with_groups = []
+        missing_files = []
         
-        # Start the timer for progressive loading
-        self._project_load_timer = QTimer()
-        self._project_load_timer.setInterval(1)  # Process quickly but yield to UI
-        self._project_load_timer.timeout.connect(self._process_project_image_batch)
-        self._project_load_timer.start()
-        
-        self.statusBar.showMessage(f"Loading project images...")
-    
-    def _process_project_image_batch(self):
-        """Process a batch of project images. Called by timer."""
-        import os
-        
-        # Process a batch of images per timer tick
-        batch_size = 10
-        end_index = min(self._project_load_index + batch_size, len(self._project_images_to_load))
-        
-        for idx in range(self._project_load_index, end_index):
-            image = self._project_images_to_load[idx]
-            
+        for image in self.project.images.values():
             if os.path.exists(image.path):
-                # Add layer with visibility off by default
-                layer_id = self.canvas.add_layer(image.path, visible=False, decimation=self.decimation_spin.value())
-                if layer_id:
-                    # Recreate group structure
-                    parent_group = self._get_or_create_project_group(image.group)
-                    self.layer_panel.add_layer(layer_id, image.path, parent_group, visible=False)
-                    # Set the group path on the canvas layer
-                    self.canvas.set_layer_group(layer_id, image.group)
-                    self._project_loaded_count += 1
+                files_with_groups.append((image.path, image.group or ""))
             else:
-                self._project_missing.append(image.path)
+                missing_files.append(image.path)
         
-        self._project_load_index = end_index
+        # Store missing files to report later
+        self._async_missing_files = missing_files
         
-        # Update progress
-        self._update_progress(self._project_load_index)
-        self.statusBar.showMessage(
-            f"Loading project: {self._project_load_index}/{len(self._project_images_to_load)} images..."
+        if not files_with_groups:
+            # No valid files to load
+            self._finish_async_loading_project()
+            return
+        
+        # Use the unified async loader with project mode
+        self._start_unified_async_loading(
+            files_with_groups,
+            mode="project",
+            progress_label="Loading project",
+            skip_project_add=True  # Images already in project
         )
-        
-        # Check if done
-        if self._project_load_index >= len(self._project_images_to_load):
-            self._finish_project_loading()
-    
-    def _get_or_create_project_group(self, group_path: str):
-        """Get or create group hierarchy for project loading."""
-        if not group_path:
-            return None
-        
-        if group_path in self._project_group_cache:
-            return self._project_group_cache[group_path]
-        
-        # Split path and create hierarchy
-        parts = group_path.replace("\\", "/").split("/")
-        parent = None
-        current_path = ""
-        
-        for part in parts:
-            current_path = f"{current_path}/{part}" if current_path else part
-            if current_path not in self._project_group_cache:
-                group = self.layer_panel.add_group(part, parent, visible=False)
-                self._project_group_cache[current_path] = group
-            parent = self._project_group_cache[current_path]
-        
-        return parent
-    
-    def _finish_project_loading(self):
-        """Complete project loading after all images are processed."""
-        # Stop the timer
-        self._project_load_timer.stop()
-        
-        # Hide progress
-        self._hide_progress()
-        
-        # Expand all groups
-        self.layer_panel.tree.expandAll()
-        
-        # Update UI
-        self._update_class_combo()
-        self._refresh_label_markers()
-        self.setWindowTitle(f"GeoLabel - {self._project_path.name}")
-        self.statusBar.showMessage(f"Opened project with {self.project.label_count} labels", 3000)
-        
-        # Show warning for missing images
-        if self._project_missing:
-            QMessageBox.warning(
-                self,
-                "Missing Images",
-                f"Could not find {len(self._project_missing)} image(s):\n" + 
-                "\n".join(self._project_missing[:5]) +
-                ("\n..." if len(self._project_missing) > 5 else "")
-            )
-        
-        # Clean up
-        del self._project_images_to_load
-        del self._project_group_cache
-        del self._project_missing
 
     def _load_project_images(self):
         """Load images stored in the project and recreate group structure."""
@@ -1322,13 +1246,6 @@ class MainWindow(QMainWindow):
         Layers are added with lazy loading (only bounds read initially) and 
         default to hidden. The tree updates progressively as files are discovered.
         """
-        # Store state for the async operation
-        self._async_root_path = root_path
-        self._async_group_cache: dict[Path, any] = {}
-        self._async_loaded_count = 0
-        self._async_total_files = len(tiff_files)
-        self._async_decimation = self.decimation_spin.value()  # capture at start
-        
         # Prepare file list with group paths
         files_with_groups = []
         for file_path in tiff_files:
@@ -1336,6 +1253,34 @@ class MainWindow(QMainWindow):
             rel_dir = rel_path.parent
             group_path_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
             files_with_groups.append((str(file_path), group_path_str))
+        
+        # Use the unified async loader with directory mode
+        self._start_unified_async_loading(
+            files_with_groups,
+            mode="directory",
+            progress_label="Loading dir",
+            skip_project_add=False  # Add images to project
+        )
+    
+    def _start_unified_async_loading(self, files_with_groups: list[tuple[str, str]], 
+                                      mode: str = "directory", 
+                                      progress_label: str = "Loading",
+                                      skip_project_add: bool = False):
+        """Unified async loading for both Open Project and Add Directory.
+        
+        Args:
+            files_with_groups: List of (file_path, group_path) tuples
+            mode: "directory" or "project" - controls completion behavior
+            progress_label: Label shown in progress bar
+            skip_project_add: If True, don't add images to project (they're already there)
+        """
+        # Store state for the async operation
+        self._async_group_cache: dict[Path, any] = {}
+        self._async_loaded_count = 0
+        self._async_total_files = len(files_with_groups)
+        self._async_decimation = self.decimation_spin.value()  # capture at start
+        self._async_mode = mode
+        self._async_skip_project_add = skip_project_add
         
         # Create and start the async loader
         self._async_loader = AsyncFileLoaderThread(self)
@@ -1348,8 +1293,11 @@ class MainWindow(QMainWindow):
         self._async_loader.progress_update.connect(self._on_async_progress)
         
         # Show progress indicator and status
-        self._show_progress(len(tiff_files), "Loading dir")
-        self.statusBar.showMessage(f"Loading {len(tiff_files)} files in background... (layers hidden by default)")
+        self._show_progress(len(files_with_groups), progress_label)
+        status_msg = f"Loading {len(files_with_groups)} files in background..."
+        if mode == "directory":
+            status_msg += " (layers hidden by default)"
+        self.statusBar.showMessage(status_msg)
         
         # Start the UI update timer
         self._async_ui_timer.start()
@@ -1399,6 +1347,7 @@ class MainWindow(QMainWindow):
         """Process queued async files and update UI.
         
         Called by timer to safely update the tree without reentrancy issues.
+        Handles both directory import and project loading modes.
         """
         if not self._async_pending_files:
             return
@@ -1422,10 +1371,12 @@ class MainWindow(QMainWindow):
                 self.layer_panel.add_layer(layer_id, file_path, parent_group, visible=False)
                 self.canvas.set_layer_group(layer_id, group_path)
                 
-                # Track in project with original dimensions
-                name = Path(file_path).stem
-                width, height = self.canvas.get_layer_source_dimensions(layer_id)
-                self.project.add_image(file_path, name, group_path, width, height)
+                # Track in project with original dimensions (skip for project loading)
+                if not self._async_skip_project_add:
+                    name = Path(file_path).stem
+                    width, height = self.canvas.get_layer_source_dimensions(layer_id)
+                    self.project.add_image(file_path, name, group_path, width, height)
+                
                 self._async_loaded_count += 1
     
     def _on_async_file_error(self, file_path: str, error: str):
@@ -1440,7 +1391,7 @@ class MainWindow(QMainWindow):
         )
     
     def _on_async_batch_complete(self, loaded: int, errors: int):
-        """Handle async loading completion."""
+        """Handle async loading completion for both directory and project modes."""
         # Stop the UI update timer
         self._async_ui_timer.stop()
         
@@ -1454,17 +1405,49 @@ class MainWindow(QMainWindow):
         # Expand all groups
         self.layer_panel.tree.expandAll()
         
-        # Show completion message
+        # Clean up loader
+        if hasattr(self, '_async_loader') and self._async_loader is not None:
+            self._async_loader.wait()  # Ensure thread is finished
+            self._async_loader.deleteLater()
+            self._async_loader = None
+        
+        # Call mode-specific completion handler
+        if self._async_mode == "project":
+            self._finish_async_loading_project(errors)
+        else:
+            self._finish_async_loading_directory(errors)
+    
+    def _finish_async_loading_directory(self, errors: int = 0):
+        """Complete directory loading after all files are processed."""
         msg = f"Loaded {self._async_loaded_count} GeoTIFF files"
         if errors > 0:
             msg += f" ({errors} errors)"
         msg += ". Check layers to display."
         self.statusBar.showMessage(msg, 10000)
+    
+    def _finish_async_loading_project(self, errors: int = 0):
+        """Complete project loading after all images are processed."""
+        # Update UI for project
+        self._update_class_combo()
+        self._refresh_label_markers()
+        self.setWindowTitle(f"GeoLabel - {self._project_path.name}")
         
-        # Clean up
-        if hasattr(self, '_async_loader'):
-            self._async_loader.deleteLater()
-            del self._async_loader
+        # Build status message
+        msg = f"Opened project with {self.project.label_count} labels"
+        if errors > 0:
+            msg += f" ({errors} load errors)"
+        self.statusBar.showMessage(msg, 3000)
+        
+        # Show warning for missing images
+        if self._async_missing_files:
+            QMessageBox.warning(
+                self,
+                "Missing Images",
+                f"Could not find {len(self._async_missing_files)} image(s):\n" + 
+                "\n".join(self._async_missing_files[:5]) +
+                ("\n..." if len(self._async_missing_files) > 5 else "")
+            )
+            self._async_missing_files = []  # Reset
     
     def _on_batch_visibility_started(self, total: int):
         """Handle start of batch visibility change (e.g., group toggle)."""
@@ -1782,3 +1765,17 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar.showMessage(f"Loaded {loaded_count} of {len(custom_files)} .{ext} files", 5000)
 
+    def closeEvent(self, event):
+        """Handle window close - ensure async loader is properly cleaned up."""
+        # Cancel and wait for any running async loader
+        if hasattr(self, '_async_loader') and self._async_loader is not None:
+            if self._async_loader.isRunning():
+                self._async_loader.cancel()
+                self._async_loader.wait()
+            self._async_loader = None
+        
+        # Stop the UI timer if running
+        if hasattr(self, '_async_ui_timer'):
+            self._async_ui_timer.stop()
+        
+        super().closeEvent(event)
