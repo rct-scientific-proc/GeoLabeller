@@ -1364,32 +1364,39 @@ class MainWindow(QMainWindow):
         if not self._async_pending_files:
             return
         
-        # Process a batch of pending files
-        batch_size = min(20, len(self._async_pending_files))
+        # Process a smaller batch to keep UI responsive
+        # Each file involves rasterio file opening + tree update
+        batch_size = min(5, len(self._async_pending_files))
         batch = self._async_pending_files[:batch_size]
         self._async_pending_files = self._async_pending_files[batch_size:]
         
-        for file_path, layer_data in batch:
-            if self.canvas.is_path_loaded(file_path):
-                continue
-            
-            group_path = layer_data['group_path']
-            parent_group = self._get_or_create_group_async(group_path)
-            
-            # Add layer with lazy loading and hidden by default
-            layer_id = self.canvas.add_layer(file_path, lazy=True, visible=False, decimation=self._async_decimation)
-            if layer_id:
-                # Add to tree as hidden (unchecked)
-                self.layer_panel.add_layer(layer_id, file_path, parent_group, visible=False)
-                self.canvas.set_layer_group(layer_id, group_path)
+        # Use batch mode to suppress tree updates during batch processing
+        self.layer_panel.begin_batch_update()
+        
+        try:
+            for file_path, layer_data in batch:
+                if self.canvas.is_path_loaded(file_path):
+                    continue
                 
-                # Track in project with original dimensions (skip for project loading)
-                if not self._async_skip_project_add:
-                    name = Path(file_path).stem
-                    width, height = self.canvas.get_layer_source_dimensions(layer_id)
-                    self.project.add_image(file_path, name, group_path, width, height)
+                group_path = layer_data['group_path']
+                parent_group = self._get_or_create_group_async(group_path)
                 
-                self._async_loaded_count += 1
+                # Add layer with lazy loading and hidden by default
+                layer_id = self.canvas.add_layer(file_path, lazy=True, visible=False, decimation=self._async_decimation)
+                if layer_id:
+                    # Add to tree as hidden (unchecked)
+                    self.layer_panel.add_layer(layer_id, file_path, parent_group, visible=False)
+                    self.canvas.set_layer_group(layer_id, group_path)
+                    
+                    # Track in project with original dimensions (skip for project loading)
+                    if not self._async_skip_project_add:
+                        name = Path(file_path).stem
+                        width, height = self.canvas.get_layer_source_dimensions(layer_id)
+                        self.project.add_image(file_path, name, group_path, width, height)
+                    
+                    self._async_loaded_count += 1
+        finally:
+            self.layer_panel.end_batch_update()
     
     def _on_async_file_error(self, file_path: str, error: str):
         """Handle a file failing to load."""
@@ -1407,9 +1414,11 @@ class MainWindow(QMainWindow):
         # Stop the UI update timer
         self._async_ui_timer.stop()
         
-        # Process any remaining pending files
+        # Process any remaining pending files with progress events
+        from PyQt5.QtWidgets import QApplication
         while self._async_pending_files:
             self._process_pending_async_files()
+            QApplication.processEvents()  # Keep UI responsive during final batch
         
         # Hide progress indicator
         self._hide_progress()
