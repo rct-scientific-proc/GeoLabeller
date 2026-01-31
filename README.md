@@ -6,20 +6,32 @@ A PyQt5-based desktop application for viewing GeoTIFF images and creating point 
 
 ### Image Viewing
 - Load individual GeoTIFF files or entire directories
+- **Async loading** with progress bar for large datasets - UI stays responsive
+- **Add Directory** creates a root group named after the selected folder
 - Organize images into groups with drag-and-drop support
-- Toggle layer visibility on/off
+- Toggle layer visibility on/off (layers default to hidden on load)
+- **Parent group auto-check**: Turning on a layer automatically enables its parent groups
 - Zoom to specific layers
 - Pan and zoom navigation with mouse wheel
 - Real-time coordinate display (WGS84) with nearest image info in status bar
 - **Scale bar** in the top-right corner showing distance at current zoom level
 - **Duplicate detection** prevents loading the same image file twice
+- **Optimized tile rendering** with O(1) visible tile calculation for smooth performance
+
+### Layer Panel
+- Hierarchical tree view of all loaded images and groups
+- **Expand All / Collapse All** via right-click context menu on groups
+- **Select All / Unselect All** children via right-click context menu
+- Drag-and-drop to reorganize layers and groups
+- Tree collapses by default on project load for cleaner UI
+- Visibility changes sync automatically with Labeled Images panel
 
 ### Labeled Images Panel
 - Separate panel below the layer panel showing all labeled images
 - Labels grouped by **object ID** (linked labels appear together)
 - Individual labels displayed with their unique label IDs
 - Click to zoom directly to any label location
-- Synchronized visibility toggle with main layer panel
+- **Synchronized visibility** toggle with main layer panel (bidirectional)
 - Right-click context menu for quick navigation
 
 ### Point Labeling
@@ -60,10 +72,18 @@ python main.py
 ### Keyboard Shortcuts
 - `Ctrl+N` - New Project
 - `Ctrl+O` - Add GeoTIFF
-- `Ctrl+Shift+O` - Add Directory
+- `Ctrl+Shift+O` - Add Directory (creates root group from folder name)
 - `Ctrl+S` - Save Project
+- `Ctrl+Shift+S` - Save Project As
 - `Ctrl+Shift+P` - Open Project
+- `F1` - Show Help/Shortcuts
 - `Escape` - Cancel link mode
+
+### Layer Panel Features
+- **Checkbox** - Toggle layer/group visibility
+- **Right-click group** - Select All, Unselect All, Expand All, Collapse All
+- **Right-click layer** - Zoom to layer, Remove
+- **Drag & Drop** - Reorder layers between groups
 
 ### Labeling Workflow
 1. Load GeoTIFF images via File menu

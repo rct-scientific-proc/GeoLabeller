@@ -1540,18 +1540,34 @@ class MainWindow(QMainWindow):
 
 <h3>Layer Panel</h3>
 <table>
-<tr><td><b>Right-click group</b></td><td>Select/Unselect all children</td></tr>
+<tr><td><b>Checkbox</b></td><td>Toggle layer/group visibility</td></tr>
+<tr><td><b>Right-click group</b></td><td>Select/Unselect all, Expand/Collapse All</td></tr>
 <tr><td><b>Right-click layer</b></td><td>Zoom to layer, Remove</td></tr>
 <tr><td><b>Drag & Drop</b></td><td>Reorder layers/groups</td></tr>
+</table>
+
+<h3>Labeled Images Panel</h3>
+<table>
+<tr><td><b>Checkbox</b></td><td>Toggle image visibility (synced with layers)</td></tr>
+<tr><td><b>Right-click label</b></td><td>Zoom to label or layer</td></tr>
+<tr><td><b>Right-click group</b></td><td>Select/Unselect all in group</td></tr>
 </table>
 
 <h3>Help</h3>
 <table>
 <tr><td><b>F1</b></td><td>Show this help</td></tr>
 </table>
+
+<h3>Tips</h3>
+<ul>
+<li>Layers default to hidden when loading - expand groups and check to display</li>
+<li>Turning on a layer automatically checks its parent groups</li>
+<li>Add Directory creates a root group named after the selected folder</li>
+<li>Visibility syncs between Layer Panel and Labeled Images Panel</li>
+</ul>
 """
         msg = QMessageBox(self)
-        msg.setWindowTitle("Keyboard Shortcuts")
+        msg.setWindowTitle("Keyboard Shortcuts & Tips")
         msg.setTextFormat(Qt.RichText)
         msg.setText(shortcuts_text)
         msg.setIcon(QMessageBox.Information)
