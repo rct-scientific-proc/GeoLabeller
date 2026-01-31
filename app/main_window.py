@@ -663,8 +663,8 @@ class MainWindow(QMainWindow):
             # Update progress indicator (progress bar repaints itself)
             self._update_progress(idx + 1)
         
-        # Expand all groups
-        self.layer_panel.tree.expandAll()
+        # Collapse all groups (user expands as needed)
+        self.layer_panel.tree.collapseAll()
         
         if missing:
             QMessageBox.warning(
@@ -1233,7 +1233,7 @@ class MainWindow(QMainWindow):
                 loaded_count += 1
         
         progress.setValue(len(tiff_files))
-        self.layer_panel.tree.expandAll()
+        self.layer_panel.tree.collapseAll()
         
         if progress.wasCanceled():
             self.statusBar.showMessage(f"Loading cancelled. Loaded {loaded_count} of {len(tiff_files)} GeoTIFF files", 5000)
@@ -1402,8 +1402,8 @@ class MainWindow(QMainWindow):
         # Hide progress indicator
         self._hide_progress()
         
-        # Expand all groups
-        self.layer_panel.tree.expandAll()
+        # Collapse all groups (user expands as needed)
+        self.layer_panel.tree.collapseAll()
         
         # Clean up loader
         if hasattr(self, '_async_loader') and self._async_loader is not None:
@@ -1758,7 +1758,7 @@ class MainWindow(QMainWindow):
                 print(f"Error loading {file_path}: {e}")
         
         progress.setValue(len(custom_files))
-        self.layer_panel.tree.expandAll()
+        self.layer_panel.tree.collapseAll()
         
         if progress.wasCanceled():
             self.statusBar.showMessage(f"Loading cancelled. Loaded {loaded_count} of {len(custom_files)} files", 5000)

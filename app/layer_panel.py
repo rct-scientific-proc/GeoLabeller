@@ -292,6 +292,13 @@ class LayerPanel(QWidget):
                 
                 unselect_all_action = menu.addAction("Unselect all children")
                 unselect_all_action.triggered.connect(lambda: self._set_all_children_checked(item, False))
+                
+                menu.addSeparator()
+                expand_all_action = menu.addAction("Expand All")
+                expand_all_action.triggered.connect(lambda: self._expand_all_children(item))
+                
+                collapse_all_action = menu.addAction("Collapse All")
+                collapse_all_action.triggered.connect(lambda: self._collapse_all_children(item))
             
             menu.addSeparator()
             remove_action = menu.addAction("Remove")
@@ -325,6 +332,30 @@ class LayerPanel(QWidget):
         set_children_state(item)
         # Also set the group item itself
         item.setCheckState(0, check_state)
+    
+    def _expand_all_children(self, item: QTreeWidgetItem):
+        """Recursively expand an item and all its children.
+        
+        Args:
+            item: The item to expand along with all descendants
+        """
+        item.setExpanded(True)
+        for i in range(item.childCount()):
+            child = item.child(i)
+            if child.data(0, Qt.UserRole + 1) == "group":
+                self._expand_all_children(child)
+    
+    def _collapse_all_children(self, item: QTreeWidgetItem):
+        """Recursively collapse an item and all its children.
+        
+        Args:
+            item: The item to collapse along with all descendants
+        """
+        for i in range(item.childCount()):
+            child = item.child(i)
+            if child.data(0, Qt.UserRole + 1) == "group":
+                self._collapse_all_children(child)
+        item.setExpanded(False)
     
     def _remove_item(self, item: QTreeWidgetItem):
         """Remove an item from the tree."""
@@ -443,6 +474,37 @@ class LayerPanel(QWidget):
         
         find_and_set()
     
+    def is_layer_checked(self, layer_id: str) -> bool:
+        """Check if a specific layer is checked (visible).
+        
+        Args:
+            layer_id: The layer ID to check
+            
+        Returns:
+            True if the layer is checked, False otherwise
+        """
+        def find_and_check(parent=None) -> bool | None:
+            if parent is None:
+                count = self.tree.topLevelItemCount()
+                for i in range(count):
+                    result = find_and_check(self.tree.topLevelItem(i))
+                    if result is not None:
+                        return result
+            else:
+                item_type = parent.data(0, Qt.UserRole + 1)
+                if item_type == "layer":
+                    if parent.data(0, Qt.UserRole) == layer_id:
+                        return parent.checkState(0) == Qt.Checked
+                else:
+                    for i in range(parent.childCount()):
+                        result = find_and_check(parent.child(i))
+                        if result is not None:
+                            return result
+            return None
+        
+        result = find_and_check()
+        return result if result is not None else False
+    
     def get_layer_id_by_path(self, file_path: str) -> str | None:
         """Find layer ID by file path.
         
@@ -551,11 +613,12 @@ class LabeledLayerPanel(QWidget):
         """Get the layer ID for a file path."""
         return self._layer_id_map.get(file_path)
     
-    def refresh(self, project):
+    def refresh(self, project, visibility_checker=None):
         """Refresh the tree with current labels from the project.
         
         Args:
             project: The LabelProject containing images and labels
+            visibility_checker: Optional callable(file_path) -> bool to check layer visibility
         """
         self.tree.blockSignals(True)
         self.tree.clear()
@@ -594,7 +657,7 @@ class LabeledLayerPanel(QWidget):
             group_item.setData(0, Qt.UserRole, object_id)
             group_item.setData(0, Qt.UserRole + 1, "group")
             group_item.setFlags(group_item.flags() | Qt.ItemIsUserCheckable)
-            group_item.setCheckState(0, Qt.Checked)
+            # Check state will be set after children are added based on their visibility
             group_item.setIcon(0, style.standardIcon(QStyle.SP_DirIcon))
             
             # Bold font for groups, different colors based on link status
@@ -609,6 +672,7 @@ class LabeledLayerPanel(QWidget):
             self.tree.addTopLevelItem(group_item)
             
             # Add each label as a child
+            any_visible = False
             for label_id, image_name, file_path, lon, lat, class_name in labels:
                 label_item = QTreeWidgetItem()
                 label_item.setText(0, f"#{label_id}: {image_name} [{class_name}]")
@@ -618,10 +682,19 @@ class LabeledLayerPanel(QWidget):
                 label_item.setData(0, Qt.UserRole + 3, lon)
                 label_item.setData(0, Qt.UserRole + 4, lat)
                 label_item.setFlags(label_item.flags() | Qt.ItemIsUserCheckable)
-                label_item.setCheckState(0, Qt.Checked)
+                
+                # Check visibility - default to unchecked if no checker provided
+                is_visible = visibility_checker(file_path) if visibility_checker else False
+                label_item.setCheckState(0, Qt.Checked if is_visible else Qt.Unchecked)
+                if is_visible:
+                    any_visible = True
+                
                 label_item.setToolTip(0, f"Label #{label_id} on {file_path}\nLon: {lon:.6f}, Lat: {lat:.6f}")
                 label_item.setIcon(0, style.standardIcon(QStyle.SP_FileIcon))
                 group_item.addChild(label_item)
+            
+            # Set group check state based on children
+            group_item.setCheckState(0, Qt.Checked if any_visible else Qt.Unchecked)
             
             group_item.setExpanded(True)
         
@@ -927,7 +1000,14 @@ class CombinedLayerPanel(QWidget):
     
     def refresh_labeled_panel(self, project):
         """Refresh the labeled images panel with current project data."""
-        self.labeled_panel.refresh(project)
+        # Create a visibility checker that looks up layer visibility from main panel
+        def check_visibility(file_path: str) -> bool:
+            layer_id = self.labeled_panel._layer_id_map.get(file_path)
+            if layer_id:
+                return self.main_panel.is_layer_checked(layer_id)
+            return False
+        
+        self.labeled_panel.refresh(project, visibility_checker=check_visibility)
     
     @property
     def tree(self):
