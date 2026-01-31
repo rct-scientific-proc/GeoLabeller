@@ -1075,13 +1075,9 @@ class CombinedLayerPanel(QWidget):
     
     def toggle_layer_visibility(self, layer_id: str):
         """Toggle the visibility of a layer by its ID in both panels."""
+        # Just toggle in main panel - the signal handler _on_main_visibility_changed
+        # will automatically sync to the labeled panel
         self.main_panel.toggle_layer_visibility(layer_id)
-        # Also update labeled panel
-        file_path = self._get_file_path_for_layer_id(layer_id)
-        if file_path:
-            # We need to get the new state after toggle - check the main panel
-            # The toggle already happened, so we sync the labeled panel
-            self.labeled_panel.toggle_layer_checked(file_path)
     
     def clear(self):
         """Clear all items from both trees."""
