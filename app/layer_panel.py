@@ -845,6 +845,12 @@ class CombinedLayerPanel(QWidget):
         # Sync to main panel
         self.main_panel.set_layer_checked(layer_id, visible)
         
+        # Also sync other labels on the same image in the labeled panel
+        # (e.g., if image has 3 labels and user unchecks one, uncheck the others too)
+        file_path = self._get_file_path_for_layer_id(layer_id)
+        if file_path:
+            self.labeled_panel.set_layer_checked(file_path, visible)
+        
         self._syncing = False
     
     def _get_file_path_for_layer_id(self, layer_id: str) -> str | None:
