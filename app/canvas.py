@@ -291,6 +291,9 @@ class TiledLayer:
         
         Args:
             view_bounds: (west, south, east, north) in Web Mercator
+            
+        Returns:
+            List of (tx, ty) tile indices. Uses O(1) calculation instead of iterating all tiles.
         """
         view_west, view_south, view_east, view_north = view_bounds
         layer_west, layer_south, layer_east, layer_north = self.bounds
@@ -300,18 +303,24 @@ class TiledLayer:
             view_north < layer_south or view_south > layer_north):
             return []
         
-        # Calculate which tiles are visible
-        visible = []
-        for ty in range(self._n_tiles_y):
-            for tx in range(self._n_tiles_x):
-                _, _, _, _, tile_west, tile_south, tile_east, tile_north = self.get_tile_bounds(tx, ty)
-                
-                # Check intersection
-                if (tile_east >= view_west and tile_west <= view_east and
-                    tile_north >= view_south and tile_south <= view_north):
-                    visible.append((tx, ty))
+        # Calculate tile indices directly from coordinates (O(1) instead of O(n²))
+        # Clamp view bounds to layer bounds
+        clamped_west = max(view_west, layer_west)
+        clamped_east = min(view_east, layer_east)
+        clamped_south = max(view_south, layer_south)
+        clamped_north = min(view_north, layer_north)
         
-        return visible
+        # Convert to tile indices
+        # tx increases left-to-right (west to east)
+        tx_min = max(0, int((clamped_west - layer_west) / self._tile_world_width))
+        tx_max = min(self._n_tiles_x - 1, int((clamped_east - layer_west) / self._tile_world_width))
+        
+        # ty increases top-to-bottom (north to south in world coords)
+        ty_min = max(0, int((layer_north - clamped_north) / self._tile_world_height))
+        ty_max = min(self._n_tiles_y - 1, int((layer_north - clamped_south) / self._tile_world_height))
+        
+        return [(tx, ty) for ty in range(ty_min, ty_max + 1) 
+                         for tx in range(tx_min, tx_max + 1)]
     
     def create_tile_pixmap(self, tx: int, ty: int) -> QPixmap | None:
         """Create a QPixmap for a specific tile."""
@@ -609,7 +618,10 @@ class CustomTiledLayer:
         return px_left, px_top, px_right, px_bottom, tile_west, tile_south, tile_east, tile_north
     
     def get_visible_tile_indices(self, view_bounds: tuple[float, float, float, float]) -> list[tuple[int, int]]:
-        """Get list of tile indices that intersect with the view bounds."""
+        """Get list of tile indices that intersect with the view bounds.
+        
+        Uses O(1) calculation instead of iterating all tiles.
+        """
         view_west, view_south, view_east, view_north = view_bounds
         layer_west, layer_south, layer_east, layer_north = self.bounds
         
@@ -617,15 +629,19 @@ class CustomTiledLayer:
             view_north < layer_south or view_south > layer_north):
             return []
         
-        visible = []
-        for ty in range(self._n_tiles_y):
-            for tx in range(self._n_tiles_x):
-                _, _, _, _, tile_west, tile_south, tile_east, tile_north = self.get_tile_bounds(tx, ty)
-                if (tile_east >= view_west and tile_west <= view_east and
-                    tile_north >= view_south and tile_south <= view_north):
-                    visible.append((tx, ty))
+        # Calculate tile indices directly from coordinates (O(1) instead of O(n²))
+        clamped_west = max(view_west, layer_west)
+        clamped_east = min(view_east, layer_east)
+        clamped_south = max(view_south, layer_south)
+        clamped_north = min(view_north, layer_north)
         
-        return visible
+        tx_min = max(0, int((clamped_west - layer_west) / self._tile_world_width))
+        tx_max = min(self._n_tiles_x - 1, int((clamped_east - layer_west) / self._tile_world_width))
+        ty_min = max(0, int((layer_north - clamped_north) / self._tile_world_height))
+        ty_max = min(self._n_tiles_y - 1, int((layer_north - clamped_south) / self._tile_world_height))
+        
+        return [(tx, ty) for ty in range(ty_min, ty_max + 1) 
+                         for tx in range(tx_min, tx_max + 1)]
     
     def create_tile_pixmap(self, tx: int, ty: int) -> QPixmap | None:
         """Create a QPixmap for a specific tile."""
