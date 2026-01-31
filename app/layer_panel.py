@@ -140,6 +140,11 @@ class LayerPanel(QWidget):
         if item_type == "layer":
             layer_id = item.data(0, Qt.UserRole)
             self.layer_visibility_changed.emit(layer_id, checked)
+            
+            # If turning ON, ensure all parent groups are also checked
+            if checked:
+                self._check_parent_groups(item)
+                
         elif item_type == "group":
             # Count all descendant layers for progress tracking
             layer_count = self._count_descendant_layers(item)
@@ -153,7 +158,62 @@ class LayerPanel(QWidget):
             
             if use_progress:
                 self.batch_visibility_finished.emit()
+            
+            # If turning ON, ensure all parent groups are also checked
+            if checked:
+                self._check_parent_groups(item)
     
+    def _check_parent_groups(self, item: QTreeWidgetItem):
+        """Ensure all parent groups of an item are checked.
+        
+        Args:
+            item: The item whose parents should be checked
+        """
+        self.tree.blockSignals(True)
+        parent = item.parent()
+        while parent is not None:
+            if parent.checkState(0) != Qt.Checked:
+                parent.setCheckState(0, Qt.Checked)
+            parent = parent.parent()
+        self.tree.blockSignals(False)
+    
+    def _check_parents_of_visible_items(self):
+        """Ensure all parent groups are checked for any checked (visible) items.
+        
+        Called after drag-drop to fix parent states when items are moved.
+        """
+        self.tree.blockSignals(True)
+        
+        def check_item(item: QTreeWidgetItem):
+            item_type = item.data(0, Qt.UserRole + 1)
+            is_checked = item.checkState(0) == Qt.Checked
+            
+            if item_type == "layer":
+                # If this layer is checked, ensure all parents are checked
+                if is_checked:
+                    parent = item.parent()
+                    while parent is not None:
+                        if parent.checkState(0) != Qt.Checked:
+                            parent.setCheckState(0, Qt.Checked)
+                        parent = parent.parent()
+            elif item_type == "group":
+                # If this group is checked, ensure all parents are checked
+                if is_checked:
+                    parent = item.parent()
+                    while parent is not None:
+                        if parent.checkState(0) != Qt.Checked:
+                            parent.setCheckState(0, Qt.Checked)
+                        parent = parent.parent()
+                # Recurse into children
+                for i in range(item.childCount()):
+                    check_item(item.child(i))
+        
+        # Check all top-level items
+        for i in range(self.tree.topLevelItemCount()):
+            check_item(self.tree.topLevelItem(i))
+        
+        self.tree.blockSignals(False)
+
     def _count_descendant_layers(self, item: QTreeWidgetItem) -> int:
         """Count all layer items that are descendants of this item."""
         count = 0
@@ -196,6 +256,9 @@ class LayerPanel(QWidget):
         
         # Emit group changes for all layers (their groups may have changed)
         self._emit_all_layer_group_changes()
+        
+        # Ensure parent groups are checked for any checked items that were moved
+        self._check_parents_of_visible_items()
     
     def _get_group_path(self, item: QTreeWidgetItem) -> str:
         """Get the group path for an item by traversing up the tree."""
@@ -451,28 +514,40 @@ class LayerPanel(QWidget):
             layer_id: The layer ID to update
             checked: True to check, False to uncheck
         """
-        def find_and_set(parent=None):
+        self.tree.blockSignals(True)
+        
+        def find_and_set(parent=None) -> QTreeWidgetItem | None:
+            """Find and set the layer, returning the item if found."""
             if parent is None:
                 count = self.tree.topLevelItemCount()
                 for i in range(count):
-                    if find_and_set(self.tree.topLevelItem(i)):
-                        return True
+                    result = find_and_set(self.tree.topLevelItem(i))
+                    if result:
+                        return result
             else:
                 item_type = parent.data(0, Qt.UserRole + 1)
                 if item_type == "layer":
                     if parent.data(0, Qt.UserRole) == layer_id:
-                        # Block signals to prevent cascading updates
-                        self.tree.blockSignals(True)
                         parent.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
-                        self.tree.blockSignals(False)
-                        return True
+                        return parent
                 else:
                     for i in range(parent.childCount()):
-                        if find_and_set(parent.child(i)):
-                            return True
-            return False
+                        result = find_and_set(parent.child(i))
+                        if result:
+                            return result
+            return None
         
-        find_and_set()
+        found_item = find_and_set()
+        
+        # If turning ON, also check all parent groups
+        if checked and found_item:
+            parent = found_item.parent()
+            while parent is not None:
+                if parent.checkState(0) != Qt.Checked:
+                    parent.setCheckState(0, Qt.Checked)
+                parent = parent.parent()
+        
+        self.tree.blockSignals(False)
     
     def is_layer_checked(self, layer_id: str) -> bool:
         """Check if a specific layer is checked (visible).
@@ -710,6 +785,15 @@ class LabeledLayerPanel(QWidget):
             layer_id = self._layer_id_map.get(file_path)
             if layer_id:
                 self.layer_visibility_changed.emit(layer_id, checked)
+            
+            # If turning ON, ensure parent group is also checked
+            if checked:
+                parent = item.parent()
+                if parent is not None and parent.checkState(0) != Qt.Checked:
+                    self.tree.blockSignals(True)
+                    parent.setCheckState(0, Qt.Checked)
+                    self.tree.blockSignals(False)
+                    
         elif item_type == "group":
             # Toggle all children
             self.tree.blockSignals(True)
@@ -780,6 +864,8 @@ class LabeledLayerPanel(QWidget):
             file_path: The file path of the layer
             checked: True to check, False to uncheck
         """
+        self.tree.blockSignals(True)
+        
         def find_and_set(parent=None):
             if parent is None:
                 count = self.tree.topLevelItemCount()
@@ -789,14 +875,18 @@ class LabeledLayerPanel(QWidget):
                 item_type = parent.data(0, Qt.UserRole + 1)
                 if item_type == "label":
                     if parent.data(0, Qt.UserRole) == file_path:
-                        self.tree.blockSignals(True)
                         parent.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
-                        self.tree.blockSignals(False)
+                        # If turning ON, also check the parent group
+                        if checked:
+                            group = parent.parent()
+                            if group is not None and group.checkState(0) != Qt.Checked:
+                                group.setCheckState(0, Qt.Checked)
                 elif item_type == "group":
                     for i in range(parent.childCount()):
                         find_and_set(parent.child(i))
         
         find_and_set()
+        self.tree.blockSignals(False)
     
     def toggle_layer_checked(self, file_path: str):
         """Toggle the check state of labels for a file path.
