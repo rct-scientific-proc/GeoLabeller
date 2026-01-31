@@ -1179,16 +1179,20 @@ class MainWindow(QMainWindow):
     
     def _add_directory_sync(self, root_path: Path, tiff_files: list):
         """Synchronous directory loading for smaller imports."""
-        # Build directory structure with groups
+        # Create root group for the selected directory
+        root_group_name = root_path.name
+        root_group = self.layer_panel.add_group(root_group_name, None, visible=False)
+        
+        # Build directory structure with groups under the root group
         group_cache: dict[Path, any] = {}
         
         def get_or_create_group(rel_dir: Path):
             if rel_dir == Path("."):
-                return None
+                return root_group  # Files at root level go under the root group
             if rel_dir in group_cache:
                 return group_cache[rel_dir]
             parent_group = get_or_create_group(rel_dir.parent)
-            group = self.layer_panel.add_group(rel_dir.name, parent_group)
+            group = self.layer_panel.add_group(rel_dir.name, parent_group, visible=False)
             group_cache[rel_dir] = group
             return group
         
@@ -1222,10 +1226,12 @@ class MainWindow(QMainWindow):
             if self.canvas.is_path_loaded(file_path_str):
                 continue
             
-            layer_id = self.canvas.add_layer(file_path_str, decimation=self.decimation_spin.value())
+            layer_id = self.canvas.add_layer(file_path_str, visible=False, decimation=self.decimation_spin.value())
             if layer_id:
-                self.layer_panel.add_layer(layer_id, file_path_str, parent_group)
-                group_path_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
+                self.layer_panel.add_layer(layer_id, file_path_str, parent_group, visible=False)
+                # Include root group name in the group path
+                rel_dir_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
+                group_path_str = f"{root_group_name}/{rel_dir_str}" if rel_dir_str else root_group_name
                 self.canvas.set_layer_group(layer_id, group_path_str)
                 name = file_path.stem
                 width, height = self.canvas.get_layer_source_dimensions(layer_id)
@@ -1246,12 +1252,17 @@ class MainWindow(QMainWindow):
         Layers are added with lazy loading (only bounds read initially) and 
         default to hidden. The tree updates progressively as files are discovered.
         """
-        # Prepare file list with group paths
+        # Get root folder name for the group
+        root_group_name = root_path.name
+        
+        # Prepare file list with group paths (prefixed with root folder name)
         files_with_groups = []
         for file_path in tiff_files:
             rel_path = file_path.relative_to(root_path)
             rel_dir = rel_path.parent
-            group_path_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
+            rel_dir_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
+            # Prefix with root group name
+            group_path_str = f"{root_group_name}/{rel_dir_str}" if rel_dir_str else root_group_name
             files_with_groups.append((str(file_path), group_path_str))
         
         # Use the unified async loader with directory mode
