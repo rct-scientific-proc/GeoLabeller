@@ -92,7 +92,8 @@ class MainWindow(QMainWindow):
         
         # Progress indicator for async operations
         self.progress_indicator = QProgressBar()
-        self.progress_indicator.setMaximumWidth(150)
+        self.progress_indicator.setMinimumWidth(200)
+        self.progress_indicator.setMaximumWidth(300)
         self.progress_indicator.setMaximumHeight(16)
         self.progress_indicator.setTextVisible(True)
         self.progress_indicator.setFormat("%p% (%v/%m)")
