@@ -856,7 +856,7 @@ class MainWindow(QMainWindow):
                 return
 
             data = {
-                "version": "2.0",
+                "version": "2.1",
                 "classes": self.project.classes,
                 "images": images,
                 "_next_id": self.project._next_id

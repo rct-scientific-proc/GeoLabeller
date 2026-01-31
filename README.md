@@ -100,28 +100,38 @@ Projects are saved as JSON with the following structure:
 
 ```json
 {
-  "version": "2.0",
+  "version": "2.1",
   "classes": ["car", "building", "tree"],
   "images": [
     {
       "path": "/path/to/image.tif",
       "name": "image",
       "group": "folder/subfolder",
+      "original_width": 1024,
+      "original_height": 768,
       "labels": [
         {
           "id": 1,
+          "unique_id": "uuid-v4-unique-to-label",
           "class_name": "car",
-          "pixel_x": 256.5,
-          "pixel_y": 128.3,
+          "pixel_x": 0.25,
+          "pixel_y": 0.167,
           "lon": -73.985,
           "lat": 40.748,
-          "object_id": "uuid-v4-string"
+          "object_id": "uuid-v4-for-linking"
         }
       ]
     }
   ]
 }
 ```
+
+### Label Fields (v2.1)
+- `id`: Sequential integer ID (internal use)
+- `unique_id`: UUID v4 string, always unique per label
+- `pixel_x`, `pixel_y`: **Percentage** coordinates (0.0-1.0), divide by original image dimensions
+- `lon`, `lat`: WGS84 geographic coordinates
+- `object_id`: UUID v4 for linking labels across images (shared by linked labels)
 
 ## Requirements
 

@@ -10,13 +10,13 @@ from typing import Optional
 class PointLabel:
     """A single point label annotation."""
     
-    # Unique identifier
+    # Unique identifier (sequential, used internally)
     id: int
     
     # Class/category name
     class_name: str
     
-    # Pixel coordinates relative to the image
+    # Pixel coordinates relative to the image (absolute pixel values)
     pixel_x: float  # column (x)
     pixel_y: float  # row (y)
     
@@ -24,33 +24,72 @@ class PointLabel:
     lon: float
     lat: float
     
+    # Unique ID for this specific label (UUID v4) - always unique per label
+    unique_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    
     # Object ID for linking labels across images (UUID v4)
-    # Every label has a unique object_id; linked labels share the same one
+    # Linked labels share the same object_id
     object_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     
-    def to_dict(self) -> dict:
-        """Convert to dictionary for serialization."""
+    def to_dict(self, image_width: int = 0, image_height: int = 0) -> dict:
+        """Convert to dictionary for serialization.
+        
+        Args:
+            image_width: Original image width for percentage calculation
+            image_height: Original image height for percentage calculation
+        """
+        # Calculate percentage coordinates if dimensions are provided
+        if image_width > 0 and image_height > 0:
+            pct_x = self.pixel_x / image_width
+            pct_y = self.pixel_y / image_height
+        else:
+            # Fallback to absolute if dimensions unknown
+            pct_x = self.pixel_x
+            pct_y = self.pixel_y
+        
         return {
             "id": self.id,
+            "unique_id": self.unique_id,
             "class_name": self.class_name,
-            "pixel_x": self.pixel_x,
-            "pixel_y": self.pixel_y,
+            "pixel_x": pct_x,
+            "pixel_y": pct_y,
             "lon": self.lon,
             "lat": self.lat,
             "object_id": self.object_id
         }
     
     @classmethod
-    def from_dict(cls, data: dict) -> "PointLabel":
-        """Create from dictionary."""
+    def from_dict(cls, data: dict, image_width: int = 0, image_height: int = 0, 
+                  version: str = "2.1") -> "PointLabel":
+        """Create from dictionary.
+        
+        Args:
+            data: Dictionary with label data
+            image_width: Original image width for converting percentages back to pixels
+            image_height: Original image height for converting percentages back to pixels
+            version: Project version for interpreting pixel coordinates
+        """
+        raw_x = data.get("pixel_x", data.get("x", 0))
+        raw_y = data.get("pixel_y", data.get("y", 0))
+        
+        # Version 2.1+ stores percentages, convert back to absolute pixels
+        if version >= "2.1" and image_width > 0 and image_height > 0:
+            pixel_x = raw_x * image_width
+            pixel_y = raw_y * image_height
+        else:
+            # Older versions store absolute pixel coordinates
+            pixel_x = raw_x
+            pixel_y = raw_y
+        
         return cls(
             id=data["id"],
             class_name=data["class_name"],
-            pixel_x=data.get("pixel_x", data.get("x", 0)),
-            pixel_y=data.get("pixel_y", data.get("y", 0)),
+            pixel_x=pixel_x,
+            pixel_y=pixel_y,
             lon=data["lon"],
             lat=data["lat"],
-            # Generate UUID if not present (backwards compatibility)
+            # Generate UUIDs if not present (backwards compatibility)
+            unique_id=data.get("unique_id") or str(uuid.uuid4()),
             object_id=data.get("object_id") or str(uuid.uuid4())
         )
 
@@ -81,21 +120,23 @@ class ImageData:
             "path": self.path,
             "name": self.name,
             "group": self.group,
-            "labels": [l.to_dict() for l in self.labels],
+            "labels": [l.to_dict(self.original_width, self.original_height) for l in self.labels],
             "original_width": self.original_width,
             "original_height": self.original_height
         }
     
     @classmethod
-    def from_dict(cls, data: dict) -> "ImageData":
+    def from_dict(cls, data: dict, version: str = "2.1") -> "ImageData":
         """Create from dictionary."""
+        width = data.get("original_width", 0)
+        height = data.get("original_height", 0)
         return cls(
             path=data["path"],
             name=data["name"],
             group=data.get("group", ""),
-            labels=[PointLabel.from_dict(l) for l in data.get("labels", [])],
-            original_width=data.get("original_width", 0),
-            original_height=data.get("original_height", 0)
+            labels=[PointLabel.from_dict(l, width, height, version) for l in data.get("labels", [])],
+            original_width=width,
+            original_height=height
         )
 
 
@@ -273,7 +314,7 @@ class LabelProject:
     def save(self, file_path: str | Path):
         """Save project to JSON file."""
         data = {
-            "version": "2.0",
+            "version": "2.1",
             "classes": self.classes,
             "images": [img.to_dict() for img in self.images.values()],
             "_next_id": self._next_id
@@ -293,10 +334,10 @@ class LabelProject:
         
         version = data.get("version", "1.0")
         
-        if version == "2.0":
-            # New image-centric format
+        if version >= "2.0":
+            # Image-centric format (2.0 and 2.1+)
             for img_data in data.get("images", []):
-                image = ImageData.from_dict(img_data)
+                image = ImageData.from_dict(img_data, version)
                 project.images[image.path] = image
         else:
             # Legacy format (version 1.0) - convert from label-centric
