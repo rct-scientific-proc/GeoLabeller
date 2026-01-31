@@ -139,3 +139,4 @@ Projects are saved as JSON with the following structure:
 - PyQt5
 - rasterio
 - numpy
+- pillow
