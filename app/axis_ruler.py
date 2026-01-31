@@ -201,16 +201,16 @@ class AxisRuler(QWidget):
     def _format_lon(self, lon: float) -> str:
         """Format longitude for display."""
         if lon >= 0:
-            return f"{lon:.2f}°E"
+            return f"{lon:.6f}°E"
         else:
-            return f"{-lon:.2f}°W"
+            return f"{-lon:.6f}°W"
     
     def _format_lat(self, lat: float) -> str:
         """Format latitude for display."""
         if lat >= 0:
-            return f"{lat:.2f}°N"
+            return f"{lat:.6f}°N"
         else:
-            return f"{-lat:.2f}°S"
+            return f"{-lat:.6f}°S"
 
 
 class MapCanvasWithAxes(QWidget):
