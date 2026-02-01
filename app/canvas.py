@@ -139,51 +139,66 @@ class TiledLayer:
                 src.crs, dst_crs, src.width, src.height, *src.bounds
             )
 
-            # Use a sentinel nodata value to identify padded pixels after reprojection
-            # We use np.nan for float operations, then track the nodata mask
-            NODATA_SENTINEL = np.nan
-
-            # Reproject each band using float32 to support nan as nodata
-            bands = []
-            for i in range(1, src.count + 1):
-                src_band = src.read(i).astype(np.float32)
-                # Handle source nodata - convert to nan
-                if src.nodata is not None:
-                    src_band[src_band == src.nodata] = np.nan
-
-                dst_band = np.full((height, width), NODATA_SENTINEL, dtype=np.float32)
-                reproject(
-                    source=src_band,
-                    destination=dst_band,
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    dst_transform=transform,
-                    dst_crs=dst_crs,
-                    resampling=Resampling.bilinear,
-                    src_nodata=np.nan,
-                    dst_nodata=NODATA_SENTINEL
-                )
-                bands.append(dst_band)
-
-            # Create nodata mask - pixels are nodata if ALL bands are nan
-            # This identifies padded areas from reprojection
-            nodata_mask = np.all([np.isnan(b) for b in bands], axis=0)
-
-            # Convert to RGBA (at full resolution)
-            if len(bands) >= 3:
-                r, g, b = bands[0], bands[1], bands[2]
+            # Optimization: reproject band 1 as float32 to detect nodata/padding,
+            # then reproject remaining bands directly as uint8 (faster, less memory).
+            # Padding areas are identical for all bands after reprojection.
+            
+            # Band 1: reproject as float32 to detect nodata
+            src_band1 = src.read(1).astype(np.float32)
+            if src.nodata is not None:
+                src_band1[src_band1 == src.nodata] = np.nan
+            
+            dst_band1 = np.full((height, width), np.nan, dtype=np.float32)
+            reproject(
+                source=src_band1,
+                destination=dst_band1,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=transform,
+                dst_crs=dst_crs,
+                resampling=Resampling.bilinear,
+                src_nodata=np.nan,
+                dst_nodata=np.nan
+            )
+            
+            # Create nodata mask from band 1 only (padding is same for all bands)
+            nodata_mask = np.isnan(dst_band1)
+            
+            # Convert band 1 to uint8
+            band1_uint8 = np.clip(np.nan_to_num(dst_band1, nan=0.0), 0, 255).astype(np.uint8)
+            del dst_band1  # Free memory
+            
+            # Reproject remaining bands directly as uint8 (faster)
+            if src.count >= 3:
+                # RGB image - reproject bands 2 and 3 as uint8
+                bands_uint8 = [band1_uint8]
+                for i in range(2, min(src.count + 1, 4)):  # bands 2, 3 (and skip 4 if exists)
+                    src_band = src.read(i)
+                    # Handle source nodata by setting to 0
+                    if src.nodata is not None:
+                        src_band = np.where(src_band == src.nodata, 0, src_band)
+                    src_band = np.clip(src_band, 0, 255).astype(np.uint8)
+                    
+                    dst_band = np.zeros((height, width), dtype=np.uint8)
+                    reproject(
+                        source=src_band,
+                        destination=dst_band,
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=transform,
+                        dst_crs=dst_crs,
+                        resampling=Resampling.bilinear,
+                        src_nodata=0,
+                        dst_nodata=0
+                    )
+                    bands_uint8.append(dst_band)
+                
+                r, g, b = bands_uint8[0], bands_uint8[1], bands_uint8[2]
             else:
-                r = g = b = bands[0]
+                # Grayscale - use band 1 for all RGB channels
+                r = g = b = band1_uint8
 
-            # Replace nan with 0 before converting to uint8, then clip
-            r = np.nan_to_num(r, nan=0.0)
-            g = np.nan_to_num(g, nan=0.0)
-            b = np.nan_to_num(b, nan=0.0)
-
-            r = np.clip(r, 0, 255).astype(np.uint8)
-            g = np.clip(g, 0, 255).astype(np.uint8)
-            b = np.clip(b, 0, 255).astype(np.uint8)
-
+            # Build RGBA array
             rgba_full = np.zeros((height, width, 4), dtype=np.uint8)
             rgba_full[:, :, 0] = r
             rgba_full[:, :, 1] = g
