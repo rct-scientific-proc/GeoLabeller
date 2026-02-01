@@ -34,7 +34,7 @@ class TiledLayer:
     on demand when the layer becomes visible.
     """
     
-    def __init__(self, file_path: str, lazy: bool = False, decimation: int = 1):
+    def __init__(self, file_path: str, lazy: bool = False):
         """Initialize a tiled layer.
         
         Args:
@@ -59,9 +59,6 @@ class TiledLayer:
         self._rgba_data: np.ndarray | None = None
         self._width = 0
         self._height = 0
-        # Decimation factor (integer >=1). If >1, image pixels are reduced
-        # by this factor using bilinear interpolation after reprojection.
-        self._decimation = max(1, int(decimation))
         
         # Tile grid info
         self._n_tiles_x = 0
@@ -99,18 +96,6 @@ class TiledLayer:
             transform, width, height = calculate_default_transform(
                 src.crs, dst_crs, src.width, src.height, *src.bounds
             )
-
-            # If decimation is requested, adjust pixel dimensions and transform
-            if self._decimation > 1:
-                factor = self._decimation
-                # New pixel size is larger by factor; number of pixels reduced
-                new_width = int(math.ceil(width / factor))
-                new_height = int(math.ceil(height / factor))
-                # Scale the affine so that pixel->world mapping remains consistent
-                transform = Affine(transform.a * factor, transform.b, transform.c,
-                                   transform.d, transform.e * factor, transform.f)
-                width = new_width
-                height = new_height
 
             self._width = width
             self._height = height
@@ -201,55 +186,9 @@ class TiledLayer:
             # Set alpha to 0 for nodata/padded pixels, 255 for valid pixels
             rgba_full[:, :, 3] = np.where(nodata_mask, 0, 255).astype(np.uint8)
 
-            # If decimation requested, downsample the rgba array using bilinear
-            if self._decimation > 1:
-                factor = self._decimation
-                new_width = int(math.ceil(width / factor))
-                new_height = int(math.ceil(height / factor))
+            self._rgba_data = rgba_full
 
-                def _bilinear_resize(img: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
-                    h, w = img.shape[0], img.shape[1]
-                    if out_h == h and out_w == w:
-                        return img
-                    # compute source coordinates
-                    ys = (np.arange(out_h) + 0.5) * (h / out_h) - 0.5
-                    xs = (np.arange(out_w) + 0.5) * (w / out_w) - 0.5
-                    y0 = np.floor(ys).astype(int)
-                    x0 = np.floor(xs).astype(int)
-                    y1 = np.clip(y0 + 1, 0, h - 1)
-                    x1 = np.clip(x0 + 1, 0, w - 1)
-                    y0 = np.clip(y0, 0, h - 1)
-                    x0 = np.clip(x0, 0, w - 1)
-
-                    wy = (ys - y0)[:, None]
-                    wx = (xs - x0)[None, :]
-
-                    # Advanced indexing to gather corner pixels
-                    c00 = img[y0[:, None], x0[None, :]]
-                    c01 = img[y0[:, None], x1[None, :]]
-                    c10 = img[y1[:, None], x0[None, :]]
-                    c11 = img[y1[:, None], x1[None, :]]
-
-                    w00 = (1 - wy) * (1 - wx)
-                    w01 = (1 - wy) * wx
-                    w10 = wy * (1 - wx)
-                    w11 = wy * wx
-
-                    out = (c00 * w00[..., None] + c01 * w01[..., None] +
-                           c10 * w10[..., None] + c11 * w11[..., None])
-                    # Clip and convert back to uint8
-                    return np.clip(out, 0, 255).astype(np.uint8)
-
-                self._rgba_data = _bilinear_resize(rgba_full, new_height, new_width)
-                # Update transform so pixel->world mapping stays correct
-                transform = Affine(transform.a * factor, transform.b, transform.c,
-                                   transform.d, transform.e * factor, transform.f)
-                width = new_width
-                height = new_height
-            else:
-                self._rgba_data = rgba_full
-
-            # Store bounds in Web Mercator (after possible decimation)
+            # Store bounds in Web Mercator
             self.bounds = rasterio.transform.array_bounds(height, width, transform)
             west, south, east, north = self.bounds
 
@@ -418,14 +357,13 @@ class CustomTiledLayer:
     rasterio reprojection. The image is already in RGBA format from PIL.
     """
     
-    def __init__(self, file_path: str, reader_func, lazy: bool = False, decimation: int = 1):
+    def __init__(self, file_path: str, reader_func, lazy: bool = False):
         """Initialize a custom tiled layer.
         
         Args:
             file_path: Path to the image file
             reader_func: Callable that takes filename and returns GCPs
             lazy: If True, only load bounds initially
-            decimation: Decimation factor for display (1 = full resolution)
         """
         from .custom_reader import load_image_with_reader, compute_bounds_from_affine, gcps_to_affine
         
@@ -449,7 +387,6 @@ class CustomTiledLayer:
         self._rgba_data: np.ndarray | None = None
         self._width = 0
         self._height = 0
-        self._decimation = max(1, int(decimation))
         
         # Tile grid info
         self._n_tiles_x = 0
@@ -488,28 +425,16 @@ class CustomTiledLayer:
         # Compute transform from GCPs
         self._src_transform, self._src_crs = gcps_to_affine(gcps, self._src_width, self._src_height)
         
-        # Apply decimation to dimensions
-        width = self._src_width
-        height = self._src_height
-        transform = self._src_transform
-        
-        if self._decimation > 1:
-            factor = self._decimation
-            width = int(math.ceil(width / factor))
-            height = int(math.ceil(height / factor))
-            transform = Affine(transform.a * factor, transform.b, transform.c,
-                               transform.d, transform.e * factor, transform.f)
-        
-        self._width = width
-        self._height = height
+        self._width = self._src_width
+        self._height = self._src_height
         
         # Compute bounds
-        self.bounds = compute_bounds_from_affine(transform, width, height)
+        self.bounds = compute_bounds_from_affine(self._src_transform, self._width, self._height)
         west, south, east, north = self.bounds
         
         # Calculate tile grid
-        self._n_tiles_x = math.ceil(width / TILE_SIZE)
-        self._n_tiles_y = math.ceil(height / TILE_SIZE)
+        self._n_tiles_x = math.ceil(self._width / TILE_SIZE)
+        self._n_tiles_y = math.ceil(self._height / TILE_SIZE)
         self._tile_world_width = (east - west) / self._n_tiles_x
         self._tile_world_height = (north - south) / self._n_tiles_y
     
@@ -526,23 +451,7 @@ class CustomTiledLayer:
         self._src_width = width
         self._src_height = height
         
-        # Apply decimation if requested
-        if self._decimation > 1:
-            factor = self._decimation
-            new_width = int(math.ceil(width / factor))
-            new_height = int(math.ceil(height / factor))
-            
-            # Use bilinear resize
-            self._rgba_data = self._bilinear_resize(rgba_array, new_height, new_width)
-            
-            # Update transform
-            affine = Affine(affine.a * factor, affine.b, affine.c,
-                            affine.d, affine.e * factor, affine.f)
-            width = new_width
-            height = new_height
-        else:
-            self._rgba_data = rgba_array
-        
+        self._rgba_data = rgba_array
         self._width = width
         self._height = height
         
@@ -555,39 +464,6 @@ class CustomTiledLayer:
         self._n_tiles_y = math.ceil(height / TILE_SIZE)
         self._tile_world_width = (east - west) / self._n_tiles_x
         self._tile_world_height = (north - south) / self._n_tiles_y
-    
-    @staticmethod
-    def _bilinear_resize(img: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
-        """Bilinear resize for RGBA image."""
-        h, w = img.shape[0], img.shape[1]
-        if out_h == h and out_w == w:
-            return img
-        
-        ys = (np.arange(out_h) + 0.5) * (h / out_h) - 0.5
-        xs = (np.arange(out_w) + 0.5) * (w / out_w) - 0.5
-        y0 = np.floor(ys).astype(int)
-        x0 = np.floor(xs).astype(int)
-        y1 = np.clip(y0 + 1, 0, h - 1)
-        x1 = np.clip(x0 + 1, 0, w - 1)
-        y0 = np.clip(y0, 0, h - 1)
-        x0 = np.clip(x0, 0, w - 1)
-        
-        wy = (ys - y0)[:, None]
-        wx = (xs - x0)[None, :]
-        
-        c00 = img[y0[:, None], x0[None, :]]
-        c01 = img[y0[:, None], x1[None, :]]
-        c10 = img[y1[:, None], x0[None, :]]
-        c11 = img[y1[:, None], x1[None, :]]
-        
-        w00 = (1 - wy) * (1 - wx)
-        w01 = (1 - wy) * wx
-        w10 = wy * (1 - wx)
-        w11 = wy * wx
-        
-        out = (c00 * w00[..., None] + c01 * w01[..., None] +
-               c10 * w10[..., None] + c11 * w11[..., None])
-        return np.clip(out, 0, 255).astype(np.uint8)
     
     def ensure_loaded(self):
         """Ensure the full image data is loaded."""
@@ -997,7 +873,7 @@ class MapCanvas(QGraphicsView):
         self._scale_bar = ScaleBarWidget(self)
         self._scale_bar.move(10, 10)  # Will be repositioned in resizeEvent
     
-    def add_layer(self, file_path: str, lazy: bool = False, visible: bool = True, decimation: int = 1) -> str | None:
+    def add_layer(self, file_path: str, lazy: bool = False, visible: bool = True) -> str | None:
         """Add a GeoTIFF layer to the canvas. Returns existing layer_id if already loaded.
         
         Args:
@@ -1010,7 +886,7 @@ class MapCanvas(QGraphicsView):
             return self._path_to_layer[file_path]
         
         try:
-            layer = TiledLayer(file_path, lazy=lazy, decimation=decimation)
+            layer = TiledLayer(file_path, lazy=lazy)
             layer.visible = visible
             
             layer_id = f"layer_{self._next_id}"
@@ -1041,7 +917,7 @@ class MapCanvas(QGraphicsView):
             return None
     
     def add_custom_layer(self, file_path: str, reader_func, lazy: bool = False, 
-                         visible: bool = True, decimation: int = 1) -> str | None:
+                         visible: bool = True) -> str | None:
         """Add a layer using a custom reader function with GCPs.
         
         Args:
@@ -1049,13 +925,12 @@ class MapCanvas(QGraphicsView):
             reader_func: Function that takes filename and returns GCPs
             lazy: If True, only load bounds initially
             visible: Whether the layer should be visible initially
-            decimation: Decimation factor for display
         """
         if file_path in self._path_to_layer:
             return self._path_to_layer[file_path]
         
         try:
-            layer = CustomTiledLayer(file_path, reader_func, lazy=lazy, decimation=decimation)
+            layer = CustomTiledLayer(file_path, reader_func, lazy=lazy)
             layer.visible = visible
             
             layer_id = f"layer_{self._next_id}"

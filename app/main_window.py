@@ -286,18 +286,6 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.class_combo)
 
         toolbar.addSeparator()
-
-        # Decimation control (reduces resolution to speed display)
-        toolbar.addWidget(QLabel(" Decimation: "))
-        self.decimation_spin = QSpinBox()
-        self.decimation_spin.setRange(1, 16)
-        self.decimation_spin.setValue(1)
-        self.decimation_spin.setToolTip(
-            "Decimation factor (1 = full resolution, higher = faster but lower quality)"
-        )
-        toolbar.addWidget(self.decimation_spin)
-        
-        toolbar.addSeparator()
         
         # Custom reader extension control
         toolbar.addWidget(QLabel(" Custom Ext: "))
@@ -650,7 +638,7 @@ class MainWindow(QMainWindow):
         
         for idx, image in enumerate(self.project.images.values()):
             if os.path.exists(image.path):
-                layer_id = self.canvas.add_layer(image.path, decimation=self.decimation_spin.value())
+                layer_id = self.canvas.add_layer(image.path)
                 if layer_id:
                     # Recreate group structure
                     parent_group = get_or_create_group(image.group)
@@ -1127,7 +1115,7 @@ class MainWindow(QMainWindow):
                 skipped += 1
                 continue
             
-            layer_id = self.canvas.add_layer(file_path, decimation=self.decimation_spin.value())
+            layer_id = self.canvas.add_layer(file_path)
             if layer_id:
                 self.layer_panel.add_layer(layer_id, file_path)
                 # Track the loaded image with original dimensions
@@ -1227,7 +1215,7 @@ class MainWindow(QMainWindow):
             if self.canvas.is_path_loaded(file_path_str):
                 continue
             
-            layer_id = self.canvas.add_layer(file_path_str, visible=False, decimation=self.decimation_spin.value())
+            layer_id = self.canvas.add_layer(file_path_str, visible=False)
             if layer_id:
                 self.layer_panel.add_layer(layer_id, file_path_str, parent_group, visible=False)
                 # Include root group name in the group path
@@ -1290,7 +1278,6 @@ class MainWindow(QMainWindow):
         self._async_group_cache: dict[Path, any] = {}
         self._async_loaded_count = 0
         self._async_total_files = len(files_with_groups)
-        self._async_decimation = self.decimation_spin.value()  # capture at start
         self._async_mode = mode
         self._async_skip_project_add = skip_project_add
         
@@ -1382,7 +1369,7 @@ class MainWindow(QMainWindow):
                 parent_group = self._get_or_create_group_async(group_path)
                 
                 # Add layer with lazy loading and hidden by default
-                layer_id = self.canvas.add_layer(file_path, lazy=True, visible=False, decimation=self._async_decimation)
+                layer_id = self.canvas.add_layer(file_path, lazy=True, visible=False)
                 if layer_id:
                     # Add to tree as hidden (unchecked)
                     self.layer_panel.add_layer(layer_id, file_path, parent_group, visible=False)
@@ -1683,8 +1670,7 @@ class MainWindow(QMainWindow):
             try:
                 layer_id = self.canvas.add_custom_layer(
                     file_path,
-                    self._custom_reader_func,
-                    decimation=self.decimation_spin.value()
+                    self._custom_reader_func
                 )
                 if layer_id:
                     self.layer_panel.add_layer(layer_id, file_path)
@@ -1780,8 +1766,7 @@ class MainWindow(QMainWindow):
             try:
                 layer_id = self.canvas.add_custom_layer(
                     file_path_str,
-                    self._custom_reader_func,
-                    decimation=self.decimation_spin.value()
+                    self._custom_reader_func
                 )
                 if layer_id:
                     self.layer_panel.add_layer(layer_id, file_path_str, parent_group)
