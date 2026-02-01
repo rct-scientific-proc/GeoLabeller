@@ -1,19 +1,24 @@
 """Map canvas for displaying GeoTIFF images with tiled rendering."""
 import math
-from pathlib import Path
+import traceback
 from enum import Enum, auto
+from pathlib import Path
 
 import numpy as np
+import rasterio
+from affine import Affine
+from PyQt5.QtCore import Qt, pyqtSignal, QRectF, QTimer, QThread, QObject
+from PyQt5.QtGui import (
+    QImage, QPixmap, QWheelEvent, QTransform, QPen, QBrush, QColor, QFont, QPainter
+)
 from PyQt5.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
     QGraphicsEllipseItem, QGraphicsTextItem, QMenu, QWidget, QLabel
 )
-from PyQt5.QtGui import QImage, QPixmap, QWheelEvent, QTransform, QPen, QBrush, QColor, QFont, QPainter
-from PyQt5.QtCore import Qt, pyqtSignal, QRectF, QTimer, QThread, QObject
-import rasterio
-from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterio.crs import CRS
-from affine import Affine
+from rasterio.warp import calculate_default_transform, reproject, Resampling, transform as transform_coords
+
+from .custom_reader import load_image_with_reader, compute_bounds_from_affine, gcps_to_affine
 
 
 # Web Mercator CRS
@@ -335,9 +340,6 @@ class TiledLayer:
             Tuple of (pixel_x, pixel_y) where pixel_x is column and pixel_y is row.
             Values are floats for sub-pixel precision.
         """
-        from rasterio.warp import transform as transform_coords
-        from rasterio.crs import CRS
-        
         # Transform from WGS84 to the image's native CRS
         wgs84 = CRS.from_epsg(4326)
         xs, ys = transform_coords(wgs84, self._src_crs, [lon], [lat])
@@ -365,8 +367,6 @@ class CustomTiledLayer:
             reader_func: Callable that takes filename and returns GCPs
             lazy: If True, only load bounds initially
         """
-        from .custom_reader import load_image_with_reader, compute_bounds_from_affine, gcps_to_affine
-        
         self.file_path = file_path
         self.name = Path(file_path).stem
         self.group_path = ""
@@ -410,7 +410,6 @@ class CustomTiledLayer:
         Note: Since the reader returns both image and GCPs, we must call the
         reader even for bounds-only loading. The image data is discarded.
         """
-        from .custom_reader import gcps_to_affine, compute_bounds_from_affine
         
         # Call reader to get image data and GCPs
         result = self._reader_func(self.file_path)
@@ -440,7 +439,6 @@ class CustomTiledLayer:
     
     def _load_full(self):
         """Load full image data using custom reader."""
-        from .custom_reader import load_image_with_reader, compute_bounds_from_affine
         
         rgba_array, affine, crs, width, height = load_image_with_reader(
             self.file_path, self._reader_func
@@ -569,8 +567,6 @@ class CustomTiledLayer:
     
     def latlon_to_pixel(self, lon: float, lat: float) -> tuple[float, float]:
         """Convert WGS84 lat/lon to pixel coordinates in the original image."""
-        from rasterio.warp import transform as transform_coords
-        
         # Transform to Web Mercator
         wgs84 = CRS.from_epsg(4326)
         xs, ys = transform_coords(wgs84, self._src_crs, [lon], [lat])
@@ -912,7 +908,6 @@ class MapCanvas(QGraphicsView):
             
         except Exception as e:
             print(f"Error loading {file_path}: {e}")
-            import traceback
             traceback.print_exc()
             return None
     
@@ -954,7 +949,6 @@ class MapCanvas(QGraphicsView):
             
         except Exception as e:
             print(f"Error loading custom layer {file_path}: {e}")
-            import traceback
             traceback.print_exc()
             return None
 
