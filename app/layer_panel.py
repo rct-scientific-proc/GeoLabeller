@@ -572,6 +572,29 @@ class LayerPanel(QWidget):
             elif child_type == "group":
                 self._collect_checked_layers(child, checked_layers)
     
+    def get_selected_group_name(self) -> str:
+        """Get the name of the currently selected group.
+        
+        Returns:
+            Group name if a group is selected, or the parent group name if a layer is selected.
+            Returns empty string if nothing is selected or selection is at root level.
+        """
+        selected = self.tree.selectedItems()
+        if not selected:
+            return ""
+        
+        item = selected[0]
+        item_type = item.data(0, Qt.UserRole + 1)
+        
+        if item_type == "group":
+            return item.text(0)
+        elif item_type == "layer":
+            parent = item.parent()
+            if parent is not None:
+                return parent.text(0)
+        
+        return ""
+    
     def clear(self):
         """Clear all items from the tree."""
         self.tree.clear()
@@ -1151,6 +1174,10 @@ class CombinedLayerPanel(QWidget):
     def get_checked_layers_in_selected_group(self) -> list[str]:
         """Get list of checked layer IDs within the currently selected group."""
         return self.main_panel.get_checked_layers_in_selected_group()
+    
+    def get_selected_group_name(self) -> str:
+        """Get the name of the currently selected group."""
+        return self.main_panel.get_selected_group_name()
     
     def clear(self):
         """Clear all items from both trees."""

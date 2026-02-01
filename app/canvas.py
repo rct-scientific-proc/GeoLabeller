@@ -1140,12 +1140,28 @@ class MapCanvas(QGraphicsView):
         self._update_scale_bar()
     
     def wheelEvent(self, event: QWheelEvent):
-        """Zoom in/out with mouse wheel."""
+        """Zoom in/out with mouse wheel, centered on mouse position."""
+        # Get the scene position under the mouse before scaling
+        old_pos = self.mapToScene(event.pos())
+        
         factor = 1.15
         if event.angleDelta().y() > 0:
             self.scale(factor, factor)
         else:
             self.scale(1 / factor, 1 / factor)
+        
+        # Get the new scene position under the mouse after scaling
+        new_pos = self.mapToScene(event.pos())
+        
+        # Adjust scrollbars to keep the point under the mouse fixed
+        delta = old_pos - new_pos
+        self.horizontalScrollBar().setValue(
+            self.horizontalScrollBar().value() + int(delta.x() * self.transform().m11())
+        )
+        self.verticalScrollBar().setValue(
+            self.verticalScrollBar().value() + int(delta.y() * self.transform().m22())
+        )
+        
         self._schedule_tile_update()
         self.update_label_markers_scale()
         self._update_scale_bar()
@@ -1184,14 +1200,17 @@ class MapCanvas(QGraphicsView):
         """Set the canvas interaction mode."""
         self._mode = mode
         if mode == CanvasMode.PAN:
-            self.setDragMode(QGraphicsView.ScrollHandDrag)
-            self.setCursor(Qt.ArrowCursor)
+            self.setDragMode(QGraphicsView.NoDrag)  # We handle panning manually
+            self.setCursor(Qt.OpenHandCursor)
+            self._pan_active = False
         elif mode == CanvasMode.LABEL:
             self.setDragMode(QGraphicsView.NoDrag)
             self.setCursor(Qt.CrossCursor)
         elif mode == CanvasMode.CYCLE:
+            # Cycle mode: left click labels, right drag pans, wheel zooms
             self.setDragMode(QGraphicsView.NoDrag)
-            self.setCursor(Qt.PointingHandCursor)
+            self.setCursor(Qt.CrossCursor)
+            self._cycle_panning = False
     
     def set_current_class(self, class_name: str):
         """Set the current class for labeling."""
@@ -1203,7 +1222,18 @@ class MapCanvas(QGraphicsView):
     
     def mousePressEvent(self, event):
         """Handle mouse press for labeling."""
-        if self._mode == CanvasMode.LABEL and event.button() == Qt.LeftButton:
+        # PAN mode: manual left-click drag panning
+        if self._mode == CanvasMode.PAN:
+            if event.button() == Qt.LeftButton:
+                self._pan_active = True
+                self._pan_start = event.pos()
+                self.setCursor(Qt.ClosedHandCursor)
+            elif event.button() == Qt.RightButton:
+                self._show_pan_context_menu(event.pos())
+            return
+        
+        # Handle labeling in LABEL or CYCLE mode
+        if self._mode in (CanvasMode.LABEL, CanvasMode.CYCLE) and event.button() == Qt.LeftButton:
             # Check if we're in link mode
             if self._link_mode_active:
                 label_id, image_path = self._get_label_at_position(event.pos())
@@ -1236,15 +1266,51 @@ class MapCanvas(QGraphicsView):
                 self._exit_link_mode()
             else:
                 self._show_label_context_menu(event.pos())
-        elif self._mode == CanvasMode.PAN and event.button() == Qt.RightButton:
-            # Right-click in pan mode - show pan context menu
-            self._show_pan_context_menu(event.pos())
+        elif self._mode == CanvasMode.CYCLE and event.button() == Qt.RightButton:
+            # Right-click drag in cycle mode - start panning
+            self._cycle_panning = True
+            self._cycle_pan_start = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
         else:
             super().mousePressEvent(event)
     
     def mouseReleaseEvent(self, event):
         """Handle mouse release."""
+        if self._mode == CanvasMode.PAN and event.button() == Qt.LeftButton:
+            if hasattr(self, '_pan_active') and self._pan_active:
+                self._pan_active = False
+                self.setCursor(Qt.OpenHandCursor)
+        elif self._mode == CanvasMode.CYCLE and event.button() == Qt.RightButton:
+            if hasattr(self, '_cycle_panning') and self._cycle_panning:
+                self._cycle_panning = False
+                self.setCursor(Qt.CrossCursor)
         super().mouseReleaseEvent(event)
+    
+    def mouseMoveEvent(self, event):
+        """Track mouse position and emit lat/lon coordinates."""
+        # Handle PAN mode left-click panning
+        if self._mode == CanvasMode.PAN and hasattr(self, '_pan_active') and self._pan_active:
+            delta = event.pos() - self._pan_start
+            self._pan_start = event.pos()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            # Still update coordinates below
+        
+        # Handle cycle mode right-click panning
+        if self._mode == CanvasMode.CYCLE and hasattr(self, '_cycle_panning') and self._cycle_panning:
+            delta = event.pos() - self._cycle_pan_start
+            self._cycle_pan_start = event.pos()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            # Still update coordinates below
+        
+        scene_pos = self.mapToScene(event.pos())
+        easting = scene_pos.x()
+        northing = -scene_pos.y()
+        
+        lon, lat = self._web_mercator_to_wgs84(easting, northing)
+        layer_name, group_path = self._get_layer_at_position(easting, northing)
+        self.coordinates_changed.emit(lon, lat, layer_name, group_path)
     
     def keyPressEvent(self, event):
         """Handle key press events."""
@@ -1255,18 +1321,6 @@ class MapCanvas(QGraphicsView):
         else:
             super().keyPressEvent(event)
 
-    def mouseMoveEvent(self, event):
-        """Track mouse position and emit lat/lon coordinates."""
-        super().mouseMoveEvent(event)
-        
-        scene_pos = self.mapToScene(event.pos())
-        easting = scene_pos.x()
-        northing = -scene_pos.y()
-        
-        lon, lat = self._web_mercator_to_wgs84(easting, northing)
-        layer_name, group_path = self._get_layer_at_position(easting, northing)
-        self.coordinates_changed.emit(lon, lat, layer_name, group_path)
-    
     def _web_mercator_to_wgs84(self, x: float, y: float) -> tuple[float, float]:
         """Convert Web Mercator (EPSG:3857) to WGS84 (EPSG:4326)."""
         R = 6378137.0

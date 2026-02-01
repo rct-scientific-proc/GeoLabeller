@@ -107,6 +107,11 @@ class MainWindow(QMainWindow):
         self.coord_label = QLabel("")
         self.statusBar.addPermanentWidget(self.coord_label)
         
+        # Selected group label for cycle mode
+        self.group_label = QLabel("")
+        self.group_label.setStyleSheet("color: #0066cc; font-weight: bold;")
+        self.statusBar.addPermanentWidget(self.group_label)
+        
         # Connect signals
         self.layer_panel.layer_visibility_changed.connect(self.canvas.set_layer_visibility)
         self.layer_panel.layers_reordered.connect(self.canvas.update_layer_order)
@@ -328,9 +333,17 @@ class MainWindow(QMainWindow):
             # Clear cycle state when leaving cycle mode
             self._cycle_layers = []
             self._cycle_index = -1
+            self.group_label.setText("")
     
     def _start_cycle_mode(self):
         """Initialize cycle mode with layers from selected group."""
+        # Get and display the selected group name
+        group_name = self.layer_panel.get_selected_group_name()
+        if group_name:
+            self.group_label.setText(f"Group: {group_name}")
+        else:
+            self.group_label.setText("")
+        
         self._cycle_layers = self.layer_panel.get_checked_layers_in_selected_group()
         if not self._cycle_layers:
             self.statusBar.showMessage("No checked layers in selected group", 3000)
@@ -364,6 +377,7 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage("Cycle complete - all layers processed", 3000)
             self._cycle_layers = []
             self._cycle_index = -1
+            self.group_label.setText("")
             return
         
         # Zoom to next layer
