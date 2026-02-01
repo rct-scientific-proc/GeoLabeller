@@ -63,6 +63,10 @@ class MainWindow(QMainWindow):
         self._custom_reader_func = None
         self._custom_extension = "png"  # Default extension for custom files
         
+        # Cycle mode state
+        self._cycle_layers: list[str] = []  # Layer IDs to cycle through
+        self._cycle_index: int = -1  # Current position in cycle (-1 means not started)
+        
         self._setup_ui()
         self._setup_menu()
         self._setup_toolbar()
@@ -126,6 +130,7 @@ class MainWindow(QMainWindow):
         self.canvas.hide_layers_outside_view.connect(self.layer_panel.uncheck_layers)
         self.canvas.show_layers_in_view.connect(self.layer_panel.check_layers)
         self.canvas.toggle_layer_visibility_requested.connect(self.layer_panel.toggle_layer_visibility)
+        self.canvas.cycle_next_requested.connect(self._cycle_to_next_layer)
     
     def _setup_menu(self):
         """Set up the menu bar."""
@@ -276,6 +281,12 @@ class MainWindow(QMainWindow):
         self.label_action.triggered.connect(lambda: self._set_mode(CanvasMode.LABEL))
         toolbar.addAction(self.label_action)
         
+        self.cycle_action = QAction("Cycle", self)
+        self.cycle_action.setCheckable(True)
+        self.cycle_action.setShortcut("C")
+        self.cycle_action.triggered.connect(lambda: self._set_mode(CanvasMode.CYCLE))
+        toolbar.addAction(self.cycle_action)
+        
         toolbar.addSeparator()
         
         # Class selector
@@ -308,6 +319,60 @@ class MainWindow(QMainWindow):
         self.canvas.set_mode(mode)
         self.pan_action.setChecked(mode == CanvasMode.PAN)
         self.label_action.setChecked(mode == CanvasMode.LABEL)
+        self.cycle_action.setChecked(mode == CanvasMode.CYCLE)
+        
+        # Handle cycle mode entry
+        if mode == CanvasMode.CYCLE:
+            self._start_cycle_mode()
+        else:
+            # Clear cycle state when leaving cycle mode
+            self._cycle_layers = []
+            self._cycle_index = -1
+    
+    def _start_cycle_mode(self):
+        """Initialize cycle mode with layers from selected group."""
+        self._cycle_layers = self.layer_panel.get_checked_layers_in_selected_group()
+        if not self._cycle_layers:
+            self.statusBar.showMessage("No checked layers in selected group", 3000)
+            self._cycle_index = -1
+            return
+        
+        # Start at the last layer (end of list) 
+        self._cycle_index = len(self._cycle_layers) - 1
+        layer_id = self._cycle_layers[self._cycle_index]
+        self.canvas.zoom_to_layer(layer_id)
+        self.statusBar.showMessage(
+            f"Cycle mode: Layer {self._cycle_index + 1}/{len(self._cycle_layers)} - Press Space to cycle",
+            0  # No timeout
+        )
+    
+    def _cycle_to_next_layer(self):
+        """Toggle off current layer and zoom to the next checked layer in the cycle."""
+        if not self._cycle_layers or self._cycle_index < 0:
+            self.statusBar.showMessage("No layers to cycle through", 3000)
+            return
+        
+        # Toggle off current layer
+        current_layer_id = self._cycle_layers[self._cycle_index]
+        self.layer_panel.uncheck_layers([current_layer_id])
+        
+        # Move to previous index (going backwards through the list)
+        self._cycle_index -= 1
+        
+        if self._cycle_index < 0:
+            # Reached the beginning, cycle complete
+            self.statusBar.showMessage("Cycle complete - all layers processed", 3000)
+            self._cycle_layers = []
+            self._cycle_index = -1
+            return
+        
+        # Zoom to next layer
+        next_layer_id = self._cycle_layers[self._cycle_index]
+        self.canvas.zoom_to_layer(next_layer_id)
+        self.statusBar.showMessage(
+            f"Cycle mode: Layer {self._cycle_index + 1}/{len(self._cycle_layers)} - Press Space to cycle",
+            0
+        )
     
     def _on_class_changed(self, class_name: str):
         """Handle class selection change."""

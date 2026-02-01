@@ -30,6 +30,7 @@ class CanvasMode(Enum):
     """Canvas interaction modes."""
     PAN = auto()      # Default pan/zoom mode
     LABEL = auto()    # Point labeling mode
+    CYCLE = auto()    # Cycle through layers mode
 
 
 class TiledLayer:
@@ -833,6 +834,9 @@ class MapCanvas(QGraphicsView):
     # Signal emitted when user requests to toggle layer visibility: (layer_id)
     toggle_layer_visibility_requested = pyqtSignal(str)
     
+    # Signal emitted when Space is pressed in cycle mode
+    cycle_next_requested = pyqtSignal()
+    
     def __init__(self):
         super().__init__()
         self._scene = QGraphicsScene()
@@ -1185,6 +1189,9 @@ class MapCanvas(QGraphicsView):
         elif mode == CanvasMode.LABEL:
             self.setDragMode(QGraphicsView.NoDrag)
             self.setCursor(Qt.CrossCursor)
+        elif mode == CanvasMode.CYCLE:
+            self.setDragMode(QGraphicsView.NoDrag)
+            self.setCursor(Qt.PointingHandCursor)
     
     def set_current_class(self, class_name: str):
         """Set the current class for labeling."""
@@ -1243,6 +1250,8 @@ class MapCanvas(QGraphicsView):
         """Handle key press events."""
         if event.key() == Qt.Key_Escape and self._link_mode_active:
             self._exit_link_mode()
+        elif event.key() == Qt.Key_Space and self._mode == CanvasMode.CYCLE:
+            self.cycle_next_requested.emit()
         else:
             super().keyPressEvent(event)
 

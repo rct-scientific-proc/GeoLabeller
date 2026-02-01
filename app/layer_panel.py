@@ -529,6 +529,49 @@ class LayerPanel(QWidget):
         find_and_check()
         self.batch_visibility_finished.emit()
     
+    def get_checked_layers_in_selected_group(self) -> list[str]:
+        """Get list of checked layer IDs within the currently selected group.
+        
+        If a group is selected, returns checked layers within that group.
+        If a layer is selected, returns checked layers in its parent group.
+        If nothing is selected or selection is at root level, returns empty list.
+        
+        Returns:
+            List of layer IDs that are checked, in tree order (top to bottom).
+        """
+        selected = self.tree.selectedItems()
+        if not selected:
+            return []
+        
+        item = selected[0]  # Use first selected item
+        item_type = item.data(0, Qt.UserRole + 1)
+        
+        # Find the group to search in
+        if item_type == "group":
+            group_item = item
+        elif item_type == "layer":
+            group_item = item.parent()
+            if group_item is None:
+                return []  # Layer at root level, no group
+        else:
+            return []
+        
+        # Collect checked layers from this group (recursively)
+        checked_layers = []
+        self._collect_checked_layers(group_item, checked_layers)
+        return checked_layers
+    
+    def _collect_checked_layers(self, item: QTreeWidgetItem, checked_layers: list):
+        """Recursively collect checked layer IDs from an item and its children."""
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child_type = child.data(0, Qt.UserRole + 1)
+            if child_type == "layer":
+                if child.checkState(0) == Qt.Checked:
+                    checked_layers.append(child.data(0, Qt.UserRole))
+            elif child_type == "group":
+                self._collect_checked_layers(child, checked_layers)
+    
     def clear(self):
         """Clear all items from the tree."""
         self.tree.clear()
@@ -1104,6 +1147,10 @@ class CombinedLayerPanel(QWidget):
         # Just toggle in main panel - the signal handler _on_main_visibility_changed
         # will automatically sync to the labeled panel
         self.main_panel.toggle_layer_visibility(layer_id)
+    
+    def get_checked_layers_in_selected_group(self) -> list[str]:
+        """Get list of checked layer IDs within the currently selected group."""
+        return self.main_panel.get_checked_layers_in_selected_group()
     
     def clear(self):
         """Clear all items from both trees."""
