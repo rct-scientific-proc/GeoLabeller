@@ -4,7 +4,8 @@
 param(
     [switch]$Msi,      # Build MSI installer instead of just executable
     [switch]$Clean,    # Clean build directory before building
-    [switch]$KeepVenv  # Keep the virtual environment after build
+    [switch]$KeepVenv, # Keep the virtual environment after build
+    [string]$Python = "python"  # Path or command for Python executable
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,7 +23,7 @@ Write-Host ""
 # Check for Python
 Write-Host "Checking Python installation..." -ForegroundColor Yellow
 try {
-    $pythonVersion = python --version 2>&1
+    $pythonVersion = & $Python --version 2>&1
     Write-Host "  Found: $pythonVersion" -ForegroundColor Green
 } catch {
     Write-Host "  ERROR: Python not found. Please install Python and add to PATH." -ForegroundColor Red
@@ -49,7 +50,7 @@ if ($Clean) {
 # Create virtual environment
 Write-Host "Creating virtual environment..." -ForegroundColor Yellow
 if (-not (Test-Path $VenvDir)) {
-    python -m venv $VenvDir
+    & $Python -m venv $VenvDir
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  ERROR: Failed to create virtual environment" -ForegroundColor Red
         exit 1
