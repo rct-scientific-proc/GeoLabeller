@@ -304,8 +304,10 @@ class LayerPanel(QWidget):
                         collect_layers(parent.child(i))
         
         collect_layers()
-        # Reverse so bottom items render first
-        return list(reversed(layers))
+        # Return in top-to-bottom tree order.
+        # MapCanvas expects the list in top-to-bottom order so that
+        # assigning increasing z-values makes bottom tree items render on top.
+        return layers
     
     def _show_context_menu(self, position):
         """Show right-click context menu."""
