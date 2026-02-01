@@ -474,6 +474,10 @@ class LayerPanel(QWidget):
         total = len(layer_ids_set)
         self.batch_visibility_started.emit(total)
         progress_count = [0]
+        changed_layers = []  # Track which layers were actually changed
+        
+        # Block signals to prevent cascading _on_item_changed calls
+        self.tree.blockSignals(True)
         
         def find_and_uncheck(parent=None):
             if parent is None:
@@ -483,8 +487,10 @@ class LayerPanel(QWidget):
             else:
                 item_type = parent.data(0, Qt.UserRole + 1)
                 if item_type == "layer":
-                    if parent.data(0, Qt.UserRole) in layer_ids_set:
+                    layer_id = parent.data(0, Qt.UserRole)
+                    if layer_id in layer_ids_set and parent.checkState(0) == Qt.Checked:
                         parent.setCheckState(0, Qt.Unchecked)
+                        changed_layers.append(layer_id)
                         progress_count[0] += 1
                         self.batch_visibility_progress.emit(progress_count[0])
                         if progress_count[0] % 10 == 0:
@@ -494,6 +500,13 @@ class LayerPanel(QWidget):
                         find_and_uncheck(parent.child(i))
         
         find_and_uncheck()
+        
+        self.tree.blockSignals(False)
+        
+        # Emit visibility changed signals for each layer that was actually changed
+        for layer_id in changed_layers:
+            self.layer_visibility_changed.emit(layer_id, False)
+        
         self.batch_visibility_finished.emit()
     
     def check_layers(self, layer_ids: list[str]):
@@ -509,6 +522,10 @@ class LayerPanel(QWidget):
         total = len(layer_ids_set)
         self.batch_visibility_started.emit(total)
         progress_count = [0]
+        changed_layers = []  # Track which layers were actually changed
+        
+        # Block signals to prevent cascading _on_item_changed calls
+        self.tree.blockSignals(True)
         
         def find_and_check(parent=None):
             if parent is None:
@@ -518,8 +535,10 @@ class LayerPanel(QWidget):
             else:
                 item_type = parent.data(0, Qt.UserRole + 1)
                 if item_type == "layer":
-                    if parent.data(0, Qt.UserRole) in layer_ids_set:
+                    layer_id = parent.data(0, Qt.UserRole)
+                    if layer_id in layer_ids_set and parent.checkState(0) == Qt.Unchecked:
                         parent.setCheckState(0, Qt.Checked)
+                        changed_layers.append(layer_id)
                         progress_count[0] += 1
                         self.batch_visibility_progress.emit(progress_count[0])
                         if progress_count[0] % 10 == 0:
@@ -529,6 +548,13 @@ class LayerPanel(QWidget):
                         find_and_check(parent.child(i))
         
         find_and_check()
+        
+        self.tree.blockSignals(False)
+        
+        # Emit visibility changed signals for each layer that was actually changed
+        for layer_id in changed_layers:
+            self.layer_visibility_changed.emit(layer_id, True)
+        
         self.batch_visibility_finished.emit()
     
     def get_checked_layers_in_selected_group(self) -> list[str]:
@@ -573,6 +599,45 @@ class LayerPanel(QWidget):
                     checked_layers.append(child.data(0, Qt.UserRole))
             elif child_type == "group":
                 self._collect_checked_layers(child, checked_layers)
+    
+    def get_all_layers_in_selected_group(self) -> list[str]:
+        """Get list of ALL layer IDs within the currently selected group.
+        
+        Similar to get_checked_layers_in_selected_group but returns all layers
+        regardless of check state.
+        
+        Returns:
+            List of layer IDs in tree order (top to bottom).
+        """
+        selected = self.tree.selectedItems()
+        if not selected:
+            return []
+        
+        item = selected[0]
+        item_type = item.data(0, Qt.UserRole + 1)
+        
+        if item_type == "group":
+            group_item = item
+        elif item_type == "layer":
+            group_item = item.parent()
+            if group_item is None:
+                return []
+        else:
+            return []
+        
+        all_layers = []
+        self._collect_all_layers(group_item, all_layers)
+        return all_layers
+    
+    def _collect_all_layers(self, item: QTreeWidgetItem, layers: list):
+        """Recursively collect ALL layer IDs from an item and its children."""
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child_type = child.data(0, Qt.UserRole + 1)
+            if child_type == "layer":
+                layers.append(child.data(0, Qt.UserRole))
+            elif child_type == "group":
+                self._collect_all_layers(child, layers)
     
     def get_selected_group_name(self) -> str:
         """Get the name of the currently selected group.
@@ -1176,6 +1241,10 @@ class CombinedLayerPanel(QWidget):
     def get_checked_layers_in_selected_group(self) -> list[str]:
         """Get list of checked layer IDs within the currently selected group."""
         return self.main_panel.get_checked_layers_in_selected_group()
+    
+    def get_all_layers_in_selected_group(self) -> list[str]:
+        """Get list of ALL layer IDs within the currently selected group."""
+        return self.main_panel.get_all_layers_in_selected_group()
     
     def get_selected_group_name(self) -> str:
         """Get the name of the currently selected group."""

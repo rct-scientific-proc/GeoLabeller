@@ -7,8 +7,8 @@ from PyQt5.QtWidgets import (
     QStatusBar, QLabel, QToolBar, QComboBox, QMessageBox, QProgressDialog,
     QApplication, QProgressBar, QSpinBox, QLineEdit, QPushButton, QHBoxLayout, QWidget
 )
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QColor
+from PyQt5.QtCore import Qt, QTimer, QEvent
+from PyQt5.QtGui import QColor, QKeyEvent
 
 from .canvas import MapCanvas, CanvasMode, AsyncFileLoaderThread
 from .layer_panel import CombinedLayerPanel
@@ -79,6 +79,9 @@ class MainWindow(QMainWindow):
         # Combined layer panel on the left (includes labeled images panel)
         self.layer_panel = CombinedLayerPanel()
         splitter.addWidget(self.layer_panel)
+        
+        # Install event filter on tree widget to intercept Space key in cycle mode
+        self.layer_panel.tree.installEventFilter(self)
         
         # Map canvas with axes on the right
         self.canvas = MapCanvas()
@@ -319,6 +322,31 @@ class MainWindow(QMainWindow):
         self.reader_status_label.setToolTip("No custom reader loaded. Use File > Custom Reader > Set Reader Script...")
         toolbar.addWidget(self.reader_status_label)
     
+    def keyPressEvent(self, event: QKeyEvent):
+        """Handle global key press events.
+        
+        Captures Space key when in cycle mode regardless of which widget has focus.
+        """
+        if event.key() == Qt.Key_Space and self.canvas._mode == CanvasMode.CYCLE:
+            # Handle space in cycle mode globally
+            self._cycle_to_next_layer()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+    
+    def eventFilter(self, obj, event: QEvent) -> bool:
+        """Filter events from child widgets.
+        
+        Intercepts Space key on the layer tree when in cycle mode to prevent
+        the tree from toggling checkboxes.
+        """
+        if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Space:
+            if self.canvas._mode == CanvasMode.CYCLE:
+                # Handle space in cycle mode - don't let tree process it
+                self._cycle_to_next_layer()
+                return True  # Event consumed
+        return super().eventFilter(obj, event)
+    
     def _set_mode(self, mode: CanvasMode):
         """Set the canvas interaction mode."""
         self.canvas.set_mode(mode)
@@ -344,15 +372,16 @@ class MainWindow(QMainWindow):
         else:
             self.group_label.setText("")
         
-        self._cycle_layers = self.layer_panel.get_checked_layers_in_selected_group()
+        self._cycle_layers = self.layer_panel.get_all_layers_in_selected_group()
         if not self._cycle_layers:
-            self.statusBar.showMessage("No checked layers in selected group", 3000)
+            self.statusBar.showMessage("No layers in selected group", 3000)
             self._cycle_index = -1
             return
         
         # Start at the last layer (end of list) 
         self._cycle_index = len(self._cycle_layers) - 1
         layer_id = self._cycle_layers[self._cycle_index]
+        self.layer_panel.check_layers([layer_id])
         self.canvas.zoom_to_layer(layer_id)
         self.statusBar.showMessage(
             f"Cycle mode: Layer {self._cycle_index + 1}/{len(self._cycle_layers)} - Press Space to cycle",
@@ -363,7 +392,7 @@ class MainWindow(QMainWindow):
         self.canvas.setFocus()
     
     def _cycle_to_next_layer(self):
-        """Toggle off current layer and zoom to the next checked layer in the cycle."""
+        """Toggle off current layer, turn on and zoom to the next layer in the cycle."""
         if not self._cycle_layers or self._cycle_index < 0:
             self.statusBar.showMessage("No layers to cycle through", 3000)
             return
@@ -383,13 +412,17 @@ class MainWindow(QMainWindow):
             self.group_label.setText("")
             return
         
-        # Zoom to next layer
+        # Turn on and zoom to next layer
         next_layer_id = self._cycle_layers[self._cycle_index]
+        self.layer_panel.check_layers([next_layer_id])
         self.canvas.zoom_to_layer(next_layer_id)
         self.statusBar.showMessage(
             f"Cycle mode: Layer {self._cycle_index + 1}/{len(self._cycle_layers)} - Press Space to cycle",
             0
         )
+        
+        # Refocus canvas so Space key continues to work
+        self.canvas.setFocus()
     
     def _on_class_changed(self, class_name: str):
         """Handle class selection change."""
