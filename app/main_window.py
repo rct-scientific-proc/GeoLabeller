@@ -1609,11 +1609,26 @@ class MainWindow(QMainWindow):
 <tr><td><b>Right-click</b></td><td>Context menu</td></tr>
 </table>
 
+<h3>Mode Switching</h3>
+<table>
+<tr><td><b>P</b></td><td>Pan mode</td></tr>
+<tr><td><b>L</b></td><td>Label mode</td></tr>
+<tr><td><b>C</b></td><td>Cycle mode</td></tr>
+</table>
+
 <h3>Labeling</h3>
 <table>
-<tr><td><b>Left-click</b></td><td>Place label (in Label mode)</td></tr>
+<tr><td><b>Left-click</b></td><td>Place label (in Label/Cycle mode)</td></tr>
 <tr><td><b>Right-click label</b></td><td>Label options (remove, link)</td></tr>
+<tr><td><b>Ctrl+Left-click</b></td><td>Label options in Cycle mode</td></tr>
 <tr><td><b>Escape</b></td><td>Cancel link mode</td></tr>
+</table>
+
+<h3>Cycle Mode</h3>
+<table>
+<tr><td><b>Space</b></td><td>Advance to next layer (unchecks current)</td></tr>
+<tr><td><b>Right-click + drag</b></td><td>Pan around</td></tr>
+<tr><td><b>Mouse wheel</b></td><td>Zoom in/out</td></tr>
 </table>
 
 <h3>Layer Panel</h3>

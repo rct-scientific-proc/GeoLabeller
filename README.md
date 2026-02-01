@@ -47,6 +47,17 @@ A PyQt5-based desktop application for viewing GeoTIFF images and creating point 
 - Right-click menu options: "Link with...", "Unlink", "Show Linked"
 - Visual highlighting of linked labels
 
+### Cycle Mode
+- Sequential workflow for labeling layers within a selected group
+- Select a group, press **C** to enter Cycle mode
+- Automatically zooms to the last checked layer in the group
+- **Left-click** places labels (same as Label mode)
+- **Right-click + drag** to pan around
+- **Mouse wheel** to zoom in/out
+- **Space** to advance: unchecks current layer and zooms to next
+- **Ctrl+Left-click** on a label for context menu (link, remove, etc.)
+- Group name displayed in status bar during cycle
+
 ### Project Management
 - Save/load projects as JSON files (`.geolabel` extension)
 - Projects preserve: images, groups, label classes, and all annotations
@@ -76,6 +87,10 @@ python main.py
 - `Ctrl+S` - Save Project
 - `Ctrl+Shift+S` - Save Project As
 - `Ctrl+Shift+P` - Open Project
+- `P` - Pan mode
+- `L` - Label mode
+- `C` - Cycle mode
+- `Space` - Next layer (in Cycle mode)
 - `F1` - Show Help/Shortcuts
 - `Escape` - Cancel link mode
 
