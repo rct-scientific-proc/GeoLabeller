@@ -465,6 +465,14 @@ class LayerPanel(QWidget):
         Args:
             layer_ids: List of layer IDs to uncheck
         """
+        if not layer_ids:
+            return
+        
+        layer_ids_set = set(layer_ids)
+        total = len(layer_ids_set)
+        self.batch_visibility_started.emit(total)
+        progress_count = [0]
+        
         def find_and_uncheck(parent=None):
             if parent is None:
                 count = self.tree.topLevelItemCount()
@@ -473,13 +481,18 @@ class LayerPanel(QWidget):
             else:
                 item_type = parent.data(0, Qt.UserRole + 1)
                 if item_type == "layer":
-                    if parent.data(0, Qt.UserRole) in layer_ids:
+                    if parent.data(0, Qt.UserRole) in layer_ids_set:
                         parent.setCheckState(0, Qt.Unchecked)
+                        progress_count[0] += 1
+                        self.batch_visibility_progress.emit(progress_count[0])
+                        if progress_count[0] % 10 == 0:
+                            QApplication.processEvents()
                 else:
                     for i in range(parent.childCount()):
                         find_and_uncheck(parent.child(i))
         
         find_and_uncheck()
+        self.batch_visibility_finished.emit()
     
     def check_layers(self, layer_ids: list[str]):
         """Check (show) layers by their IDs.
@@ -487,6 +500,14 @@ class LayerPanel(QWidget):
         Args:
             layer_ids: List of layer IDs to check
         """
+        if not layer_ids:
+            return
+        
+        layer_ids_set = set(layer_ids)
+        total = len(layer_ids_set)
+        self.batch_visibility_started.emit(total)
+        progress_count = [0]
+        
         def find_and_check(parent=None):
             if parent is None:
                 count = self.tree.topLevelItemCount()
@@ -495,13 +516,18 @@ class LayerPanel(QWidget):
             else:
                 item_type = parent.data(0, Qt.UserRole + 1)
                 if item_type == "layer":
-                    if parent.data(0, Qt.UserRole) in layer_ids:
+                    if parent.data(0, Qt.UserRole) in layer_ids_set:
                         parent.setCheckState(0, Qt.Checked)
+                        progress_count[0] += 1
+                        self.batch_visibility_progress.emit(progress_count[0])
+                        if progress_count[0] % 10 == 0:
+                            QApplication.processEvents()
                 else:
                     for i in range(parent.childCount()):
                         find_and_check(parent.child(i))
         
         find_and_check()
+        self.batch_visibility_finished.emit()
     
     def clear(self):
         """Clear all items from the tree."""
