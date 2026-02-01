@@ -1,0 +1,6 @@
+PyQt5
+numpy
+pillow
+rasterio
+cx_Freeze
+patchelf; sys_platform == "linux"
