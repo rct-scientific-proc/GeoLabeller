@@ -358,6 +358,9 @@ class MainWindow(QMainWindow):
             f"Cycle mode: Layer {self._cycle_index + 1}/{len(self._cycle_layers)} - Press Space to cycle",
             0  # No timeout
         )
+        
+        # Give canvas keyboard focus so Space key works immediately
+        self.canvas.setFocus()
     
     def _cycle_to_next_layer(self):
         """Toggle off current layer and zoom to the next checked layer in the cycle."""

@@ -1244,6 +1244,11 @@ class MapCanvas(QGraphicsView):
                 self._exit_link_mode()
                 return
             
+            # Ctrl+Left-click in CYCLE mode shows label context menu (for linking)
+            if self._mode == CanvasMode.CYCLE and event.modifiers() & Qt.ControlModifier:
+                self._show_label_context_menu(event.pos())
+                return
+            
             if not self._current_class:
                 return  # No class selected
             
@@ -1663,7 +1668,7 @@ class MapCanvas(QGraphicsView):
         self._link_source_label_id = None
         
         # Restore cursor based on mode
-        if self._mode == CanvasMode.LABEL:
+        if self._mode == CanvasMode.LABEL or self._mode == CanvasMode.CYCLE:
             self.setCursor(Qt.CrossCursor)
         else:
             self.setCursor(Qt.ArrowCursor)
