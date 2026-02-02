@@ -739,6 +739,131 @@ class AsyncFileLoader(QObject):
         self.batch_complete.emit(loaded_count, error_count)
 
 
+class AsyncCustomFileLoader(QObject):
+    """Worker object for loading custom reader files asynchronously.
+    
+    Similar to AsyncFileLoader but uses custom reader functions with GCPs
+    instead of rasterio for GeoTIFFs.
+    """
+    
+    # Emitted when a file is successfully loaded: (file_path, layer_data_dict)
+    file_loaded = pyqtSignal(str, dict)
+    
+    # Emitted when a file fails to load: (file_path, error_message)
+    file_error = pyqtSignal(str, str)
+    
+    # Emitted when a batch of files is complete: (loaded_count, error_count)
+    batch_complete = pyqtSignal(int, int)
+    
+    # Emitted periodically during loading: (files_processed, total_files)
+    progress_update = pyqtSignal(int, int)
+    
+    def __init__(self):
+        super().__init__()
+        self._files_to_load: list[tuple[str, str]] = []  # (file_path, group_path)
+        self._cancelled = False
+        self._reader_func = None
+        self._get_gcps_func = None
+    
+    def set_files(self, files: list[tuple[str, str]]):
+        """Set the list of files to load."""
+        self._files_to_load = files
+        self._cancelled = False
+    
+    def set_reader(self, reader_func, get_gcps_func=None):
+        """Set the custom reader function to use."""
+        self._reader_func = reader_func
+        self._get_gcps_func = get_gcps_func
+    
+    def cancel(self):
+        """Cancel the loading operation."""
+        self._cancelled = True
+    
+    def process(self):
+        """Process all files in the queue. Run this in a worker thread."""
+        loaded_count = 0
+        error_count = 0
+        total = len(self._files_to_load)
+        
+        for i, (file_path, group_path) in enumerate(self._files_to_load):
+            if self._cancelled:
+                break
+            
+            try:
+                # Use get_gcps if available for faster loading (lazy bounds only)
+                if self._get_gcps_func is not None:
+                    gcps, width, height = self._get_gcps_func(file_path)
+                else:
+                    # Fall back to full reader
+                    result = self._reader_func(file_path)
+                    if not isinstance(result, (list, tuple)) or len(result) != 2:
+                        raise ValueError("Reader must return (image_data, gcps)")
+                    image_data, gcps = result
+                    height, width = image_data.shape[:2]
+                
+                # Compute bounds from GCPs
+                affine, crs = gcps_to_affine(gcps, width, height)
+                bounds = compute_bounds_from_affine(affine, width, height)
+                
+                # Emit the loaded data
+                layer_data = {
+                    'file_path': file_path,
+                    'group_path': group_path,
+                    'bounds': bounds,
+                    'width': width,
+                    'height': height,
+                    'gcps': gcps,
+                }
+                self.file_loaded.emit(file_path, layer_data)
+                loaded_count += 1
+                
+            except Exception as e:
+                self.file_error.emit(file_path, str(e))
+                error_count += 1
+            
+            # Emit progress every 10 files or at the end
+            if (i + 1) % 10 == 0 or i == total - 1:
+                self.progress_update.emit(i + 1, total)
+        
+        self.batch_complete.emit(loaded_count, error_count)
+
+
+class AsyncCustomFileLoaderThread(QThread):
+    """Thread wrapper for AsyncCustomFileLoader."""
+    
+    # Forward signals from the loader
+    file_loaded = pyqtSignal(str, dict)
+    file_error = pyqtSignal(str, str)
+    batch_complete = pyqtSignal(int, int)
+    progress_update = pyqtSignal(int, int)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._loader = AsyncCustomFileLoader()
+        
+        # Connect internal signals to forwarded signals
+        self._loader.file_loaded.connect(self.file_loaded.emit)
+        self._loader.file_error.connect(self.file_error.emit)
+        self._loader.batch_complete.connect(self.batch_complete.emit)
+        self._loader.progress_update.connect(self.progress_update.emit)
+    
+    def set_files(self, files: list[tuple[str, str]]):
+        """Set files to load."""
+        self._loader.set_files(files)
+    
+    def set_reader(self, reader_func, get_gcps_func=None):
+        """Set the custom reader function."""
+        self._loader.set_reader(reader_func, get_gcps_func)
+    
+    def cancel(self):
+        """Cancel loading."""
+        self._loader.cancel()
+    
+    def run(self):
+        """Run the loading in the background thread."""
+        self._loader.process()
+
+
 class AsyncFileLoaderThread(QThread):
     """Thread wrapper for AsyncFileLoader."""
     

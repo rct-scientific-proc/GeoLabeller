@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, QEvent
 from PyQt5.QtGui import QColor, QKeyEvent
 
-from .canvas import MapCanvas, CanvasMode, AsyncFileLoaderThread
+from .canvas import MapCanvas, CanvasMode, AsyncFileLoaderThread, AsyncCustomFileLoaderThread
 from .layer_panel import CombinedLayerPanel
 from .axis_ruler import MapCanvasWithAxes
 from .labels import LabelProject, ImageData, PointLabel
@@ -748,16 +748,16 @@ class MainWindow(QMainWindow):
             self.reader_status_label.setStyleSheet("")
 
     def _start_project_image_loading(self):
-        """Start async loading of project images using the unified async loader.
+        """Start async loading of project images.
         
-        Custom files (with non-default reader) are loaded synchronously first,
-        then GeoTIFFs are loaded asynchronously.
+        Custom files are loaded asynchronously first, then GeoTIFFs.
+        Both show progress in the status bar.
         """
         import os
         
-        # Separate custom files from GeoTIFFs
+        # Separate custom files from GeoTIFFs by extension/reader
         geotiff_files = []
-        custom_files = []  # (path, group, reader_name, ext)
+        custom_files_by_ext: dict[str, list[tuple[str, str]]] = {}  # ext -> [(path, group), ...]
         missing_files = []
         
         for image in self.project.images.values():
@@ -773,20 +773,185 @@ class MainWindow(QMainWindow):
                         custom_ext = ext
                         break
                 
-                if custom_reader:
-                    custom_files.append((image.path, image.group or "", custom_reader, custom_ext))
+                if custom_reader and custom_ext:
+                    if custom_ext not in custom_files_by_ext:
+                        custom_files_by_ext[custom_ext] = []
+                    custom_files_by_ext[custom_ext].append((image.path, image.group or ""))
                 else:
                     geotiff_files.append((image.path, image.group or ""))
         
-        # Store missing files to report later
+        # Store for later use
         self._async_missing_files = missing_files
+        self._project_geotiff_files = geotiff_files
+        self._project_custom_files_by_ext = custom_files_by_ext
         
-        # Load custom files synchronously first (they need reader functions)
-        if custom_files:
-            self._load_custom_project_images(custom_files)
+        # Calculate total files for progress
+        total_custom = sum(len(files) for files in custom_files_by_ext.values())
+        total_files = total_custom + len(geotiff_files)
+        
+        if total_files == 0:
+            self._finish_async_loading_project()
+            return
+        
+        # Start loading - custom files first if any
+        if custom_files_by_ext:
+            self._start_project_custom_loading()
+        elif geotiff_files:
+            self._start_project_geotiff_loading()
+        else:
+            self._finish_async_loading_project()
+    
+    def _start_project_custom_loading(self):
+        """Start async loading of custom files during project load."""
+        # Get the first extension to process
+        if not self._project_custom_files_by_ext:
+            # No more custom files, move to GeoTIFFs
+            if self._project_geotiff_files:
+                self._start_project_geotiff_loading()
+            else:
+                self._finish_async_loading_project()
+            return
+        
+        # Pop first extension group
+        ext = next(iter(self._project_custom_files_by_ext))
+        files_with_groups = self._project_custom_files_by_ext.pop(ext)
+        
+        # Get reader for this extension
+        reader_func = self._custom_readers.get(ext)
+        gcps_func = self._custom_gcps_funcs.get(ext)
+        
+        if not reader_func:
+            print(f"Warning: No reader loaded for .{ext}, skipping {len(files_with_groups)} files")
+            # Try next extension
+            self._start_project_custom_loading()
+            return
+        
+        # Use the async custom loading infrastructure
+        self._start_custom_async_loading_project(
+            files_with_groups,
+            reader_func=reader_func,
+            get_gcps_func=gcps_func,
+            ext=ext
+        )
+    
+    def _start_custom_async_loading_project(
+        self,
+        files_with_groups: list[tuple[str, str]],
+        reader_func,
+        get_gcps_func,
+        ext: str
+    ):
+        """Start async loading of custom files for project load.
+        
+        Similar to _start_custom_async_loading but chains to next phase on completion.
+        """
+        # Store state for the async operation
+        self._async_custom_group_cache: dict[str, any] = {}
+        self._async_custom_loaded_count = 0
+        self._async_custom_total_files = len(files_with_groups)
+        self._async_custom_ext = ext
+        self._async_custom_pending_files: list[tuple[str, dict]] = []
+        self._async_custom_is_project_load = True  # Flag to chain to next phase
+        
+        # Create and start the async loader
+        self._async_custom_loader = AsyncCustomFileLoaderThread(self)
+        self._async_custom_loader.set_files(files_with_groups)
+        self._async_custom_loader.set_reader(reader_func, get_gcps_func)
+        
+        # Connect signals
+        self._async_custom_loader.file_loaded.connect(self._on_async_custom_file_loaded)
+        self._async_custom_loader.file_error.connect(self._on_async_custom_file_error)
+        self._async_custom_loader.batch_complete.connect(self._on_async_custom_project_batch_complete)
+        self._async_custom_loader.progress_update.connect(self._on_async_custom_progress)
+        
+        # Show progress
+        self._show_progress(len(files_with_groups), f"Loading .{ext}")
+        self.statusBar.showMessage(f"Loading {len(files_with_groups)} .{ext} files...")
+        
+        # Create a timer for safe UI updates
+        if not hasattr(self, '_async_custom_ui_timer'):
+            self._async_custom_ui_timer = QTimer()
+            self._async_custom_ui_timer.setInterval(100)
+            self._async_custom_ui_timer.timeout.connect(self._process_pending_custom_files_project)
+        
+        self._async_custom_ui_timer.start()
+        self._async_custom_loader.start()
+    
+    def _process_pending_custom_files_project(self):
+        """Process pending custom files during project load."""
+        if not self._async_custom_pending_files:
+            return
+        
+        # Process a batch of files
+        batch_size = min(20, len(self._async_custom_pending_files))
+        batch = self._async_custom_pending_files[:batch_size]
+        self._async_custom_pending_files = self._async_custom_pending_files[batch_size:]
+        
+        self.layer_panel.begin_batch_update()
+        try:
+            for file_path, layer_data in batch:
+                group_path = layer_data['group_path']
+                
+                # Get or create the group hierarchy
+                parent_group = self._get_or_create_custom_group(group_path)
+                
+                # Get reader for this file
+                ext = self._async_custom_ext
+                reader_func = self._custom_readers.get(ext)
+                gcps_func = self._custom_gcps_funcs.get(ext)
+                
+                # Add the layer to canvas
+                layer_id = self.canvas.add_custom_layer(
+                    file_path,
+                    reader_func,
+                    get_gcps_func=gcps_func,
+                    lazy=True,
+                    visible=False
+                )
+                
+                if layer_id:
+                    self.layer_panel.add_layer(layer_id, file_path, parent_group, visible=False)
+                    self.canvas.set_layer_group(layer_id, group_path)
+                    self._async_custom_loaded_count += 1
+        finally:
+            self.layer_panel.end_batch_update()
+    
+    def _on_async_custom_project_batch_complete(self, loaded: int, errors: int):
+        """Handle async custom loading completion during project load."""
+        # Stop the UI update timer
+        self._async_custom_ui_timer.stop()
+        
+        # Process any remaining pending files
+        while self._async_custom_pending_files:
+            self._process_pending_custom_files_project()
+            QApplication.processEvents()
+        
+        # Hide progress
+        self._hide_progress()
+        
+        # Clean up loader
+        if hasattr(self, '_async_custom_loader') and self._async_custom_loader is not None:
+            self._async_custom_loader.wait()
+            self._async_custom_loader.deleteLater()
+            self._async_custom_loader = None
+        
+        # Collapse groups
+        self.layer_panel.tree.collapseAll()
+        
+        # Chain to next phase: more custom extensions or GeoTIFFs
+        if self._project_custom_files_by_ext:
+            self._start_project_custom_loading()
+        elif self._project_geotiff_files:
+            self._start_project_geotiff_loading()
+        else:
+            self._finish_async_loading_project()
+    
+    def _start_project_geotiff_loading(self):
+        """Start async loading of GeoTIFF files during project load."""
+        geotiff_files = self._project_geotiff_files
+        self._project_geotiff_files = []  # Clear
         
         if not geotiff_files:
-            # No GeoTIFFs to load - we're done
             self._finish_async_loading_project()
             return
         
@@ -794,63 +959,10 @@ class MainWindow(QMainWindow):
         self._start_unified_async_loading(
             geotiff_files,
             mode="project",
-            progress_label="Loading project",
+            progress_label="Loading GeoTIFFs",
             skip_project_add=True  # Images already in project
         )
     
-    def _load_custom_project_images(self, custom_files: list[tuple[str, str, str, str]]):
-        """Load custom files synchronously during project load.
-        
-        Args:
-            custom_files: List of (path, group, reader_name, ext) tuples
-        """
-        # Group cache for recreating hierarchy
-        group_cache: dict[str, any] = {}
-        
-        def get_or_create_group(group_path: str):
-            if not group_path:
-                return None
-            if group_path in group_cache:
-                return group_cache[group_path]
-            parts = group_path.replace("\\", "/").split("/")
-            parent = None
-            current_path = ""
-            for part in parts:
-                current_path = f"{current_path}/{part}" if current_path else part
-                if current_path not in group_cache:
-                    group = self.layer_panel.add_group(part, parent, visible=False)
-                    group_cache[current_path] = group
-                parent = group_cache[current_path]
-            return parent
-        
-        loaded = 0
-        errors = []
-        
-        for file_path, group_path, reader_name, ext in custom_files:
-            # Get reader for this reader name
-            reader_func = self._custom_readers.get(ext)
-            if not reader_func:
-                errors.append(f"{Path(file_path).name}: No reader loaded for .{ext} (needs {reader_name})")
-                continue
-            
-            # Get optional get_gcps function for lazy loading
-            gcps_func = self._custom_gcps_funcs.get(ext)
-            
-            try:
-                layer_id = self.canvas.add_custom_layer(
-                    file_path, reader_func, get_gcps_func=gcps_func, visible=False
-                )
-                if layer_id:
-                    parent_group = get_or_create_group(group_path)
-                    self.layer_panel.add_layer(layer_id, file_path, parent_group, visible=False)
-                    self.canvas.set_layer_group(layer_id, group_path)
-                    loaded += 1
-            except Exception as e:
-                errors.append(f"{Path(file_path).name}: {e}")
-        
-        if errors:
-            print(f"Errors loading custom files: {errors}")
-
     def _load_project_images(self):
         """Load images stored in the project and recreate group structure."""
         import os
@@ -2046,7 +2158,7 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage(msg, 5000)
     
     def _add_custom_directory(self):
-        """Add a directory of files using the custom reader."""
+        """Add a directory of files using the custom reader (async loading)."""
         if self._custom_reader_func is None:
             QMessageBox.warning(
                 self,
@@ -2075,94 +2187,211 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage(f"No .{ext} files found in directory", 5000)
             return
         
-        # Create progress dialog
-        progress = QProgressDialog(
-            f"Loading .{ext} files...",
-            "Cancel",
-            0,
-            len(custom_files),
-            self
-        )
-        progress.setWindowTitle("Loading Custom Files")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-        
-        # Create root group for the selected directory
+        # Get root folder name for the group
         root_group_name = root_path.name
-        root_group = self.layer_panel.add_group(root_group_name, None, visible=False)
         
-        # Build group hierarchy cache
-        group_cache: dict[Path, any] = {}
-        
-        def get_or_create_group(rel_dir: Path):
-            if rel_dir == Path(".") or str(rel_dir) == ".":
-                return root_group  # Files at root level go under the root group
-            if rel_dir in group_cache:
-                return group_cache[rel_dir]
-            parent_group = get_or_create_group(rel_dir.parent)
-            group = self.layer_panel.add_group(rel_dir.name, parent_group, visible=False)
-            group_cache[rel_dir] = group
-            return group
-        
-        loaded_count = 0
-        for i, file_path in enumerate(custom_files):
-            if progress.wasCanceled():
-                break
-            
-            progress.setValue(i)
-            progress.setLabelText(f"Loading {file_path.name}...\n({i + 1} of {len(custom_files)})")
-            QApplication.processEvents()
-            
-            file_path_str = str(file_path)
-            if self.canvas.is_path_loaded(file_path_str):
-                continue
-            
+        # Prepare file list with group paths (prefixed with root folder name)
+        files_with_groups = []
+        for file_path in custom_files:
             rel_path = file_path.relative_to(root_path)
             rel_dir = rel_path.parent
-            parent_group = get_or_create_group(rel_dir)
-            
-            try:
+            rel_dir_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
+            # Prefix with root group name
+            group_path_str = f"{root_group_name}/{rel_dir_str}" if rel_dir_str else root_group_name
+            files_with_groups.append((str(file_path), group_path_str))
+        
+        # Use async loading
+        self._start_custom_async_loading(
+            files_with_groups,
+            reader_func=self._custom_reader_func,
+            get_gcps_func=self._custom_gcps_func,
+            ext=ext,
+            progress_label=f"Loading .{ext}"
+        )
+    
+    def _start_custom_async_loading(
+        self,
+        files_with_groups: list[tuple[str, str]],
+        reader_func,
+        get_gcps_func,
+        ext: str,
+        progress_label: str = "Loading custom"
+    ):
+        """Start async loading of custom reader files.
+        
+        Args:
+            files_with_groups: List of (file_path, group_path) tuples
+            reader_func: The custom reader function
+            get_gcps_func: Optional get_gcps function for lazy loading
+            ext: File extension (for project tracking)
+            progress_label: Label shown in progress bar
+        """
+        # Store state for the async operation
+        self._async_custom_group_cache: dict[str, any] = {}
+        self._async_custom_loaded_count = 0
+        self._async_custom_total_files = len(files_with_groups)
+        self._async_custom_ext = ext
+        self._async_custom_pending_files: list[tuple[str, dict]] = []
+        
+        # Create and start the async loader
+        self._async_custom_loader = AsyncCustomFileLoaderThread(self)
+        self._async_custom_loader.set_files(files_with_groups)
+        self._async_custom_loader.set_reader(reader_func, get_gcps_func)
+        
+        # Connect signals
+        self._async_custom_loader.file_loaded.connect(self._on_async_custom_file_loaded)
+        self._async_custom_loader.file_error.connect(self._on_async_custom_file_error)
+        self._async_custom_loader.batch_complete.connect(self._on_async_custom_batch_complete)
+        self._async_custom_loader.progress_update.connect(self._on_async_custom_progress)
+        
+        # Show progress indicator and status
+        self._show_progress(len(files_with_groups), progress_label)
+        self.statusBar.showMessage(
+            f"Loading {len(files_with_groups)} .{ext} files in background (layers hidden by default)..."
+        )
+        
+        # Create a timer for safe UI updates
+        if not hasattr(self, '_async_custom_ui_timer'):
+            self._async_custom_ui_timer = QTimer()
+            self._async_custom_ui_timer.setInterval(100)
+            self._async_custom_ui_timer.timeout.connect(self._process_pending_custom_files)
+        
+        self._async_custom_ui_timer.start()
+        self._async_custom_loader.start()
+    
+    def _on_async_custom_file_loaded(self, file_path: str, layer_data: dict):
+        """Queue a successfully loaded custom file for UI update."""
+        self._async_custom_pending_files.append((file_path, layer_data))
+    
+    def _on_async_custom_file_error(self, file_path: str, error: str):
+        """Handle a custom file failing to load."""
+        print(f"Failed to load custom file {file_path}: {error}")
+    
+    def _on_async_custom_progress(self, processed: int, total: int):
+        """Handle progress updates during async custom loading."""
+        self._update_progress(processed)
+        self.statusBar.showMessage(
+            f"Loading custom files: {processed}/{total} ({self._async_custom_loaded_count} added)..."
+        )
+    
+    def _process_pending_custom_files(self):
+        """Process pending custom files and add them to the UI (called by timer)."""
+        if not self._async_custom_pending_files:
+            return
+        
+        # Process a batch of files (limit to avoid UI freeze)
+        batch_size = min(20, len(self._async_custom_pending_files))
+        batch = self._async_custom_pending_files[:batch_size]
+        self._async_custom_pending_files = self._async_custom_pending_files[batch_size:]
+        
+        self.layer_panel.begin_batch_update()
+        try:
+            for file_path, layer_data in batch:
+                group_path = layer_data['group_path']
+                
+                # Get or create the group hierarchy
+                parent_group = self._get_or_create_custom_group(group_path)
+                
+                # Add the layer to canvas (lazy, will load full data on visibility)
                 layer_id = self.canvas.add_custom_layer(
-                    file_path_str,
+                    file_path,
                     self._custom_reader_func,
                     get_gcps_func=self._custom_gcps_func,
+                    lazy=True,
                     visible=False
                 )
+                
                 if layer_id:
-                    self.layer_panel.add_layer(layer_id, file_path_str, parent_group, visible=False)
-                    # Include root group name in the group path
-                    rel_dir_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
-                    group_path_str = f"{root_group_name}/{rel_dir_str}" if rel_dir_str else root_group_name
-                    self.canvas.set_layer_group(layer_id, group_path_str)
-                    name = file_path.stem
-                    width, height = self.canvas.get_layer_source_dimensions(layer_id)
-                    # Use new reader dict format: {ext: reader_name}
-                    reader_name = self._custom_reader_names.get(ext, "custom")
-                    self.project.add_image(file_path_str, name, group_path_str, width, height, reader={ext: reader_name})
-                    loaded_count += 1
-            except Exception as e:
-                print(f"Error loading {file_path}: {e}")
+                    # Add to tree as hidden
+                    self.layer_panel.add_layer(layer_id, file_path, parent_group, visible=False)
+                    self.canvas.set_layer_group(layer_id, group_path)
+                    
+                    # Track in project
+                    name = Path(file_path).stem
+                    width = layer_data.get('width', 0)
+                    height = layer_data.get('height', 0)
+                    reader_name = self._custom_reader_names.get(self._async_custom_ext, "custom")
+                    self.project.add_image(
+                        file_path, name, group_path, width, height,
+                        reader={self._async_custom_ext: reader_name}
+                    )
+                    
+                    self._async_custom_loaded_count += 1
+        finally:
+            self.layer_panel.end_batch_update()
+    
+    def _get_or_create_custom_group(self, group_path: str):
+        """Get or create group hierarchy for custom async loading."""
+        if not group_path:
+            return None
         
-        progress.setValue(len(custom_files))
+        if group_path in self._async_custom_group_cache:
+            return self._async_custom_group_cache[group_path]
+        
+        # Build path parts
+        parts = group_path.split("/")
+        parent = None
+        current_path = ""
+        
+        for part in parts:
+            current_path = f"{current_path}/{part}" if current_path else part
+            if current_path not in self._async_custom_group_cache:
+                group = self.layer_panel.add_group(part, parent, visible=False)
+                self._async_custom_group_cache[current_path] = group
+            parent = self._async_custom_group_cache[current_path]
+        
+        return parent
+    
+    def _on_async_custom_batch_complete(self, loaded: int, errors: int):
+        """Handle async custom loading completion."""
+        # Stop the UI update timer
+        self._async_custom_ui_timer.stop()
+        
+        # Process any remaining pending files
+        while self._async_custom_pending_files:
+            self._process_pending_custom_files()
+            QApplication.processEvents()
+        
+        # Hide progress indicator
+        self._hide_progress()
+        
+        # Collapse all groups
         self.layer_panel.tree.collapseAll()
         
-        if progress.wasCanceled():
-            self.statusBar.showMessage(f"Loading cancelled. Loaded {loaded_count} of {len(custom_files)} files", 5000)
-        else:
-            self.statusBar.showMessage(f"Loaded {loaded_count} of {len(custom_files)} .{ext} files", 5000)
+        # Clean up loader
+        if hasattr(self, '_async_custom_loader') and self._async_custom_loader is not None:
+            self._async_custom_loader.wait()
+            self._async_custom_loader.deleteLater()
+            self._async_custom_loader = None
+        
+        # Show completion message
+        ext = self._async_custom_ext
+        msg = f"Loaded {self._async_custom_loaded_count} .{ext} files"
+        if errors > 0:
+            msg += f" ({errors} errors)"
+        msg += ". Check layers to display."
+        self.statusBar.showMessage(msg, 10000)
 
     def closeEvent(self, event):
-        """Handle window close - ensure async loader is properly cleaned up."""
-        # Cancel and wait for any running async loader
+        """Handle window close - ensure async loaders are properly cleaned up."""
+        # Cancel and wait for any running async loader (GeoTIFF)
         if hasattr(self, '_async_loader') and self._async_loader is not None:
             if self._async_loader.isRunning():
                 self._async_loader.cancel()
                 self._async_loader.wait()
             self._async_loader = None
         
-        # Stop the UI timer if running
+        # Cancel and wait for any running async custom loader
+        if hasattr(self, '_async_custom_loader') and self._async_custom_loader is not None:
+            if self._async_custom_loader.isRunning():
+                self._async_custom_loader.cancel()
+                self._async_custom_loader.wait()
+            self._async_custom_loader = None
+        
+        # Stop the UI timers if running
         if hasattr(self, '_async_ui_timer'):
             self._async_ui_timer.stop()
+        if hasattr(self, '_async_custom_ui_timer'):
+            self._async_custom_ui_timer.stop()
         
         super().closeEvent(event)
