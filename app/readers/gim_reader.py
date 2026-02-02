@@ -3,6 +3,8 @@
 This reader follows the geolabel custom reader format and can be used
 with the GUI's custom reader feature.
 
+This is added as an example of how to load a custom file format into the app.
+
 GIM Binary Format:
     Header (3 doubles, 24 bytes):
         - width: image width in pixels (double)
