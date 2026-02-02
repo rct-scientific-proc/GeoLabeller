@@ -375,13 +375,15 @@ class CustomTiledLayer:
     rasterio reprojection. The image is already in RGBA format from PIL.
     """
     
-    def __init__(self, file_path: str, reader_func, lazy: bool = False):
+    def __init__(self, file_path: str, reader_func, lazy: bool = False, 
+                 get_gcps_func=None):
         """Initialize a custom tiled layer.
         
         Args:
             file_path: Path to the image file
-            reader_func: Callable that takes filename and returns GCPs
+            reader_func: Callable that takes filename and returns (image_data, gcps)
             lazy: If True, only load bounds initially
+            get_gcps_func: Optional callable that returns (gcps, width, height) for lazy loading
         """
         self.file_path = file_path
         self.name = Path(file_path).stem
@@ -392,6 +394,7 @@ class CustomTiledLayer:
         self.z_value = 0
         
         self._reader_func = reader_func
+        self._get_gcps_func = get_gcps_func
         
         # Original image info for coordinate transforms
         self._src_crs = None
@@ -423,19 +426,27 @@ class CustomTiledLayer:
     def _load_bounds_only(self):
         """Load only bounds from GCPs without loading full image data.
         
-        Note: Since the reader returns both image and GCPs, we must call the
-        reader even for bounds-only loading. The image data is discarded.
+        If a get_gcps function is available, uses it for efficient lazy loading.
+        Otherwise falls back to loading full image and discarding pixel data.
         """
         
-        # Call reader to get image data and GCPs
-        result = self._reader_func(self.file_path)
-        if not isinstance(result, (list, tuple)) or len(result) != 2:
-            raise ValueError("Reader must return a tuple of (image_data, gcps)")
-        
-        image_data, gcps = result
-        
-        # Get dimensions from image data
-        self._src_height, self._src_width = image_data.shape[:2]
+        if self._get_gcps_func is not None:
+            # Use efficient get_gcps function
+            result = self._get_gcps_func(self.file_path)
+            if not isinstance(result, (list, tuple)) or len(result) != 3:
+                raise ValueError("get_gcps must return a tuple of (gcps, width, height)")
+            
+            gcps, width, height = result
+            self._src_width = width
+            self._src_height = height
+        else:
+            # Fall back to full reader, discard image data
+            result = self._reader_func(self.file_path)
+            if not isinstance(result, (list, tuple)) or len(result) != 2:
+                raise ValueError("Reader must return a tuple of (image_data, gcps)")
+            
+            image_data, gcps = result
+            self._src_height, self._src_width = image_data.shape[:2]
         
         # Compute transform from GCPs
         self._src_transform, self._src_crs = gcps_to_affine(gcps, self._src_width, self._src_height)
@@ -489,7 +500,11 @@ class CustomTiledLayer:
         return self._fully_loaded
     
     def get_tile_bounds(self, tx: int, ty: int) -> tuple[int, int, int, int, float, float, float, float]:
-        """Get pixel and world bounds for a tile."""
+        """Get pixel and world bounds for a tile.
+        
+        Note: World bounds returned are axis-aligned bounding box, not the actual
+        rotated tile corners. Use get_tile_transform() for proper rotation support.
+        """
         west, south, east, north = self.bounds
         
         px_left = tx * TILE_SIZE
@@ -506,6 +521,50 @@ class CustomTiledLayer:
         tile_south = north - px_bottom * world_per_pixel_y
         
         return px_left, px_top, px_right, px_bottom, tile_west, tile_south, tile_east, tile_north
+    
+    def get_tile_transform(self, tx: int, ty: int) -> tuple[int, int, int, int, QTransform, float, float]:
+        """Get pixel bounds and QTransform for a tile that includes rotation/shear.
+        
+        Returns:
+            Tuple of (px_left, px_top, px_right, px_bottom, transform, world_x, world_y)
+            where transform is a QTransform that maps tile pixels to world coords,
+            and (world_x, world_y) is the position for the tile's top-left corner.
+        """
+        px_left = tx * TILE_SIZE
+        px_top = ty * TILE_SIZE
+        px_right = min((tx + 1) * TILE_SIZE, self._width)
+        px_bottom = min((ty + 1) * TILE_SIZE, self._height)
+        
+        # Get the affine transform coefficients
+        # Affine: X = a*col + b*row + c, Y = d*col + e*row + f
+        a = self._src_transform.a  # scale x / rotation
+        b = self._src_transform.b  # shear x
+        c = self._src_transform.c  # translate x
+        d = self._src_transform.d  # shear y
+        e = self._src_transform.e  # scale y (usually negative)
+        f = self._src_transform.f  # translate y
+        
+        # Compute the world position of the tile's top-left corner using the affine
+        world_x = a * px_left + b * px_top + c
+        world_y = d * px_left + e * px_top + f
+        
+        # Create a QTransform that applies the affine transformation
+        # QTransform uses: x' = m11*x + m21*y + dx, y' = m12*x + m22*y + dy
+        # But we need to account for Qt's Y-flip in scene coords (Y is negated)
+        # 
+        # Our affine maps pixel (col, row) to Web Mercator (X, Y)
+        # Scene uses (X, -Y), so we need to negate Y outputs
+        transform = QTransform(
+            a,    # m11: how pixel x affects world x
+            -d,   # m12: how pixel x affects world y (negated for Y-flip)
+            b,    # m21: how pixel y affects world x
+            -e,   # m22: how pixel y affects world y (negated for Y-flip)
+            0,    # dx: handled by setPos
+            0     # dy: handled by setPos
+        )
+        
+        # Return scene Y coordinate (negated)
+        return px_left, px_top, px_right, px_bottom, transform, world_x, -world_y
     
     def get_visible_tile_indices(self, view_bounds: tuple[float, float, float, float]) -> list[tuple[int, int]]:
         """Get list of tile indices that intersect with the view bounds.
@@ -931,20 +990,22 @@ class MapCanvas(QGraphicsView):
             return None
     
     def add_custom_layer(self, file_path: str, reader_func, lazy: bool = False, 
-                         visible: bool = True) -> str | None:
+                         visible: bool = True, get_gcps_func=None) -> str | None:
         """Add a layer using a custom reader function with GCPs.
         
         Args:
             file_path: Path to the image file
-            reader_func: Function that takes filename and returns GCPs
+            reader_func: Function that takes filename and returns (image_data, gcps)
             lazy: If True, only load bounds initially
             visible: Whether the layer should be visible initially
+            get_gcps_func: Optional function that returns (gcps, width, height) for lazy loading
         """
         if file_path in self._path_to_layer:
             return self._path_to_layer[file_path]
         
         try:
-            layer = CustomTiledLayer(file_path, reader_func, lazy=lazy)
+            layer = CustomTiledLayer(file_path, reader_func, lazy=lazy, 
+                                     get_gcps_func=get_gcps_func)
             layer.visible = visible
             
             layer_id = f"layer_{self._next_id}"
@@ -1002,21 +1063,26 @@ class MapCanvas(QGraphicsView):
                 
                 item = self._scene.addPixmap(pixmap)
                 
-                # Get tile bounds
-                px_left, px_top, px_right, px_bottom, tile_west, tile_south, tile_east, tile_north = layer.get_tile_bounds(tx, ty)
+                # Check if this is a CustomTiledLayer (supports rotation via affine)
+                if isinstance(layer, CustomTiledLayer):
+                    # Use affine-based transform for proper rotation support
+                    px_left, px_top, px_right, px_bottom, transform, world_x, world_y = layer.get_tile_transform(tx, ty)
+                    item.setTransform(transform)
+                    item.setPos(world_x, world_y)
+                else:
+                    # Standard axis-aligned scaling for GeoTIFF layers
+                    px_left, px_top, px_right, px_bottom, tile_west, tile_south, tile_east, tile_north = layer.get_tile_bounds(tx, ty)
+                    
+                    pixel_width = px_right - px_left
+                    pixel_height = px_bottom - px_top
+                    scale_x = (tile_east - tile_west) / pixel_width
+                    scale_y = (tile_north - tile_south) / pixel_height
+                    
+                    transform = QTransform()
+                    transform.scale(scale_x, scale_y)
+                    item.setTransform(transform)
+                    item.setPos(tile_west, -tile_north)
                 
-                # Scale to world coordinates
-                pixel_width = px_right - px_left
-                pixel_height = px_bottom - px_top
-                scale_x = (tile_east - tile_west) / pixel_width
-                scale_y = (tile_north - tile_south) / pixel_height
-                
-                transform = QTransform()
-                transform.scale(scale_x, scale_y)
-                item.setTransform(transform)
-                
-                # Position at top-left of tile (Y flipped)
-                item.setPos(tile_west, -tile_north)
                 item.setZValue(layer.z_value)
                 item.setVisible(layer.visible)
                 

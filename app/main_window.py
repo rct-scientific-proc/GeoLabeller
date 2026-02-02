@@ -59,8 +59,16 @@ class MainWindow(QMainWindow):
         self._async_ui_timer.timeout.connect(self._process_pending_async_files)
         
         # Custom reader state
+        # Maps file extension -> reader function
+        self._custom_readers: dict[str, callable] = {}
+        # Maps file extension -> get_gcps function (for lazy loading)
+        self._custom_gcps_funcs: dict[str, callable] = {}
+        # Maps file extension -> reader name/path (for saving to project)
+        self._custom_reader_names: dict[str, str] = {}
+        # Legacy single-reader state for backwards compatibility with UI
         self._custom_reader_script: str | None = None
         self._custom_reader_func = None
+        self._custom_gcps_func = None  # get_gcps function for current reader
         self._custom_extension = "png"  # Default extension for custom files
         
         # Cycle mode state
@@ -189,6 +197,12 @@ class MainWindow(QMainWindow):
         
         # Custom Reader submenu
         custom_menu = file_menu.addMenu("Custom &Reader")
+        
+        # Built-in Readers submenu - dynamically populated from app/readers/
+        builtin_menu = custom_menu.addMenu("&Built-in Readers")
+        self._populate_builtin_readers_menu(builtin_menu)
+        
+        custom_menu.addSeparator()
         
         # Set Reader Script
         set_reader_action = QAction("Set Reader &Script...", self)
@@ -673,6 +687,9 @@ class MainWindow(QMainWindow):
                 self.project = LabelProject.load(file_path)
                 self._project_path = Path(file_path)
                 
+                # Load custom readers from project
+                self._load_project_readers()
+                
                 # Show progress for loading images
                 num_images = len(self.project.images)
                 if num_images > 0:
@@ -689,35 +706,150 @@ class MainWindow(QMainWindow):
                 traceback.print_exc()
                 QMessageBox.critical(self, "Error", f"Failed to open project: {e}")
     
+    def _load_project_readers(self):
+        """Load custom readers defined in the project's custom_readers dict."""
+        from .readers import get_reader, get_gcps_func
+        
+        # Clear existing reader state
+        self._custom_readers.clear()
+        self._custom_gcps_funcs.clear()
+        self._custom_reader_names.clear()
+        
+        errors = []
+        for ext, reader_name in self.project.custom_readers.items():
+            try:
+                reader_func = get_reader(reader_name)
+                self._custom_readers[ext] = reader_func
+                self._custom_reader_names[ext] = reader_name
+                
+                # Also try to load get_gcps function for lazy loading
+                gcps_func = get_gcps_func(reader_name)
+                if gcps_func:
+                    self._custom_gcps_funcs[ext] = gcps_func
+            except Exception as e:
+                errors.append(f".{ext}: {e}")
+        
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Reader Loading Errors",
+                "Some custom readers could not be loaded:\n\n" + "\n".join(errors)
+            )
+        
+        # Update status indicator if any readers loaded
+        if self._custom_readers:
+            exts = ", ".join(f".{e}" for e in self._custom_readers.keys())
+            self.reader_status_label.setText(f" Readers: {exts}")
+            self.reader_status_label.setToolTip(f"Custom readers loaded for: {exts}")
+            self.reader_status_label.setStyleSheet("color: green;")
+        else:
+            self.reader_status_label.setText(" Reader: None")
+            self.reader_status_label.setToolTip("No custom reader loaded")
+            self.reader_status_label.setStyleSheet("")
+
     def _start_project_image_loading(self):
-        """Start async loading of project images using the unified async loader."""
+        """Start async loading of project images using the unified async loader.
+        
+        Custom files (with non-default reader) are loaded synchronously first,
+        then GeoTIFFs are loaded asynchronously.
+        """
         import os
         
-        # Prepare file list with group paths from project
-        files_with_groups = []
+        # Separate custom files from GeoTIFFs
+        geotiff_files = []
+        custom_files = []  # (path, group, reader_name, ext)
         missing_files = []
         
         for image in self.project.images.values():
-            if os.path.exists(image.path):
-                files_with_groups.append((image.path, image.group or ""))
-            else:
+            if not os.path.exists(image.path):
                 missing_files.append(image.path)
+            else:
+                # Check if image has a custom (non-default) reader
+                custom_reader = None
+                custom_ext = None
+                for ext, reader_name in image.reader.items():
+                    if reader_name != "default":
+                        custom_reader = reader_name
+                        custom_ext = ext
+                        break
+                
+                if custom_reader:
+                    custom_files.append((image.path, image.group or "", custom_reader, custom_ext))
+                else:
+                    geotiff_files.append((image.path, image.group or ""))
         
         # Store missing files to report later
         self._async_missing_files = missing_files
         
-        if not files_with_groups:
-            # No valid files to load
+        # Load custom files synchronously first (they need reader functions)
+        if custom_files:
+            self._load_custom_project_images(custom_files)
+        
+        if not geotiff_files:
+            # No GeoTIFFs to load - we're done
             self._finish_async_loading_project()
             return
         
-        # Use the unified async loader with project mode
+        # Use the unified async loader for GeoTIFFs
         self._start_unified_async_loading(
-            files_with_groups,
+            geotiff_files,
             mode="project",
             progress_label="Loading project",
             skip_project_add=True  # Images already in project
         )
+    
+    def _load_custom_project_images(self, custom_files: list[tuple[str, str, str, str]]):
+        """Load custom files synchronously during project load.
+        
+        Args:
+            custom_files: List of (path, group, reader_name, ext) tuples
+        """
+        # Group cache for recreating hierarchy
+        group_cache: dict[str, any] = {}
+        
+        def get_or_create_group(group_path: str):
+            if not group_path:
+                return None
+            if group_path in group_cache:
+                return group_cache[group_path]
+            parts = group_path.replace("\\", "/").split("/")
+            parent = None
+            current_path = ""
+            for part in parts:
+                current_path = f"{current_path}/{part}" if current_path else part
+                if current_path not in group_cache:
+                    group = self.layer_panel.add_group(part, parent, visible=False)
+                    group_cache[current_path] = group
+                parent = group_cache[current_path]
+            return parent
+        
+        loaded = 0
+        errors = []
+        
+        for file_path, group_path, reader_name, ext in custom_files:
+            # Get reader for this reader name
+            reader_func = self._custom_readers.get(ext)
+            if not reader_func:
+                errors.append(f"{Path(file_path).name}: No reader loaded for .{ext} (needs {reader_name})")
+                continue
+            
+            # Get optional get_gcps function for lazy loading
+            gcps_func = self._custom_gcps_funcs.get(ext)
+            
+            try:
+                layer_id = self.canvas.add_custom_layer(
+                    file_path, reader_func, get_gcps_func=gcps_func, visible=False
+                )
+                if layer_id:
+                    parent_group = get_or_create_group(group_path)
+                    self.layer_panel.add_layer(layer_id, file_path, parent_group, visible=False)
+                    self.canvas.set_layer_group(layer_id, group_path)
+                    loaded += 1
+            except Exception as e:
+                errors.append(f"{Path(file_path).name}: {e}")
+        
+        if errors:
+            print(f"Errors loading custom files: {errors}")
 
     def _load_project_images(self):
         """Load images stored in the project and recreate group structure."""
@@ -1728,6 +1860,78 @@ class MainWindow(QMainWindow):
         ext = text.strip().lstrip('.')
         self._custom_extension = ext if ext else "png"
     
+    def _populate_builtin_readers_menu(self, menu):
+        """Dynamically populate the built-in readers submenu from app/readers/."""
+        from .readers import list_builtin_readers, get_reader_info
+        
+        readers = list_builtin_readers()
+        
+        if not readers:
+            action = QAction("(No readers available)", self)
+            action.setEnabled(False)
+            menu.addAction(action)
+            return
+        
+        for reader_name in readers:
+            info = get_reader_info(reader_name)
+            display_name = info["display_name"]
+            extension = info["extension"]
+            
+            action = QAction(f"{display_name} ({reader_name})", self)
+            # Use default argument to capture current values in closure
+            action.triggered.connect(
+                lambda checked, r=reader_name, e=extension: self._set_builtin_reader(r, e)
+            )
+            menu.addAction(action)
+    
+    def _set_builtin_reader(self, reader_name: str, default_ext: str):
+        """Set a built-in reader for the specified extension.
+        
+        Args:
+            reader_name: Name of the built-in reader (e.g., "custom_hdf5")
+            default_ext: Default file extension for this reader
+        """
+        try:
+            from .readers import get_reader, get_gcps_func
+            
+            reader_func = get_reader(reader_name)
+            
+            # Update extension field
+            self._custom_extension = default_ext
+            # Also update the UI text field
+            self.custom_ext_edit.setText(default_ext)
+            
+            # Store for legacy single-reader UI
+            self._custom_reader_func = reader_func
+            self._custom_reader_script = None  # Not a script file
+            
+            # Also try to load get_gcps function for lazy loading
+            gcps_func = get_gcps_func(reader_name)
+            self._custom_gcps_func = gcps_func
+            
+            # Register in the multi-reader dict
+            self._custom_readers[default_ext] = reader_func
+            self._custom_reader_names[default_ext] = reader_name
+            if gcps_func:
+                self._custom_gcps_funcs[default_ext] = gcps_func
+            
+            # Also update project's custom_readers
+            self.project.custom_readers[default_ext] = reader_name
+            
+            # Update status
+            self.reader_status_label.setText(f" Reader: {reader_name}")
+            self.reader_status_label.setToolTip(f"Built-in reader: {reader_name} for .{default_ext} files")
+            self.reader_status_label.setStyleSheet("color: green;")
+            
+            self.statusBar.showMessage(f"Built-in reader '{reader_name}' loaded for .{default_ext} files", 5000)
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Error Loading Reader",
+                f"Failed to load built-in reader '{reader_name}':\n\n{e}"
+            )
+    
     def _set_custom_reader_script(self):
         """Open dialog to select a custom reader script."""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -1741,10 +1945,27 @@ class MainWindow(QMainWindow):
             return
         
         try:
-            from .custom_reader import load_reader_function
+            from .custom_reader import load_reader_function, load_gcps_function
             
-            self._custom_reader_func = load_reader_function(file_path)
+            reader_func = load_reader_function(file_path)
+            
+            # Store for legacy single-reader UI
+            self._custom_reader_func = reader_func
             self._custom_reader_script = file_path
+            
+            # Also try to load get_gcps function for lazy loading
+            gcps_func = load_gcps_function(file_path)
+            self._custom_gcps_func = gcps_func
+            
+            # Register in the multi-reader dict for the current extension
+            ext = self._custom_extension
+            self._custom_readers[ext] = reader_func
+            self._custom_reader_names[ext] = file_path  # Store path for external scripts
+            if gcps_func:
+                self._custom_gcps_funcs[ext] = gcps_func
+            
+            # Also update project's custom_readers
+            self.project.custom_readers[ext] = file_path
             
             # Update status
             script_name = Path(file_path).name
@@ -1752,7 +1973,7 @@ class MainWindow(QMainWindow):
             self.reader_status_label.setToolTip(f"Custom reader loaded: {file_path}")
             self.reader_status_label.setStyleSheet("color: green;")
             
-            self.statusBar.showMessage(f"Custom reader loaded: {script_name}", 5000)
+            self.statusBar.showMessage(f"Custom reader loaded: {script_name} for .{ext} files", 5000)
             
         except Exception as e:
             QMessageBox.critical(
@@ -1800,13 +2021,17 @@ class MainWindow(QMainWindow):
             try:
                 layer_id = self.canvas.add_custom_layer(
                     file_path,
-                    self._custom_reader_func
+                    self._custom_reader_func,
+                    get_gcps_func=self._custom_gcps_func,
+                    visible=False
                 )
                 if layer_id:
-                    self.layer_panel.add_layer(layer_id, file_path)
+                    self.layer_panel.add_layer(layer_id, file_path, visible=False)
                     name = Path(file_path).stem
                     width, height = self.canvas.get_layer_source_dimensions(layer_id)
-                    self.project.add_image(file_path, name, "", width, height)
+                    # Use new reader dict format: {ext: reader_name}
+                    reader_name = self._custom_reader_names.get(ext, "custom")
+                    self.project.add_image(file_path, name, "", width, height, reader={ext: reader_name})
                     loaded += 1
             except Exception as e:
                 errors.append(f"{Path(file_path).name}: {e}")
@@ -1863,16 +2088,20 @@ class MainWindow(QMainWindow):
         progress.setMinimumDuration(0)
         progress.setValue(0)
         
+        # Create root group for the selected directory
+        root_group_name = root_path.name
+        root_group = self.layer_panel.add_group(root_group_name, None, visible=False)
+        
         # Build group hierarchy cache
         group_cache: dict[Path, any] = {}
         
         def get_or_create_group(rel_dir: Path):
             if rel_dir == Path(".") or str(rel_dir) == ".":
-                return None
+                return root_group  # Files at root level go under the root group
             if rel_dir in group_cache:
                 return group_cache[rel_dir]
             parent_group = get_or_create_group(rel_dir.parent)
-            group = self.layer_panel.add_group(rel_dir.name, parent_group)
+            group = self.layer_panel.add_group(rel_dir.name, parent_group, visible=False)
             group_cache[rel_dir] = group
             return group
         
@@ -1896,15 +2125,21 @@ class MainWindow(QMainWindow):
             try:
                 layer_id = self.canvas.add_custom_layer(
                     file_path_str,
-                    self._custom_reader_func
+                    self._custom_reader_func,
+                    get_gcps_func=self._custom_gcps_func,
+                    visible=False
                 )
                 if layer_id:
-                    self.layer_panel.add_layer(layer_id, file_path_str, parent_group)
-                    group_path_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
+                    self.layer_panel.add_layer(layer_id, file_path_str, parent_group, visible=False)
+                    # Include root group name in the group path
+                    rel_dir_str = str(rel_dir).replace("\\", "/") if rel_dir != Path(".") else ""
+                    group_path_str = f"{root_group_name}/{rel_dir_str}" if rel_dir_str else root_group_name
                     self.canvas.set_layer_group(layer_id, group_path_str)
                     name = file_path.stem
                     width, height = self.canvas.get_layer_source_dimensions(layer_id)
-                    self.project.add_image(file_path_str, name, group_path_str, width, height)
+                    # Use new reader dict format: {ext: reader_name}
+                    reader_name = self._custom_reader_names.get(ext, "custom")
+                    self.project.add_image(file_path_str, name, group_path_str, width, height, reader={ext: reader_name})
                     loaded_count += 1
             except Exception as e:
                 print(f"Error loading {file_path}: {e}")

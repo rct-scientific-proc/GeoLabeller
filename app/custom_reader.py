@@ -63,6 +63,36 @@ def load_reader_function(script_path: str) -> Callable[[str], list]:
     return reader_func
 
 
+def load_gcps_function(script_path: str) -> Callable[[str], tuple] | None:
+    """Load a get_gcps function from a user-provided Python script.
+    
+    Args:
+        script_path: Path to a Python file that may contain a `get_gcps(filename)` function.
+        
+    Returns:
+        The get_gcps function, or None if not present in the script.
+    """
+    path = Path(script_path)
+    if not path.exists():
+        return None
+    
+    # Load the module dynamically
+    spec = importlib.util.spec_from_file_location("custom_reader_module", path)
+    if spec is None or spec.loader is None:
+        return None
+    
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    
+    # Check for get_gcps function
+    if hasattr(module, 'get_gcps'):
+        gcps_func = getattr(module, 'get_gcps')
+        if callable(gcps_func):
+            return gcps_func
+    
+    return None
+
+
 def gcps_to_affine(gcps: list, img_width: int, img_height: int) -> tuple[Affine, CRS]:
     """Compute an affine transform from GCPs using least-squares fitting.
     
@@ -101,12 +131,12 @@ def gcps_to_affine(gcps: list, img_width: int, img_height: int) -> tuple[Affine,
     dst_x = np.array(xs_mercator)
     dst_y = np.array(ys_mercator)
     
-    # Solve using least squares: A = dst @ pinv(src)
+    # Solve using least squares: A = pinv(src) @ dst
     # For each component separately
     src_pinv = np.linalg.pinv(src)
     
-    affine_x = dst_x @ src_pinv  # [a, b, c] for X = a*px + b*py + c
-    affine_y = dst_y @ src_pinv  # [d, e, f] for Y = d*px + e*py + f
+    affine_x = src_pinv @ dst_x  # [a, b, c] for X = a*px + b*py + c
+    affine_y = src_pinv @ dst_y  # [d, e, f] for Y = d*px + e*py + f
     
     # Create Affine transform
     # Affine(a, b, c, d, e, f) represents:
