@@ -1,39 +1,38 @@
 """Label data model and storage for point annotations."""
 import json
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 
 @dataclass
 class PointLabel:
     """A single point label annotation."""
-    
+
     # Unique identifier (sequential, used internally)
     id: int
-    
+
     # Class/category name
     class_name: str
-    
+
     # Pixel coordinates relative to the image (absolute pixel values)
     pixel_x: float  # column (x)
     pixel_y: float  # row (y)
-    
+
     # Coordinates in WGS84
     lon: float
     lat: float
-    
+
     # Unique ID for this specific label (UUID v4) - always unique per label
     unique_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    
+
     # Object ID for linking labels across images (UUID v4)
     # Linked labels share the same object_id
     object_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    
+
     def to_dict(self, image_width: int = 0, image_height: int = 0) -> dict:
         """Convert to dictionary for serialization.
-        
+
         Args:
             image_width: Original image width for percentage calculation
             image_height: Original image height for percentage calculation
@@ -46,7 +45,7 @@ class PointLabel:
             # Fallback to absolute if dimensions unknown
             pct_x = self.pixel_x
             pct_y = self.pixel_y
-        
+
         return {
             "id": self.id,
             "unique_id": self.unique_id,
@@ -57,12 +56,12 @@ class PointLabel:
             "lat": self.lat,
             "object_id": self.object_id
         }
-    
+
     @classmethod
-    def from_dict(cls, data: dict, image_width: int = 0, image_height: int = 0, 
+    def from_dict(cls, data: dict, image_width: int = 0, image_height: int = 0,
                   version: str = "2.1") -> "PointLabel":
         """Create from dictionary.
-        
+
         Args:
             data: Dictionary with label data
             image_width: Original image width for converting percentages back to pixels
@@ -71,7 +70,7 @@ class PointLabel:
         """
         raw_x = data.get("pixel_x", data.get("x", 0))
         raw_y = data.get("pixel_y", data.get("y", 0))
-        
+
         # Version 2.1+ stores percentages, convert back to absolute pixels
         if version >= "2.1" and image_width > 0 and image_height > 0:
             pixel_x = raw_x * image_width
@@ -80,7 +79,7 @@ class PointLabel:
             # Older versions store absolute pixel coordinates
             pixel_x = raw_x
             pixel_y = raw_y
-        
+
         return cls(
             id=data["id"],
             class_name=data["class_name"],
@@ -97,36 +96,39 @@ class PointLabel:
 @dataclass
 class ImageData:
     """Data for a single image including its labels."""
-    
+
     # Full file path to the image
     path: str
-    
+
     # Filename without extension
     name: str
-    
+
     # Group path (e.g., "folder/subfolder")
     group: str
-    
+
     # Labels on this image
     labels: list[PointLabel] = field(default_factory=list)
-    
+
     # Original image dimensions (as read from disk)
     original_width: int = 0
     original_height: int = 0
-    
-    # Reader info: {extension: reader_name} e.g., {"h5": "custom_hdf5"} or {"tif": "default"}
+
+    # Reader info: {extension: reader_name} e.g., {"h5": "custom_hdf5"} or
+    # {"tif": "default"}
     reader: dict[str, str] = field(default_factory=dict)
-    
+
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization."""
         d = {
             "path": self.path,
             "name": self.name,
             "group": self.group,
-            "labels": [l.to_dict(self.original_width, self.original_height) for l in self.labels],
+            "labels": [
+                l.to_dict(
+                    self.original_width,
+                    self.original_height) for l in self.labels],
             "original_width": self.original_width,
-            "original_height": self.original_height
-        }
+            "original_height": self.original_height}
         # Always include reader info - use "default" for standard GeoTIFFs
         ext = Path(self.path).suffix.lstrip('.').lower() or "tif"
         if self.reader:
@@ -134,24 +136,31 @@ class ImageData:
         else:
             d["reader"] = {ext: "default"}
         return d
-    
+
     @classmethod
     def from_dict(cls, data: dict, version: str = "2.1") -> "ImageData":
         """Create from dictionary."""
         width = data.get("original_width", 0)
         height = data.get("original_height", 0)
-        
+
         # Handle reader field - can be dict or legacy reader_ext string
         reader = data.get("reader", {})
         if not reader and data.get("reader_ext"):
             # Convert legacy reader_ext to new format
             reader = {data["reader_ext"]: "custom"}
-        
+
         return cls(
             path=data["path"],
             name=data["name"],
             group=data.get("group", ""),
-            labels=[PointLabel.from_dict(l, width, height, version) for l in data.get("labels", [])],
+            labels=[
+                PointLabel.from_dict(
+                    l,
+                    width,
+                    height,
+                    version) for l in data.get(
+                    "labels",
+                    [])],
             original_width=width,
             original_height=height,
             reader=reader
@@ -161,40 +170,41 @@ class ImageData:
 @dataclass
 class LabelProject:
     """Container for all images, labels, and classes in a project."""
-    
+
     # User-defined class names
     classes: list[str] = field(default_factory=list)
-    
+
     # Images with their labels (keyed by path for easy lookup)
     images: dict[str, ImageData] = field(default_factory=dict)
-    
+
     # Custom readers: extension -> reader name or path
     # e.g., {"h5": "h5_gcps", "dat": "./my_reader.py"}
     custom_readers: dict[str, str] = field(default_factory=dict)
-    
+
     # Auto-increment ID counter for labels
     _next_id: int = 1
-    
+
     def add_class(self, class_name: str) -> bool:
         """Add a new class. Returns True if added, False if already exists."""
         if class_name and class_name not in self.classes:
             self.classes.append(class_name)
             return True
         return False
-    
+
     def remove_class(self, class_name: str):
         """Remove a class and all labels with that class."""
         if class_name in self.classes:
             self.classes.remove(class_name)
             # Remove labels with this class from all images
             for image in self.images.values():
-                image.labels = [l for l in image.labels if l.class_name != class_name]
-    
-    def add_image(self, path: str, name: str, group: str = "", 
+                image.labels = [
+                    l for l in image.labels if l.class_name != class_name]
+
+    def add_image(self, path: str, name: str, group: str = "",
                   original_width: int = 0, original_height: int = 0,
                   reader: dict[str, str] | None = None) -> ImageData:
         """Add an image to the project (or return existing one).
-        
+
         Args:
             path: Full file path to the image
             name: Filename without extension
@@ -210,12 +220,12 @@ class LabelProject:
                 reader=reader or {}
             )
         return self.images[path]
-    
+
     def update_image_group(self, path: str, group: str):
         """Update the group for an image."""
         if path in self.images:
             self.images[path].group = group
-    
+
     def add_label(
         self,
         class_name: str,
@@ -231,7 +241,7 @@ class LabelProject:
         # Ensure image exists
         if image_path not in self.images:
             self.add_image(image_path, image_name, image_group)
-        
+
         label = PointLabel(
             id=self._next_id,
             class_name=class_name,
@@ -243,12 +253,12 @@ class LabelProject:
         self._next_id += 1
         self.images[image_path].labels.append(label)
         return label
-    
+
     def remove_label(self, label_id: int):
         """Remove a label by ID from any image."""
         for image in self.images.values():
             image.labels = [l for l in image.labels if l.id != label_id]
-    
+
     def get_all_labels(self) -> list[tuple["ImageData", PointLabel]]:
         """Get all labels with their associated image data."""
         result = []
@@ -256,14 +266,15 @@ class LabelProject:
             for label in image.labels:
                 result.append((image, label))
         return result
-    
+
     def get_labels_for_image(self, image_path: str) -> list[PointLabel]:
         """Get all labels for a specific image."""
         if image_path in self.images:
             return self.images[image_path].labels
         return []
-    
-    def get_labels_by_class(self, class_name: str) -> list[tuple["ImageData", PointLabel]]:
+
+    def get_labels_by_class(
+            self, class_name: str) -> list[tuple["ImageData", PointLabel]]:
         """Get all labels with a specific class."""
         result = []
         for image in self.images.values():
@@ -271,29 +282,32 @@ class LabelProject:
                 if label.class_name == class_name:
                     result.append((image, label))
         return result
-    
-    def get_label_by_id(self, label_id: int) -> tuple["ImageData", PointLabel] | tuple[None, None]:
+
+    def get_label_by_id(self,
+                        label_id: int) -> tuple["ImageData",
+                                                PointLabel] | tuple[None,
+                                                                    None]:
         """Get a label and its image by label ID."""
         for image in self.images.values():
             for label in image.labels:
                 if label.id == label_id:
                     return image, label
         return None, None
-    
+
     def link_labels(self, label_id1: int, label_id2: int) -> str | None:
         """Link two labels with the same object_id.
-        
+
         If either label already has an object_id, both labels get that ID.
         If neither has one, a new UUID v4 is generated.
-        
+
         Returns the object_id used, or None if either label wasn't found.
         """
         _, label1 = self.get_label_by_id(label_id1)
         _, label2 = self.get_label_by_id(label_id2)
-        
+
         if not label1 or not label2:
             return None
-        
+
         # Determine which object_id to use
         if label1.object_id:
             object_id = label1.object_id
@@ -301,8 +315,9 @@ class LabelProject:
             object_id = label2.object_id
         else:
             object_id = str(uuid.uuid4())
-        
-        # If both have different object_ids, merge them (all labels with label2's id get label1's id)
+
+        # If both have different object_ids, merge them (all labels with
+        # label2's id get label1's id)
         if label1.object_id and label2.object_id and label1.object_id != label2.object_id:
             old_id = label2.object_id
             for image in self.images.values():
@@ -312,38 +327,39 @@ class LabelProject:
         else:
             label1.object_id = object_id
             label2.object_id = object_id
-        
+
         return object_id
-    
+
     def unlink_label(self, label_id: int):
         """Remove a label from its object group by giving it a new unique UUID."""
         _, label = self.get_label_by_id(label_id)
         if label:
             label.object_id = str(uuid.uuid4())
-    
-    def get_linked_labels(self, label_id: int) -> list[tuple["ImageData", PointLabel]]:
+
+    def get_linked_labels(
+            self, label_id: int) -> list[tuple["ImageData", PointLabel]]:
         """Get all labels linked to the given label (same object_id).
-        
+
         Returns labels only if there are 2 or more with the same object_id.
         """
         _, source_label = self.get_label_by_id(label_id)
         if not source_label or not source_label.object_id:
             return []
-        
+
         result = []
         for image in self.images.values():
             for label in image.labels:
                 if label.object_id == source_label.object_id:
                     result.append((image, label))
-        
+
         # Only return if there are actually linked labels (more than 1)
         return result if len(result) > 1 else []
-    
+
     @property
     def label_count(self) -> int:
         """Get total number of labels across all images."""
         return sum(len(img.labels) for img in self.images.values())
-    
+
     def save(self, file_path: str | Path):
         """Save project to JSON file."""
         data = {
@@ -354,35 +370,36 @@ class LabelProject:
         }
         with open(file_path, 'w') as f:
             json.dump(data, f, indent=2)
-    
+
     @classmethod
     def load(cls, file_path: str | Path) -> "LabelProject":
         """Load project from JSON file."""
         with open(file_path, 'r') as f:
             data = json.load(f)
-        
+
         project = cls()
         project.classes = data.get("classes", [])
         project._next_id = data.get("_next_id", 1)
-        
+
         # Load legacy top-level custom_readers if present (v3.0 format)
         legacy_readers = data.get("custom_readers", {})
-        
+
         version = data.get("version", "1.0")
-        
+
         if version >= "2.0":
             # Image-centric format (2.0 and later)
             for img_data in data.get("images", []):
                 image = ImageData.from_dict(img_data, version)
                 project.images[image.path] = image
-                
+
                 # Build custom_readers dict from per-image reader info
                 if image.reader:
                     for ext, reader_name in image.reader.items():
                         if reader_name != "default" and ext not in project.custom_readers:
                             project.custom_readers[ext] = reader_name
-            
-            # Also include any legacy top-level custom_readers not already present
+
+            # Also include any legacy top-level custom_readers not already
+            # present
             for ext, reader_name in legacy_readers.items():
                 if ext not in project.custom_readers:
                     project.custom_readers[ext] = reader_name
@@ -392,39 +409,42 @@ class LabelProject:
                 image_path = label_data.get("image_path", "")
                 image_name = label_data.get("image_name", "")
                 image_group = label_data.get("image_group", "")
-                
+
                 if image_path and image_path not in project.images:
                     project.images[image_path] = ImageData(
                         path=image_path,
                         name=image_name,
                         group=image_group
                     )
-                
+
                 if image_path:
                     label = PointLabel(
                         id=label_data["id"],
                         class_name=label_data["class_name"],
-                        pixel_x=label_data.get("pixel_x", label_data.get("x", 0)),
-                        pixel_y=label_data.get("pixel_y", label_data.get("y", 0)),
+                        pixel_x=label_data.get(
+                            "pixel_x", label_data.get("x", 0)),
+                        pixel_y=label_data.get(
+                            "pixel_y", label_data.get("y", 0)),
                         lon=label_data["lon"],
                         lat=label_data["lat"]
                     )
                     project.images[image_path].labels.append(label)
-            
+
             # Also check for image_paths from v1 format
             for path in data.get("image_paths", []):
                 if path not in project.images:
                     name = Path(path).stem
-                    project.images[path] = ImageData(path=path, name=name, group="")
-        
+                    project.images[path] = ImageData(
+                        path=path, name=name, group="")
+
         return project
-    
+
     def clear(self):
         """Clear all labels but keep images and classes."""
         for image in self.images.values():
             image.labels.clear()
         self._next_id = 1
-    
+
     def clear_all(self):
         """Clear everything."""
         self.classes.clear()
