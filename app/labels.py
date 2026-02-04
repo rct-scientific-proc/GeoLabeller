@@ -184,6 +184,30 @@ class LabelProject:
     # Auto-increment ID counter for labels
     _next_id: int = 1
 
+    # Index mapping object_id -> set of label_ids for O(1) linked label lookup
+    _object_id_index: dict[str, set[int]] = field(default_factory=dict)
+
+    def _index_label(self, label: PointLabel):
+        """Add a label to the object_id index."""
+        if label.object_id not in self._object_id_index:
+            self._object_id_index[label.object_id] = set()
+        self._object_id_index[label.object_id].add(label.id)
+
+    def _unindex_label(self, label: PointLabel):
+        """Remove a label from the object_id index."""
+        if label.object_id in self._object_id_index:
+            self._object_id_index[label.object_id].discard(label.id)
+            # Clean up empty sets
+            if not self._object_id_index[label.object_id]:
+                del self._object_id_index[label.object_id]
+
+    def _rebuild_index(self):
+        """Rebuild the object_id index from scratch (used after loading)."""
+        self._object_id_index.clear()
+        for image in self.images.values():
+            for label in image.labels:
+                self._index_label(label)
+
     def add_class(self, class_name: str) -> bool:
         """Add a new class. Returns True if added, False if already exists."""
         if class_name and class_name not in self.classes:
@@ -197,6 +221,10 @@ class LabelProject:
             self.classes.remove(class_name)
             # Remove labels with this class from all images
             for image in self.images.values():
+                # Unindex labels being removed
+                for label in image.labels:
+                    if label.class_name == class_name:
+                        self._unindex_label(label)
                 image.labels = [
                     l for l in image.labels if l.class_name != class_name]
 
@@ -252,11 +280,17 @@ class LabelProject:
         )
         self._next_id += 1
         self.images[image_path].labels.append(label)
+        # Register in object_id index
+        self._index_label(label)
         return label
 
     def remove_label(self, label_id: int):
         """Remove a label by ID from any image."""
         for image in self.images.values():
+            for label in image.labels:
+                if label.id == label_id:
+                    self._unindex_label(label)
+                    break
             image.labels = [l for l in image.labels if l.id != label_id]
 
     def get_all_labels(self) -> list[tuple["ImageData", PointLabel]]:
@@ -320,13 +354,22 @@ class LabelProject:
         # label2's id get label1's id)
         if label1.object_id and label2.object_id and label1.object_id != label2.object_id:
             old_id = label2.object_id
+            # Get all label_ids that need to be moved (from the index)
+            labels_to_move = list(self._object_id_index.get(old_id, set()))
             for image in self.images.values():
                 for label in image.labels:
-                    if label.object_id == old_id:
+                    if label.id in labels_to_move:
+                        self._unindex_label(label)
                         label.object_id = object_id
+                        self._index_label(label)
         else:
+            # Update index for both labels
+            self._unindex_label(label1)
+            self._unindex_label(label2)
             label1.object_id = object_id
             label2.object_id = object_id
+            self._index_label(label1)
+            self._index_label(label2)
 
         return object_id
 
@@ -334,26 +377,36 @@ class LabelProject:
         """Remove a label from its object group by giving it a new unique UUID."""
         _, label = self.get_label_by_id(label_id)
         if label:
+            self._unindex_label(label)
             label.object_id = str(uuid.uuid4())
+            self._index_label(label)
 
     def get_linked_labels(
             self, label_id: int) -> list[tuple["ImageData", PointLabel]]:
         """Get all labels linked to the given label (same object_id).
 
         Returns labels only if there are 2 or more with the same object_id.
+        Uses the object_id index for O(1) lookup.
         """
         _, source_label = self.get_label_by_id(label_id)
         if not source_label or not source_label.object_id:
             return []
 
-        result = []
-        for image in self.images.values():
-            for label in image.labels:
-                if label.object_id == source_label.object_id:
-                    result.append((image, label))
+        # Use the index to get all label_ids with the same object_id
+        linked_label_ids = self._object_id_index.get(source_label.object_id, set())
 
-        # Only return if there are actually linked labels (more than 1)
-        return result if len(result) > 1 else []
+        # Only proceed if there are actually linked labels (more than 1)
+        if len(linked_label_ids) <= 1:
+            return []
+
+        # Build result list by looking up each label_id
+        result = []
+        for lid in linked_label_ids:
+            image, label = self.get_label_by_id(lid)
+            if image and label:
+                result.append((image, label))
+
+        return result
 
     @property
     def label_count(self) -> int:
@@ -437,6 +490,9 @@ class LabelProject:
                     project.images[path] = ImageData(
                         path=path, name=name, group="")
 
+        # Rebuild the object_id index after loading
+        project._rebuild_index()
+
         return project
 
     def clear(self):
@@ -444,6 +500,7 @@ class LabelProject:
         for image in self.images.values():
             image.labels.clear()
         self._next_id = 1
+        self._object_id_index.clear()
 
     def clear_all(self):
         """Clear everything."""
@@ -451,3 +508,4 @@ class LabelProject:
         self.images.clear()
         self.custom_readers.clear()
         self._next_id = 1
+        self._object_id_index.clear()

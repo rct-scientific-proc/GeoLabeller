@@ -976,6 +976,115 @@ class LabeledLayerPanel(QWidget):
 
         self.tree.blockSignals(False)
 
+    def add_label(self, label, image, visibility_checker=None):
+        """Add a single label to the tree incrementally (O(1) instead of full refresh).
+
+        Args:
+            label: The PointLabel to add
+            image: The ImageData the label belongs to
+            visibility_checker: Optional callable(file_path) -> bool to check layer visibility
+        """
+        self.tree.blockSignals(True)
+        style = QApplication.style()
+
+        object_id = label.object_id
+
+        # Find existing group for this object_id
+        group_item = None
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            if item.data(0, Qt.UserRole) == object_id:
+                group_item = item
+                break
+
+        # Create new group if needed
+        if group_item is None:
+            group_item = QTreeWidgetItem()
+            short_id = object_id[:8] + "..."  # Truncate UUID for display
+            group_item.setText(0, f"Object: {short_id} (1)")
+            group_item.setData(0, Qt.UserRole, object_id)
+            group_item.setData(0, Qt.UserRole + 1, "group")
+            group_item.setFlags(group_item.flags() | Qt.ItemIsUserCheckable)
+            group_item.setIcon(0, style.standardIcon(QStyle.SP_DirIcon))
+
+            font = group_item.font(0)
+            font.setBold(True)
+            group_item.setFont(0, font)
+            # Cornflower blue for single label
+            group_item.setForeground(0, QColor(100, 149, 237))
+            group_item.setCheckState(0, Qt.Unchecked)
+            group_item.setExpanded(True)
+
+            self.tree.addTopLevelItem(group_item)
+        else:
+            # Update group label count and color
+            new_count = group_item.childCount() + 1
+            short_id = object_id[:8] + "..."
+            group_item.setText(0, f"Object: {short_id} ({new_count})")
+            if new_count > 1:
+                # Steel blue for linked
+                group_item.setForeground(0, QColor(70, 130, 180))
+
+        # Create label item
+        label_item = QTreeWidgetItem()
+        label_item.setText(
+            0, f"#{label.id}: {image.name} [{label.class_name}]")
+        label_item.setData(0, Qt.UserRole, image.path)
+        label_item.setData(0, Qt.UserRole + 1, "label")
+        label_item.setData(0, Qt.UserRole + 2, label.id)
+        label_item.setData(0, Qt.UserRole + 3, label.lon)
+        label_item.setData(0, Qt.UserRole + 4, label.lat)
+        label_item.setFlags(label_item.flags() | Qt.ItemIsUserCheckable)
+
+        # Check visibility
+        is_visible = visibility_checker(image.path) if visibility_checker else False
+        label_item.setCheckState(0, Qt.Checked if is_visible else Qt.Unchecked)
+
+        label_item.setToolTip(
+            0, f"Label #{label.id} on {image.path}\nLon: {label.lon:.6f}, Lat: {label.lat:.6f}")
+        label_item.setIcon(0, style.standardIcon(QStyle.SP_FileIcon))
+        group_item.addChild(label_item)
+
+        # Update group check state if this label is visible
+        if is_visible and group_item.checkState(0) != Qt.Checked:
+            group_item.setCheckState(0, Qt.Checked)
+
+        self.tree.blockSignals(False)
+
+    def remove_label(self, label_id: int):
+        """Remove a single label from the tree incrementally.
+
+        Args:
+            label_id: The ID of the label to remove
+        """
+        self.tree.blockSignals(True)
+
+        # Find and remove the label item
+        for i in range(self.tree.topLevelItemCount()):
+            group_item = self.tree.topLevelItem(i)
+            for j in range(group_item.childCount()):
+                child = group_item.child(j)
+                if child.data(0, Qt.UserRole + 2) == label_id:
+                    group_item.removeChild(child)
+
+                    # Update or remove the group
+                    remaining = group_item.childCount()
+                    if remaining == 0:
+                        self.tree.takeTopLevelItem(i)
+                    else:
+                        # Update label count and color
+                        object_id = group_item.data(0, Qt.UserRole)
+                        short_id = object_id[:8] + "..."
+                        group_item.setText(0, f"Object: {short_id} ({remaining})")
+                        if remaining == 1:
+                            # Back to cornflower blue for single
+                            group_item.setForeground(0, QColor(100, 149, 237))
+
+                    self.tree.blockSignals(False)
+                    return
+
+        self.tree.blockSignals(False)
+
     def _on_item_changed(self, item: QTreeWidgetItem, column: int):
         """Handle item check state changes."""
         item_type = item.data(0, Qt.UserRole + 1)
@@ -1326,6 +1435,20 @@ class CombinedLayerPanel(QWidget):
 
         self.labeled_panel.refresh(
             project, visibility_checker=check_visibility)
+
+    def add_label_to_panel(self, label, image):
+        """Add a single label to the labeled panel incrementally."""
+        def check_visibility(file_path: str) -> bool:
+            layer_id = self.labeled_panel._layer_id_map.get(file_path)
+            if layer_id:
+                return self.main_panel.is_layer_checked(layer_id)
+            return False
+
+        self.labeled_panel.add_label(label, image, visibility_checker=check_visibility)
+
+    def remove_label_from_panel(self, label_id: int):
+        """Remove a single label from the labeled panel incrementally."""
+        self.labeled_panel.remove_label(label_id)
 
     @property
     def tree(self):

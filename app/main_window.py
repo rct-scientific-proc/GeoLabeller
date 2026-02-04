@@ -577,8 +577,10 @@ class MainWindow(QMainWindow):
             class_name,
             color)
 
-        # Refresh labeled images panel
-        self.layer_panel.refresh_labeled_panel(self.project)
+        # Add to labeled images panel incrementally (O(1) instead of full refresh)
+        image = self.project.images.get(image_path)
+        if image:
+            self.layer_panel.add_label_to_panel(label, image)
 
         self.statusBar.showMessage(
             f"Added label: {class_name} at ({
@@ -595,8 +597,8 @@ class MainWindow(QMainWindow):
         # Remove visual marker
         self.canvas.remove_label_marker(label_id)
 
-        # Refresh labeled images panel
-        self.layer_panel.refresh_labeled_panel(self.project)
+        # Remove from labeled images panel incrementally (O(1) instead of full refresh)
+        self.layer_panel.remove_label_from_panel(label_id)
 
         self.statusBar.showMessage(f"Removed label", 3000)
 
