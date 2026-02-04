@@ -179,6 +179,7 @@ class MainWindow(QMainWindow):
         self.canvas.toggle_layer_visibility_requested.connect(
             self.layer_panel.toggle_layer_visibility)
         self.canvas.cycle_next_requested.connect(self._cycle_to_next_layer)
+        self.canvas.cycle_prev_requested.connect(self._cycle_to_prev_layer)
 
     def _setup_menu(self):
         """Set up the menu bar."""
@@ -439,7 +440,7 @@ class MainWindow(QMainWindow):
             f"Cycle mode: Layer {
                 self._cycle_index + 1}/{
                 len(
-                    self._cycle_layers)} - Press Space to cycle",
+                    self._cycle_layers)} - Space=next, Ctrl+Space=prev",
             0  # No timeout
         )
 
@@ -476,11 +477,44 @@ class MainWindow(QMainWindow):
             f"Cycle mode: Layer {
                 self._cycle_index + 1}/{
                 len(
-                    self._cycle_layers)} - Press Space to cycle",
+                    self._cycle_layers)} - Space=next, Ctrl+Space=prev",
             0
         )
 
         # Refocus canvas so Space key continues to work
+        self.canvas.setFocus()
+
+    def _cycle_to_prev_layer(self):
+        """Go back to the previous layer in the cycle (undo the last forward step)."""
+        if not self._cycle_layers or self._cycle_index < 0:
+            self.statusBar.showMessage("No layers to cycle through", 3000)
+            return
+
+        # Check if we're already at the last layer (can't go back further)
+        if self._cycle_index >= len(self._cycle_layers) - 1:
+            self.statusBar.showMessage("Already at the first layer in cycle", 3000)
+            return
+
+        # Toggle off current layer
+        current_layer_id = self._cycle_layers[self._cycle_index]
+        self.layer_panel.uncheck_layers([current_layer_id])
+
+        # Move to next index (going forwards through the list = backwards in cycle)
+        self._cycle_index += 1
+
+        # Turn on and zoom to previous layer
+        prev_layer_id = self._cycle_layers[self._cycle_index]
+        self.layer_panel.check_layers([prev_layer_id])
+        self.canvas.zoom_to_layer(prev_layer_id)
+        self.statusBar.showMessage(
+            f"Cycle mode: Layer {
+                self._cycle_index + 1}/{
+                len(
+                    self._cycle_layers)} - Space=next, Ctrl+Space=prev",
+            0
+        )
+
+        # Refocus canvas so keys continue to work
         self.canvas.setFocus()
 
     def _on_class_changed(self, class_name: str):

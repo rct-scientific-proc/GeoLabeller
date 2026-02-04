@@ -15,6 +15,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Dependencies to include
 build_exe_options = {
+    # Optimization level: 0=none, 1=basic (-O), 2=full (-OO removes docstrings)
+    "optimize": 2,
+    
+    # Compress Python modules into a zip file for smaller distribution
+    "zip_include_packages": ["*"],
+    "zip_exclude_packages": [],  # Keep empty unless specific packages have issues
+    
     "packages": [
         "PyQt5",
         "PyQt5.QtCore",

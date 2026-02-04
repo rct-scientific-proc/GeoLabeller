@@ -1105,6 +1105,9 @@ class MapCanvas(QGraphicsView):
     # Signal emitted when Space is pressed in cycle mode
     cycle_next_requested = pyqtSignal()
 
+    # Signal emitted when Ctrl+Space is pressed in cycle mode (go backwards)
+    cycle_prev_requested = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         self._scene = QGraphicsScene()
@@ -1435,6 +1438,15 @@ class MapCanvas(QGraphicsView):
 
         factor = 1.15
         if event.angleDelta().y() > 0:
+            # Zooming in - check if we'd exceed the minimum view size (10m)
+            # Get current view bounds in scene coordinates (Web Mercator = meters)
+            view_rect = self.mapToScene(self.viewport().rect()).boundingRect()
+            new_width = view_rect.width() / factor
+            new_height = view_rect.height() / factor
+            MIN_VIEW_SIZE = 10.0  # meters
+            if new_width < MIN_VIEW_SIZE or new_height < MIN_VIEW_SIZE:
+                # Don't zoom in further
+                return
             self.scale(factor, factor)
         else:
             self.scale(1 / factor, 1 / factor)
@@ -1443,11 +1455,16 @@ class MapCanvas(QGraphicsView):
         new_pos = self.mapToScene(event.pos())
 
         # Adjust scrollbars to keep the point under the mouse fixed
+        # Clamp values to prevent integer overflow when zoomed in extremely far
         delta = old_pos - new_pos
-        self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() +
-                                            int(delta.x() * self.transform().m11()))
-        self.verticalScrollBar().setValue(self.verticalScrollBar().value() +
-                                          int(delta.y() * self.transform().m22()))
+        INT_MAX = 2**31 - 1
+        INT_MIN = -(2**31)
+        h_delta = delta.x() * self.transform().m11()
+        v_delta = delta.y() * self.transform().m22()
+        h_delta = max(INT_MIN, min(INT_MAX, h_delta))
+        v_delta = max(INT_MIN, min(INT_MAX, v_delta))
+        self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + int(h_delta))
+        self.verticalScrollBar().setValue(self.verticalScrollBar().value() + int(v_delta))
 
         self._schedule_tile_update()
         self.update_label_markers_scale()
@@ -1628,7 +1645,12 @@ class MapCanvas(QGraphicsView):
         if event.key() == Qt.Key_Escape and self._link_mode_active:
             self._exit_link_mode()
         elif event.key() == Qt.Key_Space and self._mode == CanvasMode.CYCLE:
-            self.cycle_next_requested.emit()
+            if event.modifiers() & Qt.ControlModifier:
+                # Ctrl+Space: go backwards
+                self.cycle_prev_requested.emit()
+            else:
+                # Space: go forwards
+                self.cycle_next_requested.emit()
         else:
             super().keyPressEvent(event)
 
