@@ -379,12 +379,22 @@ class MainWindow(QMainWindow):
         """Handle global key press events.
 
         Captures Space key when in cycle mode regardless of which widget has focus.
+        Keys 1-9 switch to the corresponding class (first 9 classes).
         """
         if event.key() == Qt.Key_Space and self.canvas._mode == CanvasMode.CYCLE:
             # Handle space in cycle mode globally
             self._cycle_to_next_layer()
             event.accept()
             return
+
+        # Handle 1-9 keys for quick class switching
+        if Qt.Key_1 <= event.key() <= Qt.Key_9:
+            class_index = event.key() - Qt.Key_1  # 0-8
+            if class_index < len(self.project.classes):
+                self.class_combo.setCurrentIndex(class_index)
+                event.accept()
+                return
+
         super().keyPressEvent(event)
 
     def eventFilter(self, obj, event: QEvent) -> bool:
