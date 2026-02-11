@@ -1369,6 +1369,7 @@ class MapCanvas(QGraphicsView):
             self._layers[layer_id].remove_from_scene(self._scene)
         self._layers.clear()
         self._layer_order.clear()
+        self._path_to_layer.clear()
 
     def set_layer_group(self, layer_id: str, group_path: str):
         """Set the group path for a layer."""
@@ -1391,6 +1392,18 @@ class MapCanvas(QGraphicsView):
             layer = self._layers[layer_id]
             return layer._src_width, layer._src_height
         return 0, 0
+
+    def get_layer_transform(self, layer_id: str) -> tuple:
+        """Get the affine transform and CRS for a layer.
+
+        Returns:
+            Tuple of (affine, crs) where affine is an Affine transform and
+            crs is a rasterio CRS, or (None, None) if layer not found.
+        """
+        if layer_id in self._layers:
+            layer = self._layers[layer_id]
+            return layer._src_transform, layer._src_crs
+        return None, None
 
     def zoom_to_layer(self, layer_id: str):
         """Zoom the view to fit a specific layer's bounds."""

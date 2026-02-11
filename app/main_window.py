@@ -2,7 +2,10 @@
 import json
 import math
 import os
+import platform
+import tempfile
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +35,26 @@ from .custom_reader import load_reader_function, load_gcps_function
 from .labels import LabelProject, ImageData
 from .layer_panel import CombinedLayerPanel
 from .readers import get_reader, get_gcps_func, list_builtin_readers, get_reader_info
+
+
+def get_recovery_dir() -> Path:
+    """Get the directory for recovery files (platform-specific)."""
+    if platform.system() == "Windows":
+        base = Path(os.environ.get("APPDATA", tempfile.gettempdir()))
+    else:
+        base = Path.home()
+    recovery_dir = base / ".geolabel"
+    recovery_dir.mkdir(parents=True, exist_ok=True)
+    return recovery_dir
+
+
+# Recovery file paths
+RECOVERY_DIR = get_recovery_dir()
+RECOVERY_FILE = RECOVERY_DIR / "recovery.geolabel"
+CRASH_MARKER_FILE = RECOVERY_DIR / ".running"
+
+# Auto-save interval in milliseconds (60 seconds)
+AUTOSAVE_INTERVAL_MS = 60000
 
 # Colors for different classes (cycles through these)
 CLASS_COLORS = [
@@ -97,9 +120,18 @@ class MainWindow(QMainWindow):
         # Current position in cycle (-1 means not started)
         self._cycle_index: int = -1
 
+        # Auto-save timer for crash recovery
+        self._autosave_timer = QTimer()
+        self._autosave_timer.setInterval(AUTOSAVE_INTERVAL_MS)
+        self._autosave_timer.timeout.connect(self._autosave_recovery)
+
         self._setup_ui()
         self._setup_menu()
         self._setup_toolbar()
+
+        # Start auto-save and crash detection
+        self._start_crash_detection()
+        self._check_for_recovery()
 
     def _setup_ui(self):
         """Set up the main UI layout."""
@@ -769,8 +801,47 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.No:
                 return
 
+        # Cancel any pending async operations
+        self._async_ui_timer.stop()
+        if self._async_loader is not None:
+            self._async_loader.cancel()
+            self._async_loader = None
+        self._async_pending_files.clear()
+        self._async_missing_files.clear()
+
+        # Cancel custom async loader if running
+        if hasattr(self, '_async_custom_ui_timer'):
+            self._async_custom_ui_timer.stop()
+        if hasattr(self, '_async_custom_loader') and self._async_custom_loader is not None:
+            self._async_custom_loader.cancel()
+            self._async_custom_loader = None
+        if hasattr(self, '_async_custom_pending_files'):
+            self._async_custom_pending_files.clear()
+
+        self._hide_progress()
+
+        # Clear project state
         self.project = LabelProject()
         self._project_path = None
+
+        # Clear custom reader state
+        self._custom_readers.clear()
+        self._custom_gcps_funcs.clear()
+        self._custom_reader_names.clear()
+        self._custom_reader_script = None
+        self._custom_reader_func = None
+        self._custom_gcps_func = None
+
+        # Reset reader status UI
+        self.reader_status_label.setText(" Reader: None")
+        self.reader_status_label.setToolTip("No custom reader loaded")
+        self.reader_status_label.setStyleSheet("")
+
+        # Clear cycle mode state
+        self._cycle_layers.clear()
+        self._cycle_index = -1
+
+        # Clear canvas and UI
         self.canvas.clear_label_markers()
         self.canvas.clear_layers()
         self.layer_panel.clear()
@@ -1151,6 +1222,126 @@ class MainWindow(QMainWindow):
                 ("\n..." if len(missing) > 5 else "")
             )
 
+    # -------------------------------------------------------------------------
+    # Crash Recovery / Auto-Save
+    # -------------------------------------------------------------------------
+
+    def _start_crash_detection(self):
+        """Start crash detection and auto-save timer.
+
+        Creates a crash marker file that persists while the app is running.
+        If the app crashes, this file will still exist on next startup.
+        """
+        try:
+            # Create crash marker with timestamp
+            CRASH_MARKER_FILE.write_text(datetime.now().isoformat())
+            # Start auto-save timer
+            self._autosave_timer.start()
+        except Exception as e:
+            print(f"Warning: Could not start crash detection: {e}")
+
+    def _check_for_recovery(self):
+        """Check for recovery file on startup and offer to restore.
+
+        If a crash marker exists along with a recovery file, it means
+        the previous session crashed without saving.
+        """
+        try:
+            has_crash_marker = CRASH_MARKER_FILE.exists()
+            has_recovery = RECOVERY_FILE.exists()
+
+            if has_crash_marker and has_recovery:
+                # Get recovery file age
+                recovery_time = datetime.fromtimestamp(
+                    RECOVERY_FILE.stat().st_mtime)
+                age_minutes = (datetime.now() - recovery_time).total_seconds() / 60
+
+                reply = QMessageBox.question(
+                    self,
+                    "Recover Previous Session",
+                    f"GeoLabel appears to have closed unexpectedly.\n\n"
+                    f"A recovery file was found from {age_minutes:.0f} minutes ago.\n\n"
+                    f"Would you like to restore your previous session?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+
+                if reply == QMessageBox.Yes:
+                    self._restore_from_recovery()
+                # If user declines, recovery file is preserved until next save
+
+            # If has_recovery but no crash_marker, keep the recovery file
+            # until user explicitly saves
+
+        except Exception as e:
+            print(f"Warning: Error checking for recovery: {e}")
+
+    def _restore_from_recovery(self):
+        """Restore project state from recovery file."""
+        try:
+            self.project = LabelProject.load(RECOVERY_FILE)
+
+            # Load custom readers from project
+            self._load_project_readers()
+
+            # Show progress for loading images
+            num_images = len(self.project.images)
+            if num_images > 0:
+                self._show_progress(num_images, "Restoring session")
+                self._start_project_image_loading()
+            else:
+                self._update_class_combo()
+                self._refresh_label_markers()
+
+            self.setWindowTitle("GeoLabel - Recovered Session (unsaved)")
+            self.statusBar.showMessage(
+                f"Restored {self.project.label_count} labels from recovery", 5000)
+
+            # Recovery file is preserved until user explicitly saves
+
+        except Exception as e:
+            traceback.print_exc()
+            QMessageBox.warning(
+                self,
+                "Recovery Failed",
+                f"Could not restore from recovery file:\n{e}\n\n"
+                f"The recovery file will be preserved at:\n{RECOVERY_FILE}"
+            )
+
+    def _autosave_recovery(self):
+        """Auto-save current project state to recovery file.
+
+        Called periodically by the auto-save timer.
+        Only saves if there's something to save (labels or images).
+        """
+        try:
+            if self.project.label_count > 0 or self.project.images:
+                self.project.save(RECOVERY_FILE)
+                # Update crash marker timestamp
+                CRASH_MARKER_FILE.write_text(datetime.now().isoformat())
+        except Exception as e:
+            # Don't show error to user for background auto-save
+            print(f"Warning: Auto-save failed: {e}")
+
+    def _clear_recovery_file(self):
+        """Clear the recovery file (called after manual save or new project)."""
+        try:
+            if RECOVERY_FILE.exists():
+                RECOVERY_FILE.unlink()
+        except Exception as e:
+            print(f"Warning: Could not clear recovery file: {e}")
+
+    def _clean_exit(self):
+        """Clean up crash detection on normal exit."""
+        try:
+            # Stop auto-save timer
+            self._autosave_timer.stop()
+            # Remove crash marker (indicates clean exit)
+            if CRASH_MARKER_FILE.exists():
+                CRASH_MARKER_FILE.unlink()
+            # Recovery file is preserved until user explicitly saves
+        except Exception as e:
+            print(f"Warning: Could not clean up on exit: {e}")
+
     def _save_project(self):
         """Save the current project."""
         if self._project_path:
@@ -1181,6 +1372,8 @@ class MainWindow(QMainWindow):
                 f"Saved {
                     self.project.label_count} labels to {
                     path.name}", 3000)
+            # Clear recovery file after successful save
+            self._clear_recovery_file()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save project: {e}")
 
@@ -1344,7 +1537,7 @@ class MainWindow(QMainWindow):
                 return
 
             data = {
-                "version": "2.1",
+                "version": "3.2",
                 "classes": self.project.classes,
                 "images": images,
                 "_next_id": self.project._next_id
@@ -1647,11 +1840,13 @@ class MainWindow(QMainWindow):
             layer_id = self.canvas.add_layer(file_path)
             if layer_id:
                 self.layer_panel.add_layer(layer_id, file_path)
-                # Track the loaded image with original dimensions
+                # Track the loaded image with original dimensions and transform
                 name = Path(file_path).stem
                 width, height = self.canvas.get_layer_source_dimensions(
                     layer_id)
-                self.project.add_image(file_path, name, "", width, height)
+                affine, crs = self.canvas.get_layer_transform(layer_id)
+                self.project.add_image(
+                    file_path, name, "", width, height, affine=affine, crs=crs)
 
         if skipped > 0:
             self.statusBar.showMessage(
@@ -1765,8 +1960,10 @@ class MainWindow(QMainWindow):
                 name = file_path.stem
                 width, height = self.canvas.get_layer_source_dimensions(
                     layer_id)
+                affine, crs = self.canvas.get_layer_transform(layer_id)
                 self.project.add_image(
-                    file_path_str, name, group_path_str, width, height)
+                    file_path_str, name, group_path_str, width, height,
+                    affine=affine, crs=crs)
                 loaded_count += 1
 
         progress.setValue(len(tiff_files))
@@ -1933,8 +2130,10 @@ class MainWindow(QMainWindow):
                         name = Path(file_path).stem
                         width, height = self.canvas.get_layer_source_dimensions(
                             layer_id)
+                        affine, crs = self.canvas.get_layer_transform(layer_id)
                         self.project.add_image(
-                            file_path, name, group_path, width, height)
+                            file_path, name, group_path, width, height,
+                            affine=affine, crs=crs)
 
                     self._async_loaded_count += 1
         finally:
@@ -1993,7 +2192,12 @@ class MainWindow(QMainWindow):
         # Update UI for project
         self._update_class_combo()
         self._refresh_label_markers()
-        self.setWindowTitle(f"GeoLabel - {self._project_path.name}")
+
+        # Update window title (handle recovery case where _project_path is None)
+        if self._project_path:
+            self.setWindowTitle(f"GeoLabel - {self._project_path.name}")
+        else:
+            self.setWindowTitle("GeoLabel - Recovered Session (unsaved)")
 
         # Build status message
         msg = f"Opened project with {self.project.label_count} labels"
@@ -2348,11 +2552,12 @@ class MainWindow(QMainWindow):
                     name = Path(file_path).stem
                     width, height = self.canvas.get_layer_source_dimensions(
                         layer_id)
+                    affine, crs = self.canvas.get_layer_transform(layer_id)
                     # Use new reader dict format: {ext: reader_name}
                     reader_name = self._custom_reader_names.get(ext, "custom")
                     self.project.add_image(
                         file_path, name, "", width, height, reader={
-                            ext: reader_name})
+                            ext: reader_name}, affine=affine, crs=crs)
                     loaded += 1
             except Exception as e:
                 errors.append(f"{Path(file_path).name}: {e}")
@@ -2531,11 +2736,13 @@ class MainWindow(QMainWindow):
                     name = Path(file_path).stem
                     width = layer_data.get('width', 0)
                     height = layer_data.get('height', 0)
+                    affine, crs = self.canvas.get_layer_transform(layer_id)
                     reader_name = self._custom_reader_names.get(
                         self._async_custom_ext, "custom")
                     self.project.add_image(
                         file_path, name, group_path, width, height,
-                        reader={self._async_custom_ext: reader_name}
+                        reader={self._async_custom_ext: reader_name},
+                        affine=affine, crs=crs
                     )
 
                     self._async_custom_loaded_count += 1
@@ -2598,6 +2805,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close - ensure async loaders are properly cleaned up."""
+        # Clean up crash detection and recovery
+        self._clean_exit()
+
         # Cancel and wait for any running async loader (GeoTIFF)
         if hasattr(self, '_async_loader') and self._async_loader is not None:
             if self._async_loader.isRunning():

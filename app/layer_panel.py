@@ -1232,8 +1232,9 @@ class LabeledLayerPanel(QWidget):
         find_and_toggle()
 
     def clear(self):
-        """Clear all items from the tree."""
+        """Clear all items from the tree and internal state."""
         self.tree.clear()
+        self._layer_id_map.clear()
 
 
 class CombinedLayerPanel(QWidget):

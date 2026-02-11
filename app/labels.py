@@ -3,6 +3,14 @@ import json
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
+
+from affine import Affine
+from rasterio.crs import CRS
+from rasterio.warp import transform as transform_coords
+
+# WGS84 CRS (EPSG:4326)
+WGS84 = CRS.from_epsg(4326)
 
 
 @dataclass
@@ -117,6 +125,104 @@ class ImageData:
     # {"tif": "default"}
     reader: dict[str, str] = field(default_factory=dict)
 
+    # Affine transform coefficients [a, b, c, d, e, f] mapping pixel -> CRS coordinates
+    # X = a*col + b*row + c, Y = d*col + e*row + f
+    affine_coeffs: Optional[list[float]] = None
+
+    # CRS EPSG code for the affine transform (e.g., 3857 for Web Mercator)
+    crs_epsg: Optional[int] = None
+
+    def get_affine(self) -> Optional[Affine]:
+        """Get the Affine transform object, or None if not set."""
+        if self.affine_coeffs is None or len(self.affine_coeffs) != 6:
+            return None
+        return Affine(*self.affine_coeffs)
+
+    def set_affine(self, affine: Affine, crs: CRS):
+        """Set the affine transform and CRS.
+
+        Args:
+            affine: Affine transform (pixel to projected coordinates)
+            crs: Coordinate reference system
+        """
+        self.affine_coeffs = [affine.a, affine.b, affine.c,
+                              affine.d, affine.e, affine.f]
+        self.crs_epsg = crs.to_epsg()
+
+    def get_crs(self) -> Optional[CRS]:
+        """Get the CRS object, or None if not set."""
+        if self.crs_epsg is None:
+            return None
+        return CRS.from_epsg(self.crs_epsg)
+
+    def pixel_to_latlon(self, pixel_x: float, pixel_y: float) -> Optional[tuple[float, float]]:
+        """Convert pixel coordinates to WGS84 lat/lon.
+
+        Args:
+            pixel_x: Pixel X coordinate (column)
+            pixel_y: Pixel Y coordinate (row)
+
+        Returns:
+            Tuple of (lat, lon) in WGS84, or None if transform not available
+        """
+        affine = self.get_affine()
+        crs = self.get_crs()
+        if affine is None or crs is None:
+            return None
+
+        # Apply affine transform: pixel -> projected coordinates
+        x_proj, y_proj = affine * (pixel_x, pixel_y)
+
+        # Transform from image CRS to WGS84
+        lons, lats = transform_coords(crs, WGS84, [x_proj], [y_proj])
+        return (lats[0], lons[0])
+
+    def latlon_to_pixel(self, lat: float, lon: float) -> Optional[tuple[float, float]]:
+        """Convert WGS84 lat/lon to pixel coordinates.
+
+        Args:
+            lat: Latitude in degrees (WGS84)
+            lon: Longitude in degrees (WGS84)
+
+        Returns:
+            Tuple of (pixel_x, pixel_y), or None if transform not available
+        """
+        affine = self.get_affine()
+        crs = self.get_crs()
+        if affine is None or crs is None:
+            return None
+
+        # Transform from WGS84 to image CRS
+        xs, ys = transform_coords(WGS84, crs, [lon], [lat])
+        x_proj, y_proj = xs[0], ys[0]
+
+        # Apply inverse affine: projected -> pixel coordinates
+        pixel_x, pixel_y = ~affine * (x_proj, y_proj)
+        return (pixel_x, pixel_y)
+
+    def get_corner_coords(self) -> Optional[dict[str, tuple[float, float]]]:
+        """Get WGS84 lat/lon coordinates for the 4 image corners.
+
+        Returns:
+            Dict with keys 'top_left', 'top_right', 'bottom_right', 'bottom_left',
+            each containing (lat, lon), or None if transform not available
+        """
+        if self.original_width <= 0 or self.original_height <= 0:
+            return None
+
+        w, h = self.original_width, self.original_height
+        corners = {
+            'top_left': self.pixel_to_latlon(0, 0),
+            'top_right': self.pixel_to_latlon(w, 0),
+            'bottom_right': self.pixel_to_latlon(w, h),
+            'bottom_left': self.pixel_to_latlon(0, h)
+        }
+
+        # Return None if any corner failed
+        if any(v is None for v in corners.values()):
+            return None
+        return corners
+
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization."""
         d = {
@@ -135,6 +241,23 @@ class ImageData:
             d["reader"] = self.reader
         else:
             d["reader"] = {ext: "default"}
+
+        # Include transform if available
+        if self.affine_coeffs is not None:
+            d["affine_coeffs"] = self.affine_coeffs
+        if self.crs_epsg is not None:
+            d["crs_epsg"] = self.crs_epsg
+
+        # Include corner coordinates in WGS84 for ground truth export
+        corners = self.get_corner_coords()
+        if corners is not None:
+            d["corners_wgs84"] = {
+                "top_left": {"lat": corners["top_left"][0], "lon": corners["top_left"][1]},
+                "top_right": {"lat": corners["top_right"][0], "lon": corners["top_right"][1]},
+                "bottom_right": {"lat": corners["bottom_right"][0], "lon": corners["bottom_right"][1]},
+                "bottom_left": {"lat": corners["bottom_left"][0], "lon": corners["bottom_left"][1]}
+            }
+
         return d
 
     @classmethod
@@ -163,7 +286,9 @@ class ImageData:
                     [])],
             original_width=width,
             original_height=height,
-            reader=reader
+            reader=reader,
+            affine_coeffs=data.get("affine_coeffs"),
+            crs_epsg=data.get("crs_epsg")
         )
 
 
@@ -244,7 +369,9 @@ class LabelProject:
 
     def add_image(self, path: str, name: str, group: str = "",
                   original_width: int = 0, original_height: int = 0,
-                  reader: dict[str, str] | None = None) -> ImageData:
+                  reader: dict[str, str] | None = None,
+                  affine: 'Affine | None' = None,
+                  crs: 'CRS | None' = None) -> ImageData:
         """Add an image to the project (or return existing one).
 
         Args:
@@ -254,6 +381,8 @@ class LabelProject:
             original_width: Original image width in pixels
             original_height: Original image height in pixels
             reader: Reader info dict {extension: reader_name}, None for default GeoTIFF
+            affine: Optional Affine transform (pixel -> projected coords)
+            crs: Optional CRS for the affine transform
         """
         if path not in self.images:
             self.images[path] = ImageData(
@@ -261,7 +390,11 @@ class LabelProject:
                 original_width=original_width, original_height=original_height,
                 reader=reader or {}
             )
-        return self.images[path]
+        img = self.images[path]
+        # Update transform if provided and not already set
+        if affine is not None and crs is not None and img.affine_coeffs is None:
+            img.set_affine(affine, crs)
+        return img
 
     def update_image_group(self, path: str, group: str):
         """Update the group for an image."""
@@ -432,7 +565,7 @@ class LabelProject:
     def save(self, file_path: str | Path):
         """Save project to JSON file."""
         data = {
-            "version": "3.1",
+            "version": "3.2",
             "classes": self.classes,
             "images": [img.to_dict() for img in self.images.values()],
             "_next_id": self._next_id
