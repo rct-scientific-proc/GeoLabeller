@@ -1,5 +1,6 @@
 """Label data model and storage for point annotations."""
 import json
+import math
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,6 +12,32 @@ from rasterio.warp import transform as transform_coords
 
 # WGS84 CRS (EPSG:4326)
 WGS84 = CRS.from_epsg(4326)
+
+# Earth's mean radius in meters (WGS84)
+EARTH_RADIUS_M = 6371008.8
+
+
+def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculate geodesic distance between two WGS84 points using Haversine formula.
+
+    Args:
+        lat1, lon1: First point (degrees)
+        lat2, lon2: Second point (degrees)
+
+    Returns:
+        Distance in meters
+    """
+    # Convert to radians
+    lat1_r = math.radians(lat1)
+    lat2_r = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+
+    # Haversine formula
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1_r) * math.cos(lat2_r) * math.sin(dlon / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    return EARTH_RADIUS_M * c
 
 
 @dataclass
@@ -225,14 +252,32 @@ class ImageData:
 
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization."""
+        # Build label dicts with distance from left edge
+        label_dicts = []
+        for label in self.labels:
+            label_dict = label.to_dict(self.original_width, self.original_height)
+
+            # Calculate distance from left edge of image to label position
+            if self.affine_coeffs is not None and self.crs_epsg is not None:
+                # Get lat/lon at left edge (same row as label)
+                left_edge = self.pixel_to_latlon(0, label.pixel_y)
+                # Get lat/lon at label position
+                label_pos = (label.lat, label.lon)
+
+                if left_edge is not None:
+                    distance_m = haversine_distance(
+                        left_edge[0], left_edge[1],  # left edge lat, lon
+                        label_pos[0], label_pos[1]   # label lat, lon
+                    )
+                    label_dict["geodesic_distance"] = round(distance_m, 3)
+
+            label_dicts.append(label_dict)
+
         d = {
             "path": self.path,
             "name": self.name,
             "group": self.group,
-            "labels": [
-                l.to_dict(
-                    self.original_width,
-                    self.original_height) for l in self.labels],
+            "labels": label_dicts,
             "original_width": self.original_width,
             "original_height": self.original_height}
         # Always include reader info - use "default" for standard GeoTIFFs
