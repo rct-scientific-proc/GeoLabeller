@@ -303,6 +303,17 @@ class ImageData:
                 "bottom_left": {"lat": corners["bottom_left"][0], "lon": corners["bottom_left"][1]}
             }
 
+            # Calculate geodesic width and height in meters using Haversine
+            tl = corners["top_left"]
+            tr = corners["top_right"]
+            bl = corners["bottom_left"]
+
+            geodesic_width = haversine_distance(tl[0], tl[1], tr[0], tr[1])
+            geodesic_height = haversine_distance(tl[0], tl[1], bl[0], bl[1])
+
+            d["geodesic_width_m"] = round(geodesic_width, 3)
+            d["geodesic_height_m"] = round(geodesic_height, 3)
+
         return d
 
     @classmethod
