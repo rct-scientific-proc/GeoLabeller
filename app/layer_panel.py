@@ -30,6 +30,10 @@ class LayerPanel(QWidget):
     zoom_to_layer_requested = pyqtSignal(str)  # layer_id
     layer_removed = pyqtSignal(str)  # layer_id
 
+    # Group memory management signals: emitted with list of layer_ids
+    group_preload_requested = pyqtSignal(list)  # layer_ids to fully load
+    group_free_requested = pyqtSignal(list)  # layer_ids to free from memory
+
     # Batch progress signals for group toggle operations
     batch_visibility_started = pyqtSignal(int)  # total items to process
     batch_visibility_progress = pyqtSignal(int)  # current progress
@@ -385,6 +389,15 @@ class LayerPanel(QWidget):
                 collapse_all_action.triggered.connect(
                     lambda: self._collapse_all_children(item))
 
+                menu.addSeparator()
+                preload_action = menu.addAction("Preload Group")
+                preload_action.triggered.connect(
+                    lambda: self._request_group_preload(item))
+
+                free_action = menu.addAction("Free Group")
+                free_action.triggered.connect(
+                    lambda: self._request_group_free(item))
+
             menu.addSeparator()
             remove_action = menu.addAction("Remove")
             remove_action.triggered.connect(lambda: self._remove_item(item))
@@ -441,6 +454,20 @@ class LayerPanel(QWidget):
             if child.data(0, Qt.UserRole + 1) == "group":
                 self._collapse_all_children(child)
         item.setExpanded(False)
+
+    def _request_group_preload(self, item: QTreeWidgetItem):
+        """Collect all layer IDs in a group and emit preload signal."""
+        layer_ids = []
+        self._collect_layer_ids(item, layer_ids)
+        if layer_ids:
+            self.group_preload_requested.emit(layer_ids)
+
+    def _request_group_free(self, item: QTreeWidgetItem):
+        """Collect all layer IDs in a group and emit free signal."""
+        layer_ids = []
+        self._collect_layer_ids(item, layer_ids)
+        if layer_ids:
+            self.group_free_requested.emit(layer_ids)
 
     def _remove_item(self, item: QTreeWidgetItem):
         """Remove an item from the tree."""
@@ -1248,6 +1275,10 @@ class CombinedLayerPanel(QWidget):
     zoom_to_label_requested = pyqtSignal(float, float)  # lon, lat
     layer_removed = pyqtSignal(str)
 
+    # Group memory management signals
+    group_preload_requested = pyqtSignal(list)  # layer_ids
+    group_free_requested = pyqtSignal(list)  # layer_ids
+
     # Batch progress signals
     batch_visibility_started = pyqtSignal(int)  # total items
     batch_visibility_progress = pyqtSignal(int)  # current progress
@@ -1295,6 +1326,12 @@ class CombinedLayerPanel(QWidget):
             self.batch_visibility_progress)
         self.main_panel.batch_visibility_finished.connect(
             self.batch_visibility_finished)
+
+        # Forward group memory management signals
+        self.main_panel.group_preload_requested.connect(
+            self.group_preload_requested)
+        self.main_panel.group_free_requested.connect(
+            self.group_free_requested)
 
         # Forward signals from labeled panel
         self.labeled_panel.layer_visibility_changed.connect(

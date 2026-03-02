@@ -356,6 +356,19 @@ class TiledLayer:
         for item in self.tiles.values():
             item.setZValue(z)
 
+    def free_data(self, scene: QGraphicsScene | None = None):
+        """Release pixel data from memory, keeping bounds and metadata.
+
+        Removes rendered tiles from the scene and frees the RGBA array.
+        The layer can be reloaded later via ensure_loaded().
+        """
+        if scene is not None:
+            for item in self.tiles.values():
+                scene.removeItem(item)
+            self.tiles.clear()
+        self._rgba_data = None
+        self._fully_loaded = False
+
     def remove_from_scene(self, scene: QGraphicsScene):
         """Remove all tiles from the scene."""
         for item in self.tiles.values():
@@ -881,6 +894,10 @@ class MapCanvas(QGraphicsView):
         if layer_id in self._layers:
             return self._layers[layer_id].file_path
         return None
+
+    def get_layer(self, layer_id: str) -> TiledLayer | None:
+        """Get the TiledLayer object for a given layer ID."""
+        return self._layers.get(layer_id)
 
     def get_layer_source_dimensions(self, layer_id: str) -> tuple[int, int]:
         """Get the original source dimensions (width, height) for a layer."""

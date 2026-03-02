@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import rasterio
-from PyQt5.QtCore import Qt, Qt as QtCore_Qt, QTimer, QEvent
+from PyQt5.QtCore import Qt, Qt as QtCore_Qt, QTimer, QEvent, QThread, QObject, pyqtSignal
 from PyQt5.QtGui import QColor, QKeyEvent
 from PyQt5.QtWidgets import (
     QMainWindow,
@@ -28,10 +28,53 @@ from PyQt5.QtWidgets import (
     QInputDialog)
 
 from .axis_ruler import MapCanvasWithAxes
-from .canvas import MapCanvas, CanvasMode, AsyncFileLoaderThread
+from .canvas import MapCanvas, CanvasMode, AsyncFileLoaderThread, TiledLayer
 from .class_editor import ClassEditorDialog
 from .labels import LabelProject, ImageData
 from .layer_panel import CombinedLayerPanel
+
+
+class GroupMemoryWorker(QObject):
+    """Worker that preloads or frees layer pixel data in a background thread."""
+
+    progress = pyqtSignal(int, int)  # (current, total)
+    finished = pyqtSignal()
+    error = pyqtSignal(str, str)  # (layer_id, error_message)
+
+    def __init__(self, layers: list[tuple[str, TiledLayer]], mode: str):
+        """Initialize the worker.
+
+        Args:
+            layers: List of (layer_id, TiledLayer) tuples to process.
+            mode: 'preload' to load pixel data, 'free' to release it.
+        """
+        super().__init__()
+        self._layers = layers
+        self._mode = mode
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def process(self):
+        total = len(self._layers)
+        for i, (layer_id, layer) in enumerate(self._layers):
+            if self._cancelled:
+                break
+            try:
+                if self._mode == 'preload':
+                    layer.ensure_loaded()
+                elif self._mode == 'free':
+                    # free_data needs the scene reference to remove tiles,
+                    # but scene operations must happen on the main thread.
+                    # Here we only release the numpy array; tile cleanup
+                    # is done by the caller on the main thread afterwards.
+                    layer._rgba_data = None
+                    layer._fully_loaded = False
+            except Exception as e:
+                self.error.emit(layer_id, str(e))
+            self.progress.emit(i + 1, total)
+        self.finished.emit()
 
 
 def get_recovery_dir() -> Path:
@@ -181,6 +224,12 @@ class MainWindow(QMainWindow):
         self.layer_panel.batch_visibility_progress.connect(
             self._update_progress)
         self.layer_panel.batch_visibility_finished.connect(self._hide_progress)
+
+        # Connect group memory management signals
+        self.layer_panel.group_preload_requested.connect(
+            self._on_group_preload_requested)
+        self.layer_panel.group_free_requested.connect(
+            self._on_group_free_requested)
 
         self.canvas.coordinates_changed.connect(self._update_coordinates)
         self.canvas.label_placed.connect(self._on_label_placed)
@@ -1899,6 +1948,90 @@ class MainWindow(QMainWindow):
         """Handle start of batch visibility change (e.g., group toggle)."""
         self._show_progress(total, "Toggling")
 
+    # ── Group memory management ──────────────────────────────────────
+
+    def _on_group_preload_requested(self, layer_ids: list[str]):
+        """Preload all layers in a group into memory (full reproject)."""
+        layers = []
+        for lid in layer_ids:
+            layer = self.canvas.get_layer(lid)
+            if layer and not layer.is_fully_loaded():
+                layers.append((lid, layer))
+
+        if not layers:
+            QMessageBox.information(self, "Preload Group",
+                                   "All layers in this group are already loaded.")
+            return
+
+        self._start_group_memory_worker(layers, 'preload', "Preloading")
+
+    def _on_group_free_requested(self, layer_ids: list[str]):
+        """Free pixel data for all layers in a group."""
+        layers = []
+        for lid in layer_ids:
+            layer = self.canvas.get_layer(lid)
+            if layer and layer.is_fully_loaded():
+                layers.append((lid, layer))
+
+        if not layers:
+            QMessageBox.information(self, "Free Group",
+                                   "No loaded layers to free in this group.")
+            return
+
+        # Remove on-screen tiles on the main thread before freeing data
+        for lid, layer in layers:
+            layer.free_data(self.canvas._scene)
+
+        QMessageBox.information(
+            self, "Free Group",
+            f"Freed pixel data for {len(layers)} layer(s).")
+
+    def _start_group_memory_worker(self, layers, mode, label):
+        """Launch a background worker with a progress dialog."""
+        total = len(layers)
+
+        dlg = QProgressDialog(f"{label} 0/{total}...", "Cancel", 0, total, self)
+        dlg.setWindowTitle(label)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+
+        thread = QThread(self)
+        worker = GroupMemoryWorker(layers, mode)
+        worker.moveToThread(thread)
+
+        # Store references so they aren't garbage-collected
+        self._group_mem_thread = thread
+        self._group_mem_worker = worker
+
+        def on_progress(current, tot):
+            dlg.setLabelText(f"{label} {current}/{tot}...")
+            dlg.setValue(current)
+
+        def on_finished():
+            dlg.setValue(total)
+            thread.quit()
+
+        def on_thread_finished():
+            # Refresh visible tiles in case freed layers were displayed
+            self.canvas._update_visible_tiles()
+            self._group_mem_thread = None
+            self._group_mem_worker = None
+
+        def on_error(lid, msg):
+            print(f"Group memory op error on {lid}: {msg}")
+
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        thread.started.connect(worker.process)
+        thread.finished.connect(on_thread_finished)
+
+        dlg.canceled.connect(worker.cancel)
+        dlg.canceled.connect(thread.quit)
+
+        thread.start()
+
     def _show_progress(self, maximum: int, label: str = "Loading"):
         """Show the progress indicator with a maximum value."""
         self.progress_indicator.setMaximum(maximum)
@@ -2056,6 +2189,16 @@ class MainWindow(QMainWindow):
                 self._async_loader.cancel()
                 self._async_loader.wait()
             self._async_loader = None
+
+        # Cancel and wait for any running group memory worker
+        if hasattr(self, '_group_mem_thread') and self._group_mem_thread is not None:
+            if self._group_mem_thread.isRunning():
+                if self._group_mem_worker:
+                    self._group_mem_worker.cancel()
+                self._group_mem_thread.quit()
+                self._group_mem_thread.wait()
+            self._group_mem_thread = None
+            self._group_mem_worker = None
 
         # Stop the UI timers if running
         if hasattr(self, '_async_ui_timer'):
