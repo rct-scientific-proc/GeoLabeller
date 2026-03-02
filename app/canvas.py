@@ -73,8 +73,7 @@ class TiledLayer:
         # Tile grid info
         self._n_tiles_x = 0
         self._n_tiles_y = 0
-        self._tile_world_width = 0
-        self._tile_world_height = 0
+
 
         # Lazy loading state
         self._lazy = lazy
@@ -118,8 +117,6 @@ class TiledLayer:
             # Calculate tile grid
             self._n_tiles_x = math.ceil(width / TILE_SIZE)
             self._n_tiles_y = math.ceil(height / TILE_SIZE)
-            self._tile_world_width = (east - west) / self._n_tiles_x
-            self._tile_world_height = (north - south) / self._n_tiles_y
 
     def ensure_loaded(self):
         """Ensure the full raster data is loaded. Call before accessing pixel data."""
@@ -233,8 +230,6 @@ class TiledLayer:
             self._height = height
             self._n_tiles_x = math.ceil(width / TILE_SIZE)
             self._n_tiles_y = math.ceil(height / TILE_SIZE)
-            self._tile_world_width = (east - west) / self._n_tiles_x
-            self._tile_world_height = (north - south) / self._n_tiles_y
 
     def get_tile_bounds(self,
                         tx: int,
@@ -288,27 +283,32 @@ class TiledLayer:
                 view_north < layer_south or view_south > layer_north):
             return []
 
-        # Calculate tile indices directly from coordinates (O(1) instead of O(n²))
         # Clamp view bounds to layer bounds
         clamped_west = max(view_west, layer_west)
         clamped_east = min(view_east, layer_east)
         clamped_south = max(view_south, layer_south)
         clamped_north = min(view_north, layer_north)
 
-        # Convert to tile indices
-        # tx increases left-to-right (west to east)
-        tx_min = max(
-            0, int(
-                (clamped_west - layer_west) / self._tile_world_width))
-        tx_max = min(self._n_tiles_x - 1,
-                     int((clamped_east - layer_west) / self._tile_world_width))
+        # Convert world coordinates to pixel coordinates first, then derive
+        # tile indices.  This is consistent with get_tile_bounds() which
+        # computes tile world extents from pixel bounds.  Using the old
+        # _tile_world_width/_tile_world_height (uniform world-space division)
+        # caused mismatches for edge tiles whose pixel count is smaller than
+        # TILE_SIZE.
+        world_per_pixel_x = (layer_east - layer_west) / self._width
+        world_per_pixel_y = (layer_north - layer_south) / self._height
 
-        # ty increases top-to-bottom (north to south in world coords)
-        ty_min = max(
-            0, int(
-                (layer_north - clamped_north) / self._tile_world_height))
-        ty_max = min(self._n_tiles_y - 1,
-                     int((layer_north - clamped_south) / self._tile_world_height))
+        # Pixel coordinates corresponding to clamped view edges
+        px_left = (clamped_west - layer_west) / world_per_pixel_x
+        px_right = (clamped_east - layer_west) / world_per_pixel_x
+        px_top = (layer_north - clamped_north) / world_per_pixel_y
+        px_bottom = (layer_north - clamped_south) / world_per_pixel_y
+
+        # Tile indices from pixel coordinates
+        tx_min = max(0, int(px_left / TILE_SIZE))
+        tx_max = min(self._n_tiles_x - 1, int(px_right / TILE_SIZE))
+        ty_min = max(0, int(px_top / TILE_SIZE))
+        ty_max = min(self._n_tiles_y - 1, int(px_bottom / TILE_SIZE))
 
         return [(tx, ty) for ty in range(ty_min, ty_max + 1)
                 for tx in range(tx_min, tx_max + 1)]
@@ -324,12 +324,14 @@ class TiledLayer:
         px_left, px_top, px_right, px_bottom, _, _, _, _ = self.get_tile_bounds(
             tx, ty)
 
-        # Extract tile data
-        tile_data = self._rgba_data[px_top:px_bottom, px_left:px_right].copy()
-        height, width = tile_data.shape[:2]
+        height = px_bottom - px_top
+        width = px_right - px_left
 
         if height == 0 or width == 0:
             return None
+
+        # Extract contiguous tile data (required by QImage)
+        tile_data = self._rgba_data[px_top:px_bottom, px_left:px_right].copy()
 
         image = QImage(
             tile_data.data,
@@ -338,7 +340,9 @@ class TiledLayer:
             width * 4,
             QImage.Format_RGBA8888
         )
-        return QPixmap.fromImage(image.copy())
+        # fromImage deep-copies into the native pixmap format,
+        # so an intermediate image.copy() is unnecessary.
+        return QPixmap.fromImage(image)
 
     def set_visibility(self, visible: bool):
         """Set visibility for all tiles."""
