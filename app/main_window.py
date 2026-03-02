@@ -386,6 +386,13 @@ class MainWindow(QMainWindow):
             lambda: self._set_mode(CanvasMode.CYCLE))
         toolbar.addAction(self.cycle_action)
 
+        self.view_cycle_action = QAction("View Cycle", self)
+        self.view_cycle_action.setCheckable(True)
+        self.view_cycle_action.setShortcut("V")
+        self.view_cycle_action.triggered.connect(
+            lambda: self._set_mode(CanvasMode.VIEW_CYCLE))
+        toolbar.addAction(self.view_cycle_action)
+
         toolbar.addSeparator()
 
         # Class selector
@@ -401,7 +408,7 @@ class MainWindow(QMainWindow):
         Captures Space key when in cycle mode regardless of which widget has focus.
         Keys 1-9 switch to the corresponding class (first 9 classes).
         """
-        if event.key() == Qt.Key_Space and self.canvas._mode == CanvasMode.CYCLE:
+        if event.key() == Qt.Key_Space and self.canvas._mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
             # Handle space in cycle mode globally
             self._cycle_to_next_layer()
             event.accept()
@@ -424,7 +431,7 @@ class MainWindow(QMainWindow):
         the tree from toggling checkboxes.
         """
         if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Space:
-            if self.canvas._mode == CanvasMode.CYCLE:
+            if self.canvas._mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
                 # Handle space in cycle mode - don't let tree process it
                 self._cycle_to_next_layer()
                 return True  # Event consumed
@@ -436,10 +443,13 @@ class MainWindow(QMainWindow):
         self.pan_action.setChecked(mode == CanvasMode.PAN)
         self.label_action.setChecked(mode == CanvasMode.LABEL)
         self.cycle_action.setChecked(mode == CanvasMode.CYCLE)
+        self.view_cycle_action.setChecked(mode == CanvasMode.VIEW_CYCLE)
 
         # Handle cycle mode entry
         if mode == CanvasMode.CYCLE:
             self._start_cycle_mode()
+        elif mode == CanvasMode.VIEW_CYCLE:
+            self._start_view_cycle_mode()
         else:
             # Clear cycle state when leaving cycle mode
             self._cycle_layers = []
@@ -468,6 +478,33 @@ class MainWindow(QMainWindow):
         self.canvas.zoom_to_layer(layer_id)
         self.statusBar.showMessage(
             f"Cycle mode: Layer {
+                self._cycle_index + 1}/{
+                len(
+                    self._cycle_layers)} - Space=next, Ctrl+Space=prev",
+            0  # No timeout
+        )
+
+        # Give canvas keyboard focus so Space key works immediately
+        self.canvas.setFocus()
+
+    def _start_view_cycle_mode(self):
+        """Initialize view cycle mode with layers visible in the current canvas view."""
+        self._cycle_layers = self.canvas.get_layers_in_view()
+        if not self._cycle_layers:
+            self.statusBar.showMessage("No layers in current view", 3000)
+            self._cycle_index = -1
+            self.group_label.setText("View Cycle")
+            return
+
+        self.group_label.setText("View Cycle")
+
+        # Start at the last layer (end of list)
+        self._cycle_index = len(self._cycle_layers) - 1
+        layer_id = self._cycle_layers[self._cycle_index]
+        self.layer_panel.check_layers([layer_id])
+        self.canvas.zoom_to_layer(layer_id)
+        self.statusBar.showMessage(
+            f"View Cycle: Layer {
                 self._cycle_index + 1}/{
                 len(
                     self._cycle_layers)} - Space=next, Ctrl+Space=prev",

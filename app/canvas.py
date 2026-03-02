@@ -34,7 +34,8 @@ class CanvasMode(Enum):
     """Canvas interaction modes."""
     PAN = auto()      # Default pan/zoom mode
     LABEL = auto()    # Point labeling mode
-    CYCLE = auto()    # Cycle through layers mode
+    CYCLE = auto()    # Cycle through layers in a group
+    VIEW_CYCLE = auto()  # Cycle through layers visible in current view
 
 
 class TiledLayer:
@@ -1038,7 +1039,7 @@ class MapCanvas(QGraphicsView):
         elif mode == CanvasMode.LABEL:
             self.setDragMode(QGraphicsView.NoDrag)
             self.setCursor(Qt.CrossCursor)
-        elif mode == CanvasMode.CYCLE:
+        elif mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
             # Cycle mode: left click labels, right drag pans, wheel zooms
             self.setDragMode(QGraphicsView.NoDrag)
             self.setCursor(Qt.CrossCursor)
@@ -1064,10 +1065,11 @@ class MapCanvas(QGraphicsView):
                 self._show_pan_context_menu(event.pos())
             return
 
-        # Handle labeling in LABEL or CYCLE mode
+        # Handle labeling in LABEL or CYCLE/VIEW_CYCLE mode
         if self._mode in (
                 CanvasMode.LABEL,
-                CanvasMode.CYCLE) and event.button() == Qt.LeftButton:
+                CanvasMode.CYCLE,
+                CanvasMode.VIEW_CYCLE) and event.button() == Qt.LeftButton:
             # Check if we're in link mode
             if self._link_mode_active:
                 label_id, image_path = self._get_label_at_position(event.pos())
@@ -1079,9 +1081,9 @@ class MapCanvas(QGraphicsView):
                 self._exit_link_mode()
                 return
 
-            # Ctrl+Left-click in CYCLE mode shows label context menu (for
+            # Ctrl+Left-click in CYCLE/VIEW_CYCLE mode shows label context menu (for
             # linking)
-            if self._mode == CanvasMode.CYCLE and event.modifiers() & Qt.ControlModifier:
+            if self._mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE) and event.modifiers() & Qt.ControlModifier:
                 self._show_label_context_menu(event.pos())
                 return
 
@@ -1116,7 +1118,7 @@ class MapCanvas(QGraphicsView):
                 self._exit_link_mode()
             else:
                 self._show_label_context_menu(event.pos())
-        elif self._mode == CanvasMode.CYCLE and event.button() == Qt.RightButton:
+        elif self._mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE) and event.button() == Qt.RightButton:
             # Right-click drag in cycle mode - start panning
             self._cycle_panning = True
             self._cycle_pan_start = event.pos()
@@ -1130,7 +1132,7 @@ class MapCanvas(QGraphicsView):
             if hasattr(self, '_pan_active') and self._pan_active:
                 self._pan_active = False
                 self.setCursor(Qt.OpenHandCursor)
-        elif self._mode == CanvasMode.CYCLE and event.button() == Qt.RightButton:
+        elif self._mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE) and event.button() == Qt.RightButton:
             if hasattr(self, '_cycle_panning') and self._cycle_panning:
                 self._cycle_panning = False
                 self.setCursor(Qt.CrossCursor)
@@ -1149,7 +1151,7 @@ class MapCanvas(QGraphicsView):
             # Still update coordinates below
 
         # Handle cycle mode right-click panning
-        if self._mode == CanvasMode.CYCLE and hasattr(
+        if self._mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE) and hasattr(
                 self, '_cycle_panning') and self._cycle_panning:
             delta = event.pos() - self._cycle_pan_start
             self._cycle_pan_start = event.pos()
@@ -1170,7 +1172,7 @@ class MapCanvas(QGraphicsView):
         """Handle key press events."""
         if event.key() == Qt.Key_Escape and self._link_mode_active:
             self._exit_link_mode()
-        elif event.key() == Qt.Key_Space and self._mode == CanvasMode.CYCLE:
+        elif event.key() == Qt.Key_Space and self._mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
             if event.modifiers() & Qt.ControlModifier:
                 # Ctrl+Space: go backwards
                 self.cycle_prev_requested.emit()
@@ -1503,6 +1505,30 @@ class MapCanvas(QGraphicsView):
         if layers_to_show:
             self.show_layers_in_view.emit(layers_to_show)
 
+    def get_layers_in_view(self) -> list[str]:
+        """Get layer IDs whose bounds intersect the current view.
+
+        Returns:
+            List of layer_ids that overlap with the visible viewport.
+        """
+        view_bounds = self._get_view_bounds()
+        view_west, view_south, view_east, view_north = view_bounds
+
+        result = []
+        for layer_id, layer in self._layers.items():
+            if layer.bounds is None:
+                continue
+            layer_west, layer_south, layer_east, layer_north = layer.bounds
+            intersects = not (
+                layer_east < view_west or
+                layer_west > view_east or
+                layer_north < view_south or
+                layer_south > view_north
+            )
+            if intersects:
+                result.append(layer_id)
+        return result
+
     def _enter_link_mode(self, source_label_id: int):
         """Enter link mode with the given label as the source."""
         self._link_mode_active = True
@@ -1539,7 +1565,7 @@ class MapCanvas(QGraphicsView):
         self._link_source_label_id = None
 
         # Restore cursor based on mode
-        if self._mode == CanvasMode.LABEL or self._mode == CanvasMode.CYCLE:
+        if self._mode in (CanvasMode.LABEL, CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
             self.setCursor(Qt.CrossCursor)
         else:
             self.setCursor(Qt.ArrowCursor)
