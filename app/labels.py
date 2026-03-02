@@ -358,10 +358,6 @@ class LabelProject:
     # Images with their labels (keyed by path for easy lookup)
     images: dict[str, ImageData] = field(default_factory=dict)
 
-    # Custom readers: extension -> reader name or path
-    # e.g., {"h5": "h5_gcps", "dat": "./my_reader.py"}
-    custom_readers: dict[str, str] = field(default_factory=dict)
-
     # Auto-increment ID counter for labels
     _next_id: int = 1
 
@@ -639,9 +635,6 @@ class LabelProject:
         project.classes = data.get("classes", [])
         project._next_id = data.get("_next_id", 1)
 
-        # Load legacy top-level custom_readers if present (v3.0 format)
-        legacy_readers = data.get("custom_readers", {})
-
         version = data.get("version", "1.0")
 
         if version >= "2.0":
@@ -649,18 +642,6 @@ class LabelProject:
             for img_data in data.get("images", []):
                 image = ImageData.from_dict(img_data, version)
                 project.images[image.path] = image
-
-                # Build custom_readers dict from per-image reader info
-                if image.reader:
-                    for ext, reader_name in image.reader.items():
-                        if reader_name != "default" and ext not in project.custom_readers:
-                            project.custom_readers[ext] = reader_name
-
-            # Also include any legacy top-level custom_readers not already
-            # present
-            for ext, reader_name in legacy_readers.items():
-                if ext not in project.custom_readers:
-                    project.custom_readers[ext] = reader_name
         else:
             # Legacy format (version 1.0) - convert from label-centric
             for label_data in data.get("labels", []):
@@ -712,7 +693,6 @@ class LabelProject:
         """Clear everything."""
         self.classes.clear()
         self.images.clear()
-        self.custom_readers.clear()
         self._next_id = 1
         self._object_id_index.clear()
         self._label_id_index.clear()
