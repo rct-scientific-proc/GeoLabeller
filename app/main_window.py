@@ -25,7 +25,8 @@ from PyQt5.QtWidgets import (
     QProgressDialog,
     QApplication,
     QProgressBar,
-    QInputDialog)
+    QInputDialog,
+    QSpinBox)
 
 from .axis_ruler import MapCanvasWithAxes
 from .canvas import MapCanvas, CanvasMode, AsyncFileLoaderThread, TiledLayer
@@ -401,6 +402,20 @@ class MainWindow(QMainWindow):
         self.class_combo.setMinimumWidth(150)
         self.class_combo.currentTextChanged.connect(self._on_class_changed)
         toolbar.addWidget(self.class_combo)
+
+        toolbar.addSeparator()
+
+        # Decimation factor
+        toolbar.addWidget(QLabel(" Decimation: "))
+        self.decimation_spin = QSpinBox()
+        self.decimation_spin.setRange(1, 32)
+        self.decimation_spin.setValue(1)
+        self.decimation_spin.setToolTip(
+            "Image decimation factor (1 = full resolution, 2 = half, etc.)\n"
+            "Higher values reduce memory usage and speed up loading.\n"
+            "Applies to newly loaded images only."
+        )
+        toolbar.addWidget(self.decimation_spin)
 
     def keyPressEvent(self, event: QKeyEvent):
         """Handle global key press events.
@@ -963,7 +978,9 @@ class MainWindow(QMainWindow):
 
         for idx, image in enumerate(self.project.images.values()):
             if os.path.exists(image.path):
-                layer_id = self.canvas.add_layer(image.path)
+                layer_id = self.canvas.add_layer(
+                    image.path,
+                    decimation_factor=self.decimation_spin.value())
                 if layer_id:
                     # Recreate group structure
                     parent_group = get_or_create_group(image.group)
@@ -1602,7 +1619,8 @@ class MainWindow(QMainWindow):
                 skipped += 1
                 continue
 
-            layer_id = self.canvas.add_layer(file_path)
+            layer_id = self.canvas.add_layer(
+                file_path, decimation_factor=self.decimation_spin.value())
             if layer_id:
                 self.layer_panel.add_layer(layer_id, file_path)
                 # Track the loaded image with original dimensions and transform
@@ -1713,7 +1731,9 @@ class MainWindow(QMainWindow):
             if self.canvas.is_path_loaded(file_path_str):
                 continue
 
-            layer_id = self.canvas.add_layer(file_path_str, visible=False)
+            layer_id = self.canvas.add_layer(
+                file_path_str, visible=False,
+                decimation_factor=self.decimation_spin.value())
             if layer_id:
                 self.layer_panel.add_layer(
                     layer_id, file_path_str, parent_group, visible=False)
@@ -1882,7 +1902,8 @@ class MainWindow(QMainWindow):
 
                 # Add layer with lazy loading and hidden by default
                 layer_id = self.canvas.add_layer(
-                    file_path, lazy=True, visible=False)
+                    file_path, lazy=True, visible=False,
+                    decimation_factor=self.decimation_spin.value())
                 if layer_id:
                     # Add to tree as hidden (unchecked)
                     self.layer_panel.add_layer(

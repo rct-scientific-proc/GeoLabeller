@@ -45,12 +45,13 @@ class TiledLayer:
     on demand when the layer becomes visible.
     """
 
-    def __init__(self, file_path: str, lazy: bool = False):
+    def __init__(self, file_path: str, lazy: bool = False, decimation_factor: int = 1):
         """Initialize a tiled layer.
 
         Args:
             file_path: Path to the GeoTIFF file
             lazy: If True, only load bounds initially, defer full data loading
+            decimation_factor: Factor by which to reduce image resolution (1 = full res, 2 = half, etc.)
         """
         self.file_path = file_path
         self.name = Path(file_path).stem  # File name without extension
@@ -79,6 +80,7 @@ class TiledLayer:
         # Lazy loading state
         self._lazy = lazy
         self._fully_loaded = False
+        self._decimation_factor = max(1, decimation_factor)
 
         if lazy:
             self._load_bounds_only()
@@ -106,6 +108,15 @@ class TiledLayer:
             transform, width, height = calculate_default_transform(
                 src.crs, dst_crs, src.width, src.height, *src.bounds
             )
+
+            # Apply decimation factor to reduce resolution
+            if self._decimation_factor > 1:
+                dec_w = max(1, width // self._decimation_factor)
+                dec_h = max(1, height // self._decimation_factor)
+                transform, width, height = calculate_default_transform(
+                    src.crs, dst_crs, src.width, src.height, *src.bounds,
+                    dst_width=dec_w, dst_height=dec_h
+                )
 
             self._width = width
             self._height = height
@@ -142,6 +153,15 @@ class TiledLayer:
             transform, width, height = calculate_default_transform(
                 src.crs, dst_crs, src.width, src.height, *src.bounds
             )
+
+            # Apply decimation factor to reduce resolution
+            if self._decimation_factor > 1:
+                dec_w = max(1, width // self._decimation_factor)
+                dec_h = max(1, height // self._decimation_factor)
+                transform, width, height = calculate_default_transform(
+                    src.crs, dst_crs, src.width, src.height, *src.bounds,
+                    dst_width=dec_w, dst_height=dec_h
+                )
 
             # Optimization: reproject band 1 as float32 to detect nodata/padding,
             # then reproject remaining bands directly as uint8 (faster, less memory).
@@ -731,20 +751,21 @@ class MapCanvas(QGraphicsView):
         self._scale_bar.move(10, 10)  # Will be repositioned in resizeEvent
 
     def add_layer(self, file_path: str, lazy: bool = False,
-                  visible: bool = True) -> str | None:
+                  visible: bool = True, decimation_factor: int = 1) -> str | None:
         """Add a GeoTIFF layer to the canvas. Returns existing layer_id if already loaded.
 
         Args:
             file_path: Path to the GeoTIFF file
             lazy: If True, only load bounds initially (faster for bulk imports)
             visible: Whether the layer should be visible initially
+            decimation_factor: Factor by which to reduce image resolution (1 = full res)
         """
         # Check if this file is already loaded
         if file_path in self._path_to_layer:
             return self._path_to_layer[file_path]
 
         try:
-            layer = TiledLayer(file_path, lazy=lazy)
+            layer = TiledLayer(file_path, lazy=lazy, decimation_factor=decimation_factor)
             layer.visible = visible
 
             layer_id = f"layer_{self._next_id}"
