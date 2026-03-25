@@ -42,6 +42,7 @@ class LayerPanel(QWidget):
     def __init__(self):
         super().__init__()
         self._batch_mode = False  # When True, suppress signals during batch operations
+        self._nongeo_root = None  # Top-level node for non-georeferenced images
         self._setup_ui()
 
     def _setup_ui(self):
@@ -717,6 +718,78 @@ class LayerPanel(QWidget):
     def clear(self):
         """Clear all items from the tree."""
         self.tree.clear()
+        self._nongeo_root = None
+
+    def get_or_create_nongeo_root(self) -> QTreeWidgetItem:
+        """Get or create the 'Non-Georeferenced' top-level group.
+
+        This is a persistent root node that holds all non-georeferenced layers.
+        """
+        if hasattr(self, '_nongeo_root') and self._nongeo_root is not None:
+            return self._nongeo_root
+
+        item = QTreeWidgetItem()
+        item.setText(0, "Non-Georeferenced")
+        item.setData(0, Qt.UserRole + 1, "group")
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(0, Qt.Unchecked)
+
+        # Distinct styling: orange color, bold, folder icon
+        style = QApplication.style()
+        item.setIcon(0, style.standardIcon(QStyle.SP_DirIcon))
+        font = item.font(0)
+        font.setBold(True)
+        font.setItalic(True)
+        item.setFont(0, font)
+        item.setForeground(0, QColor(210, 140, 50))  # Orange color
+
+        self.tree.addTopLevelItem(item)
+        self._nongeo_root = item
+        return item
+
+    def add_nongeo_group(self, name: str, parent: QTreeWidgetItem = None,
+                         visible: bool = True) -> QTreeWidgetItem:
+        """Add a group under the Non-Georeferenced section.
+
+        Same as add_group but with a slightly different style.
+        """
+        nongeo_parent = parent or self.get_or_create_nongeo_root()
+        item = QTreeWidgetItem()
+        item.setText(0, name)
+        item.setData(0, Qt.UserRole + 1, "group")
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(0, Qt.Checked if visible else Qt.Unchecked)
+
+        style = QApplication.style()
+        item.setIcon(0, style.standardIcon(QStyle.SP_DirIcon))
+        font = item.font(0)
+        font.setBold(True)
+        item.setFont(0, font)
+        item.setForeground(0, QColor(210, 140, 50))  # Orange
+
+        nongeo_parent.addChild(item)
+        return item
+
+    def add_nongeo_layer(self, layer_id: str, file_path: str,
+                         parent: QTreeWidgetItem = None, visible: bool = True):
+        """Add a layer to the Non-Georeferenced section.
+
+        Same as add_layer but defaults to the non-geo root if no parent given.
+        """
+        nongeo_parent = parent or self.get_or_create_nongeo_root()
+
+        item = QTreeWidgetItem()
+        item.setText(0, os.path.basename(file_path))
+        item.setData(0, Qt.UserRole, layer_id)
+        item.setData(0, Qt.UserRole + 1, "layer")
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(0, Qt.Checked if visible else Qt.Unchecked)
+        item.setToolTip(0, file_path)
+
+        style = QApplication.style()
+        item.setIcon(0, style.standardIcon(QStyle.SP_FileIcon))
+
+        nongeo_parent.addChild(item)
 
     def set_layer_checked(self, layer_id: str, checked: bool):
         """Set the check state of a specific layer without emitting signals.
@@ -1455,6 +1528,20 @@ class CombinedLayerPanel(QWidget):
     def get_selected_group_name(self) -> str:
         """Get the name of the currently selected group."""
         return self.main_panel.get_selected_group_name()
+
+    def get_or_create_nongeo_root(self):
+        """Get or create the 'Non-Georeferenced' top-level group."""
+        return self.main_panel.get_or_create_nongeo_root()
+
+    def add_nongeo_group(self, name: str, parent=None, visible: bool = True):
+        """Add a group under the Non-Georeferenced section."""
+        return self.main_panel.add_nongeo_group(name, parent, visible)
+
+    def add_nongeo_layer(self, layer_id: str, file_path: str,
+                         parent=None, visible: bool = True):
+        """Add a layer to the Non-Georeferenced section."""
+        self.main_panel.add_nongeo_layer(layer_id, file_path, parent, visible)
+        self.labeled_panel.set_layer_id_map(file_path, layer_id)
 
     def clear(self):
         """Clear all items from both trees."""

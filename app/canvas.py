@@ -29,6 +29,13 @@ from rasterio.warp import calculate_default_transform, reproject, Resampling, tr
 WEB_MERCATOR = CRS.from_epsg(3857)
 TILE_SIZE = 512  # Pixels per tile
 
+# Pixel zone: non-georeferenced images are placed beyond valid Web Mercator bounds.
+# Scene units are scaled so pixel images have similar visual size to typical geo images.
+PIXEL_ZONE_ORIGIN_X = 25_000_000.0  # Well beyond WEB_MERCATOR_MAX (~20M)
+PIXEL_ZONE_ORIGIN_Y = 0.0
+PIXEL_ZONE_SCALE = 50.0  # Scene units per pixel (makes images ~similar size to geo layers)
+PIXEL_ZONE_GROUP_GAP = 5000.0  # Gap between group columns in scene units
+
 
 class CanvasMode(Enum):
     """Canvas interaction modes."""
@@ -45,21 +52,24 @@ class TiledLayer:
     on demand when the layer becomes visible.
     """
 
-    def __init__(self, file_path: str, lazy: bool = False, decimation_factor: int = 1):
+    def __init__(self, file_path: str, lazy: bool = False,
+                 decimation_factor: int = 1, geo: bool = True):
         """Initialize a tiled layer.
 
         Args:
             file_path: Path to the GeoTIFF file
             lazy: If True, only load bounds initially, defer full data loading
             decimation_factor: Factor by which to reduce image resolution (1 = full res, 2 = half, etc.)
+            geo: If True (default), reproject to Web Mercator. If False, use raw pixel coordinates.
         """
         self.file_path = file_path
         self.name = Path(file_path).stem  # File name without extension
         self.group_path = ""  # Group hierarchy (e.g., "folder/subfolder")
         self.visible = True
-        self.bounds = None  # (west, south, east, north) in Web Mercator
+        self.bounds = None  # (west, south, east, north) in Web Mercator or pixel coords
         self.tiles: dict[tuple[int, int], QGraphicsPixmapItem] = {}
         self.z_value = 0
+        self.geo = geo  # Whether this is a georeferenced layer
 
         # Original image info for coordinate transforms
         self._src_crs = None  # Original CRS
@@ -82,11 +92,18 @@ class TiledLayer:
         self._fully_loaded = False
         self._decimation_factor = max(1, decimation_factor)
 
-        if lazy:
-            self._load_bounds_only()
+        if geo:
+            if lazy:
+                self._load_bounds_only()
+            else:
+                self._load_and_reproject()
+                self._fully_loaded = True
         else:
-            self._load_and_reproject()
-            self._fully_loaded = True
+            if lazy:
+                self._load_pixel_bounds_only()
+            else:
+                self._load_pixel_data()
+                self._fully_loaded = True
 
     def _load_bounds_only(self):
         """Load only the bounds and metadata, not the full raster data.
@@ -139,7 +156,10 @@ class TiledLayer:
     def ensure_loaded(self):
         """Ensure the full raster data is loaded. Call before accessing pixel data."""
         if not self._fully_loaded:
-            self._load_and_reproject()
+            if self.geo:
+                self._load_and_reproject()
+            else:
+                self._load_pixel_data()
             self._fully_loaded = True
 
     def is_fully_loaded(self) -> bool:
@@ -263,6 +283,75 @@ class TiledLayer:
             self._height = height
             self._n_tiles_x = math.ceil(width / TILE_SIZE)
             self._n_tiles_y = math.ceil(height / TILE_SIZE)
+
+    def _load_pixel_bounds_only(self):
+        """Load only dimensions for a non-georeferenced image (no CRS/reprojection).
+
+        Bounds are set later by the canvas layout manager via set_pixel_bounds().
+        """
+        with rasterio.open(self.file_path) as src:
+            self._src_width = src.width
+            self._src_height = src.height
+
+            width = src.width // self._decimation_factor or 1
+            height = src.height // self._decimation_factor or 1
+
+            self._width = width
+            self._height = height
+            self._n_tiles_x = math.ceil(width / TILE_SIZE)
+            self._n_tiles_y = math.ceil(height / TILE_SIZE)
+
+            # Bounds will be assigned by the pixel zone layout manager
+            # Use placeholder bounds at origin; will be overwritten
+            self.bounds = (0, 0, width, height)
+
+    def _load_pixel_data(self):
+        """Load a non-georeferenced image directly as pixel data (no reprojection)."""
+        # Preserve bounds if already assigned by set_pixel_bounds()
+        saved_bounds = self.bounds
+
+        with rasterio.open(self.file_path) as src:
+            self._src_width = src.width
+            self._src_height = src.height
+
+            width = src.width // self._decimation_factor or 1
+            height = src.height // self._decimation_factor or 1
+
+            if src.count >= 3:
+                r = src.read(1, out_shape=(height, width)).astype(np.uint8)
+                g = src.read(2, out_shape=(height, width)).astype(np.uint8)
+                b = src.read(3, out_shape=(height, width)).astype(np.uint8)
+            else:
+                gray = src.read(1, out_shape=(height, width)).astype(np.uint8)
+                r = g = b = gray
+
+            rgba = np.zeros((height, width, 4), dtype=np.uint8)
+            rgba[:, :, 0] = r
+            rgba[:, :, 1] = g
+            rgba[:, :, 2] = b
+            rgba[:, :, 3] = 255
+
+            self._rgba_data = rgba
+            self._width = width
+            self._height = height
+            self._n_tiles_x = math.ceil(width / TILE_SIZE)
+            self._n_tiles_y = math.ceil(height / TILE_SIZE)
+
+            # Restore bounds if they were already set (by set_pixel_bounds)
+            if saved_bounds and saved_bounds != (0, 0, width, height):
+                self.bounds = saved_bounds
+            else:
+                self.bounds = (0, 0, width, height)
+
+    def set_pixel_bounds(self, origin_x: float, origin_y: float):
+        """Set the bounds for a non-georeferenced layer at the given origin.
+
+        Places the image so that its top-left corner is at (origin_x, origin_y)
+        in scene coordinates, scaled by PIXEL_ZONE_SCALE.
+        """
+        w = self._width * PIXEL_ZONE_SCALE
+        h = self._height * PIXEL_ZONE_SCALE
+        self.bounds = (origin_x, origin_y, origin_x + w, origin_y + h)
 
     def get_tile_bounds(self,
                         tx: int,
@@ -449,6 +538,19 @@ class TiledLayer:
 
         return (col, row)
 
+    def scene_to_pixel(self, easting: float, northing: float) -> tuple[float, float]:
+        """Convert scene coordinates to pixel coordinates for non-geo layers.
+
+        Scene units are scaled by PIXEL_ZONE_SCALE relative to source pixels.
+        Pixel Y=0 is the top of the image (north), increasing downward.
+        """
+        if self.bounds is None:
+            return (0, 0)
+        west, _, _, north = self.bounds
+        pixel_x = (easting - west) / PIXEL_ZONE_SCALE
+        pixel_y = (north - northing) / PIXEL_ZONE_SCALE
+        return (pixel_x, pixel_y)
+
 
 class AsyncFileLoader(QObject):
     """Worker object for loading GeoTIFF files asynchronously in a background thread.
@@ -500,24 +602,26 @@ class AsyncFileLoader(QObject):
             try:
                 # Load just the bounds (fast operation)
                 with rasterio.open(file_path) as src:
-                    if src.crs is None:
-                        raise ValueError(
-                            f"No CRS found in '{file_path}'. "
-                            "The file may not be a valid GeoTIFF."
-                        )
-
                     src_crs = src.crs
                     src_transform = src.transform
                     src_width = src.width
                     src_height = src.height
 
-                    # Calculate bounds in Web Mercator
-                    dst_crs = WEB_MERCATOR
-                    transform, width, height = calculate_default_transform(
-                        src.crs, dst_crs, src.width, src.height, *src.bounds
-                    )
-                    bounds = rasterio.transform.array_bounds(
-                        height, width, transform)
+                    if src.crs is not None:
+                        # Georeferenced: calculate bounds in Web Mercator
+                        dst_crs = WEB_MERCATOR
+                        transform, width, height = calculate_default_transform(
+                            src.crs, dst_crs, src.width, src.height, *src.bounds
+                        )
+                        bounds = rasterio.transform.array_bounds(
+                            height, width, transform)
+                        geo = True
+                    else:
+                        # Non-georeferenced: use raw pixel dimensions
+                        width = src.width
+                        height = src.height
+                        bounds = (0, 0, width, height)  # Placeholder
+                        geo = False
 
                 # Emit the loaded data
                 layer_data = {
@@ -530,6 +634,7 @@ class AsyncFileLoader(QObject):
                     'src_transform': src_transform,
                     'src_width': src_width,
                     'src_height': src_height,
+                    'geo': geo,
                 }
                 self.file_loaded.emit(file_path, layer_data)
                 loaded_count += 1
@@ -675,7 +780,7 @@ class MapCanvas(QGraphicsView):
 
     # Signal emitted when mouse moves: (longitude, latitude, layer_name,
     # group_path)
-    coordinates_changed = pyqtSignal(float, float, str, str)
+    coordinates_changed = pyqtSignal(float, float, str, str, bool)  # x, y, layer, group, is_pixel
 
     # Signal emitted when a label is placed: (pixel_x, pixel_y, lon, lat,
     # image_name, image_group, image_path)
@@ -727,13 +832,14 @@ class MapCanvas(QGraphicsView):
         # Set background and allow dragging on empty space
         self.setBackgroundBrush(Qt.darkGray)
         # Web Mercator bounds: approximately -20037508 to +20037508 meters
-        # Add some padding but keep it reasonable
+        # Extended to include pixel zone (non-georeferenced images placed at X > 25M)
         WEB_MERCATOR_MAX = 20037508.34  # meters (at 180° longitude)
+        SCENE_MAX = 30_000_000  # Enough to include pixel zone
         self.setSceneRect(
             -WEB_MERCATOR_MAX * 1.1,  # left (west)
-            -WEB_MERCATOR_MAX * 1.1,  # top (remember Y is flipped: -north)
-            WEB_MERCATOR_MAX * 2.2,   # width
-            WEB_MERCATOR_MAX * 2.2    # height
+            -SCENE_MAX,               # top (remember Y is flipped: -north)
+            WEB_MERCATOR_MAX * 1.1 + SCENE_MAX,  # width (extends into pixel zone)
+            SCENE_MAX * 2             # height
         )
 
         # Canvas mode
@@ -758,6 +864,11 @@ class MapCanvas(QGraphicsView):
         # file_path -> layer_id for duplicate detection
         self._path_to_layer: dict[str, str] = {}
         self._next_id = 1
+
+        # Pixel zone layout: group_path -> (origin_x, max_width)
+        # Tracks column positions for non-georeferenced image groups
+        self._pixel_zone_groups: dict[str, tuple[float, float]] = {}
+        self._pixel_zone_next_x = PIXEL_ZONE_ORIGIN_X
 
         # Tile update timer (debounce rapid view changes)
         self._tile_update_timer = QTimer()
@@ -811,6 +922,80 @@ class MapCanvas(QGraphicsView):
             print(f"Error loading {file_path}: {e}")
             traceback.print_exc()
             return None
+
+    def add_pixel_layer(self, file_path: str, group_path: str = "",
+                        lazy: bool = False, visible: bool = True,
+                        decimation_factor: int = 1) -> str | None:
+        """Add a non-georeferenced image layer to the pixel zone.
+
+        Images in the same group are stacked (same position, cycled via visibility).
+        Each group occupies a separate column in the pixel zone.
+
+        Args:
+            file_path: Path to the image file
+            group_path: Group hierarchy for column layout
+            lazy: If True, only load bounds initially
+            visible: Whether the layer should be visible initially
+            decimation_factor: Factor by which to reduce image resolution
+        """
+        if file_path in self._path_to_layer:
+            return self._path_to_layer[file_path]
+
+        try:
+            layer = TiledLayer(file_path, lazy=lazy,
+                               decimation_factor=decimation_factor, geo=False)
+            layer.visible = visible
+            layer.group_path = group_path
+
+            # Assign pixel zone position based on group
+            origin_x = self._get_pixel_zone_column(group_path, layer._width)
+            layer.set_pixel_bounds(origin_x, PIXEL_ZONE_ORIGIN_Y)
+
+            layer_id = f"layer_{self._next_id}"
+            self._next_id += 1
+
+            self._layers[layer_id] = layer
+            self._layer_order.append(layer_id)
+            self._path_to_layer[file_path] = layer_id
+            self._update_z_order()
+
+            if visible:
+                self._update_visible_tiles()
+
+            return layer_id
+
+        except Exception as e:
+            print(f"Error loading pixel layer {file_path}: {e}")
+            traceback.print_exc()
+            return None
+
+    def _get_pixel_zone_column(self, group_path: str, layer_width: int) -> float:
+        """Get or create a pixel zone column for a group.
+
+        All images in the same group share the same X origin (stacked).
+        Different groups get different columns.
+
+        Returns:
+            The X origin for this group's column.
+        """
+        if group_path in self._pixel_zone_groups:
+            origin_x, max_width = self._pixel_zone_groups[group_path]
+            # Update max width if this image is wider
+            scaled_width = layer_width * PIXEL_ZONE_SCALE
+            if scaled_width > max_width:
+                self._pixel_zone_groups[group_path] = (origin_x, scaled_width)
+            return origin_x
+
+        # Allocate a new column
+        origin_x = self._pixel_zone_next_x
+        scaled_width = layer_width * PIXEL_ZONE_SCALE
+        self._pixel_zone_groups[group_path] = (origin_x, scaled_width)
+        self._pixel_zone_next_x = origin_x + scaled_width + PIXEL_ZONE_GROUP_GAP
+        return origin_x
+
+    def is_in_pixel_zone(self, easting: float) -> bool:
+        """Check if a scene X coordinate is in the pixel zone."""
+        return easting >= PIXEL_ZONE_ORIGIN_X
 
     def _get_view_bounds(self) -> tuple[float, float, float, float]:
         """Get current view bounds in Web Mercator coordinates."""
@@ -869,9 +1054,13 @@ class MapCanvas(QGraphicsView):
     def set_layer_visibility(self, layer_id: str, visible: bool):
         """Show or hide a layer."""
         if layer_id in self._layers:
-            self._layers[layer_id].set_visibility(visible)
+            layer = self._layers[layer_id]
+            layer.set_visibility(visible)
             if visible:
                 self._update_visible_tiles()
+            # For non-geo layers, toggle associated label markers
+            if not layer.geo:
+                self._set_label_visibility_for_image(layer.file_path, visible)
             # Force viewport update to ensure cursor appears on top of tiles
             self.viewport().update()
 
@@ -919,6 +1108,8 @@ class MapCanvas(QGraphicsView):
         self._layers.clear()
         self._layer_order.clear()
         self._path_to_layer.clear()
+        self._pixel_zone_groups.clear()
+        self._pixel_zone_next_x = PIXEL_ZONE_ORIGIN_X
 
     def set_layer_group(self, layer_id: str, group_path: str):
         """Set the group path for a layer."""
@@ -1139,9 +1330,13 @@ class MapCanvas(QGraphicsView):
 
             # Only allow labeling on actual images (not "nearest" ones)
             if layer and layer_name and not layer_name.startswith("~"):
-                lon, lat = self._web_mercator_to_wgs84(easting, northing)
-                # Convert lat/lon to pixel coordinates in the original image
-                pixel_x, pixel_y = layer.latlon_to_pixel(lon, lat)
+                if layer.geo:
+                    lon, lat = self._web_mercator_to_wgs84(easting, northing)
+                    pixel_x, pixel_y = layer.latlon_to_pixel(lon, lat)
+                else:
+                    # Non-georeferenced: scene coords map directly to pixels
+                    pixel_x, pixel_y = layer.scene_to_pixel(easting, northing)
+                    lon, lat = 0.0, 0.0
                 self.label_placed.emit(
                     pixel_x,
                     pixel_y,
@@ -1203,9 +1398,19 @@ class MapCanvas(QGraphicsView):
         easting = scene_pos.x()
         northing = -scene_pos.y()
 
-        lon, lat = self._web_mercator_to_wgs84(easting, northing)
-        layer_name, group_path = self._get_layer_at_position(easting, northing)
-        self.coordinates_changed.emit(lon, lat, layer_name, group_path)
+        if self.is_in_pixel_zone(easting):
+            # In the pixel zone: find the layer and compute pixel coords
+            layer_name, group_path = self._get_layer_at_position(easting, northing)
+            layer, _, _ = self._get_layer_and_info_at_position(easting, northing)
+            if layer and not layer.geo:
+                px, py = layer.scene_to_pixel(easting, northing)
+                self.coordinates_changed.emit(px, py, layer_name, group_path, True)
+            else:
+                self.coordinates_changed.emit(0.0, 0.0, layer_name, group_path, True)
+        else:
+            lon, lat = self._web_mercator_to_wgs84(easting, northing)
+            layer_name, group_path = self._get_layer_at_position(easting, northing)
+            self.coordinates_changed.emit(lon, lat, layer_name, group_path, False)
 
     def keyPressEvent(self, event):
         """Handle key press events."""
@@ -1306,24 +1511,36 @@ class MapCanvas(QGraphicsView):
 
     def add_label_marker(self, label_id: int, lon: float, lat: float,
                          image_name: str, image_group: str, image_path: str,
-                         class_name: str, color: QColor = None):
+                         class_name: str, color: QColor = None,
+                         pixel_x: float = None, pixel_y: float = None):
         """Add a visual marker for a label on the canvas.
 
         Args:
             label_id: Unique ID of the label
-            lon: Longitude (WGS84)
-            lat: Latitude (WGS84)
+            lon: Longitude (WGS84) — used for geo layers
+            lat: Latitude (WGS84) — used for geo layers
             image_name: Name of the image the label belongs to
             image_group: Group path of the image
             image_path: Full file path of the image
             class_name: Class name to display
             color: Optional color for the marker
+            pixel_x: Pixel X coord — for non-geo layers, used to position marker
+            pixel_y: Pixel Y coord — for non-geo layers, used to position marker
         """
         if color is None:
             color = QColor(255, 50, 50)  # Default red
 
-        # Convert lat/lon to Web Mercator for scene positioning
-        x, y = self._wgs84_to_web_mercator(lon, lat)
+        # Determine scene position based on whether layer is georeferenced
+        layer = self._get_layer_by_name_and_group(image_name, image_group)
+        if layer and not layer.geo and pixel_x is not None and pixel_y is not None:
+            # Non-geo layer: compute scene position from pixel coords
+            # pixel_y=0 is top of image (north), increasing downward
+            west, _, _, north = layer.bounds
+            x = west + pixel_x * PIXEL_ZONE_SCALE
+            y = north - pixel_y * PIXEL_ZONE_SCALE
+        else:
+            # Geo layer: convert lat/lon to Web Mercator
+            x, y = self._wgs84_to_web_mercator(lon, lat)
 
         # Get current view scale to size markers appropriately
         view_scale = self.transform().m11()  # Horizontal scale factor
@@ -1369,6 +1586,13 @@ class MapCanvas(QGraphicsView):
         """Remove all label markers from the canvas."""
         for label_id in list(self._label_items.keys()):
             self.remove_label_marker(label_id)
+
+    def _set_label_visibility_for_image(self, image_path: str, visible: bool):
+        """Show or hide all label markers belonging to a specific image."""
+        for ellipse, text in self._label_items.values():
+            if ellipse.data(0) == image_path:
+                ellipse.setVisible(visible)
+                text.setVisible(visible)
 
     def update_label_markers_scale(self):
         """Update label marker sizes based on current zoom level."""

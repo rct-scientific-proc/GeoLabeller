@@ -657,19 +657,28 @@ class MainWindow(QMainWindow):
             image_group,
             image_path,
             class_name,
-            color)
+            color,
+            pixel_x=pixel_x,
+            pixel_y=pixel_y)
 
         # Add to labeled images panel incrementally (O(1) instead of full refresh)
         image = self.project.images.get(image_path)
         if image:
             self.layer_panel.add_label_to_panel(label, image)
 
-        self.statusBar.showMessage(
-            f"Added label: {class_name} at ({
-                lon:.6f}, {
-                lat:.6f}) on {image_name}",
-            3000
-        )
+        # Show appropriate message for geo vs pixel layers
+        layer = self.canvas.get_layer(self.canvas._path_to_layer.get(image_path, ""))
+        if layer and not layer.geo:
+            self.statusBar.showMessage(
+                f"Added label: {class_name} at pixel ({pixel_x:.1f}, {pixel_y:.1f}) on {image_name}",
+                3000)
+        else:
+            self.statusBar.showMessage(
+                f"Added label: {class_name} at ({
+                    lon:.6f}, {
+                    lat:.6f}) on {image_name}",
+                3000
+            )
 
     def _on_label_removed(self, label_id: int, image_path: str):
         """Handle a label being removed."""
@@ -771,7 +780,8 @@ class MainWindow(QMainWindow):
             self.canvas.add_label_marker(
                 label.id, label.lon, label.lat,
                 image.name, image.group, image.path,
-                label.class_name, color
+                label.class_name, color,
+                pixel_x=label.pixel_x, pixel_y=label.pixel_y
             )
             # Check if label is linked to others
             linked_labels = self.project.get_linked_labels(label.id)
@@ -978,17 +988,28 @@ class MainWindow(QMainWindow):
 
         for idx, image in enumerate(self.project.images.values()):
             if os.path.exists(image.path):
-                layer_id = self.canvas.add_layer(
-                    image.path,
-                    decimation_factor=self.decimation_spin.value())
-                if layer_id:
-                    # Recreate group structure
-                    parent_group = get_or_create_group(image.group)
-                    self.layer_panel.add_layer(
-                        layer_id, image.path, parent_group)
-                    # Set the group path on the canvas layer
-                    self.canvas.set_layer_group(layer_id, image.group)
-                    loaded += 1
+                if image.crs_epsg is not None:
+                    # Georeferenced image
+                    layer_id = self.canvas.add_layer(
+                        image.path,
+                        decimation_factor=self.decimation_spin.value())
+                    if layer_id:
+                        parent_group = get_or_create_group(image.group)
+                        self.layer_panel.add_layer(
+                            layer_id, image.path, parent_group)
+                        self.canvas.set_layer_group(layer_id, image.group)
+                        loaded += 1
+                else:
+                    # Non-georeferenced image
+                    layer_id = self.canvas.add_pixel_layer(
+                        image.path, group_path=image.group,
+                        decimation_factor=self.decimation_spin.value())
+                    if layer_id:
+                        nongeo_parent = self.layer_panel.add_nongeo_group(
+                            image.group.split("/")[-1] if image.group else "Ungrouped")
+                        self.layer_panel.add_nongeo_layer(
+                            layer_id, image.path, nongeo_parent)
+                        loaded += 1
             else:
                 missing.append(image.path)
 
@@ -1619,10 +1640,27 @@ class MainWindow(QMainWindow):
                 skipped += 1
                 continue
 
-            layer_id = self.canvas.add_layer(
-                file_path, decimation_factor=self.decimation_spin.value())
+            # Check if the file has a valid CRS
+            has_crs = True
+            try:
+                with rasterio.open(file_path) as src:
+                    if src.crs is None:
+                        has_crs = False
+            except Exception:
+                pass
+
+            if has_crs:
+                layer_id = self.canvas.add_layer(
+                    file_path, decimation_factor=self.decimation_spin.value())
+                if layer_id:
+                    self.layer_panel.add_layer(layer_id, file_path)
+            else:
+                layer_id = self.canvas.add_pixel_layer(
+                    file_path, decimation_factor=self.decimation_spin.value())
+                if layer_id:
+                    self.layer_panel.add_nongeo_layer(layer_id, file_path)
+
             if layer_id:
-                self.layer_panel.add_layer(layer_id, file_path)
                 # Track the loaded image with original dimensions and transform
                 name = Path(file_path).stem
                 width, height = self.canvas.get_layer_source_dimensions(
@@ -1731,17 +1769,38 @@ class MainWindow(QMainWindow):
             if self.canvas.is_path_loaded(file_path_str):
                 continue
 
-            layer_id = self.canvas.add_layer(
-                file_path_str, visible=False,
-                decimation_factor=self.decimation_spin.value())
+            # Check CRS to decide geo vs pixel-mode loading
+            has_crs = True
+            try:
+                with rasterio.open(file_path_str) as src:
+                    if src.crs is None:
+                        has_crs = False
+            except Exception:
+                pass
+
+            rel_dir_str = str(rel_dir).replace(
+                "\\", "/") if rel_dir != Path(".") else ""
+            group_path_str = f"{root_group_name}/{rel_dir_str}" if rel_dir_str else root_group_name
+
+            if has_crs:
+                layer_id = self.canvas.add_layer(
+                    file_path_str, visible=False,
+                    decimation_factor=self.decimation_spin.value())
+                if layer_id:
+                    self.layer_panel.add_layer(
+                        layer_id, file_path_str, parent_group, visible=False)
+                    self.canvas.set_layer_group(layer_id, group_path_str)
+            else:
+                layer_id = self.canvas.add_pixel_layer(
+                    file_path_str, group_path=group_path_str, visible=False,
+                    decimation_factor=self.decimation_spin.value())
+                if layer_id:
+                    nongeo_parent = self.layer_panel.add_nongeo_group(
+                        rel_dir.name if rel_dir != Path(".") else root_group_name)
+                    self.layer_panel.add_nongeo_layer(
+                        layer_id, file_path_str, nongeo_parent, visible=False)
+
             if layer_id:
-                self.layer_panel.add_layer(
-                    layer_id, file_path_str, parent_group, visible=False)
-                # Include root group name in the group path
-                rel_dir_str = str(rel_dir).replace(
-                    "\\", "/") if rel_dir != Path(".") else ""
-                group_path_str = f"{root_group_name}/{rel_dir_str}" if rel_dir_str else root_group_name
-                self.canvas.set_layer_group(layer_id, group_path_str)
                 name = file_path.stem
                 width, height = self.canvas.get_layer_source_dimensions(
                     layer_id)
@@ -1752,6 +1811,10 @@ class MainWindow(QMainWindow):
                 loaded_count += 1
 
         progress.setValue(len(tiff_files))
+
+        # Remove empty geo groups (e.g. directory had only non-geo files)
+        self._remove_empty_groups(root_group)
+
         self.layer_panel.tree.collapseAll()
 
         if progress.wasCanceled():
@@ -1834,6 +1897,28 @@ class MainWindow(QMainWindow):
         self._async_ui_timer.start()
         self._async_loader.start()
 
+    def _remove_empty_groups(self, item):
+        """Recursively remove empty group items from the layer tree.
+
+        A group is empty if it has no children after pruning.
+        """
+        if item is None:
+            return
+        # Process children bottom-up
+        for i in range(item.childCount() - 1, -1, -1):
+            child = item.child(i)
+            if child.data(0, Qt.UserRole + 1) == "group":
+                self._remove_empty_groups(child)
+        # If this group is now childless, remove it
+        if item.childCount() == 0:
+            parent = item.parent()
+            if parent:
+                parent.removeChild(item)
+            else:
+                index = self.layer_panel.tree.indexOfTopLevelItem(item)
+                if index >= 0:
+                    self.layer_panel.tree.takeTopLevelItem(index)
+
     def _get_or_create_group_async(self, group_path: str):
         """Get or create group hierarchy for async loading."""
         if not group_path:
@@ -1857,6 +1942,35 @@ class MainWindow(QMainWindow):
             if current_key not in self._async_group_cache:
                 # Create group with visible=False for async imports
                 group = self.layer_panel.add_group(part, parent, visible=False)
+                self._async_group_cache[current_key] = group
+            parent = self._async_group_cache[current_key]
+
+        return parent
+
+    def _get_or_create_nongeo_group_async(self, group_path: str):
+        """Get or create group hierarchy for non-georeferenced async loading.
+
+        Uses the 'Non-Georeferenced' tree section in the layer panel.
+        """
+        nongeo_key = Path("__nongeo__")
+        if nongeo_key not in self._async_group_cache:
+            nongeo_root = self.layer_panel.get_or_create_nongeo_root()
+            self._async_group_cache[nongeo_key] = nongeo_root
+
+        if not group_path:
+            return self._async_group_cache[nongeo_key]
+
+        # Build sub-groups under the non-geo root
+        parts = group_path.split("/")
+        parent = self._async_group_cache[nongeo_key]
+        current_path = "__nongeo__"
+
+        for part in parts:
+            current_path = f"{current_path}/{part}"
+            current_key = Path(current_path.replace("/", "\\"))
+
+            if current_key not in self._async_group_cache:
+                group = self.layer_panel.add_nongeo_group(part, parent, visible=False)
                 self._async_group_cache[current_key] = group
             parent = self._async_group_cache[current_key]
 
@@ -1898,18 +2012,32 @@ class MainWindow(QMainWindow):
                     continue
 
                 group_path = layer_data['group_path']
-                parent_group = self._get_or_create_group_async(group_path)
+                is_geo = layer_data.get('geo', True)
 
-                # Add layer with lazy loading and hidden by default
-                layer_id = self.canvas.add_layer(
-                    file_path, lazy=True, visible=False,
-                    decimation_factor=self.decimation_spin.value())
+                if is_geo:
+                    parent_group = self._get_or_create_group_async(group_path)
+
+                    # Add georeferenced layer with lazy loading
+                    layer_id = self.canvas.add_layer(
+                        file_path, lazy=True, visible=False,
+                        decimation_factor=self.decimation_spin.value())
+                    if layer_id:
+                        self.layer_panel.add_layer(
+                            layer_id, file_path, parent_group, visible=False)
+                        self.canvas.set_layer_group(layer_id, group_path)
+                else:
+                    # Non-georeferenced: add to pixel zone
+                    parent_group = self._get_or_create_nongeo_group_async(group_path)
+
+                    layer_id = self.canvas.add_pixel_layer(
+                        file_path, group_path=group_path, lazy=True,
+                        visible=False,
+                        decimation_factor=self.decimation_spin.value())
+                    if layer_id:
+                        self.layer_panel.add_nongeo_layer(
+                            layer_id, file_path, parent_group, visible=False)
+
                 if layer_id:
-                    # Add to tree as hidden (unchecked)
-                    self.layer_panel.add_layer(
-                        layer_id, file_path, parent_group, visible=False)
-                    self.canvas.set_layer_group(layer_id, group_path)
-
                     # Track in project with original dimensions (skip for
                     # project loading)
                     if not self._async_skip_project_add:
@@ -1969,6 +2097,11 @@ class MainWindow(QMainWindow):
 
     def _finish_async_loading_directory(self, errors: int = 0):
         """Complete directory loading after all files are processed."""
+        # Remove empty geo groups (e.g. directory had only non-geo files)
+        if hasattr(self, '_async_group_cache'):
+            for item in self._async_group_cache.values():
+                self._remove_empty_groups(item)
+
         msg = f"Loaded {self._async_loaded_count} GeoTIFF files"
         if errors > 0:
             msg += f" ({errors} errors)"
@@ -2108,8 +2241,9 @@ class MainWindow(QMainWindow):
         self.progress_indicator.hide()
         self.progress_indicator.setValue(0)
 
-    def _update_coordinates(self, lon: float, lat: float,
-                            layer_name: str, group_path: str):
+    def _update_coordinates(self, x: float, y: float,
+                            layer_name: str, group_path: str,
+                            is_pixel: bool = False):
         """Update the coordinate display in the status bar."""
         if layer_name:
             # Build display name with group path if present
@@ -2118,19 +2252,26 @@ class MainWindow(QMainWindow):
             else:
                 display_name = layer_name.lstrip('~')
 
-            if layer_name.startswith("~"):
+            if is_pixel:
+                # Non-georeferenced image: show pixel coordinates
+                self.coord_label.setText(
+                    f"Pixel: ({x:.1f}, {y:.1f})  |  Image: {display_name}")
+            elif layer_name.startswith("~"):
                 # Layer name prefixed with ~ means "closest to"
                 self.coord_label.setText(
                     f"Lon: {
-                        lon:.6f}°  Lat: {
-                        lat:.6f}°  |  Nearest: {display_name}")
+                        x:.6f}°  Lat: {
+                        y:.6f}°  |  Nearest: {display_name}")
             else:
                 self.coord_label.setText(
                     f"Lon: {
-                        lon:.6f}°  Lat: {
-                        lat:.6f}°  |  Image: {display_name}")
+                        x:.6f}°  Lat: {
+                        y:.6f}°  |  Image: {display_name}")
         else:
-            self.coord_label.setText(f"Lon: {lon:.6f}°  Lat: {lat:.6f}°")
+            if is_pixel:
+                self.coord_label.setText(f"Pixel: ({x:.1f}, {y:.1f})")
+            else:
+                self.coord_label.setText(f"Lon: {x:.6f}°  Lat: {y:.6f}°")
 
     def _on_layer_group_changed(self, layer_id: str, group_path: str):
         """Handle layer group change - update both canvas and project."""
