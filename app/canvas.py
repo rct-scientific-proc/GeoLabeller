@@ -103,6 +103,12 @@ class TiledLayer:
             self._src_width = src.width
             self._src_height = src.height
 
+            if src.crs is None:
+                raise ValueError(
+                    f"No CRS found in '{self.file_path}'. "
+                    "The file may not be a valid GeoTIFF."
+                )
+
             # Calculate bounds in Web Mercator without loading pixel data
             dst_crs = WEB_MERCATOR
             transform, width, height = calculate_default_transform(
@@ -148,6 +154,12 @@ class TiledLayer:
             self._src_transform = src.transform
             self._src_width = src.width
             self._src_height = src.height
+
+            if src.crs is None:
+                raise ValueError(
+                    f"No CRS found in '{self.file_path}'. "
+                    "The file may not be a valid GeoTIFF."
+                )
 
             dst_crs = WEB_MERCATOR
             transform, width, height = calculate_default_transform(
@@ -488,6 +500,12 @@ class AsyncFileLoader(QObject):
             try:
                 # Load just the bounds (fast operation)
                 with rasterio.open(file_path) as src:
+                    if src.crs is None:
+                        raise ValueError(
+                            f"No CRS found in '{file_path}'. "
+                            "The file may not be a valid GeoTIFF."
+                        )
+
                     src_crs = src.crs
                     src_transform = src.transform
                     src_width = src.width

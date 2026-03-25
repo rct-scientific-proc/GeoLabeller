@@ -1927,7 +1927,9 @@ class MainWindow(QMainWindow):
 
     def _on_async_file_error(self, file_path: str, error: str):
         """Handle a file failing to load."""
+        name = os.path.basename(file_path)
         print(f"Failed to load {file_path}: {error}")
+        self.statusBar.showMessage(f"Failed to load {name}: {error}", 8000)
 
     def _on_async_progress(self, processed: int, total: int):
         """Handle progress updates during async loading."""
