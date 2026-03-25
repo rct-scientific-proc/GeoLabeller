@@ -1722,6 +1722,7 @@ class MainWindow(QMainWindow):
 
         # Build directory structure with groups under the root group
         group_cache: dict[Path, any] = {}
+        nongeo_group_cache: dict[str, any] = {}
 
         def get_or_create_group(rel_dir: Path):
             if rel_dir == Path("."):
@@ -1732,6 +1733,13 @@ class MainWindow(QMainWindow):
             group = self.layer_panel.add_group(
                 rel_dir.name, parent_group, visible=False)
             group_cache[rel_dir] = group
+            return group
+
+        def get_or_create_nongeo_group(name: str):
+            if name in nongeo_group_cache:
+                return nongeo_group_cache[name]
+            group = self.layer_panel.add_nongeo_group(name)
+            nongeo_group_cache[name] = group
             return group
 
         # Create progress dialog
@@ -1795,7 +1803,7 @@ class MainWindow(QMainWindow):
                     file_path_str, group_path=group_path_str, visible=False,
                     decimation_factor=self.decimation_spin.value())
                 if layer_id:
-                    nongeo_parent = self.layer_panel.add_nongeo_group(
+                    nongeo_parent = get_or_create_nongeo_group(
                         rel_dir.name if rel_dir != Path(".") else root_group_name)
                     self.layer_panel.add_nongeo_layer(
                         layer_id, file_path_str, nongeo_parent, visible=False)
