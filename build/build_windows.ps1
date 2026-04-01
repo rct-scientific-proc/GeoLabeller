@@ -5,7 +5,8 @@ param(
     [switch]$Msi,      # Build MSI installer instead of just executable
     [switch]$Clean,    # Clean build directory before building
     [switch]$KeepVenv, # Keep the virtual environment after build
-    [string]$Python = "python"  # Path or command for Python executable
+    [string]$Python = "python",  # Path or command for Python executable
+    [string]$Version   # Optional version string (e.g. "1.2.3")
 )
 
 $ErrorActionPreference = "Stop"
@@ -74,6 +75,16 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "  Dependencies installed" -ForegroundColor Green
 
+# Set version environment variable if provided
+if ($Version) {
+    if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+        Write-Host "  ERROR: Version must be in X.X.X format (e.g. 1.2.3)" -ForegroundColor Red
+        exit 1
+    }
+    $env:GEOLABELLER_VERSION = $Version
+    Write-Host "Version: $Version" -ForegroundColor Cyan
+}
+
 # Change to build directory
 Push-Location $ScriptDir
 
@@ -109,6 +120,11 @@ try {
 } finally {
     Pop-Location
     
+    # Clear version environment variable
+    if ($env:GEOLABELLER_VERSION) {
+        Remove-Item Env:GEOLABELLER_VERSION
+    }
+
     # Clean up virtual environment unless -KeepVenv is specified
     if (-not $KeepVenv -and (Test-Path $VenvDir)) {
         Write-Host "Cleaning up virtual environment..." -ForegroundColor Yellow

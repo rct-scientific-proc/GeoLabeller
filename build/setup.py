@@ -6,12 +6,21 @@ Usage:
     python setup.py bdist_msi   # Build MSI installer (Windows only)
 """
 
+import os
 import sys
 from pathlib import Path
 from cx_Freeze import setup, Executable
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Version can be overridden via GEOLABELLER_VERSION environment variable
+VERSION = os.environ.get("GEOLABELLER_VERSION", "1.0.0")
+
+# Locate rasterio's bundled PROJ data directory (contains proj.db)
+# rasterio ships a newer PROJ than pyproj, so we must use its copy
+import rasterio
+proj_data_dir = Path(rasterio.__file__).parent / "proj_data"
 
 # Dependencies to include
 build_exe_options = {
@@ -77,8 +86,7 @@ build_exe_options = {
         "PyQt5.QtXmlPatterns",
     ],
     "include_files": [
-        # Include any additional data files here
-        # ("source_path", "dest_path"),
+        (str(proj_data_dir), "proj_data"),
     ],
     "include_msvcr": True,  # Include Microsoft Visual C++ runtime (Windows)
 }
@@ -105,9 +113,9 @@ target = Executable(
 
 setup(
     name="GeoLabeller",
-    version="1.0.0",
+    version=VERSION,
     description="A geospatial image labeling tool for creating ground truth datasets",
-    author="Ryan",
+    author="MIT License",
     options={
         "build_exe": build_exe_options,
         "bdist_msi": bdist_msi_options,
