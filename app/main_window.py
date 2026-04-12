@@ -2316,7 +2316,7 @@ class MainWindow(QMainWindow):
 <tr><td><b>Ctrl+Shift+P</b></td><td>Open Project</td></tr>
 <tr><td><b>Ctrl+S</b></td><td>Save Project</td></tr>
 <tr><td><b>Ctrl+Shift+S</b></td><td>Save Project As</td></tr>
-<tr><td><b>Ctrl+O</b></td><td>Add GeoTIFF</td></tr>
+<tr><td><b>Ctrl+O</b></td><td>Add Image (GeoTIFF + custom formats)</td></tr>
 <tr><td><b>Ctrl+Shift+O</b></td><td>Add Directory</td></tr>
 <tr><td><b>Ctrl+Q</b></td><td>Exit</td></tr>
 </table>
@@ -2332,7 +2332,8 @@ class MainWindow(QMainWindow):
 <table>
 <tr><td><b>P</b></td><td>Pan mode</td></tr>
 <tr><td><b>L</b></td><td>Label mode</td></tr>
-<tr><td><b>C</b></td><td>Cycle mode</td></tr>
+<tr><td><b>C</b></td><td>Cycle mode (group-based)</td></tr>
+<tr><td><b>V</b></td><td>View Cycle mode (layers in current view)</td></tr>
 </table>
 
 <h3>Labeling</h3>
@@ -2340,12 +2341,14 @@ class MainWindow(QMainWindow):
 <tr><td><b>Left-click</b></td><td>Place label (in Label/Cycle mode)</td></tr>
 <tr><td><b>Right-click label</b></td><td>Label options (remove, link)</td></tr>
 <tr><td><b>Ctrl+Left-click</b></td><td>Label options in Cycle mode</td></tr>
+<tr><td><b>1&ndash;9</b></td><td>Quick-switch to class 1&ndash;9</td></tr>
 <tr><td><b>Escape</b></td><td>Cancel link mode</td></tr>
 </table>
 
-<h3>Cycle Mode</h3>
+<h3>Cycle / View Cycle Mode</h3>
 <table>
 <tr><td><b>Space</b></td><td>Advance to next layer (unchecks current)</td></tr>
+<tr><td><b>Ctrl+Space</b></td><td>Go back to previous layer</td></tr>
 <tr><td><b>Right-click + drag</b></td><td>Pan around</td></tr>
 <tr><td><b>Mouse wheel</b></td><td>Zoom in/out</td></tr>
 </table>
@@ -2355,7 +2358,7 @@ class MainWindow(QMainWindow):
 <tr><td><b>Checkbox</b></td><td>Toggle layer/group visibility</td></tr>
 <tr><td><b>Right-click group</b></td><td>Select/Unselect all, Expand/Collapse All</td></tr>
 <tr><td><b>Right-click layer</b></td><td>Zoom to layer, Remove</td></tr>
-<tr><td><b>Drag & Drop</b></td><td>Reorder layers/groups</td></tr>
+<tr><td><b>Drag &amp; Drop</b></td><td>Reorder layers/groups</td></tr>
 </table>
 
 <h3>Labeled Images Panel</h3>
@@ -2372,10 +2375,11 @@ class MainWindow(QMainWindow):
 
 <h3>Tips</h3>
 <ul>
-<li>Layers default to hidden when loading - expand groups and check to display</li>
+<li>Layers default to hidden when loading &mdash; expand groups and check to display</li>
 <li>Turning on a layer automatically checks its parent groups</li>
 <li>Add Directory creates a root group named after the selected folder</li>
 <li>Visibility syncs between Layer Panel and Labeled Images Panel</li>
+<li>Custom file readers are auto-detected &mdash; registered formats appear in file dialogs</li>
 </ul>
 """
         msg = QMessageBox(self)

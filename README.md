@@ -85,30 +85,66 @@ python main.py
 ```
 
 ### Keyboard Shortcuts
-- `Ctrl+N` - New Project
-- `Ctrl+O` - Add GeoTIFF
-- `Ctrl+Shift+O` - Add Directory (creates root group from folder name)
-- `Ctrl+S` - Save Project
-- `Ctrl+Shift+S` - Save Project As
-- `Ctrl+Shift+P` - Open Project
-- `P` - Pan mode
-- `L` - Label mode
-- `C` - Cycle mode
-- `Space` - Next layer (in Cycle mode)
-- `F1` - Show Help/Shortcuts
-- `Escape` - Cancel link mode
+
+#### File Operations
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+N` | New Project |
+| `Ctrl+Shift+P` | Open Project |
+| `Ctrl+S` | Save Project |
+| `Ctrl+Shift+S` | Save Project As |
+| `Ctrl+O` | Add Image (GeoTIFF + custom formats) |
+| `Ctrl+Shift+O` | Add Directory |
+| `Ctrl+Q` | Exit |
+
+#### Navigation
+| Shortcut | Action |
+|----------|--------|
+| Mouse Wheel | Zoom in/out |
+| Click + Drag | Pan (in Pan mode) |
+| Right-click | Context menu |
+
+#### Mode Switching
+| Shortcut | Action |
+|----------|--------|
+| `P` | Pan mode |
+| `L` | Label mode |
+| `C` | Cycle mode (group-based) |
+| `V` | View Cycle mode (layers in current view) |
+
+#### Labeling
+| Shortcut | Action |
+|----------|--------|
+| Left-click | Place label (in Label/Cycle mode) |
+| Right-click label | Label options (remove, link) |
+| `Ctrl`+Left-click | Label options in Cycle mode |
+| `1`–`9` | Quick-switch to class 1–9 |
+| `Escape` | Cancel link mode |
+
+#### Cycle / View Cycle Mode
+| Shortcut | Action |
+|----------|--------|
+| `Space` | Advance to next layer (unchecks current) |
+| `Ctrl+Space` | Go back to previous layer |
+| Right-click + drag | Pan around |
+| Mouse wheel | Zoom in/out |
+
+#### Help
+| Shortcut | Action |
+|----------|--------|
+| `F1` | Show keyboard shortcuts & tips |
 
 ### Layer Panel Features
-- **Checkbox** - Toggle layer/group visibility
-- **Right-click group** - Select All, Unselect All, Expand All, Collapse All
-- **Right-click layer** - Zoom to layer, Remove
-- **Drag & Drop** - Reorder layers between groups
+- **Checkbox** — Toggle layer/group visibility
+- **Right-click group** — Select All, Unselect All, Expand All, Collapse All
+- **Right-click layer** — Zoom to layer, Remove
+- **Drag & Drop** — Reorder layers between groups
 
 ### Labeling Workflow
-1. Load GeoTIFF images via File menu
+1. Load images via File → Add Image or Add Directory
 2. Create label classes via Labels → Edit Classes
-3. Select a class from the toolbar dropdown
-4. Click the Label Mode button (or use the Labels menu)
+3. Select a class from the toolbar dropdown (or press `1`–`9`)
+4. Press `L` to enter Label mode
 5. Click on images to place point annotations
 6. Right-click labels to remove, link, or view linked labels
 7. Save project to preserve all work
