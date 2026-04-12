@@ -24,6 +24,8 @@ from PyQt5.QtWidgets import (
 from rasterio.crs import CRS
 from rasterio.warp import calculate_default_transform, reproject, Resampling, transform as transform_coords
 
+from app.readers import registry as reader_registry, ReaderResult
+
 
 # Web Mercator CRS
 WEB_MERCATOR = CRS.from_epsg(3857)
@@ -92,7 +94,14 @@ class TiledLayer:
         self._fully_loaded = False
         self._decimation_factor = max(1, decimation_factor)
 
-        if geo:
+        # Check for a custom reader first
+        if reader_registry.can_read(file_path):
+            if lazy:
+                self._load_custom_bounds_only()
+            else:
+                self._load_custom()
+                self._fully_loaded = True
+        elif geo:
             if lazy:
                 self._load_bounds_only()
             else:
@@ -153,10 +162,65 @@ class TiledLayer:
             self._n_tiles_x = math.ceil(width / TILE_SIZE)
             self._n_tiles_y = math.ceil(height / TILE_SIZE)
 
+    def _load_custom_bounds_only(self):
+        """Load only bounds/dimensions via a custom reader (lazy mode)."""
+        br = reader_registry.read_bounds(self.file_path)
+        self._src_width = br.src_width or br.width
+        self._src_height = br.src_height or br.height
+        self._width = br.width
+        self._height = br.height
+        self._n_tiles_x = math.ceil(br.width / TILE_SIZE)
+        self._n_tiles_y = math.ceil(br.height / TILE_SIZE)
+
+        if br.crs is not None and br.transform is not None:
+            self._src_crs = br.crs
+            self._src_transform = br.transform
+            self.geo = True
+            # Calculate bounds in Web Mercator
+            dst_crs = WEB_MERCATOR
+            transform, width, height = calculate_default_transform(
+                br.crs, dst_crs, br.width, br.height,
+                *rasterio.transform.array_bounds(br.height, br.width, br.transform)
+            )
+            self.bounds = rasterio.transform.array_bounds(height, width, transform)
+        else:
+            self.geo = False
+            self.bounds = (0, 0, br.width, br.height)
+
+    def _load_custom(self):
+        """Fully load a file via a custom reader."""
+        result = reader_registry.read(self.file_path, self._decimation_factor)
+        self._src_width = result.src_width or result.width
+        self._src_height = result.src_height or result.height
+        self._rgba_data = result.rgba
+        self._width = result.width
+        self._height = result.height
+        self._n_tiles_x = math.ceil(result.width / TILE_SIZE)
+        self._n_tiles_y = math.ceil(result.height / TILE_SIZE)
+
+        if result.crs is not None and result.transform is not None:
+            self._src_crs = result.crs
+            self._src_transform = result.transform
+            self.geo = True
+            dst_crs = WEB_MERCATOR
+            transform, width, height = calculate_default_transform(
+                result.crs, dst_crs, result.width, result.height,
+                *rasterio.transform.array_bounds(result.height, result.width, result.transform)
+            )
+            self.bounds = rasterio.transform.array_bounds(height, width, transform)
+        else:
+            self.geo = False
+            self.bounds = (0, 0, result.width, result.height)
+
+        if result.nodata_mask is not None:
+            self._rgba_data[:, :, 3] = np.where(result.nodata_mask, 0, self._rgba_data[:, :, 3])
+
     def ensure_loaded(self):
         """Ensure the full raster data is loaded. Call before accessing pixel data."""
         if not self._fully_loaded:
-            if self.geo:
+            if reader_registry.can_read(self.file_path):
+                self._load_custom()
+            elif self.geo:
                 self._load_and_reproject()
             else:
                 self._load_pixel_data()
@@ -600,28 +664,54 @@ class AsyncFileLoader(QObject):
                 break
 
             try:
-                # Load just the bounds (fast operation)
-                with rasterio.open(file_path) as src:
-                    src_crs = src.crs
-                    src_transform = src.transform
-                    src_width = src.width
-                    src_height = src.height
+                if reader_registry.can_read(file_path):
+                    # Use custom reader for bounds detection
+                    br = reader_registry.read_bounds(file_path)
+                    src_crs = br.crs
+                    src_transform = br.transform
+                    src_width = br.src_width or br.width
+                    src_height = br.src_height or br.height
+                    width = br.width
+                    height = br.height
 
-                    if src.crs is not None:
-                        # Georeferenced: calculate bounds in Web Mercator
+                    if br.crs is not None and br.transform is not None:
                         dst_crs = WEB_MERCATOR
                         transform, width, height = calculate_default_transform(
-                            src.crs, dst_crs, src.width, src.height, *src.bounds
+                            br.crs, dst_crs, br.width, br.height,
+                            *rasterio.transform.array_bounds(
+                                br.height, br.width, br.transform)
                         )
                         bounds = rasterio.transform.array_bounds(
                             height, width, transform)
                         geo = True
                     else:
-                        # Non-georeferenced: use raw pixel dimensions
-                        width = src.width
-                        height = src.height
-                        bounds = (0, 0, width, height)  # Placeholder
+                        bounds = (0, 0, width, height)
                         geo = False
+
+                    reader_info = reader_registry.reader_info(file_path)
+                else:
+                    # Default: use rasterio
+                    with rasterio.open(file_path) as src:
+                        src_crs = src.crs
+                        src_transform = src.transform
+                        src_width = src.width
+                        src_height = src.height
+
+                        if src.crs is not None:
+                            dst_crs = WEB_MERCATOR
+                            transform, width, height = calculate_default_transform(
+                                src.crs, dst_crs, src.width, src.height, *src.bounds
+                            )
+                            bounds = rasterio.transform.array_bounds(
+                                height, width, transform)
+                            geo = True
+                        else:
+                            width = src.width
+                            height = src.height
+                            bounds = (0, 0, width, height)
+                            geo = False
+
+                    reader_info = {}
 
                 # Emit the loaded data
                 layer_data = {
@@ -635,6 +725,7 @@ class AsyncFileLoader(QObject):
                     'src_width': src_width,
                     'src_height': src_height,
                     'geo': geo,
+                    'reader_info': reader_info,
                 }
                 self.file_loaded.emit(file_path, layer_data)
                 loaded_count += 1

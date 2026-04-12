@@ -33,6 +33,7 @@ from .canvas import MapCanvas, CanvasMode, AsyncFileLoaderThread, TiledLayer
 from .class_editor import ClassEditorDialog
 from .labels import LabelProject, ImageData
 from .layer_panel import CombinedLayerPanel
+from .readers import registry as reader_registry
 
 
 class GroupMemoryWorker(QObject):
@@ -1625,12 +1626,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Export Complete", msg)
 
     def _add_geotiff(self):
-        """Open file dialog to add a GeoTIFF."""
+        """Open file dialog to add an image (GeoTIFF or custom format)."""
+        file_filter = reader_registry.file_dialog_filter()
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Add GeoTIFF",
+            "Add Image",
             "",
-            "GeoTIFF Files (*.tif *.tiff);;All Files (*)"
+            file_filter
         )
 
         skipped = 0
@@ -1643,9 +1645,13 @@ class MainWindow(QMainWindow):
             # Check if the file has a valid CRS
             has_crs = True
             try:
-                with rasterio.open(file_path) as src:
-                    if src.crs is None:
-                        has_crs = False
+                if reader_registry.can_read(file_path):
+                    br = reader_registry.read_bounds(file_path)
+                    has_crs = br.crs is not None
+                else:
+                    with rasterio.open(file_path) as src:
+                        if src.crs is None:
+                            has_crs = False
             except Exception:
                 pass
 
@@ -1666,15 +1672,17 @@ class MainWindow(QMainWindow):
                 width, height = self.canvas.get_layer_source_dimensions(
                     layer_id)
                 affine, crs = self.canvas.get_layer_transform(layer_id)
+                reader_info = reader_registry.reader_info(file_path)
                 self.project.add_image(
-                    file_path, name, "", width, height, affine=affine, crs=crs)
+                    file_path, name, "", width, height,
+                    reader=reader_info, affine=affine, crs=crs)
 
         if skipped > 0:
             self.statusBar.showMessage(
                 f"Skipped {skipped} already loaded image(s)", 3000)
 
     def _add_directory(self):
-        """Open directory dialog and load all GeoTIFFs preserving directory structure.
+        """Open directory dialog and load all supported images preserving directory structure.
 
         Uses async loading for better performance with large directories:
         - Files are discovered and tree structure is built immediately
@@ -1684,7 +1692,7 @@ class MainWindow(QMainWindow):
         """
         dir_path = QFileDialog.getExistingDirectory(
             self,
-            "Select Directory with GeoTIFFs",
+            "Select Directory with Images",
             "",
             QFileDialog.ShowDirsOnly
         )
@@ -1692,28 +1700,28 @@ class MainWindow(QMainWindow):
         if not dir_path:
             return
 
-        # Find all GeoTIFF files recursively
+        # Find all supported files recursively
         root_path = Path(dir_path)
-        tiff_files = list(root_path.rglob("*.tif")) + \
-            list(root_path.rglob("*.tiff"))
+        image_files = []
+        for pattern in reader_registry.all_glob_patterns():
+            image_files.extend(root_path.rglob(pattern))
+        # Deduplicate (in case of overlapping patterns) and sort
+        image_files = sorted(set(image_files))
 
-        # Sort by path for consistent ordering
-        tiff_files.sort()
-
-        if not tiff_files:
+        if not image_files:
             self.statusBar.showMessage(
-                "No GeoTIFF files found in directory", 5000)
+                "No supported image files found in directory", 5000)
             return
 
         # Check for large import - use async for better UX
-        use_async = len(tiff_files) > 50
+        use_async = len(image_files) > 50
 
         if use_async:
-            self._add_directory_async(root_path, tiff_files)
+            self._add_directory_async(root_path, image_files)
         else:
-            self._add_directory_sync(root_path, tiff_files)
+            self._add_directory_sync(root_path, image_files)
 
-    def _add_directory_sync(self, root_path: Path, tiff_files: list):
+    def _add_directory_sync(self, root_path: Path, image_files: list):
         """Synchronous directory loading for smaller imports."""
         # Create root group for the selected directory
         root_group_name = root_path.name
@@ -1744,10 +1752,10 @@ class MainWindow(QMainWindow):
 
         # Create progress dialog
         progress = QProgressDialog(
-            "Loading GeoTIFF files...",
+            "Loading image files...",
             "Cancel",
             0,
-            len(tiff_files),
+            len(image_files),
             self
         )
         progress.setWindowTitle("Loading Images")
@@ -1756,7 +1764,7 @@ class MainWindow(QMainWindow):
         progress.setValue(0)
 
         loaded_count = 0
-        for i, file_path in enumerate(tiff_files):
+        for i, file_path in enumerate(image_files):
             if progress.wasCanceled():
                 break
 
@@ -1766,7 +1774,7 @@ class MainWindow(QMainWindow):
                     file_path.name}...\n({
                     i +
                     1} of {
-                    len(tiff_files)})")
+                    len(image_files)})")
             QApplication.processEvents()
 
             rel_path = file_path.relative_to(root_path)
@@ -1780,9 +1788,13 @@ class MainWindow(QMainWindow):
             # Check CRS to decide geo vs pixel-mode loading
             has_crs = True
             try:
-                with rasterio.open(file_path_str) as src:
-                    if src.crs is None:
-                        has_crs = False
+                if reader_registry.can_read(file_path_str):
+                    br = reader_registry.read_bounds(file_path_str)
+                    has_crs = br.crs is not None
+                else:
+                    with rasterio.open(file_path_str) as src:
+                        if src.crs is None:
+                            has_crs = False
             except Exception:
                 pass
 
@@ -1813,12 +1825,13 @@ class MainWindow(QMainWindow):
                 width, height = self.canvas.get_layer_source_dimensions(
                     layer_id)
                 affine, crs = self.canvas.get_layer_transform(layer_id)
+                ri = reader_registry.reader_info(file_path_str)
                 self.project.add_image(
                     file_path_str, name, group_path_str, width, height,
-                    affine=affine, crs=crs)
+                    reader=ri, affine=affine, crs=crs)
                 loaded_count += 1
 
-        progress.setValue(len(tiff_files))
+        progress.setValue(len(image_files))
 
         # Remove empty geo groups (e.g. directory had only non-geo files)
         self._remove_empty_groups(root_group)
@@ -1828,13 +1841,13 @@ class MainWindow(QMainWindow):
         if progress.wasCanceled():
             self.statusBar.showMessage(
                 f"Loading cancelled. Loaded {loaded_count} of {
-                    len(tiff_files)} GeoTIFF files", 5000)
+                    len(image_files)} image files", 5000)
         else:
             self.statusBar.showMessage(
                 f"Loaded {loaded_count} of {
-                    len(tiff_files)} GeoTIFF files", 5000)
+                    len(image_files)} image files", 5000)
 
-    def _add_directory_async(self, root_path: Path, tiff_files: list):
+    def _add_directory_async(self, root_path: Path, image_files: list):
         """Asynchronous directory loading for large imports.
 
         Layers are added with lazy loading (only bounds read initially) and
@@ -1845,7 +1858,7 @@ class MainWindow(QMainWindow):
 
         # Prepare file list with group paths (prefixed with root folder name)
         files_with_groups = []
-        for file_path in tiff_files:
+        for file_path in image_files:
             rel_path = file_path.relative_to(root_path)
             rel_dir = rel_path.parent
             rel_dir_str = str(rel_dir).replace(
@@ -2053,9 +2066,10 @@ class MainWindow(QMainWindow):
                         width, height = self.canvas.get_layer_source_dimensions(
                             layer_id)
                         affine, crs = self.canvas.get_layer_transform(layer_id)
+                        ri = layer_data.get('reader_info', {})
                         self.project.add_image(
                             file_path, name, group_path, width, height,
-                            affine=affine, crs=crs)
+                            reader=ri, affine=affine, crs=crs)
 
                     self._async_loaded_count += 1
         finally:
