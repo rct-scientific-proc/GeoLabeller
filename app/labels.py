@@ -278,24 +278,41 @@ class ImageData:
 
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization."""
+        # Pre-compute the WGS84 coordinate of the left image edge at every
+        # label's row in a single vectorised pyproj call, instead of one
+        # transform per label. This is the dominant cost when serialising
+        # images with many labels.
+        left_edge_by_label: dict[int, tuple[float, float]] = {}
+        if (self.affine_coeffs is not None and self.crs_epsg is not None
+                and self.labels and self._ensure_transformers()):
+            affine = self.get_affine()
+            # Project pixel (0, pixel_y) to native CRS via affine, then
+            # batch-transform all native points to WGS84 in one call.
+            xs_proj: list[float] = []
+            ys_proj: list[float] = []
+            for label in self.labels:
+                x_proj, y_proj = affine * (0.0, label.pixel_y)
+                xs_proj.append(x_proj)
+                ys_proj.append(y_proj)
+            lon_arr, lat_arr = self._to_wgs84_transformer.transform(
+                xs_proj, ys_proj
+            )
+            for idx in range(len(self.labels)):
+                left_edge_by_label[idx] = (lat_arr[idx], lon_arr[idx])
+
         # Build label dicts with distance from left edge
         label_dicts = []
-        for label in self.labels:
+        for idx, label in enumerate(self.labels):
             label_dict = label.to_dict(self.original_width, self.original_height)
 
             # Calculate distance from left edge of image to label position
-            if self.affine_coeffs is not None and self.crs_epsg is not None:
-                # Get lat/lon at left edge (same row as label)
-                left_edge = self.pixel_to_latlon(0, label.pixel_y)
-                # Get lat/lon at label position
-                label_pos = (label.lat, label.lon)
-
-                if left_edge is not None:
-                    distance_m = haversine_distance(
-                        left_edge[0], left_edge[1],  # left edge lat, lon
-                        label_pos[0], label_pos[1]   # label lat, lon
-                    )
-                    label_dict["geodesic_distance"] = round(distance_m, 3)
+            left_edge = left_edge_by_label.get(idx)
+            if left_edge is not None:
+                distance_m = haversine_distance(
+                    left_edge[0], left_edge[1],  # left edge lat, lon
+                    label.lat, label.lon         # label lat, lon
+                )
+                label_dict["geodesic_distance"] = round(distance_m, 3)
 
             label_dicts.append(label_dict)
 
