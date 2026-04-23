@@ -4,6 +4,7 @@ import math
 import os
 import platform
 import tempfile
+import threading
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -98,6 +99,25 @@ CRASH_MARKER_FILE = RECOVERY_DIR / ".running"
 # Auto-save interval in milliseconds (60 seconds)
 AUTOSAVE_INTERVAL_MS = 60000
 
+
+def _write_recovery_snapshot(
+        snapshot: dict, recovery_path: Path, crash_marker_path: Path):
+    """Write a recovery snapshot to disk on a background thread.
+
+    Uses compact JSON separators (no indentation) since the recovery file is
+    machine-read, and writes via a temp file + atomic rename so a crash
+    during write never leaves the recovery file half-serialized.
+    """
+    try:
+        tmp_path = recovery_path.with_suffix(recovery_path.suffix + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, separators=(",", ":"))
+        os.replace(tmp_path, recovery_path)
+        crash_marker_path.write_text(datetime.now().isoformat())
+    except Exception as e:
+        # Background thread: log only, don't surface to user.
+        print(f"Warning: Auto-save write failed: {e}")
+
 # Colors for different classes (cycles through these)
 CLASS_COLORS = [
     QColor(255, 50, 50),    # Red
@@ -153,6 +173,12 @@ class MainWindow(QMainWindow):
         self._autosave_timer = QTimer()
         self._autosave_timer.setInterval(AUTOSAVE_INTERVAL_MS)
         self._autosave_timer.timeout.connect(self._autosave_recovery)
+
+        # Background autosave plumbing: a single worker thread at a time
+        # writes the recovery file. The snapshot dict is always built on
+        # the UI thread (so it sees a consistent project state), then the
+        # JSON serialization + atomic file write run on a daemon thread.
+        self._autosave_thread: threading.Thread | None = None
 
         self._setup_ui()
         self._setup_menu()
@@ -1114,14 +1140,41 @@ class MainWindow(QMainWindow):
     def _autosave_recovery(self):
         """Auto-save current project state to recovery file.
 
-        Called periodically by the auto-save timer.
-        Only saves if there's something to save (labels or images).
+        Called periodically by the auto-save timer. The snapshot is built on
+        the UI thread (cheap dict construction over current project state)
+        and the JSON serialization + file write are dispatched to a daemon
+        thread so the UI doesn't stall every minute. Skips silently if a
+        previous autosave is still in flight.
         """
         try:
-            if self.project.label_count > 0 or self.project.images:
-                self.project.save(RECOVERY_FILE)
-                # Update crash marker timestamp
-                CRASH_MARKER_FILE.write_text(datetime.now().isoformat())
+            if self.project.label_count == 0 and not self.project.images:
+                return
+
+            # Skip if a previous autosave hasn't finished yet (don't queue up
+            # writes if a save is genuinely slow).
+            prev = self._autosave_thread
+            if prev is not None and prev.is_alive():
+                return
+
+            # Build the serializable snapshot on the UI thread for consistency
+            # with the project state. This is pure-Python and does not perform
+            # any I/O.
+            snapshot = {
+                "version": "3.2",
+                "classes": list(self.project.classes),
+                "images": [img.to_dict() for img in self.project.images.values()],
+                "_next_id": self.project._next_id,
+            }
+            recovery_path = RECOVERY_FILE
+            crash_marker_path = CRASH_MARKER_FILE
+
+            self._autosave_thread = threading.Thread(
+                target=_write_recovery_snapshot,
+                args=(snapshot, recovery_path, crash_marker_path),
+                name="GeoLabelAutosave",
+                daemon=True,
+            )
+            self._autosave_thread.start()
         except Exception as e:
             # Don't show error to user for background auto-save
             print(f"Warning: Auto-save failed: {e}")
@@ -1139,6 +1192,11 @@ class MainWindow(QMainWindow):
         try:
             # Stop auto-save timer
             self._autosave_timer.stop()
+            # Wait briefly for any in-flight autosave to finish so the
+            # recovery file isn't left half-written.
+            t = self._autosave_thread
+            if t is not None and t.is_alive():
+                t.join(timeout=2.0)
             # Remove crash marker (indicates clean exit)
             if CRASH_MARKER_FILE.exists():
                 CRASH_MARKER_FILE.unlink()
