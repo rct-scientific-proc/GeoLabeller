@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import rasterio
+from PyQt5 import sip
 from PyQt5.QtCore import Qt, pyqtSignal, QRectF, QTimer, QThread, QObject
 from PyQt5.QtGui import (
     QImage,
@@ -523,18 +524,25 @@ class TiledLayer:
         if height == 0 or width == 0:
             return None
 
-        # Extract contiguous tile data (required by QImage)
-        tile_data = self._rgba_data[px_top:px_bottom, px_left:px_right].copy()
-
+        # Build a QImage that points directly at the slice within _rgba_data
+        # without copying. The slice is non-contiguous (its rows are spaced by
+        # the parent array's full row stride), so we tell QImage the actual
+        # row stride via `bytesPerLine`. The parent buffer has enough bytes;
+        # numpy's slice memoryview reports a smaller nbytes and would be
+        # rejected, so we wrap the raw address with sip.voidptr instead.
+        # QPixmap.fromImage() immediately deep-copies into Qt's native pixmap
+        # format, so the numpy buffer only needs to outlive that single call
+        # (self._rgba_data does).
+        tile_view = self._rgba_data[px_top:px_bottom, px_left:px_right]
+        bytes_per_line = self._rgba_data.strides[0]
+        ptr = sip.voidptr(tile_view.ctypes.data)
         image = QImage(
-            tile_data.data,
+            ptr,
             width,
             height,
-            width * 4,
+            bytes_per_line,
             QImage.Format_RGBA8888
         )
-        # fromImage deep-copies into the native pixmap format,
-        # so an intermediate image.copy() is unnecessary.
         return QPixmap.fromImage(image)
 
     def set_visibility(self, visible: bool):
