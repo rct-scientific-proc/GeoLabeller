@@ -43,6 +43,11 @@ class LayerPanel(QWidget):
         super().__init__()
         self._batch_mode = False  # When True, suppress signals during batch operations
         self._nongeo_root = None  # Top-level node for non-georeferenced images
+        # O(1) lookup caches keyed by layer id and by file path. Maintained
+        # in add_layer / add_nongeo_layer / _remove_item / clear. Drag-drop
+        # reparents existing items in place, so cached references stay valid.
+        self._layer_items: dict[str, QTreeWidgetItem] = {}
+        self._path_items: dict[str, QTreeWidgetItem] = {}
         self._setup_ui()
 
     def _setup_ui(self):
@@ -110,6 +115,10 @@ class LayerPanel(QWidget):
             parent.addChild(item)
         else:
             self.tree.addTopLevelItem(item)
+
+        # Register in O(1) lookup caches
+        self._layer_items[layer_id] = item
+        self._path_items[file_path] = item
 
     def add_group(self, name: str, parent: QTreeWidgetItem = None,
                   visible: bool = True):
@@ -496,6 +505,10 @@ class LayerPanel(QWidget):
             index = self.tree.indexOfTopLevelItem(item)
             self.tree.takeTopLevelItem(index)
 
+        # Drop removed layers from O(1) lookup caches
+        for layer_id in layer_ids_to_remove:
+            self._drop_layer_from_caches(layer_id)
+
         # Emit removal signals for each layer
         for layer_id in layer_ids_to_remove:
             self.layer_removed.emit(layer_id)
@@ -509,6 +522,14 @@ class LayerPanel(QWidget):
             for i in range(item.childCount()):
                 self._collect_layer_ids(item.child(i), layer_ids)
 
+    def _drop_layer_from_caches(self, layer_id: str):
+        """Remove a layer's entries from the lookup caches."""
+        item = self._layer_items.pop(layer_id, None)
+        if item is not None:
+            file_path = item.toolTip(0)
+            if file_path and self._path_items.get(file_path) is item:
+                del self._path_items[file_path]
+
     def uncheck_layers(self, layer_ids: list[str]):
         """Uncheck (hide) layers by their IDs.
 
@@ -518,38 +539,20 @@ class LayerPanel(QWidget):
         if not layer_ids:
             return
 
-        layer_ids_set = set(layer_ids)
-        total = len(layer_ids_set)
+        total = len(layer_ids)
         self.batch_visibility_started.emit(total)
-        progress_count = [0]
-        changed_layers = []  # Track which layers were actually changed
+        changed_layers = []
 
         # Block signals to prevent cascading _on_item_changed calls
         self.tree.blockSignals(True)
-
-        def find_and_uncheck(parent=None):
-            if parent is None:
-                count = self.tree.topLevelItemCount()
-                for i in range(count):
-                    find_and_uncheck(self.tree.topLevelItem(i))
-            else:
-                item_type = parent.data(0, Qt.UserRole + 1)
-                if item_type == "layer":
-                    layer_id = parent.data(0, Qt.UserRole)
-                    if layer_id in layer_ids_set and parent.checkState(
-                            0) == Qt.Checked:
-                        parent.setCheckState(0, Qt.Unchecked)
-                        changed_layers.append(layer_id)
-                        progress_count[0] += 1
-                        self.batch_visibility_progress.emit(progress_count[0])
-                        if progress_count[0] % 10 == 0:
-                            QApplication.processEvents()
-                else:
-                    for i in range(parent.childCount()):
-                        find_and_uncheck(parent.child(i))
-
-        find_and_uncheck()
-
+        for i, layer_id in enumerate(layer_ids, start=1):
+            item = self._layer_items.get(layer_id)
+            if item is not None and item.checkState(0) == Qt.Checked:
+                item.setCheckState(0, Qt.Unchecked)
+                changed_layers.append(layer_id)
+            self.batch_visibility_progress.emit(i)
+            if i % 50 == 0:
+                QApplication.processEvents()
         self.tree.blockSignals(False)
 
         # Emit visibility changed signals for each layer that was actually
@@ -568,38 +571,20 @@ class LayerPanel(QWidget):
         if not layer_ids:
             return
 
-        layer_ids_set = set(layer_ids)
-        total = len(layer_ids_set)
+        total = len(layer_ids)
         self.batch_visibility_started.emit(total)
-        progress_count = [0]
-        changed_layers = []  # Track which layers were actually changed
+        changed_layers = []
 
         # Block signals to prevent cascading _on_item_changed calls
         self.tree.blockSignals(True)
-
-        def find_and_check(parent=None):
-            if parent is None:
-                count = self.tree.topLevelItemCount()
-                for i in range(count):
-                    find_and_check(self.tree.topLevelItem(i))
-            else:
-                item_type = parent.data(0, Qt.UserRole + 1)
-                if item_type == "layer":
-                    layer_id = parent.data(0, Qt.UserRole)
-                    if layer_id in layer_ids_set and parent.checkState(
-                            0) == Qt.Unchecked:
-                        parent.setCheckState(0, Qt.Checked)
-                        changed_layers.append(layer_id)
-                        progress_count[0] += 1
-                        self.batch_visibility_progress.emit(progress_count[0])
-                        if progress_count[0] % 10 == 0:
-                            QApplication.processEvents()
-                else:
-                    for i in range(parent.childCount()):
-                        find_and_check(parent.child(i))
-
-        find_and_check()
-
+        for i, layer_id in enumerate(layer_ids, start=1):
+            item = self._layer_items.get(layer_id)
+            if item is not None and item.checkState(0) == Qt.Unchecked:
+                item.setCheckState(0, Qt.Checked)
+                changed_layers.append(layer_id)
+            self.batch_visibility_progress.emit(i)
+            if i % 50 == 0:
+                QApplication.processEvents()
         self.tree.blockSignals(False)
 
         # Emit visibility changed signals for each layer that was actually
@@ -719,6 +704,8 @@ class LayerPanel(QWidget):
         """Clear all items from the tree."""
         self.tree.clear()
         self._nongeo_root = None
+        self._layer_items.clear()
+        self._path_items.clear()
 
     def get_or_create_nongeo_root(self) -> QTreeWidgetItem:
         """Get or create the 'Non-Georeferenced' top-level group.
@@ -791,6 +778,10 @@ class LayerPanel(QWidget):
 
         nongeo_parent.addChild(item)
 
+        # Register in O(1) lookup caches
+        self._layer_items[layer_id] = item
+        self._path_items[file_path] = item
+
     def set_layer_checked(self, layer_id: str, checked: bool):
         """Set the check state of a specific layer without emitting signals.
 
@@ -798,34 +789,15 @@ class LayerPanel(QWidget):
             layer_id: The layer ID to update
             checked: True to check, False to uncheck
         """
+        found_item = self._layer_items.get(layer_id)
+        if found_item is None:
+            return
+
         self.tree.blockSignals(True)
-
-        def find_and_set(parent=None) -> QTreeWidgetItem | None:
-            """Find and set the layer, returning the item if found."""
-            if parent is None:
-                count = self.tree.topLevelItemCount()
-                for i in range(count):
-                    result = find_and_set(self.tree.topLevelItem(i))
-                    if result:
-                        return result
-            else:
-                item_type = parent.data(0, Qt.UserRole + 1)
-                if item_type == "layer":
-                    if parent.data(0, Qt.UserRole) == layer_id:
-                        parent.setCheckState(
-                            0, Qt.Checked if checked else Qt.Unchecked)
-                        return parent
-                else:
-                    for i in range(parent.childCount()):
-                        result = find_and_set(parent.child(i))
-                        if result:
-                            return result
-            return None
-
-        found_item = find_and_set()
+        found_item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
 
         # If turning ON, also check all parent groups
-        if checked and found_item:
+        if checked:
             parent = found_item.parent()
             while parent is not None:
                 if parent.checkState(0) != Qt.Checked:
@@ -843,27 +815,10 @@ class LayerPanel(QWidget):
         Returns:
             True if the layer is checked, False otherwise
         """
-        def find_and_check(parent=None) -> bool | None:
-            if parent is None:
-                count = self.tree.topLevelItemCount()
-                for i in range(count):
-                    result = find_and_check(self.tree.topLevelItem(i))
-                    if result is not None:
-                        return result
-            else:
-                item_type = parent.data(0, Qt.UserRole + 1)
-                if item_type == "layer":
-                    if parent.data(0, Qt.UserRole) == layer_id:
-                        return parent.checkState(0) == Qt.Checked
-                else:
-                    for i in range(parent.childCount()):
-                        result = find_and_check(parent.child(i))
-                        if result is not None:
-                            return result
-            return None
-
-        result = find_and_check()
-        return result if result is not None else False
+        item = self._layer_items.get(layer_id)
+        if item is None:
+            return False
+        return item.checkState(0) == Qt.Checked
 
     def get_layer_id_by_path(self, file_path: str) -> str | None:
         """Find layer ID by file path.
@@ -874,26 +829,10 @@ class LayerPanel(QWidget):
         Returns:
             The layer ID if found, None otherwise
         """
-        def find_layer(parent=None):
-            if parent is None:
-                count = self.tree.topLevelItemCount()
-                for i in range(count):
-                    result = find_layer(self.tree.topLevelItem(i))
-                    if result:
-                        return result
-            else:
-                item_type = parent.data(0, Qt.UserRole + 1)
-                if item_type == "layer":
-                    if parent.toolTip(0) == file_path:
-                        return parent.data(0, Qt.UserRole)
-                else:
-                    for i in range(parent.childCount()):
-                        result = find_layer(parent.child(i))
-                        if result:
-                            return result
+        item = self._path_items.get(file_path)
+        if item is None:
             return None
-
-        return find_layer()
+        return item.data(0, Qt.UserRole)
 
     def toggle_layer_visibility(self, layer_id: str):
         """Toggle the visibility of a layer by its ID.
@@ -901,28 +840,12 @@ class LayerPanel(QWidget):
         Args:
             layer_id: The layer ID to toggle
         """
-        def find_and_toggle(parent=None):
-            if parent is None:
-                count = self.tree.topLevelItemCount()
-                for i in range(count):
-                    if find_and_toggle(self.tree.topLevelItem(i)):
-                        return True
-            else:
-                item_type = parent.data(0, Qt.UserRole + 1)
-                if item_type == "layer":
-                    if parent.data(0, Qt.UserRole) == layer_id:
-                        # Toggle the check state
-                        current_state = parent.checkState(0)
-                        new_state = Qt.Unchecked if current_state == Qt.Checked else Qt.Checked
-                        parent.setCheckState(0, new_state)
-                        return True
-                else:
-                    for i in range(parent.childCount()):
-                        if find_and_toggle(parent.child(i)):
-                            return True
-            return False
-
-        find_and_toggle()
+        item = self._layer_items.get(layer_id)
+        if item is None:
+            return
+        current_state = item.checkState(0)
+        new_state = Qt.Unchecked if current_state == Qt.Checked else Qt.Checked
+        item.setCheckState(0, new_state)
 
 
 class LabeledLayerPanel(QWidget):
