@@ -995,6 +995,17 @@ class MapCanvas(QGraphicsView):
         self._tile_update_timer.setSingleShot(True)
         self._tile_update_timer.timeout.connect(self._update_visible_tiles)
 
+        # Coordinates emit throttle: coalesce mouseMoveEvent emissions so the
+        # status bar isn't updated on every single pixel of mouse motion.
+        # _pending_coords holds the latest payload; the timer fires at most
+        # ~33 fps and emits only when the payload differs from the last one.
+        self._coords_emit_timer = QTimer()
+        self._coords_emit_timer.setSingleShot(True)
+        self._coords_emit_timer.setInterval(30)
+        self._coords_emit_timer.timeout.connect(self._flush_pending_coords)
+        self._pending_coords: tuple | None = None
+        self._last_emitted_coords: tuple | None = None
+
         # Scale bar overlay widget
         self._scale_bar = ScaleBarWidget(self)
         self._scale_bar.move(10, 10)  # Will be repositioned in resizeEvent
@@ -1524,13 +1535,40 @@ class MapCanvas(QGraphicsView):
             layer, _, _ = self._get_layer_and_info_at_position(easting, northing)
             if layer and not layer.geo:
                 px, py = layer.scene_to_pixel(easting, northing)
-                self.coordinates_changed.emit(px, py, layer_name, group_path, True)
+                self._queue_coords_emit(px, py, layer_name, group_path, True)
             else:
-                self.coordinates_changed.emit(0.0, 0.0, layer_name, group_path, True)
+                self._queue_coords_emit(0.0, 0.0, layer_name, group_path, True)
         else:
             lon, lat = self._web_mercator_to_wgs84(easting, northing)
             layer_name, group_path = self._get_layer_at_position(easting, northing)
-            self.coordinates_changed.emit(lon, lat, layer_name, group_path, False)
+            self._queue_coords_emit(lon, lat, layer_name, group_path, False)
+
+    def _queue_coords_emit(self, x: float, y: float, layer_name: str,
+                           group_path: str, is_pixel: bool):
+        """Coalesce coordinates_changed emissions from rapid mouse movement.
+
+        Stores the latest payload and starts a short timer; only the most
+        recent payload is emitted, and only if it differs from the previously
+        emitted one (rounded to display precision).
+        """
+        # Round numeric coords to the precision the status bar actually shows
+        # so micro-movements don't trigger redundant UI updates.
+        if is_pixel:
+            rounded = (round(x, 1), round(y, 1))
+        else:
+            rounded = (round(x, 6), round(y, 6))
+        payload = (rounded[0], rounded[1], layer_name, group_path, is_pixel)
+        self._pending_coords = payload
+        if not self._coords_emit_timer.isActive():
+            self._coords_emit_timer.start()
+
+    def _flush_pending_coords(self):
+        """Emit the pending coordinates payload if it changed since last emit."""
+        payload = self._pending_coords
+        if payload is None or payload == self._last_emitted_coords:
+            return
+        self._last_emitted_coords = payload
+        self.coordinates_changed.emit(*payload)
 
     def keyPressEvent(self, event):
         """Handle key press events."""
