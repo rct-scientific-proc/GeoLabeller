@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from affine import Affine
+from pyproj import Transformer
 from rasterio.crs import CRS
 from rasterio.warp import transform as transform_coords
 
@@ -175,12 +176,40 @@ class ImageData:
         self.affine_coeffs = [affine.a, affine.b, affine.c,
                               affine.d, affine.e, affine.f]
         self.crs_epsg = crs.to_epsg()
+        # Invalidate cached transformers so they are rebuilt for the new CRS
+        self._to_wgs84_transformer = None
+        self._from_wgs84_transformer = None
+        self._cached_transformer_epsg = None
 
     def get_crs(self) -> Optional[CRS]:
         """Get the CRS object, or None if not set."""
         if self.crs_epsg is None:
             return None
         return CRS.from_epsg(self.crs_epsg)
+
+    def _ensure_transformers(self) -> bool:
+        """Lazily build and cache pyproj transformers for this image's CRS.
+
+        Returns True if transformers are available, False if no CRS is set.
+        Cached transformers are reused across calls and invalidated when the
+        image's ``crs_epsg`` changes (e.g. via :meth:`set_affine`).
+        """
+        if self.crs_epsg is None:
+            return False
+        # Use private attrs lazily; getattr() avoids needing dataclass fields
+        # which would otherwise affect equality/serialization.
+        cached_epsg = getattr(self, "_cached_transformer_epsg", None)
+        if (cached_epsg != self.crs_epsg
+                or getattr(self, "_to_wgs84_transformer", None) is None
+                or getattr(self, "_from_wgs84_transformer", None) is None):
+            self._to_wgs84_transformer = Transformer.from_crs(
+                self.crs_epsg, 4326, always_xy=True
+            )
+            self._from_wgs84_transformer = Transformer.from_crs(
+                4326, self.crs_epsg, always_xy=True
+            )
+            self._cached_transformer_epsg = self.crs_epsg
+        return True
 
     def pixel_to_latlon(self, pixel_x: float, pixel_y: float) -> Optional[tuple[float, float]]:
         """Convert pixel coordinates to WGS84 lat/lon.
@@ -193,16 +222,15 @@ class ImageData:
             Tuple of (lat, lon) in WGS84, or None if transform not available
         """
         affine = self.get_affine()
-        crs = self.get_crs()
-        if affine is None or crs is None:
+        if affine is None or not self._ensure_transformers():
             return None
 
         # Apply affine transform: pixel -> projected coordinates
         x_proj, y_proj = affine * (pixel_x, pixel_y)
 
-        # Transform from image CRS to WGS84
-        lons, lats = transform_coords(crs, WGS84, [x_proj], [y_proj])
-        return (lats[0], lons[0])
+        # Transform from image CRS to WGS84 (always_xy: lon, lat order)
+        lon, lat = self._to_wgs84_transformer.transform(x_proj, y_proj)
+        return (lat, lon)
 
     def latlon_to_pixel(self, lat: float, lon: float) -> Optional[tuple[float, float]]:
         """Convert WGS84 lat/lon to pixel coordinates.
@@ -215,13 +243,11 @@ class ImageData:
             Tuple of (pixel_x, pixel_y), or None if transform not available
         """
         affine = self.get_affine()
-        crs = self.get_crs()
-        if affine is None or crs is None:
+        if affine is None or not self._ensure_transformers():
             return None
 
-        # Transform from WGS84 to image CRS
-        xs, ys = transform_coords(WGS84, crs, [lon], [lat])
-        x_proj, y_proj = xs[0], ys[0]
+        # Transform from WGS84 to image CRS (always_xy: lon/lat -> x/y)
+        x_proj, y_proj = self._from_wgs84_transformer.transform(lon, lat)
 
         # Apply inverse affine: projected -> pixel coordinates
         pixel_x, pixel_y = ~affine * (x_proj, y_proj)

@@ -21,6 +21,7 @@ from PyQt5.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
     QGraphicsEllipseItem, QGraphicsTextItem, QMenu, QWidget
 )
+from pyproj import Transformer
 from rasterio.crs import CRS
 from rasterio.warp import calculate_default_transform, reproject, Resampling, transform as transform_coords
 
@@ -78,6 +79,12 @@ class TiledLayer:
         self._src_transform = None  # Original geotransform
         self._src_width = 0
         self._src_height = 0
+
+        # Cached pyproj transformer (WGS84 -> native CRS). Built lazily and
+        # reused across calls to avoid the per-call cost of constructing a
+        # transformer inside rasterio.warp.transform.
+        self._wgs84_to_native_transformer: Transformer | None = None
+        self._wgs84_to_native_crs = None
 
         # Image data (kept in memory after reprojection)
         self._rgba_data: np.ndarray | None = None
@@ -580,6 +587,21 @@ class TiledLayer:
         cx, cy = self.get_center()
         return math.sqrt((easting - cx) ** 2 + (northing - cy) ** 2)
 
+    def _get_wgs84_to_native_transformer(self) -> Transformer:
+        """Return a cached WGS84 -> native CRS transformer, building it on first use.
+
+        Cached for the lifetime of the layer (rebuilt only if the source CRS
+        changes, which should not happen after load).
+        """
+        if (self._wgs84_to_native_transformer is None
+                or self._wgs84_to_native_crs is not self._src_crs):
+            # always_xy=True makes input/output (lon, lat) / (x, y) consistent
+            self._wgs84_to_native_transformer = Transformer.from_crs(
+                4326, self._src_crs, always_xy=True
+            )
+            self._wgs84_to_native_crs = self._src_crs
+        return self._wgs84_to_native_transformer
+
     def latlon_to_pixel(self, lon: float, lat: float) -> tuple[float, float]:
         """Convert WGS84 lat/lon to pixel coordinates in the original image.
 
@@ -591,10 +613,9 @@ class TiledLayer:
             Tuple of (pixel_x, pixel_y) where pixel_x is column and pixel_y is row.
             Values are floats for sub-pixel precision.
         """
-        # Transform from WGS84 to the image's native CRS
-        wgs84 = CRS.from_epsg(4326)
-        xs, ys = transform_coords(wgs84, self._src_crs, [lon], [lat])
-        x_native, y_native = xs[0], ys[0]
+        # Transform from WGS84 to the image's native CRS using a cached transformer
+        transformer = self._get_wgs84_to_native_transformer()
+        x_native, y_native = transformer.transform(lon, lat)
 
         # Use inverse of geotransform to get pixel coordinates
         # ~transform gives the inverse transform
