@@ -3,4 +3,5 @@ numpy
 pillow
 rasterio
 cx_Freeze
+pyproj
 patchelf; sys_platform == "linux"
