@@ -53,7 +53,6 @@ build_exe_options = {
         "unittest",
         "email",
         "html",
-        "http",
         "pydoc",
         "doctest",
         "asyncio",
@@ -108,7 +107,7 @@ target = Executable(
     script="../main.py",
     base=base,
     target_name="GeoLabeller",
-    icon=None,  # Add icon path here if available: "icon.ico"
+    icon="geolabel_icon.ico",  # Add icon path here if available: "icon.ico"
 )
 
 setup(
