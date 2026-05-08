@@ -24,6 +24,9 @@ This directory contains build scripts for creating standalone executables using 
 
 ```powershell
 .\build_windows.ps1 -Msi
+
+# Build MSI with desktop shortcut
+.\build_windows.ps1 -Msi -Shortcut
 ```
 
 ### Manual Build

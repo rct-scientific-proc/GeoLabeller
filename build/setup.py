@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Version can be overridden via GEOLABELLER_VERSION environment variable
 VERSION = os.environ.get("GEOLABELLER_VERSION", "1.0.0")
+ENABLE_MSI_SHORTCUT = os.environ.get("GEOLABELLER_MSI_SHORTCUT", "").lower() in {"1", "true", "yes", "on"}
 
 # Locate rasterio's bundled PROJ data directory (contains proj.db)
 # rasterio ships a newer PROJ than pyproj, so we must use its copy
@@ -108,6 +109,8 @@ target = Executable(
     base=base,
     target_name="GeoLabeller",
     icon="geolabel_icon.ico",  # Add icon path here if available: "icon.ico"
+    shortcut_name="GeoLabeller" if ENABLE_MSI_SHORTCUT else None,
+    shortcut_dir="DesktopFolder" if ENABLE_MSI_SHORTCUT else None,
 )
 
 setup(

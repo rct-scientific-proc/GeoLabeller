@@ -3,6 +3,7 @@
 
 param(
     [switch]$Msi,      # Build MSI installer instead of just executable
+    [switch]$Shortcut, # Include desktop shortcut in MSI installer
     [switch]$Clean,    # Clean build directory before building
     [switch]$KeepVenv, # Keep the virtual environment after build
     [string]$Python = "python",  # Path or command for Python executable
@@ -85,6 +86,15 @@ if ($Version) {
     Write-Host "Version: $Version" -ForegroundColor Cyan
 }
 
+# Set desktop shortcut flag for MSI build if requested
+if ($Shortcut) {
+    if (-not $Msi) {
+        Write-Host "  WARNING: -Shortcut only applies when building MSI (-Msi)." -ForegroundColor Yellow
+    }
+    $env:GEOLABELLER_MSI_SHORTCUT = "1"
+    Write-Host "MSI option: Desktop shortcut enabled" -ForegroundColor Cyan
+}
+
 # Change to build directory
 Push-Location $ScriptDir
 
@@ -123,6 +133,11 @@ try {
     # Clear version environment variable
     if ($env:GEOLABELLER_VERSION) {
         Remove-Item Env:GEOLABELLER_VERSION
+    }
+
+    # Clear desktop shortcut flag
+    if ($env:GEOLABELLER_MSI_SHORTCUT) {
+        Remove-Item Env:GEOLABELLER_MSI_SHORTCUT
     }
 
     # Clean up virtual environment unless -KeepVenv is specified
