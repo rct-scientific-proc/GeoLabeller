@@ -29,16 +29,17 @@ Each is intended to be independently committable.
 
 ## Phase 1 — Discover overview metadata
 
-- [ ] **1.1** In `TiledLayer`, add fields to hold overview info:
+- [x] **1.1** In `TiledLayer`, add fields to hold overview info:
   `self._overviews: list[int]` (decimation factors) and
   `self._src_level_dims: list[tuple[int, int]]`.
-- [ ] **1.2** In the `rasterio.open(...)` blocks of `_load_and_reproject` and
+- [x] **1.2** In the `rasterio.open(...)` blocks of `_load_and_reproject` and
   `_load_pixel_data` (and the bounds-only loaders), read
   `src.overviews(1)` and populate the new fields. Handle the empty-list case
-  (no overviews → current behaviour).
-- [ ] **1.3** Add a tiny helper `TiledLayer.has_overviews() -> bool` and a debug
+  (no overviews → current behaviour). *(Added `_read_overview_metadata(src)`
+  helper, called from all four loaders.)*
+- [x] **1.3** Add a tiny helper `TiledLayer.has_overviews() -> bool` and a debug
   log line reporting discovered levels, to verify the test images expose
-  `[2, 4, 8, 16, 32, 64]`.
+  `[2, 4, 8, 16, 32, 64]`. *(Verified against `tests/test_imgs/image_000.tif`.)*
 
 ## Phase 2 — Compute the target level from zoom
 

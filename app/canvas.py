@@ -93,6 +93,13 @@ class TiledLayer:
         self._n_tiles_x = 0
         self._n_tiles_y = 0
 
+        # Pyramid / overview info (populated when the source file is opened).
+        # `_overviews` holds decimation factors from src.overviews(1)
+        # (e.g. [2, 4, 8, 16, 32, 64]); empty when the file has no pyramids.
+        # `_src_level_dims` holds the (width, height) of each overview level.
+        self._overviews: list[int] = []
+        self._src_level_dims: list[tuple[int, int]] = []
+
 
         # Lazy loading state
         self._lazy = lazy
@@ -125,6 +132,7 @@ class TiledLayer:
             self._src_transform = src.transform
             self._src_width = src.width
             self._src_height = src.height
+            self._read_overview_metadata(src)
 
             if src.crs is None:
                 raise ValueError(
@@ -163,6 +171,30 @@ class TiledLayer:
         """Check if full raster data has been loaded."""
         return self._fully_loaded
 
+    def has_overviews(self) -> bool:
+        """Return True if the source file exposes pyramid overviews."""
+        return bool(self._overviews)
+
+    def _read_overview_metadata(self, src) -> None:
+        """Read pyramid/overview metadata from an open rasterio dataset.
+
+        Populates ``self._overviews`` with the decimation factors reported by
+        ``src.overviews(1)`` (e.g. ``[2, 4, 8, 16, 32, 64]``) and
+        ``self._src_level_dims`` with the (width, height) of each level. Both
+        are left empty when the file has no overviews.
+        """
+        try:
+            factors = list(src.overviews(1))
+        except Exception:
+            factors = []
+        self._overviews = factors
+        self._src_level_dims = [
+            (max(1, src.width // f), max(1, src.height // f)) for f in factors
+        ]
+        if factors:
+            print(f"[pyramid] {Path(self.file_path).name}: "
+                  f"overviews={factors} level_dims={self._src_level_dims}")
+
     def _load_and_reproject(self):
         """Load GeoTIFF and reproject to Web Mercator."""
         with rasterio.open(self.file_path) as src:
@@ -171,6 +203,7 @@ class TiledLayer:
             self._src_transform = src.transform
             self._src_width = src.width
             self._src_height = src.height
+            self._read_overview_metadata(src)
 
             if src.crs is None:
                 raise ValueError(
@@ -280,6 +313,7 @@ class TiledLayer:
         with rasterio.open(self.file_path) as src:
             self._src_width = src.width
             self._src_height = src.height
+            self._read_overview_metadata(src)
 
             width = src.width
             height = src.height
@@ -301,6 +335,7 @@ class TiledLayer:
         with rasterio.open(self.file_path) as src:
             self._src_width = src.width
             self._src_height = src.height
+            self._read_overview_metadata(src)
 
             width = src.width
             height = src.height
