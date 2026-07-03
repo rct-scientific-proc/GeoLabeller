@@ -43,16 +43,19 @@ Each is intended to be independently committable.
 
 ## Phase 2 — Compute the target level from zoom
 
-- [ ] **2.1** Add `MapCanvas._scene_units_per_pixel() -> float` using
+- [x] **2.1** Add `MapCanvas._scene_units_per_pixel() -> float` using
   `self.transform().m11()` (already used at ~L1586). This is meters-per-screen-
-  pixel in Web Mercator.
-- [ ] **2.2** Add `TiledLayer.select_overview_level(scene_units_per_pixel)` that
+  pixel in Web Mercator. *(Returns `1/m11`, the reciprocal of view-pixels-per-
+  scene-unit.)*
+- [x] **2.2** Add `TiledLayer.select_overview_level(scene_units_per_pixel)` that
   returns the coarsest decimation factor whose effective ground resolution is
   still finer than one screen pixel (i.e. pick the smallest overview that keeps
   detail without over-reading). Return `1` when zoomed in fully or when no
   overviews exist.
-- [ ] **2.3** Unit-check the mapping with a few zoom values so level selection is
-  predictable before wiring it into rendering.
+- [x] **2.3** Unit-check the mapping with a few zoom values so level selection is
+  predictable before wiring it into rendering. *(Verified on
+  `tests/test_imgs/image_000.tif`: native≈0.01 m/px → level 1; 3×→2, 10×→8,
+  50×→32, ≥200×→64.)*
 
 ## Phase 3 — Read from overviews instead of full resolution
 

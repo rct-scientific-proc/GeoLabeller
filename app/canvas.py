@@ -175,6 +175,37 @@ class TiledLayer:
         """Return True if the source file exposes pyramid overviews."""
         return bool(self._overviews)
 
+    def select_overview_level(self, scene_units_per_pixel: float) -> int:
+        """Return the coarsest overview decimation factor suitable for display.
+
+        Args:
+            scene_units_per_pixel: Size of one on-screen pixel in scene units
+                (Web Mercator metres for geo layers). Larger = more zoomed out.
+
+        Returns:
+            A decimation factor where 1 means full resolution. Always returns 1
+            when the file has no overviews or when the view is zoomed in past
+            native resolution.
+        """
+        if not self._overviews or self._width <= 0 or scene_units_per_pixel <= 0:
+            return 1
+
+        # Scene units covered by one full-resolution data pixel.
+        west, _south, east, _north = self.bounds
+        native_res = (east - west) / self._width
+        if native_res <= 0:
+            return 1
+
+        # Pick the largest decimation factor whose level resolution is still no
+        # finer than one screen pixel (overviews are sorted ascending).
+        best = 1
+        for f in self._overviews:
+            if native_res * f <= scene_units_per_pixel:
+                best = f
+            else:
+                break
+        return best
+
     def _read_overview_metadata(self, src) -> None:
         """Read pyramid/overview metadata from an open rasterio dataset.
 
@@ -1050,6 +1081,16 @@ class MapCanvas(QGraphicsView):
         rect = self.mapToScene(self.viewport().rect()).boundingRect()
         # Scene coords: X = easting, Y = -northing
         return (rect.left(), -rect.bottom(), rect.right(), -rect.top())
+
+    def _scene_units_per_pixel(self) -> float:
+        """Return the size of one on-screen pixel in scene units.
+
+        Scene units are Web Mercator metres for geo layers. Larger values mean
+        the view is more zoomed out. Derived from the view transform's
+        horizontal scale factor (view-pixels per scene-unit).
+        """
+        m11 = self.transform().m11()
+        return 1.0 / m11 if m11 > 0 else 0.0
 
     def _update_visible_tiles(self):
         """Load tiles that are visible, unload tiles that aren't."""
