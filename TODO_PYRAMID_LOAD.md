@@ -87,25 +87,32 @@ requests a non-1 level yet — Phase 4 wires zoom → level.
 
 ## Phase 4 — Switch levels on zoom (level-of-detail)
 
-- [ ] **4.1** In `_update_visible_tiles`, before creating tiles, compute the
-  desired level via Phase 2 and compare with `self._loaded_level`.
-- [ ] **4.2** When the desired level differs, reload `self._rgba_data` at the new
+- [x] **4.1** In `_update_visible_tiles`, before creating tiles, compute the
+  desired level via Phase 2 and compare with `self._loaded_level`. *(Computes
+  `units_per_pixel` once, then calls `_apply_layer_lod(layer, units_per_pixel)`
+  per visible layer.)*
+- [x] **4.2** When the desired level differs, reload `self._rgba_data` at the new
   level and clear existing tiles (`layer.tiles`) so they regenerate at the new
-  resolution. Reuse `free_data()`/`ensure_loaded()`-style plumbing.
-- [ ] **4.3** Debounce/guard against thrashing: only switch when the level
+  resolution. Reuse `free_data()`/`ensure_loaded()`-style plumbing. *(New
+  `_apply_layer_lod` removes old tiles from the scene and calls
+  `layer.ensure_loaded(level=desired)`.)*
+- [x] **4.3** Debounce/guard against thrashing: only switch when the level
   actually changes, and keep the existing 50 ms `_schedule_tile_update` timer.
-- [ ] **4.4** Add a "true ground resolution" value for the canvas view, in
-  **meters/pixel**. `_scene_units_per_pixel()` returns Web Mercator metres per
-  pixel (`1/m11`), which the existing scale bar uses directly. Web Mercator
-  inflates real-world distance by `1/cos(latitude)`, so the *actual* ground
-  resolution is `scene_units_per_pixel * cos(lat_center)`, where `lat_center`
-  comes from `_web_mercator_to_wgs84()` of the view-centre.
-  - Add `MapCanvas.view_ground_resolution() -> float` returning that corrected
-    value (falls back to `_scene_units_per_pixel()` when no geo layer / at the
-    equator, where the factor is ≈ 1 — as with the Null Island test images).
-  - Optional: feed this corrected value into `_update_scale_bar` so the scale
-    bar is accurate away from the equator, and/or expose it for level selection
-    if we want LOD keyed to true ground resolution rather than raw scene units.
+  *(Early-returns when the correct level is already loaded, so panning at a
+  fixed zoom never reloads.)*
+- [x] **4.4** Add a "true ground resolution" value for the canvas view, in
+  **meters/pixel**. *(Added `MapCanvas.view_ground_resolution()` =
+  `_scene_units_per_pixel() * cos(view-centre latitude)`, latitude derived via
+  `_web_mercator_to_wgs84()`. Verified: equals scene-units at the equator, and
+  applies 0.866× @30°, 0.500× @60°.)*
+
+**Verified (test image):** driving the view through units/px 0.005→0.1→0.5→2.0
+switches the layer to level 1→8→32→64 and shrinks the tile grid
+20×20→3×3→1×1→1×1.
+
+> Caveat: zooming *in* to level 1 reloads the full-resolution array on the UI
+> thread (~11 s for 10000×10000), which can freeze the UI. Progressive/threaded
+> loading and freeing full-res when zoomed out are handled in **Phase 5**.
 
 ## Phase 5 — Responsiveness & memory
 

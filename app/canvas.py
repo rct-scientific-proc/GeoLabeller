@@ -1151,13 +1151,38 @@ class MapCanvas(QGraphicsView):
         m11 = self.transform().m11()
         return 1.0 / m11 if m11 > 0 else 0.0
 
+    def view_ground_resolution(self) -> float:
+        """Return the view's true ground resolution in metres per pixel.
+
+        `_scene_units_per_pixel()` gives Web Mercator metres per pixel, which
+        overestimates real-world distance by 1/cos(latitude). This applies the
+        cos(latitude) correction using the latitude at the centre of the view,
+        yielding actual metres per pixel on the ground. Falls back to the raw
+        scene-units value at the equator (factor ≈ 1) or when there is nothing
+        to measure.
+        """
+        units_per_pixel = self._scene_units_per_pixel()
+        if units_per_pixel <= 0:
+            return 0.0
+
+        # View-centre latitude in WGS84 (scene Y is -northing in Web Mercator).
+        rect = self.mapToScene(self.viewport().rect()).boundingRect()
+        center_northing = -rect.center().y()
+        _lon, lat = self._web_mercator_to_wgs84(0.0, center_northing)
+        return units_per_pixel * math.cos(math.radians(lat))
+
     def _update_visible_tiles(self):
         """Load tiles that are visible, unload tiles that aren't."""
         view_bounds = self._get_view_bounds()
+        units_per_pixel = self._scene_units_per_pixel()
 
         for layer_id, layer in self._layers.items():
             if not layer.visible:
                 continue
+
+            # Level-of-detail: pick an overview level for the current zoom and
+            # reload this layer if it differs from what is currently loaded.
+            self._apply_layer_lod(layer, units_per_pixel)
 
             visible_indices = set(layer.get_visible_tile_indices(view_bounds))
             current_indices = set(layer.tiles.keys())
@@ -1194,6 +1219,31 @@ class MapCanvas(QGraphicsView):
                 item.setVisible(layer.visible)
 
                 layer.tiles[idx] = item
+
+    def _apply_layer_lod(self, layer: TiledLayer, units_per_pixel: float):
+        """Switch a layer to the overview level suited to the current zoom.
+
+        Reloads the layer's raster data at the selected level and drops its
+        existing tiles so they regenerate at the new resolution. No-op for
+        layers without overviews or when the level is unchanged (so panning at a
+        fixed zoom never triggers a reload).
+        """
+        if not layer.has_overviews():
+            return
+
+        desired = layer.select_overview_level(units_per_pixel)
+
+        # Nothing to do if the correct level is already loaded.
+        if layer.is_fully_loaded() and desired == layer._loaded_level:
+            return
+
+        # Existing tiles belong to the old level; remove them so they can be
+        # rebuilt from the newly loaded resolution.
+        for item in layer.tiles.values():
+            self._scene.removeItem(item)
+        layer.tiles.clear()
+
+        layer.ensure_loaded(level=desired)
 
     def _schedule_tile_update(self):
         """Schedule a tile update (debounced)."""
