@@ -33,7 +33,6 @@ from .canvas import MapCanvas, CanvasMode, AsyncFileLoaderThread, TiledLayer
 from .class_editor import ClassEditorDialog
 from .labels import LabelProject, ImageData
 from .layer_panel import CombinedLayerPanel
-from .readers import registry as reader_registry
 
 
 class GroupMemoryWorker(QObject):
@@ -1666,8 +1665,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Export Complete", msg)
 
     def _add_geotiff(self):
-        """Open file dialog to add an image (GeoTIFF or custom format)."""
-        file_filter = reader_registry.file_dialog_filter()
+        """Open file dialog to add a GeoTIFF image."""
+        file_filter = "GeoTIFF (*.tif *.tiff);;All Files (*)"
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Add Image",
@@ -1685,13 +1684,9 @@ class MainWindow(QMainWindow):
             # Check if the file has a valid CRS
             has_crs = True
             try:
-                if reader_registry.can_read(file_path):
-                    br = reader_registry.read_bounds(file_path)
-                    has_crs = br.crs is not None
-                else:
-                    with rasterio.open(file_path) as src:
-                        if src.crs is None:
-                            has_crs = False
+                with rasterio.open(file_path) as src:
+                    if src.crs is None:
+                        has_crs = False
             except Exception:
                 pass
 
@@ -1710,10 +1705,9 @@ class MainWindow(QMainWindow):
                 width, height = self.canvas.get_layer_source_dimensions(
                     layer_id)
                 affine, crs = self.canvas.get_layer_transform(layer_id)
-                reader_info = reader_registry.reader_info(file_path)
                 self.project.add_image(
                     file_path, name, "", width, height,
-                    reader=reader_info, affine=affine, crs=crs)
+                    affine=affine, crs=crs)
 
         if skipped > 0:
             self.statusBar.showMessage(
@@ -1741,7 +1735,7 @@ class MainWindow(QMainWindow):
         # Find all supported files recursively
         root_path = Path(dir_path)
         image_files = []
-        for pattern in reader_registry.all_glob_patterns():
+        for pattern in ("*.tif", "*.tiff"):
             image_files.extend(root_path.rglob(pattern))
         # Deduplicate (in case of overlapping patterns) and sort
         image_files = sorted(set(image_files))
@@ -1826,13 +1820,9 @@ class MainWindow(QMainWindow):
             # Check CRS to decide geo vs pixel-mode loading
             has_crs = True
             try:
-                if reader_registry.can_read(file_path_str):
-                    br = reader_registry.read_bounds(file_path_str)
-                    has_crs = br.crs is not None
-                else:
-                    with rasterio.open(file_path_str) as src:
-                        if src.crs is None:
-                            has_crs = False
+                with rasterio.open(file_path_str) as src:
+                    if src.crs is None:
+                        has_crs = False
             except Exception:
                 pass
 
@@ -1861,10 +1851,9 @@ class MainWindow(QMainWindow):
                 width, height = self.canvas.get_layer_source_dimensions(
                     layer_id)
                 affine, crs = self.canvas.get_layer_transform(layer_id)
-                ri = reader_registry.reader_info(file_path_str)
                 self.project.add_image(
                     file_path_str, name, group_path_str, width, height,
-                    reader=ri, affine=affine, crs=crs)
+                    affine=affine, crs=crs)
                 loaded_count += 1
 
         progress.setValue(len(image_files))
@@ -2100,10 +2089,9 @@ class MainWindow(QMainWindow):
                         width, height = self.canvas.get_layer_source_dimensions(
                             layer_id)
                         affine, crs = self.canvas.get_layer_transform(layer_id)
-                        ri = layer_data.get('reader_info', {})
                         self.project.add_image(
                             file_path, name, group_path, width, height,
-                            reader=ri, affine=affine, crs=crs)
+                            affine=affine, crs=crs)
 
                     self._async_loaded_count += 1
         finally:

@@ -1,6 +1,6 @@
 # GeoLabeller
 
-A PyQt5-based desktop application for viewing georeferenced and non-georeferenced raster images and creating point annotations for machine learning datasets. Supports GeoTIFF out of the box, with a plugin-style reader registry for adding custom file formats (e.g. GIM, HDF5).
+A PyQt5-based desktop application for viewing georeferenced and non-georeferenced raster images and creating point annotations for machine learning datasets. Supports GeoTIFF images.
 
 ## Features
 
@@ -188,48 +188,11 @@ Projects are saved as JSON with the following structure:
 - `lon`, `lat`: WGS84 geographic coordinates
 - `object_id`: UUID v4 for linking labels across images (shared by linked labels)
 
-### Image Fields
-- `reader`: Dict mapping file extension to reader name (e.g. `{"gim": "gim_reader"}`). Empty or `{"tif": "default"}` for standard GeoTIFF.
-
-## Extending with Custom Readers
-
-GeoLabel supports loading arbitrary raster formats via the reader registry in `app/readers/`. To add a new format:
-
-1. Create a new module in `app/readers/` (e.g. `app/readers/myformat.py`).
-2. Implement a read function returning a `ReaderResult` and, optionally, a fast bounds-only function returning a `BoundsResult`.
-3. Register the reader at module level.
-4. Import the module from `app/readers/__init__.py`.
-
-```python
-# app/readers/myformat.py
-import numpy as np
-from app.readers import registry, ReaderResult, BoundsResult
-
-def read_myformat_bounds(file_path: str) -> BoundsResult:
-    """Fast path: read only header metadata (no pixel data)."""
-    # ... parse header for width, height, CRS, transform ...
-    return BoundsResult(width=w, height=h, src_width=w, src_height=h,
-                        crs=my_crs, transform=my_affine)
-
-def read_myformat(file_path: str) -> ReaderResult:
-    """Full read: decode pixels into an RGBA uint8 array."""
-    # ... load and convert image data ...
-    return ReaderResult(rgba=rgba, width=w, height=h,
-                        src_width=orig_w, src_height=orig_h,
-                        crs=my_crs, transform=my_affine)
-
-registry.register(".myf", "my_format", read_myformat,
-                   bounds_callback=read_myformat_bounds)
-```
-
-The file dialog, directory scanner, async loader, and project persistence will automatically pick up the new extension.
-
 ## Supported File Formats
 
 | Format | Extension | Reader | Notes |
 |--------|-----------|--------|-------|
 | GeoTIFF | `.tif`, `.tiff` | Built-in (rasterio) | Georeferenced and non-georeferenced |
-| GIM | `.gim` | `gim_reader` | Binary format with GCPs; see `app/readers/gim.py` |
 
 ## Requirements
 
