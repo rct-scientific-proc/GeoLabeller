@@ -26,8 +26,7 @@ from PyQt5.QtWidgets import (
     QProgressDialog,
     QApplication,
     QProgressBar,
-    QInputDialog,
-    QSpinBox)
+    QInputDialog)
 
 from .axis_ruler import MapCanvasWithAxes
 from .canvas import MapCanvas, CanvasMode, AsyncFileLoaderThread, TiledLayer
@@ -429,20 +428,6 @@ class MainWindow(QMainWindow):
         self.class_combo.setMinimumWidth(150)
         self.class_combo.currentTextChanged.connect(self._on_class_changed)
         toolbar.addWidget(self.class_combo)
-
-        toolbar.addSeparator()
-
-        # Decimation factor
-        toolbar.addWidget(QLabel(" Decimation: "))
-        self.decimation_spin = QSpinBox()
-        self.decimation_spin.setRange(1, 32)
-        self.decimation_spin.setValue(1)
-        self.decimation_spin.setToolTip(
-            "Image decimation factor (1 = full resolution, 2 = half, etc.)\n"
-            "Higher values reduce memory usage and speed up loading.\n"
-            "Applies to newly loaded images only."
-        )
-        toolbar.addWidget(self.decimation_spin)
 
     def keyPressEvent(self, event: QKeyEvent):
         """Handle global key press events.
@@ -1017,9 +1002,7 @@ class MainWindow(QMainWindow):
             if os.path.exists(image.path):
                 if image.crs_epsg is not None:
                     # Georeferenced image
-                    layer_id = self.canvas.add_layer(
-                        image.path,
-                        decimation_factor=self.decimation_spin.value())
+                    layer_id = self.canvas.add_layer(image.path)
                     if layer_id:
                         parent_group = get_or_create_group(image.group)
                         self.layer_panel.add_layer(
@@ -1029,8 +1012,7 @@ class MainWindow(QMainWindow):
                 else:
                     # Non-georeferenced image
                     layer_id = self.canvas.add_pixel_layer(
-                        image.path, group_path=image.group,
-                        decimation_factor=self.decimation_spin.value())
+                        image.path, group_path=image.group)
                     if layer_id:
                         nongeo_parent = self.layer_panel.add_nongeo_group(
                             image.group.split("/")[-1] if image.group else "Ungrouped")
@@ -1714,13 +1696,11 @@ class MainWindow(QMainWindow):
                 pass
 
             if has_crs:
-                layer_id = self.canvas.add_layer(
-                    file_path, decimation_factor=self.decimation_spin.value())
+                layer_id = self.canvas.add_layer(file_path)
                 if layer_id:
                     self.layer_panel.add_layer(layer_id, file_path)
             else:
-                layer_id = self.canvas.add_pixel_layer(
-                    file_path, decimation_factor=self.decimation_spin.value())
+                layer_id = self.canvas.add_pixel_layer(file_path)
                 if layer_id:
                     self.layer_panel.add_nongeo_layer(layer_id, file_path)
 
@@ -1862,16 +1842,14 @@ class MainWindow(QMainWindow):
 
             if has_crs:
                 layer_id = self.canvas.add_layer(
-                    file_path_str, visible=False,
-                    decimation_factor=self.decimation_spin.value())
+                    file_path_str, visible=False)
                 if layer_id:
                     self.layer_panel.add_layer(
                         layer_id, file_path_str, parent_group, visible=False)
                     self.canvas.set_layer_group(layer_id, group_path_str)
             else:
                 layer_id = self.canvas.add_pixel_layer(
-                    file_path_str, group_path=group_path_str, visible=False,
-                    decimation_factor=self.decimation_spin.value())
+                    file_path_str, group_path=group_path_str, visible=False)
                 if layer_id:
                     nongeo_parent = get_or_create_nongeo_group(
                         rel_dir.name if rel_dir != Path(".") else root_group_name)
@@ -2098,8 +2076,7 @@ class MainWindow(QMainWindow):
 
                     # Add georeferenced layer with lazy loading
                     layer_id = self.canvas.add_layer(
-                        file_path, lazy=True, visible=False,
-                        decimation_factor=self.decimation_spin.value())
+                        file_path, lazy=True, visible=False)
                     if layer_id:
                         self.layer_panel.add_layer(
                             layer_id, file_path, parent_group, visible=False)
@@ -2110,8 +2087,7 @@ class MainWindow(QMainWindow):
 
                     layer_id = self.canvas.add_pixel_layer(
                         file_path, group_path=group_path, lazy=True,
-                        visible=False,
-                        decimation_factor=self.decimation_spin.value())
+                        visible=False)
                     if layer_id:
                         self.layer_panel.add_nongeo_layer(
                             layer_id, file_path, parent_group, visible=False)

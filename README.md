@@ -211,7 +211,7 @@ def read_myformat_bounds(file_path: str) -> BoundsResult:
     return BoundsResult(width=w, height=h, src_width=w, src_height=h,
                         crs=my_crs, transform=my_affine)
 
-def read_myformat(file_path: str, decimation_factor: int = 1) -> ReaderResult:
+def read_myformat(file_path: str) -> ReaderResult:
     """Full read: decode pixels into an RGBA uint8 array."""
     # ... load and convert image data ...
     return ReaderResult(rgba=rgba, width=w, height=h,

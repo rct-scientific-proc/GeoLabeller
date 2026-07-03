@@ -42,8 +42,8 @@ class ReaderResult:
 
     Attributes:
         rgba: RGBA uint8 image array with shape (height, width, 4).
-        width: Image width in pixels (after any decimation).
-        height: Image height in pixels (after any decimation).
+        width: Image width in pixels.
+        height: Image height in pixels.
         src_width: Original (on-disk) image width.
         src_height: Original (on-disk) image height.
         crs: Optional CRS of the source image.
@@ -62,8 +62,8 @@ class ReaderResult:
 
 
 # Type alias for a reader callable.
-# Signature: (file_path: str, decimation_factor: int) -> ReaderResult
-ReaderCallable = Callable[[str, int], ReaderResult]
+# Signature: (file_path: str) -> ReaderResult
+ReaderCallable = Callable[[str], ReaderResult]
 
 
 @dataclass
@@ -130,7 +130,7 @@ class ReaderRegistry:
             extension: File extension *including* the dot, e.g. ``".h5"``.
                        Case-insensitive.
             name: Human-readable reader name (must be unique).
-            callback: ``(file_path, decimation_factor) -> ReaderResult``.
+            callback: ``(file_path) -> ReaderResult``.
             bounds_callback: Optional fast path ``(file_path) -> BoundsResult``
                 that reads only header/metadata without decoding pixels.
                 Used for lazy loading and async imports.
@@ -189,7 +189,7 @@ class ReaderRegistry:
         """Return ``True`` if a custom reader is registered for this file."""
         return self.get_reader(file_path) is not None
 
-    def read(self, file_path: str, decimation_factor: int = 1) -> ReaderResult:
+    def read(self, file_path: str) -> ReaderResult:
         """Read *file_path* using its registered reader.
 
         Raises:
@@ -200,7 +200,7 @@ class ReaderRegistry:
             raise ValueError(
                 f"No reader registered for '{Path(file_path).suffix}'"
             )
-        return entry.callback(file_path, decimation_factor)
+        return entry.callback(file_path)
 
     def has_bounds_reader(self, file_path: str) -> bool:
         """Return ``True`` if a fast bounds-only reader exists for this file."""

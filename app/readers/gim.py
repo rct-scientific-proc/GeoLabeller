@@ -45,7 +45,7 @@ def read_gim_bounds(file_path: str) -> BoundsResult:
     )
 
 
-def read_gim(file_path: str, decimation_factor: int = 1) -> ReaderResult:
+def read_gim(file_path: str) -> ReaderResult:
     """Read a GIM binary file."""
     with open(file_path, "rb") as f:
         # Header
@@ -66,10 +66,6 @@ def read_gim(file_path: str, decimation_factor: int = 1) -> ReaderResult:
     else:
         img = raw.reshape((h, w, c))
 
-    # Apply decimation
-    dec = max(1, decimation_factor)
-    if dec > 1:
-        img = img[::dec, ::dec] if img.ndim == 2 else img[::dec, ::dec, :]
     dh, dw = img.shape[:2]
 
     # Convert float [0,1] → uint8 RGBA
