@@ -116,14 +116,27 @@ switches the layer to level 1→8→32→64 and shrinks the tile grid
 
 ## Phase 5 — Responsiveness & memory
 
-- [ ] **5.1** Progressive load: on first display, load the coarsest overview for
+- [x] **5.1** Progressive load: on first display, load the coarsest overview for
   an instant preview, then refine to the target level. (Optional but high impact
-  for the 10000×10000 images.)
-- [ ] **5.2** Move overview reads off the UI thread (extend the existing
+  for the 10000×10000 images.) *(In `_apply_layer_lod`: expensive target levels
+  show the coarsest overview / keep current tiles as a preview, then refine.)*
+- [x] **5.2** Move overview reads off the UI thread (extend the existing
   `AsyncFileLoader`/`QThread` pattern in `app/canvas.py`) so level switches don't
-  freeze panning.
-- [ ] **5.3** Free full-resolution data when zoomed out (call `free_data()` when a
-  coarser level is active) to cap memory per layer.
+  freeze panning. *(New `_LevelLoadRunnable`/`_LevelLoadSignals` on a
+  `QThreadPool`; computes in a throwaway `TiledLayer` off-thread and applies the
+  result via `apply_level_result` on the main thread. Zoom-in to level 1 now
+  returns in ~0 s instead of blocking ~11 s. Stale/superseded results are
+  discarded via `_target_level`; one in-flight load per layer via
+  `_loading_level`.)*
+- [x] **5.3** Free full-resolution data when zoomed out (call `free_data()` when a
+  coarser level is active) to cap memory per layer. *(Switching to a coarser
+  level reloads a smaller array, replacing the full-res buffer — verified 400 MB
+  → 0.39 MB on zoom-out.)*
+
+**Verified:** cheap coarse levels load synchronously; expensive fine levels load
+in the background with a preview and no UI freeze; rapid zoom churn settles to
+`loaded_level == target` with no pending load; full-res memory is reclaimed on
+zoom-out.
 
 ## Phase 6 — Validation & fallback
 

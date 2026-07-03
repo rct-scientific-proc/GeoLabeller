@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import rasterio
 from PyQt5 import sip
-from PyQt5.QtCore import Qt, pyqtSignal, QRectF, QTimer, QThread, QObject
+from PyQt5.QtCore import Qt, pyqtSignal, QRectF, QTimer, QThread, QObject, QThreadPool, QRunnable
 from PyQt5.QtGui import (
     QImage,
     QPixmap,
@@ -105,6 +105,10 @@ class TiledLayer:
         self._full_height = 0
         # Overview decimation factor of the data currently in `_rgba_data`.
         self._loaded_level = 1
+        # Level-of-detail scheduling: the level the view currently wants, and
+        # the level (if any) being loaded in a background thread.
+        self._target_level = 1
+        self._loading_level: int | None = None
 
 
         # Lazy loading state
@@ -222,6 +226,46 @@ class TiledLayer:
             else:
                 break
         return best
+
+    def level_pixel_count(self, level: int) -> int:
+        """Approximate RGBA pixel count of the array at the given level."""
+        fw = self._full_width or self._width
+        fh = self._full_height or self._height
+        level = max(1, level)
+        return (fw // level) * (fh // level)
+
+    def coarsest_level(self) -> int:
+        """Return the coarsest available overview decimation factor (or 1)."""
+        return self._overviews[-1] if self._overviews else 1
+
+    def apply_level_result(self, result: dict) -> None:
+        """Apply raster data computed (possibly off-thread) for one level.
+
+        Sets the RGBA buffer, dimensions, tile grid and level metadata. Geo
+        layers get their Web Mercator bounds updated; non-geo layers keep their
+        existing pixel-zone bounds.
+        """
+        self._rgba_data = result['rgba']
+        self._width = result['width']
+        self._height = result['height']
+        if result.get('full_width'):
+            self._full_width = result['full_width']
+        if result.get('full_height'):
+            self._full_height = result['full_height']
+        if result.get('overviews'):
+            self._overviews = result['overviews']
+        if result.get('level_dims'):
+            self._src_level_dims = result['level_dims']
+        self._src_crs = result['src_crs']
+        self._src_transform = result['src_transform']
+        self._src_width = result['src_width']
+        self._src_height = result['src_height']
+        self._n_tiles_x = math.ceil(self._width / TILE_SIZE)
+        self._n_tiles_y = math.ceil(self._height / TILE_SIZE)
+        if self.geo:
+            self.bounds = result['bounds']
+        self._loaded_level = result['level']
+        self._fully_loaded = True
 
     def _read_overview_metadata(self, src) -> None:
         """Read pyramid/overview metadata from an open rasterio dataset.
@@ -906,6 +950,53 @@ class ScaleBarWidget(QWidget):
         painter.end()
 
 
+class _LevelLoadSignals(QObject):
+    """Signals for a background overview-level load."""
+    finished = pyqtSignal(str, int, object)  # layer_id, level, result dict
+    error = pyqtSignal(str, str)             # layer_id, message
+
+
+class _LevelLoadRunnable(QRunnable):
+    """Compute a layer's RGBA data at a given overview level off the UI thread.
+
+    Uses a throwaway TiledLayer so no state is shared with the live layer; the
+    finished numpy array and metadata are handed back to the main thread via a
+    queued signal for application there.
+    """
+
+    def __init__(self, layer_id: str, file_path: str, geo: bool, level: int,
+                 signals: "_LevelLoadSignals"):
+        super().__init__()
+        self._layer_id = layer_id
+        self._file_path = file_path
+        self._geo = geo
+        self._level = level
+        self._signals = signals
+
+    def run(self):
+        try:
+            tmp = TiledLayer(self._file_path, lazy=True, geo=self._geo)
+            tmp.ensure_loaded(level=self._level)
+            result = {
+                'rgba': tmp._rgba_data,
+                'width': tmp._width,
+                'height': tmp._height,
+                'bounds': tmp.bounds,
+                'full_width': tmp._full_width,
+                'full_height': tmp._full_height,
+                'overviews': tmp._overviews,
+                'level_dims': tmp._src_level_dims,
+                'src_crs': tmp._src_crs,
+                'src_transform': tmp._src_transform,
+                'src_width': tmp._src_width,
+                'src_height': tmp._src_height,
+                'level': tmp._loaded_level,
+            }
+            self._signals.finished.emit(self._layer_id, self._level, result)
+        except Exception as e:  # report any load failure back to the UI thread
+            self._signals.error.emit(self._layer_id, str(e))
+
+
 class MapCanvas(QGraphicsView):
     """Canvas widget for displaying geospatial raster layers with tiling."""
 
@@ -948,6 +1039,10 @@ class MapCanvas(QGraphicsView):
 
     # Signal emitted when Ctrl+Space is pressed in cycle mode (go backwards)
     cycle_prev_requested = pyqtSignal()
+
+    # Maximum RGBA pixel count to load synchronously on the UI thread. Larger
+    # levels load in a background thread with a coarse preview shown first.
+    _SYNC_LOAD_MAX_PIXELS = 2_000_000
 
     def __init__(self):
         super().__init__()
@@ -1020,6 +1115,12 @@ class MapCanvas(QGraphicsView):
         # Scale bar overlay widget
         self._scale_bar = ScaleBarWidget(self)
         self._scale_bar.move(10, 10)  # Will be repositioned in resizeEvent
+
+        # Background loader for expensive (fine) overview levels. `_level_load_
+        # signals` keeps the per-job signal objects alive until they deliver.
+        self._level_load_pool = QThreadPool(self)
+        self._level_load_pool.setMaxThreadCount(2)
+        self._level_load_signals: set = set()
 
     def add_layer(self, file_path: str, lazy: bool = False,
                   visible: bool = True) -> str | None:
@@ -1173,7 +1274,6 @@ class MapCanvas(QGraphicsView):
 
     def _update_visible_tiles(self):
         """Load tiles that are visible, unload tiles that aren't."""
-        view_bounds = self._get_view_bounds()
         units_per_pixel = self._scene_units_per_pixel()
 
         for layer_id, layer in self._layers.items():
@@ -1181,69 +1281,141 @@ class MapCanvas(QGraphicsView):
                 continue
 
             # Level-of-detail: pick an overview level for the current zoom and
-            # reload this layer if it differs from what is currently loaded.
-            self._apply_layer_lod(layer, units_per_pixel)
+            # (re)load this layer if it differs from what is currently loaded.
+            self._apply_layer_lod(layer_id, layer, units_per_pixel)
 
-            visible_indices = set(layer.get_visible_tile_indices(view_bounds))
-            current_indices = set(layer.tiles.keys())
+            self._rebuild_layer_tiles(layer)
 
-            # Remove tiles no longer visible
-            for idx in current_indices - visible_indices:
-                self._scene.removeItem(layer.tiles[idx])
-                del layer.tiles[idx]
+    def _rebuild_layer_tiles(self, layer: TiledLayer):
+        """Add/remove a single layer's tiles to match the current view."""
+        view_bounds = self._get_view_bounds()
+        visible_indices = set(layer.get_visible_tile_indices(view_bounds))
+        current_indices = set(layer.tiles.keys())
 
-            # Add newly visible tiles
-            for idx in visible_indices - current_indices:
-                tx, ty = idx
-                pixmap = layer.create_tile_pixmap(tx, ty)
-                if pixmap is None:
-                    continue
+        # Remove tiles no longer visible
+        for idx in current_indices - visible_indices:
+            self._scene.removeItem(layer.tiles[idx])
+            del layer.tiles[idx]
 
-                item = self._scene.addPixmap(pixmap)
+        # Add newly visible tiles
+        for idx in visible_indices - current_indices:
+            tx, ty = idx
+            pixmap = layer.create_tile_pixmap(tx, ty)
+            if pixmap is None:
+                continue
 
-                # Standard axis-aligned scaling for GeoTIFF layers
-                px_left, px_top, px_right, px_bottom, tile_west, tile_south, tile_east, tile_north = layer.get_tile_bounds(
-                    tx, ty)
+            item = self._scene.addPixmap(pixmap)
 
-                pixel_width = px_right - px_left
-                pixel_height = px_bottom - px_top
-                scale_x = (tile_east - tile_west) / pixel_width
-                scale_y = (tile_north - tile_south) / pixel_height
+            # Standard axis-aligned scaling for GeoTIFF layers
+            px_left, px_top, px_right, px_bottom, tile_west, tile_south, tile_east, tile_north = layer.get_tile_bounds(
+                tx, ty)
 
-                transform = QTransform()
-                transform.scale(scale_x, scale_y)
-                item.setTransform(transform)
-                item.setPos(tile_west, -tile_north)
+            pixel_width = px_right - px_left
+            pixel_height = px_bottom - px_top
+            scale_x = (tile_east - tile_west) / pixel_width
+            scale_y = (tile_north - tile_south) / pixel_height
 
-                item.setZValue(layer.z_value)
-                item.setVisible(layer.visible)
+            transform = QTransform()
+            transform.scale(scale_x, scale_y)
+            item.setTransform(transform)
+            item.setPos(tile_west, -tile_north)
 
-                layer.tiles[idx] = item
+            item.setZValue(layer.z_value)
+            item.setVisible(layer.visible)
 
-    def _apply_layer_lod(self, layer: TiledLayer, units_per_pixel: float):
-        """Switch a layer to the overview level suited to the current zoom.
+            layer.tiles[idx] = item
 
-        Reloads the layer's raster data at the selected level and drops its
-        existing tiles so they regenerate at the new resolution. No-op for
-        layers without overviews or when the level is unchanged (so panning at a
-        fixed zoom never triggers a reload).
+    def _clear_layer_tiles(self, layer: TiledLayer):
+        """Remove all of a layer's tiles from the scene."""
+        for item in layer.tiles.values():
+            self._scene.removeItem(item)
+        layer.tiles.clear()
+
+    def _apply_layer_lod(self, layer_id: str, layer: TiledLayer,
+                         units_per_pixel: float):
+        """Choose and apply the overview level for a layer at the current zoom.
+
+        Cheap (coarse) levels load synchronously. Expensive (fine) levels load
+        in a background thread while a coarser preview stays on screen, so the
+        UI never freezes on zoom-in. Panning at a fixed zoom is a no-op.
         """
         if not layer.has_overviews():
             return
 
         desired = layer.select_overview_level(units_per_pixel)
+        layer._target_level = desired
 
-        # Nothing to do if the correct level is already loaded.
-        if layer.is_fully_loaded() and desired == layer._loaded_level:
+        if layer.is_fully_loaded() and layer._loaded_level == desired:
             return
 
-        # Existing tiles belong to the old level; remove them so they can be
-        # rebuilt from the newly loaded resolution.
-        for item in layer.tiles.values():
-            self._scene.removeItem(item)
-        layer.tiles.clear()
+        expensive = layer.level_pixel_count(desired) > self._SYNC_LOAD_MAX_PIXELS
 
-        layer.ensure_loaded(level=desired)
+        if not layer.is_fully_loaded():
+            # Nothing on screen yet: show a cheap preview immediately, then
+            # refine to the target level in the background if it is expensive.
+            preview = layer.coarsest_level() if expensive else desired
+            self._clear_layer_tiles(layer)
+            layer.ensure_loaded(level=preview)
+            if expensive and layer._loaded_level != desired:
+                self._dispatch_level_load(layer_id, layer, desired)
+            return
+
+        if not expensive:
+            # Cheap swap: replace data now; the caller rebuilds the tiles.
+            self._clear_layer_tiles(layer)
+            layer.ensure_loaded(level=desired)
+        else:
+            # Keep the current tiles as a preview and load the target level in
+            # the background (swapped in by _on_level_loaded when ready).
+            self._dispatch_level_load(layer_id, layer, desired)
+
+    def _dispatch_level_load(self, layer_id: str, layer: TiledLayer, level: int):
+        """Start a background load of *layer* at *level* (if not already running)."""
+        if layer._loading_level == level:
+            return
+        layer._loading_level = level
+
+        signals = _LevelLoadSignals()
+        self._level_load_signals.add(signals)
+        signals.finished.connect(self._on_level_loaded)
+        signals.error.connect(self._on_level_load_error)
+        # Keep the signals object alive until it has delivered, then release it.
+        signals.finished.connect(
+            lambda *_a, s=signals: self._level_load_signals.discard(s))
+        signals.error.connect(
+            lambda *_a, s=signals: self._level_load_signals.discard(s))
+
+        runnable = _LevelLoadRunnable(
+            layer_id, layer.file_path, layer.geo, level, signals)
+        self._level_load_pool.start(runnable)
+
+    def _on_level_loaded(self, layer_id: str, level: int, result: dict):
+        """Apply a background-loaded overview level on the UI thread."""
+        layer = self._layers.get(layer_id)
+        if layer is None:
+            return  # Layer was removed while loading.
+
+        if layer._loading_level == level:
+            layer._loading_level = None
+
+        # A newer zoom may have superseded this level; if so, chase the new one.
+        if level != layer._target_level:
+            if (layer.has_overviews()
+                    and layer._target_level != layer._loaded_level):
+                self._dispatch_level_load(layer_id, layer, layer._target_level)
+            return
+
+        layer.apply_level_result(result)
+        self._clear_layer_tiles(layer)
+        self._rebuild_layer_tiles(layer)
+
+    def _on_level_load_error(self, layer_id: str, message: str):
+        """Handle a failed background level load."""
+        layer = self._layers.get(layer_id)
+        if layer is not None:
+            layer._loading_level = None
+        print(f"[pyramid] background level load failed for {layer_id}: {message}")
+
 
     def _schedule_tile_update(self):
         """Schedule a tile update (debounced)."""
