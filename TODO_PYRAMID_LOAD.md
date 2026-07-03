@@ -59,19 +59,31 @@ Each is intended to be independently committable.
 
 ## Phase 3 — Read from overviews instead of full resolution
 
-- [ ] **3.1** Non-geo path first (simplest, no reprojection): change
+- [x] **3.1** Non-geo path first (simplest, no reprojection): change
   `_load_pixel_data` to read at a decimated `out_shape` matching the selected
   level. A smaller `out_shape` makes GDAL/rasterio serve data straight from the
   nearest overview. Update `self._width/_height/_n_tiles_*` to the level dims.
-- [ ] **3.2** Geo path: in `_load_and_reproject`, read the source bands at a
+  *(Now takes a `level` arg; reads `src.width // level` sized data.)*
+- [x] **3.2** Geo path: in `_load_and_reproject`, read the source bands at a
   decimated `out_shape` (overview) *before* `reproject`, and shrink the
   destination `width/height` accordingly via `calculate_default_transform(...,
   dst_width=, dst_height=)`. Keep `self.bounds` in Web Mercator unchanged.
-- [ ] **3.3** Track the currently loaded level in `self._loaded_level` so callers
-  know which resolution `self._rgba_data` represents.
-- [ ] **3.4** Verify `create_tile_pixmap` still works: tile geo-extent math in
+  *(Uses `src.transform.scale(...)` for the decimated source transform; bounds
+  verified stable across levels 1/8/64.)*
+- [x] **3.3** Track the currently loaded level in `self._loaded_level` so callers
+  know which resolution `self._rgba_data` represents. *(Also added stable
+  `_full_width/_full_height` so `select_overview_level` compares against native
+  res even after a decimated load. `ensure_loaded(level=None)` keeps the current
+  level and reloads only when it changes.)*
+- [x] **3.4** Verify `create_tile_pixmap` still works: tile geo-extent math in
   `_update_visible_tiles` divides geo span by pixel span, so reduced pixel dims
-  should self-correct the scale. Confirm no coordinate drift.
+  should self-correct the scale. Confirm no coordinate drift. *(At level 8 the
+  grid drops from ~20×20 to 3×3 tiles; pixmap renders 512×512 and the loaded
+  level is preserved through `create_tile_pixmap`.)*
+
+**Measured (10000×10000 test image):** full load 11.35 s → level 8 0.20 s (57×)
+→ level 64 0.013 s (870×). Behaviour unchanged in the app so far because nothing
+requests a non-1 level yet — Phase 4 wires zoom → level.
 
 ## Phase 4 — Switch levels on zoom (level-of-detail)
 
@@ -82,6 +94,18 @@ Each is intended to be independently committable.
   resolution. Reuse `free_data()`/`ensure_loaded()`-style plumbing.
 - [ ] **4.3** Debounce/guard against thrashing: only switch when the level
   actually changes, and keep the existing 50 ms `_schedule_tile_update` timer.
+- [ ] **4.4** Add a "true ground resolution" value for the canvas view, in
+  **meters/pixel**. `_scene_units_per_pixel()` returns Web Mercator metres per
+  pixel (`1/m11`), which the existing scale bar uses directly. Web Mercator
+  inflates real-world distance by `1/cos(latitude)`, so the *actual* ground
+  resolution is `scene_units_per_pixel * cos(lat_center)`, where `lat_center`
+  comes from `_web_mercator_to_wgs84()` of the view-centre.
+  - Add `MapCanvas.view_ground_resolution() -> float` returning that corrected
+    value (falls back to `_scene_units_per_pixel()` when no geo layer / at the
+    equator, where the factor is ≈ 1 — as with the Null Island test images).
+  - Optional: feed this corrected value into `_update_scale_bar` so the scale
+    bar is accurate away from the equator, and/or expose it for level selection
+    if we want LOD keyed to true ground resolution rather than raw scene units.
 
 ## Phase 5 — Responsiveness & memory
 

@@ -99,6 +99,12 @@ class TiledLayer:
         # `_src_level_dims` holds the (width, height) of each overview level.
         self._overviews: list[int] = []
         self._src_level_dims: list[tuple[int, int]] = []
+        # Full-resolution reprojected dimensions, kept stable across level
+        # switches so overview selection always compares against native res.
+        self._full_width = 0
+        self._full_height = 0
+        # Overview decimation factor of the data currently in `_rgba_data`.
+        self._loaded_level = 1
 
 
         # Lazy loading state
@@ -146,6 +152,8 @@ class TiledLayer:
                 src.crs, dst_crs, src.width, src.height, *src.bounds
             )
 
+            self._full_width = width
+            self._full_height = height
             self._width = width
             self._height = height
 
@@ -158,13 +166,21 @@ class TiledLayer:
             self._n_tiles_x = math.ceil(width / TILE_SIZE)
             self._n_tiles_y = math.ceil(height / TILE_SIZE)
 
-    def ensure_loaded(self):
-        """Ensure the full raster data is loaded. Call before accessing pixel data."""
-        if not self._fully_loaded:
+    def ensure_loaded(self, level: int | None = None):
+        """Ensure raster data is loaded, optionally at a specific overview level.
+
+        Args:
+            level: Overview decimation factor to load. When ``None`` the
+                currently loaded level is kept (or full resolution on first
+                load). Reloads only when the data is missing or the requested
+                level differs from what is loaded.
+        """
+        target = self._loaded_level if level is None else max(1, level)
+        if not self._fully_loaded or self._loaded_level != target:
             if self.geo:
-                self._load_and_reproject()
+                self._load_and_reproject(target)
             else:
-                self._load_pixel_data()
+                self._load_pixel_data(target)
             self._fully_loaded = True
 
     def is_fully_loaded(self) -> bool:
@@ -187,12 +203,13 @@ class TiledLayer:
             when the file has no overviews or when the view is zoomed in past
             native resolution.
         """
-        if not self._overviews or self._width <= 0 or scene_units_per_pixel <= 0:
+        full_width = self._full_width or self._width
+        if not self._overviews or full_width <= 0 or scene_units_per_pixel <= 0:
             return 1
 
         # Scene units covered by one full-resolution data pixel.
         west, _south, east, _north = self.bounds
-        native_res = (east - west) / self._width
+        native_res = (east - west) / full_width
         if native_res <= 0:
             return 1
 
@@ -226,8 +243,14 @@ class TiledLayer:
             print(f"[pyramid] {Path(self.file_path).name}: "
                   f"overviews={factors} level_dims={self._src_level_dims}")
 
-    def _load_and_reproject(self):
-        """Load GeoTIFF and reproject to Web Mercator."""
+    def _load_and_reproject(self, level: int = 1):
+        """Load GeoTIFF and reproject to Web Mercator at the given overview level.
+
+        Args:
+            level: Overview decimation factor (1 = full resolution). Source
+                pixels are read from the matching pyramid level via a decimated
+                ``out_shape`` so the full image is never decoded when zoomed out.
+        """
         with rasterio.open(self.file_path) as src:
             # Store original image info for coordinate transforms
             self._src_crs = src.crs
@@ -242,17 +265,39 @@ class TiledLayer:
                     "The file may not be a valid GeoTIFF."
                 )
 
+            level = max(1, level)
+
+            # Decimated source read shape (served from the nearest overview),
+            # and the source transform scaled to match that read shape.
+            rd_w = max(1, src.width // level)
+            rd_h = max(1, src.height // level)
+            src_read_transform = src.transform * src.transform.scale(
+                src.width / rd_w, src.height / rd_h)
+
             dst_crs = WEB_MERCATOR
             transform, width, height = calculate_default_transform(
                 src.crs, dst_crs, src.width, src.height, *src.bounds
             )
+
+            # Remember the full-resolution reprojected dimensions (used for
+            # overview level selection) before reducing for this level.
+            self._full_width = width
+            self._full_height = height
+
+            if level > 1:
+                dst_w = max(1, width // level)
+                dst_h = max(1, height // level)
+                transform, width, height = calculate_default_transform(
+                    src.crs, dst_crs, src.width, src.height, *src.bounds,
+                    dst_width=dst_w, dst_height=dst_h
+                )
 
             # Optimization: reproject band 1 as float32 to detect nodata/padding,
             # then reproject remaining bands directly as uint8 (faster, less memory).
             # Padding areas are identical for all bands after reprojection.
 
             # Band 1: reproject as float32 to detect nodata
-            src_band1 = src.read(1).astype(np.float32)
+            src_band1 = src.read(1, out_shape=(rd_h, rd_w)).astype(np.float32)
             if src.nodata is not None:
                 src_band1[src_band1 == src.nodata] = np.nan
 
@@ -260,7 +305,7 @@ class TiledLayer:
             reproject(
                 source=src_band1,
                 destination=dst_band1,
-                src_transform=src.transform,
+                src_transform=src_read_transform,
                 src_crs=src.crs,
                 dst_transform=transform,
                 dst_crs=dst_crs,
@@ -289,7 +334,7 @@ class TiledLayer:
                 bands_uint8 = [band1_uint8]
                 for i in range(2, min(src.count + 1, 4)
                                ):  # bands 2, 3 (and skip 4 if exists)
-                    src_band = src.read(i)
+                    src_band = src.read(i, out_shape=(rd_h, rd_w))
                     # Handle source nodata by setting to 0
                     if src.nodata is not None:
                         src_band = np.where(
@@ -300,7 +345,7 @@ class TiledLayer:
                     reproject(
                         source=src_band,
                         destination=dst_band,
-                        src_transform=src.transform,
+                        src_transform=src_read_transform,
                         src_crs=src.crs,
                         dst_transform=transform,
                         dst_crs=dst_crs,
@@ -335,6 +380,7 @@ class TiledLayer:
             self._height = height
             self._n_tiles_x = math.ceil(width / TILE_SIZE)
             self._n_tiles_y = math.ceil(height / TILE_SIZE)
+            self._loaded_level = level
 
     def _load_pixel_bounds_only(self):
         """Load only dimensions for a non-georeferenced image (no CRS/reprojection).
@@ -349,6 +395,8 @@ class TiledLayer:
             width = src.width
             height = src.height
 
+            self._full_width = width
+            self._full_height = height
             self._width = width
             self._height = height
             self._n_tiles_x = math.ceil(width / TILE_SIZE)
@@ -358,8 +406,14 @@ class TiledLayer:
             # Use placeholder bounds at origin; will be overwritten
             self.bounds = (0, 0, width, height)
 
-    def _load_pixel_data(self):
-        """Load a non-georeferenced image directly as pixel data (no reprojection)."""
+    def _load_pixel_data(self, level: int = 1):
+        """Load a non-georeferenced image directly as pixel data (no reprojection).
+
+        Args:
+            level: Overview decimation factor (1 = full resolution). Pixels are
+                read at a decimated ``out_shape`` served from the matching
+                pyramid level.
+        """
         # Preserve bounds if already assigned by set_pixel_bounds()
         saved_bounds = self.bounds
 
@@ -368,8 +422,12 @@ class TiledLayer:
             self._src_height = src.height
             self._read_overview_metadata(src)
 
-            width = src.width
-            height = src.height
+            self._full_width = src.width
+            self._full_height = src.height
+
+            level = max(1, level)
+            width = max(1, src.width // level)
+            height = max(1, src.height // level)
 
             if src.count >= 3:
                 r = src.read(1, out_shape=(height, width)).astype(np.uint8)
@@ -390,6 +448,7 @@ class TiledLayer:
             self._height = height
             self._n_tiles_x = math.ceil(width / TILE_SIZE)
             self._n_tiles_y = math.ceil(height / TILE_SIZE)
+            self._loaded_level = level
 
             # Restore bounds if they were already set (by set_pixel_bounds)
             if saved_bounds and saved_bounds != (0, 0, width, height):
