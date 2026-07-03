@@ -867,11 +867,16 @@ class ScaleBarWidget(QWidget):
         200000, 500000, 1000000
     ]
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, orientation=Qt.Horizontal):
         super().__init__(parent)
+        self._orientation = orientation
         self._distance_meters = 100  # Current scale bar distance
-        self._bar_width_pixels = 100  # Current bar width in pixels
-        self.setFixedSize(150, 40)
+        self._bar_width_pixels = 100  # Current bar extent in pixels
+        self._meters_per_pixel = 0.0  # Ground metres per view pixel
+        if orientation == Qt.Horizontal:
+            self.setFixedSize(160, 54)
+        else:
+            self.setFixedSize(120, 170)
         # Don't intercept mouse events
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
 
@@ -879,6 +884,8 @@ class ScaleBarWidget(QWidget):
         """Update the scale bar based on meters per pixel."""
         if meters_per_pixel <= 0:
             return
+
+        self._meters_per_pixel = meters_per_pixel
 
         # Target bar width: 80-120 pixels
         target_width = 100
@@ -897,6 +904,18 @@ class ScaleBarWidget(QWidget):
         self._bar_width_pixels = max(
             30, min(140, self._bar_width_pixels))  # Clamp width
         self.update()
+
+    def _format_mpp(self, mpp: float) -> str:
+        """Format ground resolution (metres per view pixel)."""
+        if mpp <= 0:
+            return "-- m/px"
+        if mpp >= 100:
+            return f"{mpp:.0f} m/px"
+        if mpp >= 1:
+            return f"{mpp:.2f} m/px"
+        if mpp >= 0.001:
+            return f"{mpp:.3f} m/px"
+        return f"{mpp:.2e} m/px"
 
     def _format_distance(self, meters: float) -> str:
         """Format distance with appropriate units."""
@@ -920,9 +939,18 @@ class ScaleBarWidget(QWidget):
         painter.setPen(Qt.NoPen)
         painter.drawRoundedRect(0, 0, self.width(), self.height(), 5, 5)
 
+        if self._orientation == Qt.Horizontal:
+            self._paint_horizontal(painter)
+        else:
+            self._paint_vertical(painter)
+
+        painter.end()
+
+    def _paint_horizontal(self, painter):
+        """Draw the horizontal scale bar with distance above and m/px below."""
         # Draw scale bar
         bar_height = 6
-        bar_y = 25
+        bar_y = 22
         bar_x = 10
 
         painter.setPen(QPen(QColor(0, 0, 0), 2))
@@ -939,15 +967,57 @@ class ScaleBarWidget(QWidget):
             bar_x + self._bar_width_pixels,
             bar_y + bar_height + 2)
 
-        # Draw distance text
+        # Draw distance text (above the bar)
         painter.setPen(QColor(0, 0, 0))
         font = QFont("Arial", 10, QFont.Bold)
         painter.setFont(font)
         text = self._format_distance(self._distance_meters)
-        painter.drawText(bar_x, 5, self._bar_width_pixels + 20, 18,
+        painter.drawText(bar_x, 2, self._bar_width_pixels + 30, 16,
                          Qt.AlignLeft | Qt.AlignVCenter, text)
 
-        painter.end()
+        # Draw ground resolution (metres per view pixel) below the bar
+        res_font = QFont("Arial", 8)
+        painter.setFont(res_font)
+        painter.drawText(bar_x, bar_y + bar_height + 2,
+                         self.width() - bar_x - 4, 16,
+                         Qt.AlignLeft | Qt.AlignVCenter,
+                         self._format_mpp(self._meters_per_pixel))
+
+    def _paint_vertical(self, painter):
+        """Draw the vertical scale bar with distance and m/px beside it."""
+        bar_width = 6
+        bar_x = 12
+        bar_top = 12
+        length = self._bar_width_pixels
+
+        painter.setPen(QPen(QColor(0, 0, 0), 2))
+        painter.setBrush(QColor(0, 0, 0))
+
+        # Main bar (vertical)
+        painter.drawRect(bar_x, bar_top, bar_width, length)
+
+        # End caps (horizontal lines)
+        painter.drawLine(bar_x - 2, bar_top, bar_x + bar_width + 2, bar_top)
+        painter.drawLine(bar_x - 2, bar_top + length,
+                         bar_x + bar_width + 2, bar_top + length)
+
+        # Distance and resolution text to the right, centred on the bar
+        text_x = bar_x + bar_width + 8
+        text_w = self.width() - text_x - 4
+        center_y = bar_top + length / 2
+
+        painter.setPen(QColor(0, 0, 0))
+        font = QFont("Arial", 10, QFont.Bold)
+        painter.setFont(font)
+        painter.drawText(text_x, int(center_y) - 16, text_w, 16,
+                         Qt.AlignLeft | Qt.AlignVCenter,
+                         self._format_distance(self._distance_meters))
+
+        res_font = QFont("Arial", 8)
+        painter.setFont(res_font)
+        painter.drawText(text_x, int(center_y), text_w, 16,
+                         Qt.AlignLeft | Qt.AlignVCenter,
+                         self._format_mpp(self._meters_per_pixel))
 
 
 class _LevelLoadSignals(QObject):
@@ -992,9 +1062,20 @@ class _LevelLoadRunnable(QRunnable):
                 'src_height': tmp._src_height,
                 'level': tmp._loaded_level,
             }
-            self._signals.finished.emit(self._layer_id, self._level, result)
         except Exception as e:  # report any load failure back to the UI thread
-            self._signals.error.emit(self._layer_id, str(e))
+            self._safe_emit(self._signals.error, self._layer_id, str(e))
+            return
+        self._safe_emit(self._signals.finished, self._layer_id, self._level, result)
+
+    @staticmethod
+    def _safe_emit(signal, *args):
+        """Emit a signal, ignoring the case where the receiver was already
+        deleted (e.g. the canvas/app was torn down while this load was running).
+        """
+        try:
+            signal.emit(*args)
+        except RuntimeError:
+            pass
 
 
 class MapCanvas(QGraphicsView):
@@ -1042,7 +1123,7 @@ class MapCanvas(QGraphicsView):
 
     # Maximum RGBA pixel count to load synchronously on the UI thread. Larger
     # levels load in a background thread with a coarse preview shown first.
-    _SYNC_LOAD_MAX_PIXELS = 2_000_000
+    _SYNC_LOAD_MAX_PIXELS = 500_000
 
     def __init__(self):
         super().__init__()
@@ -1115,6 +1196,11 @@ class MapCanvas(QGraphicsView):
         # Scale bar overlay widget
         self._scale_bar = ScaleBarWidget(self)
         self._scale_bar.move(10, 10)  # Will be repositioned in resizeEvent
+
+        # Vertical scale bar (vertical distance + m/px), shown below the
+        # horizontal one.
+        self._scale_bar_v = ScaleBarWidget(self, orientation=Qt.Vertical)
+        self._scale_bar_v.move(10, 74)  # Will be repositioned in resizeEvent
 
         # Background loader for expensive (fine) overview levels. `_level_load_
         # signals` keeps the per-job signal objects alive until they deliver.
@@ -1274,10 +1360,18 @@ class MapCanvas(QGraphicsView):
 
     def _update_visible_tiles(self):
         """Load tiles that are visible, unload tiles that aren't."""
+        view_bounds = self._get_view_bounds()
         units_per_pixel = self._scene_units_per_pixel()
 
         for layer_id, layer in self._layers.items():
             if not layer.visible:
+                continue
+
+            # Cull layers entirely outside the viewport: they must not trigger
+            # any pyramid loading. Drop any tiles they may still hold.
+            if not self._layer_intersects_view(layer, view_bounds):
+                if layer.tiles:
+                    self._clear_layer_tiles(layer)
                 continue
 
             # Level-of-detail: pick an overview level for the current zoom and
@@ -1285,6 +1379,17 @@ class MapCanvas(QGraphicsView):
             self._apply_layer_lod(layer_id, layer, units_per_pixel)
 
             self._rebuild_layer_tiles(layer)
+
+    @staticmethod
+    def _layer_intersects_view(
+            layer: TiledLayer,
+            view_bounds: tuple[float, float, float, float]) -> bool:
+        """Return True if a layer's bounds overlap the current view bounds."""
+        if layer.bounds is None:
+            return False
+        lw, ls, le, ln = layer.bounds
+        vw, vs, ve, vn = view_bounds
+        return not (le < vw or lw > ve or ln < vs or ls > vn)
 
     def _rebuild_layer_tiles(self, layer: TiledLayer):
         """Add/remove a single layer's tiles to match the current view."""
@@ -1616,17 +1721,21 @@ class MapCanvas(QGraphicsView):
         y = margin
         self._scale_bar.move(x, y)
 
+        # Vertical scale bar directly below the horizontal one, right-aligned.
+        vx = self.viewport().width() - self._scale_bar_v.width() - margin
+        vy = y + self._scale_bar.height() + margin
+        self._scale_bar_v.move(vx, vy)
+
     def _update_scale_bar(self):
-        """Update scale bar based on current zoom level."""
-        # Get meters per pixel from current transform
-        # In Web Mercator, scene units are meters
+        """Update scale bars based on current zoom level."""
+        # In Web Mercator, scene units are meters. m11()/m22() give the
+        # horizontal/vertical scale factors (view pixels per scene unit), so the
+        # inverse is meters per pixel along each axis.
         transform = self.transform()
-        # m11() gives the horizontal scale factor (scene units per pixel)
-        # Since we're in Web Mercator, this is meters per pixel (inverted
-        # because of scaling)
         if transform.m11() != 0:
-            meters_per_pixel = 1.0 / abs(transform.m11())
-            self._scale_bar.set_scale(meters_per_pixel)
+            self._scale_bar.set_scale(1.0 / abs(transform.m11()))
+        if transform.m22() != 0:
+            self._scale_bar_v.set_scale(1.0 / abs(transform.m22()))
 
     def set_mode(self, mode: CanvasMode):
         """Set the canvas interaction mode."""

@@ -140,14 +140,19 @@ zoom-out.
 
 ## Phase 6 — Validation & fallback
 
-- [ ] **6.1** Generate a test set: `python tests/generate_large_high_res_tiff.py
+- [x] **6.1** Generate a test set: `python tests/generate_large_high_res_tiff.py
   --output-dir tests/test_imgs --num-images 5`, load them, and measure first-
   paint time + memory before vs. after.
-- [ ] **6.2** Confirm graceful fallback for images **without** overviews (must
-  behave exactly like today).
-- [ ] **6.3** Confirm label placement, scale bar, and coordinate readouts remain
+- [x] **6.2** Confirm graceful fallback for images **without** overviews (must
+  behave exactly like today). *(No-overview GeoTIFF: `has_overviews()` False,
+  `_apply_layer_lod` no-ops, stays at full-res level 1 at every zoom with no
+  background loads — identical to pre-pyramid behaviour.)*
+- [x] **6.3** Confirm label placement, scale bar, and coordinate readouts remain
   pixel-accurate across level switches (these read `self.transform()` and layer
-  bounds, which stay in Web Mercator).
+  bounds, which stay in Web Mercator). *(`latlon_to_pixel` uses the full-res
+  `_src_transform`/`_src_crs` set on every load → returns identical source
+  pixels across levels 1/8/64; layer bounds identical across levels; scale bar
+  derives from `transform().m11()` only, independent of level.)*
 
 ---
 
