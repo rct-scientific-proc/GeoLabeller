@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import rasterio
+from pyproj import Transformer
 from PyQt5.QtCore import Qt, Qt as QtCore_Qt, QTimer, QEvent, QThread, QObject, pyqtSignal
 from PyQt5.QtGui import QColor, QKeyEvent
 from PyQt5.QtWidgets import (
@@ -31,7 +32,7 @@ from PyQt5.QtWidgets import (
 from .axis_ruler import MapCanvasWithAxes
 from .canvas import MapCanvas, CanvasMode, AsyncFileLoaderThread, TiledLayer
 from .class_editor import ClassEditorDialog
-from .labels import LabelProject, ImageData
+from .labels import LabelProject, ImageData, haversine_distance
 from .layer_panel import CombinedLayerPanel
 
 
@@ -1536,6 +1537,33 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(
                 self, "Error", f"Failed to export ground truth: {e}")
 
+    @staticmethod
+    def _ground_res_per_pixel(src, px: int, py: int) -> tuple[float, float]:
+        """Measure true ground metres per pixel at a pixel, for any CRS.
+
+        Projects the pixel and its immediate right/below neighbours to WGS84
+        and takes geodesic (Haversine) distances, so the result is correct for
+        projected, geographic and Web Mercator sources alike (the last of which
+        has a cos(lat) scale factor that raw transform coefficients ignore) and
+        for non-square pixels.
+
+        Returns (metres_per_pixel_x, metres_per_pixel_y); (0, 0) if it can't be
+        determined.
+        """
+        try:
+            transformer = Transformer.from_crs(src.crs, 4326, always_xy=True)
+            ax, ay = src.transform * (px, py)
+            bx, by = src.transform * (px + 1, py)
+            cx, cy = src.transform * (px, py + 1)
+            a_lon, a_lat = transformer.transform(ax, ay)
+            b_lon, b_lat = transformer.transform(bx, by)
+            c_lon, c_lat = transformer.transform(cx, cy)
+            mppx = haversine_distance(a_lat, a_lon, b_lat, b_lon)
+            mppy = haversine_distance(a_lat, a_lon, c_lat, c_lon)
+            return mppx, mppy
+        except Exception:
+            return 0.0, 0.0
+
     def _export_subimages(self):
         """Export sub-images centered on labels as GeoTIFFs preserving original pixels."""
 
@@ -1595,49 +1623,43 @@ class MainWindow(QMainWindow):
 
             try:
                 with rasterio.open(image_path) as src:
-                    # Get the pixel resolution (meters per pixel)
-                    # For projected CRS, transform coefficients give pixel size directly
-                    # For geographic CRS, we need to approximate
-                    transform = src.transform
-
                     # Handle missing CRS
                     if src.crs is None:
                         errors.append(f"Image has no CRS: {image_path}")
                         continue
 
-                    if src.crs.is_geographic:
-                        # Approximate meters per degree at the label's latitude
-                        lat_rad = math.radians(label.lat)
-                        meters_per_deg_lat = 111320  # approximate
-                        meters_per_deg_lon = 111320 * math.cos(lat_rad)
-                        pixel_width_m = abs(transform.a) * meters_per_deg_lon
-                        pixel_height_m = abs(transform.e) * meters_per_deg_lat
-                    else:
-                        # Projected CRS - transform gives pixel size in CRS
-                        # units (usually meters)
-                        pixel_width_m = abs(transform.a)
-                        pixel_height_m = abs(transform.e)
+                    # Label pixel in the ORIGINAL image (absolute pixel coords)
+                    pixel_x = int(round(label.pixel_x))
+                    pixel_y = int(round(label.pixel_y))
 
-                    # Calculate pixel size for the requested meter size
+                    # Skip if pixel coordinates are outside image bounds
+                    if (pixel_x < 0 or pixel_x >= src.width
+                            or pixel_y < 0 or pixel_y >= src.height):
+                        errors.append(
+                            f"Label {label.id}: pixel coords "
+                            f"({pixel_x}, {pixel_y}) outside image bounds "
+                            f"({src.width}x{src.height})")
+                        continue
+
+                    # True ground metres per pixel at the label, measured from
+                    # the actual pixel geometry so it is correct for any CRS
+                    # (projected, geographic, or Web Mercator) and for
+                    # non-square pixels.
+                    pixel_width_m, pixel_height_m = self._ground_res_per_pixel(
+                        src, pixel_x, pixel_y)
+                    if pixel_width_m <= 0 or pixel_height_m <= 0:
+                        errors.append(
+                            f"Label {label.id}: could not determine pixel "
+                            f"resolution")
+                        continue
+
+                    # Pixels spanning the requested square ground region.
                     half_size_px_x = max(
                         1, int((size_meters / 2) / pixel_width_m))
                     half_size_px_y = max(
                         1, int((size_meters / 2) / pixel_height_m))
                     full_size_px_x = half_size_px_x * 2
                     full_size_px_y = half_size_px_y * 2
-
-                    # Get pixel coordinates from the label
-                    pixel_x = int(round(label.pixel_x))
-                    pixel_y = int(round(label.pixel_y))
-
-                    # Skip if pixel coordinates are outside image bounds
-                    if pixel_x < 0 or pixel_x >= src.width or pixel_y < 0 or pixel_y >= src.height:
-                        errors.append(
-                            f"Label {
-                                label.id}: pixel coords ({pixel_x}, {pixel_y}) outside image bounds ({
-                                src.width}x{
-                                src.height})")
-                        continue
 
                     # Calculate initial window bounds (centered on label)
                     col_start = pixel_x - half_size_px_x
@@ -1715,70 +1737,29 @@ class MainWindow(QMainWindow):
                     window_transform = rasterio.windows.transform(
                         window, src.transform)
 
-                    # Convert to grayscale and normalize
-                    num_bands = data.shape[0]
-
-                    # Robust normalization across datatypes: convert to float
-                    # in [0,1]
-                    dtype = data.dtype
-                    if np.issubdtype(dtype, np.integer):
-                        scale = float(np.iinfo(dtype).max)
-                        arr = data.astype(np.float32) / scale
-                    else:
-                        arr = data.astype(np.float32)
-                        # If float data appears to be in 0-255 range, normalize
-                        if arr.max() > 1.0:
-                            arr = arr / 255.0
-
-                    # Convert to grayscale using luminance weights (or average
-                    # if single band)
-                    if num_bands == 1:
-                        gray = arr[0]
-                    elif num_bands >= 3:
-                        gray = (
-                            0.299 *
-                            arr[0] +
-                            0.587 *
-                            arr[1] +
-                            0.114 *
-                            arr[2])
-                    else:
-                        gray = np.mean(arr, axis=0)
-
-                    # Apply mean/std normalization: shift mean to 0.4, std to
-                    # 0.2
-                    current_mean = np.mean(gray)
-                    current_std = np.std(gray)
-
-                    if current_std > 1e-6:  # Avoid division by zero
-                        # Standardize (zero mean, unit std), then apply target
-                        # mean/std
-                        gray = (gray - current_mean) / current_std
-                        gray = gray * 0.2 + 0.4
-                    else:
-                        # Flat image - just set to target mean
-                        gray = np.full_like(gray, 0.4)
-
-                    # Scale to [0, 255] and clip
-                    out_data = np.clip(gray * 255.0, 0, 255).astype(np.uint8)
-
-                    # Reshape for rasterio (1 band)
-                    out_data = out_data[np.newaxis, :, :]
-
-                    # Save as grayscale GeoTIFF with original CRS and transform
+                    # Write the cropped pixels unmodified: all source bands at
+                    # the original dtype, preserving CRS/transform, colour
+                    # interpretation and nodata so RGB (or any multi-band) data
+                    # round-trips exactly.
                     with rasterio.open(
                         out_path,
                         'w',
                         driver='GTiff',
                         height=window_height,
                         width=window_width,
-                        count=1,
-                        dtype=np.uint8,
+                        count=data.shape[0],
+                        dtype=data.dtype,
                         crs=src.crs,
                         transform=window_transform,
+                        nodata=src.nodata,
                         compress='lzw'
                     ) as dst:
-                        dst.write(out_data)
+                        dst.write(data)
+                        # Preserve per-band colour interpretation (RGB tagging).
+                        try:
+                            dst.colorinterp = src.colorinterp
+                        except Exception:
+                            pass
 
                     exported += 1
 
