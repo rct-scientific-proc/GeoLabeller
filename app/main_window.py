@@ -792,7 +792,10 @@ class MainWindow(QMainWindow):
         label.length_m = length_m
         label.width_m = width_m
 
-        # Reflect the new values in the labeled-images panel.
+        # Adorn the canvas marker and reflect the values in the panel.
+        has_measurement = length_m is not None or width_m is not None
+        self.canvas.set_label_measured(
+            label_id, has_measurement, length_m, width_m)
         self.layer_panel.refresh_labeled_panel(self.project)
 
         if length_m is None and width_m is None:
@@ -832,6 +835,11 @@ class MainWindow(QMainWindow):
             # Check if label is linked to others
             linked_labels = self.project.get_linked_labels(label.id)
             self.canvas.set_label_linked(label.id, len(linked_labels) > 1)
+
+            # Restore measurement adornment for labels loaded with dimensions
+            if label.length_m is not None or label.width_m is not None:
+                self.canvas.set_label_measured(
+                    label.id, True, label.length_m, label.width_m)
 
         # Refresh labeled images panel
         self.layer_panel.refresh_labeled_panel(self.project)

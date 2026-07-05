@@ -2125,6 +2125,7 @@ class MapCanvas(QGraphicsView):
 
         # Create text label
         text = QGraphicsTextItem(class_name)
+        text.setData(0, class_name)  # base label text, for measurement relabeling
         text.setDefaultTextColor(Qt.white)
         font = QFont("Arial", 8)
         font.setBold(True)
@@ -2235,6 +2236,12 @@ class MapCanvas(QGraphicsView):
             ellipse, _ = self._label_items.get(label_id, (None, None))
             is_linked = ellipse and ellipse.data(1)
 
+            # Clear measurements - only if this label has been measured
+            # (data slot 4 stores True when length/width are set).
+            clear_measure_action = None
+            if ellipse and ellipse.data(4):
+                clear_measure_action = menu.addAction("Clear Measurements")
+
             # Unlink and Show linked options (only if label is linked to
             # others)
             unlink_action = None
@@ -2259,6 +2266,10 @@ class MapCanvas(QGraphicsView):
                 self._enter_link_mode(label_id)
             elif action == measure_action:
                 self._enter_measure_mode(label_id)
+            elif clear_measure_action is not None and action == clear_measure_action:
+                # Clearing is routed through the same signal; main_window
+                # resets length_m/width_m and calls set_label_measured(False).
+                self.label_measured.emit(label_id, None, None)
             elif action == unlink_action:
                 self.label_unlinked.emit(label_id)
             elif action == show_linked_action:
@@ -2564,6 +2575,37 @@ class MapCanvas(QGraphicsView):
         if label_id in self._label_items:
             ellipse, _ = self._label_items[label_id]
             ellipse.setData(1, is_linked)  # Store linked status in data slot 1
+
+    def set_label_measured(self, label_id: int, measured: bool,
+                           length_m: float | None = None,
+                           width_m: float | None = None):
+        """Adorn a label marker to reflect whether it has length/width set.
+
+        Measured labels get a cyan outline (matching the measure lines) and the
+        dimensions appended to their text; clearing restores the class colour
+        and base text. The measured flag is stored in data slot 4 so the
+        context menu can offer "Clear Measurements".
+        """
+        if label_id not in self._label_items:
+            return
+        ellipse, text = self._label_items[label_id]
+        ellipse.setData(4, bool(measured))
+
+        pen = ellipse.pen()
+        if measured:
+            pen.setColor(QColor(0, 200, 255))
+        else:
+            # Restore the default outline (derived from the class fill colour).
+            pen.setColor(ellipse.brush().color().darker(150))
+        ellipse.setPen(pen)
+
+        base = text.data(0) or text.toPlainText()
+        if measured and (length_m is not None or width_m is not None):
+            length_s = f"{length_m:.1f}" if length_m is not None else "?"
+            width_s = f"{width_m:.1f}" if width_m is not None else "?"
+            text.setPlainText(f"{base} ({length_s}×{width_s} m)")
+        else:
+            text.setPlainText(base)
 
     def highlight_labels(self, label_ids: list[int], highlight: bool = True):
         """Highlight or unhighlight a set of label markers."""

@@ -898,6 +898,15 @@ class LabeledLayerPanel(QWidget):
         """Get the layer ID for a file path."""
         return self._layer_id_map.get(file_path)
 
+    @staticmethod
+    def _measurement_suffix(length_m, width_m) -> str:
+        """Compact ' • L×W m' suffix for a label row, or '' if unmeasured."""
+        if length_m is None and width_m is None:
+            return ""
+        length_s = f"{length_m:.1f}" if length_m is not None else "?"
+        width_s = f"{width_m:.1f}" if width_m is not None else "?"
+        return f"  •  {length_s}×{width_s} m"
+
     def refresh(self, project, visibility_checker=None):
         """Refresh the tree with current labels from the project.
 
@@ -929,7 +938,9 @@ class LabeledLayerPanel(QWidget):
                     image.path,
                     label.lon,
                     label.lat,
-                    label.class_name
+                    label.class_name,
+                    label.length_m,
+                    label.width_m
                 ))
 
         # Create tree items
@@ -963,10 +974,12 @@ class LabeledLayerPanel(QWidget):
 
             # Add each label as a child
             any_visible = False
-            for label_id, image_name, file_path, lon, lat, class_name in labels:
+            for (label_id, image_name, file_path, lon, lat, class_name,
+                 length_m, width_m) in labels:
                 label_item = QTreeWidgetItem()
                 label_item.setText(
-                    0, f"#{label_id}: {image_name} [{class_name}]")
+                    0, f"#{label_id}: {image_name} [{class_name}]"
+                       + self._measurement_suffix(length_m, width_m))
                 label_item.setData(0, Qt.UserRole, file_path)
                 label_item.setData(0, Qt.UserRole + 1, "label")
                 label_item.setData(0, Qt.UserRole + 2, label_id)
@@ -1051,7 +1064,8 @@ class LabeledLayerPanel(QWidget):
         # Create label item
         label_item = QTreeWidgetItem()
         label_item.setText(
-            0, f"#{label.id}: {image.name} [{label.class_name}]")
+            0, f"#{label.id}: {image.name} [{label.class_name}]"
+               + self._measurement_suffix(label.length_m, label.width_m))
         label_item.setData(0, Qt.UserRole, image.path)
         label_item.setData(0, Qt.UserRole + 1, "label")
         label_item.setData(0, Qt.UserRole + 2, label.id)
