@@ -25,9 +25,37 @@ This directory contains build scripts for creating standalone executables using 
 ```powershell
 .\build_windows.ps1 -Msi
 
-# Build MSI with desktop shortcut
+# Build MSI with a Desktop shortcut (a Start Menu shortcut is always added)
 .\build_windows.ps1 -Msi -Shortcut
+
+# Set the version explicitly (otherwise auto-detected from a VERSION file or git tag)
+.\build_windows.ps1 -Msi -Version 1.2.3
+
+# Set the publisher / about link shown in Add/Remove Programs
+.\build_windows.ps1 -Msi -Author "Your Name" -Url "https://example.com/geolabeller"
 ```
+
+The MSI installs into the 64-bit `Program Files\GeoLabeller`, adds a Start Menu
+shortcut (Desktop optional via `-Shortcut`), and records the publisher, version
+and icon in Add/Remove Programs. Keep incrementing the version between releases
+so a new MSI cleanly upgrades a previous install (the upgrade GUID in `setup.py`
+must never change).
+
+### Code Signing (recommended for distribution)
+
+Unsigned installers trigger SmartScreen / "unknown publisher" warnings. Sign the
+executable and the MSI with an Authenticode certificate:
+
+```powershell
+# Using a certificate already in a Windows certificate store (by thumbprint)
+.\build_windows.ps1 -Msi -Sign -CertThumbprint "ABC123..."
+
+# Using a .pfx file
+.\build_windows.ps1 -Msi -Sign -CertPath "C:\certs\code.pfx" -CertPassword "***"
+```
+
+Requires `signtool.exe` (Windows SDK) on PATH or installed under the Windows Kits
+directory. A `.sha256` checksum file is written next to the produced `.msi`.
 
 ### Manual Build
 

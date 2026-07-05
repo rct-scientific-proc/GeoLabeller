@@ -7,9 +7,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-# When running as a frozen executable, set PROJ_DATA so pyproj/rasterio can find proj.db
+# When running as a frozen executable, point PROJ and GDAL at the data folders
+# bundled next to the executable so pyproj/rasterio can find proj.db (CRS
+# transforms) and GDAL's support files without a system GDAL install.
 if getattr(sys, 'frozen', False):
-    os.environ['PROJ_DATA'] = os.path.join(os.path.dirname(sys.executable), 'proj_data')
+    _frozen_root = os.path.dirname(sys.executable)
+    os.environ['PROJ_DATA'] = os.path.join(_frozen_root, 'proj_data')
+    os.environ['GDAL_DATA'] = os.path.join(_frozen_root, 'gdal_data')
 
 
 def _get_log_dir() -> Path:

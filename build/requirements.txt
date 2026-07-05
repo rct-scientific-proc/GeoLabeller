@@ -1,7 +1,12 @@
-PyQt5
-numpy
-pillow
-rasterio
-cx_Freeze
-pyproj
+# Pinned build dependencies for reproducible installers.
+# Update these deliberately (and re-test the build) rather than letting them float:
+# an incompatible numpy/rasterio pairing can silently ship a broken installer.
+PyQt5==5.15.11
+numpy==2.5.0
+pillow==12.3.0
+rasterio==1.5.0
+pyproj==3.7.2
+# cx_Freeze 7.2+ is required for the MSI options used in setup.py
+# (install_icon, all_users, summary_data, ProgramFiles64Folder handling).
+cx_Freeze>=7.2,<9
 patchelf; sys_platform == "linux"
