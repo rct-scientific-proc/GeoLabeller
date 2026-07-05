@@ -56,9 +56,11 @@ class GroupMemoryWorker(QObject):
         self._cancelled = False
 
     def cancel(self):
+        """Request cancellation; processing stops before the next layer."""
         self._cancelled = True
 
     def process(self):
+        """Preload or free each layer's pixel data, emitting progress signals."""
         total = len(self._layers)
         for i, (layer_id, layer) in enumerate(self._layers):
             if self._cancelled:
@@ -134,6 +136,7 @@ class MainWindow(QMainWindow):
     """Main window with canvas and layer panel."""
 
     def __init__(self):
+        """Initialize the window, canvas, layer panel, menus, and project state."""
         super().__init__()
         self.setWindowTitle("GeoLabel")
         self.setMinimumSize(1024, 768)
@@ -744,6 +747,7 @@ class MainWindow(QMainWindow):
         group = [lbl for _, lbl in linked]
 
         def has_meas(lbl):
+            """Return True if the label has a length or width measurement."""
             return lbl.length_m is not None or lbl.width_m is not None
 
         # Choose the donor: link source first, then the clicked label, then any
@@ -1411,6 +1415,7 @@ class MainWindow(QMainWindow):
             # Helper: clone ImageData (and contained labels) to avoid mutating
             # originals
             def clone_image(image: ImageData) -> ImageData:
+                """Deep-copy an ImageData (and its labels) via serialization."""
                 return ImageData.from_dict(image.to_dict())
 
             # Track maximum label id
@@ -1883,6 +1888,7 @@ class MainWindow(QMainWindow):
         nongeo_group_cache: dict[str, any] = {}
 
         def get_or_create_group(rel_dir: Path):
+            """Return the panel group for a directory, creating parents as needed."""
             if rel_dir == Path("."):
                 return root_group  # Files at root level go under the root group
             if rel_dir in group_cache:
@@ -1894,6 +1900,7 @@ class MainWindow(QMainWindow):
             return group
 
         def get_or_create_nongeo_group(name: str):
+            """Return the cached non-geo panel group for a name, creating it once."""
             if name in nongeo_group_cache:
                 return nongeo_group_cache[name]
             group = self.layer_panel.add_nongeo_group(name)
@@ -2360,20 +2367,24 @@ class MainWindow(QMainWindow):
         self._group_mem_worker = worker
 
         def on_progress(current, tot):
+            """Worker progress callback: update the dialog text and value."""
             dlg.setLabelText(f"{label} {current}/{tot}...")
             dlg.setValue(current)
 
         def on_finished():
+            """Worker finished callback: complete the dialog and stop the thread."""
             dlg.setValue(total)
             thread.quit()
 
         def on_thread_finished():
+            """Thread cleanup callback: refresh tiles and drop worker references."""
             # Refresh visible tiles in case freed layers were displayed
             self.canvas._update_visible_tiles()
             self._group_mem_thread = None
             self._group_mem_worker = None
 
         def on_error(lid, msg):
+            """Worker error callback: log the failure for a single layer."""
             print(f"Group memory op error on {lid}: {msg}")
 
         worker.progress.connect(on_progress)

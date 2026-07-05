@@ -11,6 +11,7 @@ class AxisRuler(QWidget):
     RULER_SIZE = 30  # Width/height of the ruler in pixels
 
     def __init__(self, orientation: Qt.Orientation, canvas):
+        """Initialize the ruler for the given orientation and canvas."""
         super().__init__()
         self.orientation = orientation
         self.canvas = canvas
@@ -234,6 +235,7 @@ class MapCanvasWithAxes(QWidget):
     """Widget that combines MapCanvas with axis rulers."""
 
     def __init__(self, canvas):
+        """Initialize the composite widget wrapping the canvas with rulers."""
         super().__init__()
         self.canvas = canvas
 
@@ -278,14 +280,17 @@ class MapCanvasWithAxes(QWidget):
         original_resize = self.canvas.resizeEvent
 
         def wheel_wrapper(event):
+            """Run the canvas wheel handler, then refresh the rulers."""
             original_wheel(event)
             self._update_rulers()
 
         def scroll_wrapper(dx, dy):
+            """Run the canvas scroll handler, then refresh the rulers."""
             original_scroll(dx, dy)
             self._update_rulers()
 
         def resize_wrapper(event):
+            """Run the canvas resize handler, then refresh the rulers."""
             original_resize(event)
             self._update_rulers()
 

@@ -40,6 +40,7 @@ class LayerPanel(QWidget):
     batch_visibility_finished = pyqtSignal()  # batch complete
 
     def __init__(self):
+        """Initialize the layer panel and its lookup caches."""
         super().__init__()
         self._batch_mode = False  # When True, suppress signals during batch operations
         self._nongeo_root = None  # Top-level node for non-georeferenced images
@@ -202,6 +203,7 @@ class LayerPanel(QWidget):
         self.tree.blockSignals(True)
 
         def check_item(item: QTreeWidgetItem):
+            """Recursively ensure parents of any checked item are also checked."""
             item_type = item.data(0, Qt.UserRole + 1)
             is_checked = item.checkState(0) == Qt.Checked
 
@@ -250,6 +252,7 @@ class LayerPanel(QWidget):
         progress_count = [0]  # Use list for mutable closure
 
         def process_item(parent: QTreeWidgetItem):
+            """Recursively apply the check state to descendants, emitting progress per layer."""
             for i in range(parent.childCount()):
                 child = parent.child(i)
                 child.setCheckState(0, check_state)
@@ -293,6 +296,7 @@ class LayerPanel(QWidget):
     def _emit_all_layer_group_changes(self):
         """Emit group change signals for all layers."""
         def emit_for_item(item: QTreeWidgetItem):
+            """Recursively emit a group-change signal for each layer descendant."""
             item_type = item.data(0, Qt.UserRole + 1)
             if item_type == "layer":
                 layer_id = item.data(0, Qt.UserRole)
@@ -310,6 +314,7 @@ class LayerPanel(QWidget):
         layers = []
 
         def collect_layers(parent=None):
+            """Recursively gather layer IDs into ``layers`` in top-to-bottom tree order."""
             if parent is None:
                 count = self.tree.topLevelItemCount()
                 for i in range(count):
@@ -430,6 +435,7 @@ class LayerPanel(QWidget):
         check_state = Qt.Checked if checked else Qt.Unchecked
 
         def set_children_state(parent: QTreeWidgetItem):
+            """Recursively apply the check state to all descendants, including nested groups."""
             for i in range(parent.childCount()):
                 child = parent.child(i)
                 child.setCheckState(0, check_state)
@@ -858,6 +864,7 @@ class LabeledLayerPanel(QWidget):
     zoom_to_label_requested = pyqtSignal(float, float)
 
     def __init__(self):
+        """Initialize the labeled-layer panel and its file-to-layer map."""
         super().__init__()
         # file_path -> layer_id (from main panel)
         self._layer_id_map: dict[str, str] = {}
@@ -1219,6 +1226,7 @@ class LabeledLayerPanel(QWidget):
         self.tree.blockSignals(True)
 
         def find_and_set(parent=None):
+            """Recursively set the check state of label items matching ``file_path``."""
             if parent is None:
                 count = self.tree.topLevelItemCount()
                 for i in range(count):
@@ -1249,6 +1257,7 @@ class LabeledLayerPanel(QWidget):
             file_path: The file path of the layer to toggle
         """
         def find_and_toggle(parent=None):
+            """Recursively toggle the check state of label items matching ``file_path``."""
             if parent is None:
                 count = self.tree.topLevelItemCount()
                 for i in range(count):
@@ -1295,6 +1304,7 @@ class CombinedLayerPanel(QWidget):
     batch_visibility_finished = pyqtSignal()
 
     def __init__(self):
+        """Initialize the combined panel wrapping the main and labeled panels."""
         super().__init__()
         self._syncing = False  # Prevent infinite recursion during sync
         self._setup_ui()
@@ -1490,6 +1500,7 @@ class CombinedLayerPanel(QWidget):
         # Create a visibility checker that looks up layer visibility from main
         # panel
         def check_visibility(file_path: str) -> bool:
+            """Return whether the layer for ``file_path`` is currently visible in the main panel."""
             layer_id = self.labeled_panel._layer_id_map.get(file_path)
             if layer_id:
                 return self.main_panel.is_layer_checked(layer_id)
@@ -1501,6 +1512,7 @@ class CombinedLayerPanel(QWidget):
     def add_label_to_panel(self, label, image):
         """Add a single label to the labeled panel incrementally."""
         def check_visibility(file_path: str) -> bool:
+            """Return whether the layer for ``file_path`` is currently visible in the main panel."""
             layer_id = self.labeled_panel._layer_id_map.get(file_path)
             if layer_id:
                 return self.main_panel.is_layer_checked(layer_id)

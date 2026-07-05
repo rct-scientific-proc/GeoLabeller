@@ -757,6 +757,7 @@ class AsyncFileLoader(QObject):
     progress_update = pyqtSignal(int, int)
 
     def __init__(self):
+        """Initialize the loader with an empty file queue and no cancellation."""
         super().__init__()
         # (file_path, group_path)
         self._files_to_load: list[tuple[str, str]] = []
@@ -843,6 +844,7 @@ class AsyncFileLoaderThread(QThread):
     progress_update = pyqtSignal(int, int)
 
     def __init__(self, parent=None):
+        """Create the wrapped AsyncFileLoader and forward its signals."""
         super().__init__(parent)
         self._loader = AsyncFileLoader()
 
@@ -876,6 +878,7 @@ class ScaleBarWidget(QWidget):
     ]
 
     def __init__(self, parent=None, orientation=Qt.Horizontal):
+        """Initialize the scale bar's orientation, size and default scale state."""
         super().__init__(parent)
         self._orientation = orientation
         self._distance_meters = 100  # Current scale bar distance
@@ -1044,6 +1047,7 @@ class _LevelLoadRunnable(QRunnable):
 
     def __init__(self, layer_id: str, file_path: str, geo: bool, level: int,
                  signals: "_LevelLoadSignals"):
+        """Store the layer identity, level and signal group for the load job."""
         super().__init__()
         self._layer_id = layer_id
         self._file_path = file_path
@@ -1052,6 +1056,8 @@ class _LevelLoadRunnable(QRunnable):
         self._signals = signals
 
     def run(self):
+        """Compute the layer's RGBA data for the level off the UI thread and
+        emit the result (or an error) back to the main thread."""
         try:
             tmp = TiledLayer(self._file_path, lazy=True, geo=self._geo)
             tmp.ensure_loaded(level=self._level)
@@ -1147,6 +1153,8 @@ class MapCanvas(QGraphicsView):
     _MIN_MEASURE_PIXELS = 4
 
     def __init__(self):
+        """Set up the graphics scene, view interaction, mode/link/measure state,
+        layer storage, overlays and background level-loading pool."""
         super().__init__()
         self._scene = QGraphicsScene()
         self.setScene(self._scene)

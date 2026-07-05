@@ -9,6 +9,7 @@ class ClassEditorDialog(QDialog):
     """Dialog for editing label classes."""
 
     def __init__(self, current_classes: list[str], parent=None):
+        """Initialize the class editor dialog with the current classes."""
         super().__init__(parent)
         self.setWindowTitle("Edit Classes")
         self.setMinimumSize(300, 400)
