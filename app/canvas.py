@@ -1141,6 +1141,11 @@ class MapCanvas(QGraphicsView):
     # levels load in a background thread with a coarse preview shown first.
     _SYNC_LOAD_MAX_PIXELS = 500_000
 
+    # Minimum on-screen separation (view pixels) between the two clicks of a
+    # measurement line; shorter lines are treated as an accidental click and
+    # ignored so a stray double-click never records a bogus sub-metre value.
+    _MIN_MEASURE_PIXELS = 4
+
     def __init__(self):
         super().__init__()
         self._scene = QGraphicsScene()
@@ -1179,6 +1184,7 @@ class MapCanvas(QGraphicsView):
         self._measure_label_id: int | None = None
         self._measure_stage = MeasureStage.LENGTH
         self._measure_start = None  # QPointF: first click of the current line
+        self._measure_start_view = None  # first click in view coords (for min-drag)
         self._measure_temp_line: QGraphicsLineItem | None = None  # rubber band
         self._measure_committed_line: QGraphicsLineItem | None = None  # finished length line
         self._measure_length_m: float | None = None  # result of the length line
@@ -1879,6 +1885,10 @@ class MapCanvas(QGraphicsView):
 
     def mouseReleaseEvent(self, event):
         """Handle mouse release."""
+        # Measure mode consumes clicks in mousePressEvent; swallow the matching
+        # release so it can't reach pan/cycle release handling.
+        if self._measure_active:
+            return
         if self._mode == CanvasMode.PAN and event.button() == Qt.LeftButton:
             if hasattr(self, '_pan_active') and self._pan_active:
                 self._pan_active = False
@@ -2464,8 +2474,17 @@ class MapCanvas(QGraphicsView):
         if self._measure_start is None:
             # First click of this line: anchor it and start the rubber band.
             self._measure_start = scene_pos
+            self._measure_start_view = view_pos
             self._ensure_measure_temp_line()
             return
+
+        # Reject an accidental click too close to the start (in screen pixels),
+        # which would otherwise record a bogus near-zero line.
+        if self._measure_start_view is not None:
+            dx = view_pos.x() - self._measure_start_view.x()
+            dy = view_pos.y() - self._measure_start_view.y()
+            if (dx * dx + dy * dy) ** 0.5 < self._MIN_MEASURE_PIXELS:
+                return
 
         # Second click: finalise the current line.
         dist_m = self._line_distance_m(self._measure_start, scene_pos)
@@ -2478,6 +2497,7 @@ class MapCanvas(QGraphicsView):
             self._promote_temp_to_committed(scene_pos)
             self._measure_stage = MeasureStage.WIDTH
             self._measure_start = None
+            self._measure_start_view = None
             self.measure_mode_changed.emit(
                 True, "Measure WIDTH: click start, then end (Esc to cancel)")
         else:
@@ -2549,6 +2569,7 @@ class MapCanvas(QGraphicsView):
                 self._scene.removeItem(item)
         self._measure_temp_line = None
         self._measure_committed_line = None
+        self._measure_start_view = None
         self._measure_active = False
         self._measure_label_id = None
         self._measure_start = None
