@@ -35,11 +35,19 @@ This directory contains build scripts for creating standalone executables using 
 .\build_windows.ps1 -Msi -Author "Your Name" -Url "https://example.com/geolabeller"
 ```
 
-The MSI installs into the 64-bit `Program Files\GeoLabeller`, adds a Start Menu
-shortcut (Desktop optional via `-Shortcut`), and records the publisher, version
-and icon in Add/Remove Programs. Keep incrementing the version between releases
-so a new MSI cleanly upgrades a previous install (the upgrade GUID in `setup.py`
-must never change).
+The MSI is a **per-user** install: it installs into
+`%LocalAppData%\Programs\GeoLabeller` for the current user and requires **no
+administrator elevation**. It adds a (per-user) Start Menu shortcut (Desktop
+optional via `-Shortcut`), and records the publisher, version and icon in Add/
+Remove Programs. Keep incrementing the version between releases so a new MSI
+cleanly upgrades a previous install (the upgrade GUID in `setup.py` must never
+change).
+
+> Because it installs per-user, each Windows user who wants GeoLabeller runs the
+> MSI themselves; it is not installed once for the whole machine. To deploy it
+> machine-wide instead (into Program Files, for all users), an administrator can
+> run `msiexec /i GeoLabeller-<ver>.msi ALLUSERS=1` — that path does require
+> admin rights.
 
 ### Code Signing (recommended for distribution)
 

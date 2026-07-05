@@ -147,24 +147,36 @@ if ENABLE_MSI_SHORTCUT:
         None, None, None, None, "TARGETDIR",
     ))
 
-msi_data = {"Shortcut": shortcut_table}
-
+# Per-user install: cx_Freeze's `all_users = False` (below) sets the MSI
+# ALLUSERS property to "" (empty), meaning "install for the current user only",
+# which does NOT require administrator elevation. Combined with the LocalAppData
+# target, a standard (non-admin) user can install it, and the Start Menu /
+# Desktop shortcut folders resolve to that user's own profile.
+#
+# IMPORTANT: cx_Freeze always writes its own ALLUSERS row into the Property
+# table, so do NOT add ALLUSERS / MSIINSTALLPERUSER here - a duplicate key fails
+# the build with MSI error 2259. Control the install scope via `all_users`.
+msi_properties = []
 # Add/Remove Programs "about"/help links, if a URL was provided.
 if ABOUT_URL:
-    msi_data["Property"] = [
+    msi_properties += [
         ("ARPURLINFOABOUT", ABOUT_URL),
         ("ARPHELPLINK", ABOUT_URL),
     ]
+
+msi_data = {"Shortcut": shortcut_table}
+if msi_properties:
+    msi_data["Property"] = msi_properties
 
 bdist_msi_options = {
     # Stable across ALL versions so a new build cleanly upgrades an older one.
     # DO NOT CHANGE this GUID once installers have been distributed.
     "upgrade_code": "{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}",
     "add_to_path": False,
-    # Install into the real 64-bit Program Files (not Program Files (x86)).
-    "initial_target_dir": r"[ProgramFiles64Folder]\GeoLabeller",
-    # Per-machine install (matches a Program Files target; requires elevation).
-    "all_users": True,
+    # Per-user install (ALLUSERS=""): no administrator elevation required.
+    "all_users": False,
+    # Default location: %LocalAppData%\Programs\GeoLabeller (user-writable).
+    "initial_target_dir": r"[LocalAppDataFolder]\Programs\GeoLabeller",
     # Icon shown for the app in Add/Remove Programs.
     "install_icon": ICON_FILE,
     "summary_data": {
