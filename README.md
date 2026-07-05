@@ -5,8 +5,7 @@ A PyQt5-based desktop application for viewing georeferenced and non-georeference
 ## Features
 
 ### Image Viewing
-- Load individual images or entire directories (GeoTIFF + any registered custom format)
-- **Custom file reader registry** — register readers for new formats with a few lines of Python (see [Extending with Custom Readers](#extending-with-custom-readers))
+- Load individual GeoTIFF images or entire directories of them
 - **Non-georeferenced image support** — images without a CRS are displayed in a separate pixel zone
 - **Async loading** with progress bar for large datasets — UI stays responsive
 - **Lazy bounds-only loading** — reads only file headers for fast bulk imports; pixel data loaded on demand
@@ -93,7 +92,7 @@ python main.py
 | `Ctrl+Shift+P` | Open Project |
 | `Ctrl+S` | Save Project |
 | `Ctrl+Shift+S` | Save Project As |
-| `Ctrl+O` | Add Image (GeoTIFF + custom formats) |
+| `Ctrl+O` | Add Image (GeoTIFF) |
 | `Ctrl+Shift+O` | Add Directory |
 | `Ctrl+Q` | Exit |
 
@@ -190,9 +189,58 @@ Projects are saved as JSON with the following structure:
 
 ## Supported File Formats
 
-| Format | Extension | Reader | Notes |
-|--------|-----------|--------|-------|
-| GeoTIFF | `.tif`, `.tiff` | Built-in (rasterio) | Georeferenced and non-georeferenced |
+GeoTIFF (`.tif`, `.tiff`), both georeferenced and non-georeferenced, read via rasterio.
+
+## Preparing GeoTIFFs for Fast Rendering
+
+GeoLabeller draws large rasters with tiled, level-of-detail rendering: when you
+zoom out it draws from **pyramid overviews** (reduced-resolution copies stored
+inside the file) instead of decoding full-resolution pixels, and it loads
+overview levels in the background so the UI stays responsive. Files **without**
+overviews force the app to read full resolution at every zoom level — the main
+cause of slow panning and zooming on large images.
+
+For the fastest experience, give each GeoTIFF **internal tiling** and **internal
+overviews** before loading it. The simplest option is a Cloud-Optimized GeoTIFF
+(COG), which is tiled and overviewed by definition.
+
+**Recommendations**
+- **Internal overviews** with power-of-two decimation factors down to ~256 px on
+  the long side — e.g. `2 4 8 16 32 64`.
+- **Internal tiling** with 512×512 blocks (256×256 also works well).
+- **Overview resampling**: `average` (or `gauss`) for imagery; `nearest` for
+  categorical / label rasters.
+- **Compression** such as `DEFLATE` (with `PREDICTOR=2`) or `LZW` keeps files
+  small without meaningfully slowing rendering.
+
+**Add overviews to an existing file, in place** (GDAL):
+
+```bash
+gdaladdo -r average --config COMPRESS_OVERVIEW DEFLATE image.tif 2 4 8 16 32 64
+```
+
+**Or convert to a Cloud-Optimized GeoTIFF** (GDAL 3.1+):
+
+```bash
+gdal_translate input.tif image_cog.tif -of COG \
+  -co COMPRESS=DEFLATE -co PREDICTOR=2 \
+  -co BLOCKSIZE=512 -co OVERVIEW_RESAMPLING=AVERAGE
+```
+
+**Or with rasterio:**
+
+```python
+import rasterio
+from rasterio.enums import Resampling
+
+with rasterio.open("image.tif", "r+") as ds:
+    ds.build_overviews([2, 4, 8, 16, 32, 64], Resampling.average)
+    ds.update_tags(ns="rio_overview", resampling="average")
+```
+
+> Very large single images benefit the most: without overviews the first
+> zoomed-out view has to decode the entire raster, whereas with overviews the app
+> reads only a small decimated level.
 
 ## Requirements
 
