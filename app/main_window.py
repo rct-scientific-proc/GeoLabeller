@@ -37,22 +37,32 @@ from .layer_panel import CombinedLayerPanel
 
 
 class GroupMemoryWorker(QObject):
-    """Worker that preloads or frees layer pixel data in a background thread."""
+    """Worker that reprojects layer pixel data off the UI thread for preloading.
 
-    progress = pyqtSignal(int, int)  # (current, total)
+    To avoid racing the renderer, it never mutates the live TiledLayer objects.
+    Each layer is loaded into a throwaway TiledLayer on the worker thread and
+    the finished RGBA buffer + metadata is emitted via ``layer_ready``; the main
+    thread applies it to the real layer (see
+    ``MainWindow._on_preload_layer_ready``). This mirrors the throwaway-layer
+    pattern already used for background overview-level loads (_LevelLoadRunnable).
+    """
+
+    progress = pyqtSignal(int, int)         # (current, total)
+    layer_ready = pyqtSignal(str, object)   # (layer_id, result dict)
     finished = pyqtSignal()
-    error = pyqtSignal(str, str)  # (layer_id, error_message)
+    error = pyqtSignal(str, str)            # (layer_id, error_message)
 
-    def __init__(self, layers: list[tuple[str, TiledLayer]], mode: str):
+    def __init__(self, layers: list[tuple[str, str, bool]]):
         """Initialize the worker.
 
         Args:
-            layers: List of (layer_id, TiledLayer) tuples to process.
-            mode: 'preload' to load pixel data, 'free' to release it.
+            layers: List of (layer_id, file_path, geo) tuples to preload. Only
+                identifiers and load parameters are passed - never the live
+                TiledLayer - so nothing shared with the renderer is touched off
+                the UI thread.
         """
         super().__init__()
         self._layers = layers
-        self._mode = mode
         self._cancelled = False
 
     def cancel(self):
@@ -60,21 +70,32 @@ class GroupMemoryWorker(QObject):
         self._cancelled = True
 
     def process(self):
-        """Preload or free each layer's pixel data, emitting progress signals."""
+        """Reproject each layer off-thread and emit its data for the UI thread."""
         total = len(self._layers)
-        for i, (layer_id, layer) in enumerate(self._layers):
+        for i, (layer_id, file_path, geo) in enumerate(self._layers):
             if self._cancelled:
                 break
             try:
-                if self._mode == 'preload':
-                    layer.ensure_loaded()
-                elif self._mode == 'free':
-                    # free_data needs the scene reference to remove tiles,
-                    # but scene operations must happen on the main thread.
-                    # Here we only release the numpy array; tile cleanup
-                    # is done by the caller on the main thread afterwards.
-                    layer._rgba_data = None
-                    layer._fully_loaded = False
+                # Load into a throwaway layer so the live layer (which the
+                # renderer may read at any time) is never mutated here.
+                tmp = TiledLayer(file_path, lazy=True, geo=geo)
+                tmp.ensure_loaded()
+                result = {
+                    'rgba': tmp._rgba_data,
+                    'width': tmp._width,
+                    'height': tmp._height,
+                    'bounds': tmp.bounds,
+                    'full_width': tmp._full_width,
+                    'full_height': tmp._full_height,
+                    'overviews': tmp._overviews,
+                    'level_dims': tmp._src_level_dims,
+                    'src_crs': tmp._src_crs,
+                    'src_transform': tmp._src_transform,
+                    'src_width': tmp._src_width,
+                    'src_height': tmp._src_height,
+                    'level': tmp._loaded_level,
+                }
+                self.layer_ready.emit(layer_id, result)
             except Exception as e:
                 self.error.emit(layer_id, str(e))
             self.progress.emit(i + 1, total)
@@ -185,6 +206,15 @@ class MainWindow(QMainWindow):
         # the UI thread (so it sees a consistent project state), then the
         # JSON serialization + atomic file write run on a daemon thread.
         self._autosave_thread: threading.Thread | None = None
+
+        # Group preload worker state (background reproject into memory). The
+        # dialog/thread/worker refs are kept so the main-thread slots can reach
+        # them and so the QThread/worker aren't garbage-collected mid-run.
+        self._group_mem_thread: QThread | None = None
+        self._group_mem_worker: GroupMemoryWorker | None = None
+        self._group_mem_dialog = None
+        self._group_mem_total = 0
+        self._group_mem_label = ""
 
         self._setup_ui()
         self._setup_menu()
@@ -2318,14 +2348,16 @@ class MainWindow(QMainWindow):
         for lid in layer_ids:
             layer = self.canvas.get_layer(lid)
             if layer and not layer.is_fully_loaded():
-                layers.append((lid, layer))
+                # Pass only load parameters; the worker must not touch the
+                # live layer off the UI thread.
+                layers.append((lid, layer.file_path, layer.geo))
 
         if not layers:
             QMessageBox.information(self, "Preload Group",
                                    "All layers in this group are already loaded.")
             return
 
-        self._start_group_memory_worker(layers, 'preload', "Preloading")
+        self._start_group_memory_worker(layers, "Preloading")
 
     def _on_group_free_requested(self, layer_ids: list[str]):
         """Free pixel data for all layers in a group."""
@@ -2348,8 +2380,16 @@ class MainWindow(QMainWindow):
             self, "Free Group",
             f"Freed pixel data for {len(layers)} layer(s).")
 
-    def _start_group_memory_worker(self, layers, mode, label):
-        """Launch a background worker with a progress dialog."""
+    def _start_group_memory_worker(self, layers, label):
+        """Launch the preload worker with a progress dialog.
+
+        The worker computes each layer's pixel data off-thread and emits it via
+        ``layer_ready``; results are applied to the live layers on the main
+        thread by ``_on_preload_layer_ready``. All worker signals connect to
+        bound-method slots (not lambdas): because the worker lives on another
+        thread, those connect as QueuedConnection and run on the UI thread,
+        which is what keeps the shared layer state off the worker thread.
+        """
         total = len(layers)
 
         dlg = QProgressDialog(f"{label} 0/{total}...", "Cancel", 0, total, self)
@@ -2359,44 +2399,63 @@ class MainWindow(QMainWindow):
         dlg.setValue(0)
 
         thread = QThread(self)
-        worker = GroupMemoryWorker(layers, mode)
+        worker = GroupMemoryWorker(layers)
         worker.moveToThread(thread)
 
-        # Store references so they aren't garbage-collected
+        # Store references so they aren't garbage-collected and so the
+        # main-thread slots can reach the dialog/thread.
         self._group_mem_thread = thread
         self._group_mem_worker = worker
+        self._group_mem_dialog = dlg
+        self._group_mem_total = total
+        self._group_mem_label = label
 
-        def on_progress(current, tot):
-            """Worker progress callback: update the dialog text and value."""
-            dlg.setLabelText(f"{label} {current}/{tot}...")
-            dlg.setValue(current)
-
-        def on_finished():
-            """Worker finished callback: complete the dialog and stop the thread."""
-            dlg.setValue(total)
-            thread.quit()
-
-        def on_thread_finished():
-            """Thread cleanup callback: refresh tiles and drop worker references."""
-            # Refresh visible tiles in case freed layers were displayed
-            self.canvas._update_visible_tiles()
-            self._group_mem_thread = None
-            self._group_mem_worker = None
-
-        def on_error(lid, msg):
-            """Worker error callback: log the failure for a single layer."""
-            print(f"Group memory op error on {lid}: {msg}")
-
-        worker.progress.connect(on_progress)
-        worker.finished.connect(on_finished)
-        worker.error.connect(on_error)
+        worker.progress.connect(self._on_preload_progress)
+        worker.layer_ready.connect(self._on_preload_layer_ready)
+        worker.finished.connect(self._on_preload_finished)
+        worker.error.connect(self._on_preload_error)
         thread.started.connect(worker.process)
-        thread.finished.connect(on_thread_finished)
+        thread.finished.connect(self._on_preload_thread_finished)
 
         dlg.canceled.connect(worker.cancel)
         dlg.canceled.connect(thread.quit)
 
         thread.start()
+
+    def _on_preload_progress(self, current: int, total: int):
+        """Update the preload progress dialog (runs on the main thread)."""
+        if self._group_mem_dialog is not None:
+            self._group_mem_dialog.setLabelText(
+                f"{self._group_mem_label} {current}/{total}...")
+            self._group_mem_dialog.setValue(current)
+
+    def _on_preload_layer_ready(self, layer_id: str, result: dict):
+        """Apply off-thread-computed pixel data to the live layer (main thread).
+
+        Delivered via QueuedConnection, so the mutation of the live TiledLayer
+        happens on the UI thread and can never race the renderer.
+        """
+        layer = self.canvas.get_layer(layer_id)
+        if layer is not None:
+            layer.apply_level_result(result)
+
+    def _on_preload_finished(self):
+        """Complete the dialog and stop the worker thread (main thread)."""
+        if self._group_mem_dialog is not None:
+            self._group_mem_dialog.setValue(self._group_mem_total)
+        if self._group_mem_thread is not None:
+            self._group_mem_thread.quit()
+
+    def _on_preload_thread_finished(self):
+        """Refresh tiles for now-loaded layers and drop worker refs (main thread)."""
+        self.canvas._update_visible_tiles()
+        self._group_mem_thread = None
+        self._group_mem_worker = None
+        self._group_mem_dialog = None
+
+    def _on_preload_error(self, layer_id: str, msg: str):
+        """Log a per-layer preload failure."""
+        print(f"Group preload error on {layer_id}: {msg}")
 
     def _show_progress(self, maximum: int, label: str = "Loading"):
         """Show the progress indicator with a maximum value."""
