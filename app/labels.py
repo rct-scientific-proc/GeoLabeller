@@ -66,6 +66,11 @@ class PointLabel:
     # Linked labels share the same object_id
     object_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
+    # Physical dimensions in meters (user-supplied or auto-measured).
+    # None means the dimension has not been set for this label.
+    length_m: Optional[float] = None
+    width_m: Optional[float] = None
+
     def to_dict(self, image_width: int = 0, image_height: int = 0) -> dict:
         """Convert to dictionary for serialization.
 
@@ -82,7 +87,7 @@ class PointLabel:
             pct_x = self.pixel_x
             pct_y = self.pixel_y
 
-        return {
+        d = {
             "id": self.id,
             "unique_id": self.unique_id,
             "class_name": self.class_name,
@@ -92,6 +97,11 @@ class PointLabel:
             "lat": self.lat,
             "object_id": self.object_id
         }
+        if self.length_m is not None:
+            d["length_m"] = self.length_m
+        if self.width_m is not None:
+            d["width_m"] = self.width_m
+        return d
 
     @classmethod
     def from_dict(cls, data: dict, image_width: int = 0, image_height: int = 0,
@@ -125,7 +135,9 @@ class PointLabel:
             lat=data["lat"],
             # Generate UUIDs if not present (backwards compatibility)
             unique_id=data.get("unique_id") or str(uuid.uuid4()),
-            object_id=data.get("object_id") or str(uuid.uuid4())
+            object_id=data.get("object_id") or str(uuid.uuid4()),
+            length_m=data.get("length_m"),
+            width_m=data.get("width_m")
         )
 
 
