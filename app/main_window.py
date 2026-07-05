@@ -722,6 +722,56 @@ class MainWindow(QMainWindow):
 
         self.statusBar.showMessage(f"Removed label", 3000)
 
+    def _sync_measurements_in_group(self, label_id1: int, label_id2: int) -> int:
+        """Make a just-linked object group share one measurement.
+
+        Only runs when the "Wire meas. to linked objects" option is on. Picks a
+        donor measurement (preferring the link source, then the clicked label,
+        then any measured label in the group) and applies its length/width to
+        every other label in the group. This is what makes linking a measured
+        object to an unmeasured one propagate the values immediately.
+
+        Returns the number of labels updated (0 if wiring is off, nobody in the
+        group has a measurement, or the group is already consistent).
+        """
+        if not self._wire_meas_to_linked:
+            return 0
+
+        linked = self.project.get_linked_labels(label_id1)
+        if not linked:
+            return 0
+        group = [lbl for _, lbl in linked]
+
+        def has_meas(lbl):
+            return lbl.length_m is not None or lbl.width_m is not None
+
+        # Choose the donor: link source first, then the clicked label, then any
+        # measured label in the group.
+        _, l1 = self.project.get_label_by_id(label_id1)
+        _, l2 = self.project.get_label_by_id(label_id2)
+        donor = None
+        if l1 and has_meas(l1):
+            donor = l1
+        elif l2 and has_meas(l2):
+            donor = l2
+        else:
+            donor = next((lbl for lbl in group if has_meas(lbl)), None)
+        if donor is None:
+            return 0  # no measurements anywhere in the group
+
+        length_m, width_m = donor.length_m, donor.width_m
+        has_measurement = length_m is not None or width_m is not None
+        updated = 0
+        for lbl in group:
+            if lbl.length_m == length_m and lbl.width_m == width_m:
+                continue  # already consistent
+            lbl.length_m = length_m
+            lbl.width_m = width_m
+            self.canvas.set_label_measured(
+                lbl.id, has_measurement, length_m, width_m)
+            updated += 1
+        return updated
+
     def _on_labels_linked(self, label_id1: int, label_id2: int):
         """Handle two labels being linked."""
         object_id = self.project.link_labels(label_id1, label_id2)
@@ -732,13 +782,18 @@ class MainWindow(QMainWindow):
             for _, label in linked_labels:
                 self.canvas.set_label_linked(label.id, True)
 
+            # If wiring is on, propagate any existing measurement across the
+            # newly-merged group before refreshing the panel.
+            synced = self._sync_measurements_in_group(label_id1, label_id2)
+
             # Refresh labeled images panel (grouping may have changed)
             self.layer_panel.refresh_labeled_panel(self.project)
 
             count = len(linked_labels)
-            self.statusBar.showMessage(
-                f"Linked labels (object has {count} labels)", 3000
-            )
+            msg = f"Linked labels (object has {count} labels)"
+            if synced:
+                msg += f" · shared measurements to {synced}"
+            self.statusBar.showMessage(msg, 3000)
         else:
             self.statusBar.showMessage("Failed to link labels", 3000)
 
