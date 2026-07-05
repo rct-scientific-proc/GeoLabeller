@@ -264,6 +264,8 @@ class MainWindow(QMainWindow):
         self.canvas.label_unlinked.connect(self._on_label_unlinked)
         self.canvas.show_linked_requested.connect(self._on_show_linked)
         self.canvas.link_mode_changed.connect(self._on_link_mode_changed)
+        self.canvas.label_measured.connect(self._on_label_measured)
+        self.canvas.measure_mode_changed.connect(self._on_measure_mode_changed)
         self.canvas.hide_layers_outside_view.connect(
             self.layer_panel.uncheck_layers)
         self.canvas.show_layers_in_view.connect(self.layer_panel.check_layers)
@@ -773,6 +775,39 @@ class MainWindow(QMainWindow):
         """Handle link mode state changes."""
         if is_active:
             self.statusBar.showMessage(message, 0)  # 0 = no timeout
+        else:
+            self.statusBar.clearMessage()
+
+    def _on_label_measured(self, label_id: int, length_m, width_m):
+        """Store measured length/width (metres) on a label.
+
+        Values are picked up automatically by the periodic recovery autosave
+        and by normal project save/export (PointLabel.to_dict serialises
+        length_m / width_m). ``None`` values clear the respective dimension.
+        """
+        _, label = self.project.get_label_by_id(label_id)
+        if label is None:
+            return
+
+        label.length_m = length_m
+        label.width_m = width_m
+
+        # Reflect the new values in the labeled-images panel.
+        self.layer_panel.refresh_labeled_panel(self.project)
+
+        if length_m is None and width_m is None:
+            self.statusBar.showMessage("Cleared measurements", 3000)
+        else:
+            self.statusBar.showMessage(
+                f"Measured: length {length_m:.2f} m, width {width_m:.2f} m",
+                4000)
+
+    def _on_measure_mode_changed(self, is_active: bool, message: str):
+        """Handle measure mode state changes (live status-bar prompt)."""
+        if is_active:
+            self.statusBar.showMessage(message, 0)  # 0 = no timeout
+        elif message:
+            self.statusBar.showMessage(message, 3000)
         else:
             self.statusBar.clearMessage()
 
