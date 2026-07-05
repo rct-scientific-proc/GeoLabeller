@@ -141,6 +141,10 @@ class MainWindow(QMainWindow):
         self.project = LabelProject()
         self._project_path: Path | None = None
 
+        # Options (in-memory, default off): when on, measuring one label's
+        # length/width propagates to all labels linked to it (same object_id).
+        self._wire_meas_to_linked = False
+
         # Async loading state (initialized here to avoid AttributeError)
         self._async_root_path = None
         self._async_group_cache: dict[Path, any] = {}
@@ -368,6 +372,18 @@ class MainWindow(QMainWindow):
         export_subimages_action = QAction("&Sub-images...", self)
         export_subimages_action.triggered.connect(self._export_subimages)
         export_menu.addAction(export_subimages_action)
+
+        # Options menu
+        options_menu = menubar.addMenu("&Options")
+
+        # Wire measurements to linked objects: propagate a label's measured
+        # length/width to all labels sharing its object_id.
+        self._wire_meas_action = QAction(
+            "Wire meas. to linked objects", self)
+        self._wire_meas_action.setCheckable(True)
+        self._wire_meas_action.setChecked(self._wire_meas_to_linked)
+        self._wire_meas_action.toggled.connect(self._on_wire_meas_toggled)
+        options_menu.addAction(self._wire_meas_action)
 
         # Help menu
         help_menu = menubar.addMenu("&Help")
@@ -778,32 +794,55 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar.clearMessage()
 
+    def _on_wire_meas_toggled(self, checked: bool):
+        """Toggle propagation of measurements to linked objects."""
+        self._wire_meas_to_linked = checked
+        state = "on" if checked else "off"
+        self.statusBar.showMessage(
+            f"Wire measurements to linked objects: {state}", 3000)
+
     def _on_label_measured(self, label_id: int, length_m, width_m):
         """Store measured length/width (metres) on a label.
 
         Values are picked up automatically by the periodic recovery autosave
         and by normal project save/export (PointLabel.to_dict serialises
         length_m / width_m). ``None`` values clear the respective dimension.
+
+        When the "Wire meas. to linked objects" option is on and this label is
+        linked (shares an object_id with others), the same values are applied
+        to every label in that object group.
         """
         _, label = self.project.get_label_by_id(label_id)
         if label is None:
             return
 
-        label.length_m = length_m
-        label.width_m = width_m
+        # Decide which labels receive the values: just this one, or the whole
+        # linked object group. get_linked_labels returns [] for an unlinked
+        # label and otherwise includes the source label itself.
+        targets = [label]
+        if self._wire_meas_to_linked:
+            linked = self.project.get_linked_labels(label_id)
+            if linked:
+                targets = [lbl for _, lbl in linked]
 
-        # Adorn the canvas marker and reflect the values in the panel.
         has_measurement = length_m is not None or width_m is not None
-        self.canvas.set_label_measured(
-            label_id, has_measurement, length_m, width_m)
+        for lbl in targets:
+            lbl.length_m = length_m
+            lbl.width_m = width_m
+            # Marker may not exist if its image isn't loaded; set_label_measured
+            # is a no-op then, and the load path re-adorns it later.
+            self.canvas.set_label_measured(
+                lbl.id, has_measurement, length_m, width_m)
         self.layer_panel.refresh_labeled_panel(self.project)
 
+        n = len(targets)
+        linked_note = f" ({n} linked labels)" if n > 1 else ""
         if length_m is None and width_m is None:
-            self.statusBar.showMessage("Cleared measurements", 3000)
+            self.statusBar.showMessage(f"Cleared measurements{linked_note}", 3000)
         else:
             self.statusBar.showMessage(
-                f"Measured: length {length_m:.2f} m, width {width_m:.2f} m",
-                4000)
+                f"Measured: length {length_m:.2f} m, width {width_m:.2f} m"
+                f"{linked_note}", 4000)
 
     def _on_measure_mode_changed(self, is_active: bool, message: str):
         """Handle measure mode state changes (live status-bar prompt)."""
