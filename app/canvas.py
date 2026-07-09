@@ -27,6 +27,7 @@ from rasterio.crs import CRS
 from rasterio.warp import calculate_default_transform, reproject, Resampling, transform as transform_coords
 
 from .labels import haversine_distance
+from .debug_log import debug
 
 
 # Web Mercator CRS
@@ -296,7 +297,7 @@ class TiledLayer:
             (max(1, src.width // f), max(1, src.height // f)) for f in factors
         ]
         if factors:
-            print(f"[pyramid] {Path(self.file_path).name}: "
+            debug(f"pyramid {Path(self.file_path).name}: "
                   f"overviews={factors} level_dims={self._src_level_dims}")
 
     def _load_and_reproject(self, level: int = 1):
@@ -1629,9 +1630,11 @@ class MapCanvas(QGraphicsView):
 
         # Cancel the previous in-flight load for this layer (different level).
         if layer._pending_runnable is not None:
+            debug(f"supersede: {layer.name} level {layer._loading_level} -> {level}")
             layer._pending_runnable.cancel()
             layer._pending_runnable = None
 
+        debug(f"dispatch load: {layer.name} level={level}")
         layer._loading_level = level
 
         # Count this in-flight load and show the spinner. Each started runnable
@@ -1660,6 +1663,8 @@ class MapCanvas(QGraphicsView):
         counter), so the spinner clears once the cancelled loads drain.
         """
         if layer._pending_runnable is not None:
+            debug(f"cancel load (out of view/hidden): {layer.name} "
+                  f"level={layer._loading_level}")
             layer._pending_runnable.cancel()
             layer._pending_runnable = None
             layer._loading_level = None
@@ -1687,6 +1692,8 @@ class MapCanvas(QGraphicsView):
             return
 
         layer.apply_level_result(result)
+        debug(f"applied level {level}: {layer.name} "
+              f"{layer._width}x{layer._height}")
         self._clear_layer_tiles(layer)
         self._rebuild_layer_tiles(layer)
 
@@ -1699,7 +1706,7 @@ class MapCanvas(QGraphicsView):
         if layer is not None and layer._loading_level == level:
             layer._loading_level = None
             layer._pending_runnable = None
-        print(f"[pyramid] background level load failed for {layer_id}: {message}")
+        debug(f"load FAILED: {layer_id} level={level}: {message}")
 
     def _on_level_load_cancelled(self, layer_id: str, level: int):
         """Handle a cancelled background level load (superseded or culled)."""

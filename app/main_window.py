@@ -36,6 +36,7 @@ from .labels import LabelProject, ImageData, haversine_distance
 from .layer_panel import CombinedLayerPanel
 from .optimize_export import OptimizeExportDialog, OptimizeWorker, plan_output_path
 from .mosaic_export import MosaicExportDialog, MosaicWorker
+from .debug_log import debug, debug_log, DebugConsole
 
 
 class GroupMemoryWorker(QObject):
@@ -163,6 +164,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("GeoLabel")
         self.setMinimumSize(1024, 768)
+
+        # Create the debug logger on the UI thread up front (before any
+        # background thread logs) so cross-thread messages queue correctly.
+        debug_log()
+        self._debug_console: DebugConsole | None = None
 
         # Label project
         self.project = LabelProject()
@@ -459,6 +465,14 @@ class MainWindow(QMainWindow):
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
 
+        help_menu.addSeparator()
+
+        # Debug Console (live timestamped debug messages)
+        debug_action = QAction("&Debug Console", self)
+        debug_action.setShortcut("F12")
+        debug_action.triggered.connect(self._show_debug_console)
+        help_menu.addAction(debug_action)
+
     def _setup_toolbar(self):
         """Set up the toolbar for labeling."""
         toolbar = QToolBar("Labeling")
@@ -568,6 +582,11 @@ class MainWindow(QMainWindow):
             self._cycle_index = -1
             self.group_label.setText("")
 
+    def _layer_name(self, layer_id: str) -> str:
+        """Return a layer's display name for logging (falls back to its id)."""
+        layer = self.canvas.get_layer(layer_id)
+        return layer.name if layer is not None else layer_id
+
     def _start_cycle_mode(self):
         """Initialize cycle mode with layers from selected group."""
         # Get and display the selected group name
@@ -588,6 +607,9 @@ class MainWindow(QMainWindow):
         layer_id = self._cycle_layers[self._cycle_index]
         self.layer_panel.check_layers([layer_id])
         self.canvas.zoom_to_layer(layer_id)
+        count = len(self._cycle_layers)
+        debug(f"cycle start: group '{group_name}' - {count} images; "
+              f"at {self._layer_name(layer_id)} [{self._cycle_index + 1}/{count}]")
         self.statusBar.showMessage(
             f"Cycle mode: Layer {
                 self._cycle_index + 1}/{
@@ -615,6 +637,9 @@ class MainWindow(QMainWindow):
         layer_id = self._cycle_layers[self._cycle_index]
         self.layer_panel.check_layers([layer_id])
         self.canvas.zoom_to_layer(layer_id)
+        count = len(self._cycle_layers)
+        debug(f"view cycle start: {count} images in view; "
+              f"at {self._layer_name(layer_id)} [{self._cycle_index + 1}/{count}]")
         self.statusBar.showMessage(
             f"View Cycle: Layer {
                 self._cycle_index + 1}/{
@@ -641,6 +666,7 @@ class MainWindow(QMainWindow):
 
         if self._cycle_index < 0:
             # Reached the beginning, cycle complete
+            debug("cycle complete: all images processed")
             self.statusBar.showMessage(
                 "Cycle complete - all layers processed", 3000)
             self._cycle_layers = []
@@ -652,6 +678,9 @@ class MainWindow(QMainWindow):
         next_layer_id = self._cycle_layers[self._cycle_index]
         self.layer_panel.check_layers([next_layer_id])
         self.canvas.zoom_to_layer(next_layer_id)
+        count = len(self._cycle_layers)
+        debug(f"cycle next: {self._layer_name(next_layer_id)} "
+              f"[{self._cycle_index + 1}/{count}, {self._cycle_index} remaining]")
         self.statusBar.showMessage(
             f"Cycle mode: Layer {
                 self._cycle_index + 1}/{
@@ -685,6 +714,9 @@ class MainWindow(QMainWindow):
         prev_layer_id = self._cycle_layers[self._cycle_index]
         self.layer_panel.check_layers([prev_layer_id])
         self.canvas.zoom_to_layer(prev_layer_id)
+        count = len(self._cycle_layers)
+        debug(f"cycle prev: {self._layer_name(prev_layer_id)} "
+              f"[{self._cycle_index + 1}/{count}, {self._cycle_index} remaining]")
         self.statusBar.showMessage(
             f"Cycle mode: Layer {
                 self._cycle_index + 1}/{
@@ -743,6 +775,9 @@ class MainWindow(QMainWindow):
             image_group=image_group,
             image_path=image_path
         )
+        debug(f"label added: #{label.id} '{class_name}' on {image_name} "
+              f"at pixel ({pixel_x:.1f}, {pixel_y:.1f}) "
+              f"[{self.project.label_count} total]")
 
         # Add visual marker
         color = self._get_class_color(class_name)
@@ -779,6 +814,8 @@ class MainWindow(QMainWindow):
 
     def _on_label_removed(self, label_id: int, image_path: str):
         """Handle a label being removed."""
+        debug(f"label removed: #{label_id} "
+              f"[{self.project.label_count - 1} remaining]")
         # Remove from project
         self.project.remove_label(label_id)
 
@@ -2828,6 +2865,15 @@ class MainWindow(QMainWindow):
             "<li>Label linking across images</li>"
             "<li>Ground truth export</li>"
             "</ul>")
+
+    def _show_debug_console(self):
+        """Open (or focus) the live Debug Console window."""
+        if self._debug_console is None:
+            self._debug_console = DebugConsole(self)
+        self._debug_console.show()
+        self._debug_console.raise_()
+        self._debug_console.activateWindow()
+        debug("Debug Console opened")
 
     def closeEvent(self, event):
         """Handle window close - ensure async loaders are properly cleaned up."""
