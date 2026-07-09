@@ -34,6 +34,7 @@ from .canvas import MapCanvas, CanvasMode, AsyncFileLoaderThread, TiledLayer
 from .class_editor import ClassEditorDialog
 from .labels import LabelProject, ImageData, haversine_distance
 from .layer_panel import CombinedLayerPanel
+from .optimize_export import OptimizeExportDialog, OptimizeWorker, plan_output_path
 
 
 class GroupMemoryWorker(QObject):
@@ -215,6 +216,12 @@ class MainWindow(QMainWindow):
         self._group_mem_dialog = None
         self._group_mem_total = 0
         self._group_mem_label = ""
+
+        # Optimized-export worker state (background tiled/pyramid conversion).
+        self._optimize_thread: QThread | None = None
+        self._optimize_worker: OptimizeWorker | None = None
+        self._optimize_dialog = None
+        self._optimize_total = 0
 
         self._setup_ui()
         self._setup_menu()
@@ -407,6 +414,13 @@ class MainWindow(QMainWindow):
         export_subimages_action = QAction("&Sub-images...", self)
         export_subimages_action.triggered.connect(self._export_subimages)
         export_menu.addAction(export_subimages_action)
+
+        export_menu.addSeparator()
+
+        # Export Optimized GeoTIFFs (tiled + pyramided copies)
+        export_optimized_action = QAction("&Optimized GeoTIFFs...", self)
+        export_optimized_action.triggered.connect(self._export_optimized)
+        export_menu.addAction(export_optimized_action)
 
         # Options menu
         options_menu = menubar.addMenu("&Options")
@@ -1587,6 +1601,95 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(
                 self, "Error", f"Failed to export ground truth: {e}")
+
+    def _export_optimized(self):
+        """Export tiled + pyramided copies of the loaded GeoTIFFs."""
+        infos = self.canvas.get_layer_infos()
+        if not infos:
+            QMessageBox.information(
+                self, "Optimized GeoTIFFs",
+                "No layers are loaded to optimize.")
+            return
+
+        dialog = OptimizeExportDialog(infos, self)
+        if not dialog.exec_():
+            return
+        opts = dialog.get_options()
+
+        # Build the (source, destination) task list, mirroring the group tree.
+        tasks = []
+        for info in infos:
+            dst = plan_output_path(
+                opts["output_dir"], info.get("group_path", ""),
+                info["file_path"])
+            tasks.append((info["file_path"], str(dst)))
+
+        self._start_optimize_worker(tasks, opts)
+
+    def _start_optimize_worker(self, tasks, opts):
+        """Run the optimize worker off the UI thread with a progress dialog."""
+        total = len(tasks)
+        dlg = QProgressDialog("Preparing...", "Cancel", 0, total, self)
+        dlg.setWindowTitle("Creating Optimized GeoTIFFs")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+
+        thread = QThread(self)
+        worker = OptimizeWorker(tasks, opts)
+        worker.moveToThread(thread)
+
+        self._optimize_thread = thread
+        self._optimize_worker = worker
+        self._optimize_dialog = dlg
+        self._optimize_total = total
+
+        worker.progress.connect(self._on_optimize_progress)
+        worker.finished.connect(self._on_optimize_finished)
+        thread.started.connect(worker.process)
+        thread.finished.connect(self._on_optimize_thread_finished)
+        # Direct connection so Cancel is seen between files: the worker loop has
+        # no event loop of its own to deliver a queued slot call.
+        dlg.canceled.connect(worker.cancel, Qt.DirectConnection)
+
+        thread.start()
+
+    def _on_optimize_progress(self, index: int, total: int, filename: str):
+        """Update the optimize progress dialog (runs on the main thread)."""
+        if self._optimize_dialog is not None:
+            self._optimize_dialog.setLabelText(
+                f"Optimizing {index + 1}/{total}: {filename}")
+            self._optimize_dialog.setValue(index)
+
+    def _on_optimize_finished(self, done: int, skipped: int, errors):
+        """Show a summary and stop the worker thread (main thread)."""
+        if self._optimize_dialog is not None:
+            self._optimize_dialog.setValue(self._optimize_total)
+        if self._optimize_thread is not None:
+            self._optimize_thread.quit()
+
+        msg = f"Optimized {done} image(s)."
+        if skipped:
+            msg += f"\nSkipped {skipped} (output already existed)."
+        if errors:
+            msg += f"\n\n{len(errors)} error(s):\n" + "\n".join(
+                f"- {os.path.basename(p)}: {e}" for p, e in errors[:5])
+            if len(errors) > 5:
+                msg += f"\n... and {len(errors) - 5} more."
+            QMessageBox.warning(self, "Optimized GeoTIFFs", msg)
+        else:
+            QMessageBox.information(self, "Optimized GeoTIFFs", msg)
+
+        note = f"Optimized {done} image(s)"
+        if skipped:
+            note += f", {skipped} skipped"
+        self.statusBar.showMessage(note, 5000)
+
+    def _on_optimize_thread_finished(self):
+        """Drop worker references after the thread ends (main thread)."""
+        self._optimize_thread = None
+        self._optimize_worker = None
+        self._optimize_dialog = None
 
     @staticmethod
     def _ground_res_per_pixel(src, px: int, py: int) -> tuple[float, float]:

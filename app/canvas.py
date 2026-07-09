@@ -1657,6 +1657,27 @@ class MapCanvas(QGraphicsView):
             return self._layers[layer_id].file_path
         return None
 
+    def get_layer_infos(self) -> list[dict]:
+        """Return per-layer info for all loaded layers, in display order.
+
+        Each dict has keys ``layer_id``, ``file_path``, ``group_path``,
+        ``name`` and ``geo``. Used by the optimized-export feature to mirror the
+        layer tree structure and locate the source rasters.
+        """
+        infos = []
+        for layer_id in self._layer_order:
+            layer = self._layers.get(layer_id)
+            if layer is None:
+                continue
+            infos.append({
+                "layer_id": layer_id,
+                "file_path": layer.file_path,
+                "group_path": layer.group_path,
+                "name": layer.name,
+                "geo": layer.geo,
+            })
+        return infos
+
     def get_layer(self, layer_id: str) -> TiledLayer | None:
         """Get the TiledLayer object for a given layer ID."""
         return self._layers.get(layer_id)
