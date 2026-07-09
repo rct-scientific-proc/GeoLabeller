@@ -15,7 +15,9 @@ param(
     [string]$Python = "python",  # Path or command for Python executable
     [string]$Version,         # Optional version string (e.g. "1.2.3"); auto-detected if omitted
     [string]$Author,          # Publisher shown in Add/Remove Programs
-    [string]$Url              # About/help URL shown in Add/Remove Programs
+    [string]$Url,             # About/help URL shown in Add/Remove Programs
+    [string]$Proxy,           # pip proxy (e.g. http://proxy.corp:8080); auto-detected if omitted
+    [switch]$NoProxy          # Skip proxy detection entirely (direct connection)
 )
 
 $ErrorActionPreference = "Stop"
@@ -148,14 +150,70 @@ Write-Host "  Virtual environment ready" -ForegroundColor Green
 # Activate venv and get python path
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 
+# Determine a pip proxy: explicit -Proxy, else standard env vars, else the
+# Windows (WinINET / Internet Options) proxy, else the WinHTTP proxy. Corporate
+# machines usually configure the proxy in Internet Options rather than env vars,
+# which is why pip needs it passed explicitly.
+function Get-PipProxy {
+    if ($Proxy) { return $Proxy }
+
+    # Standard proxy environment variables (pip honours these, but be explicit).
+    foreach ($name in 'HTTPS_PROXY', 'HTTP_PROXY', 'https_proxy', 'http_proxy') {
+        $val = [Environment]::GetEnvironmentVariable($name)
+        if ($val) { return $val }
+    }
+
+    # Windows (WinINET / IE / Edge) proxy from the registry.
+    try {
+        $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+        $s = Get-ItemProperty -Path $key -ErrorAction Stop
+        if ($s.ProxyEnable -eq 1 -and $s.ProxyServer) {
+            $server = [string]$s.ProxyServer
+            if ($server -match '=') {
+                # Per-protocol list like "http=host:port;https=host:port".
+                $map = @{}
+                foreach ($pair in $server -split ';') {
+                    $kv = $pair -split '=', 2
+                    if ($kv.Count -eq 2) { $map[$kv[0].Trim().ToLower()] = $kv[1].Trim() }
+                }
+                if ($map['https']) { return $map['https'] }
+                if ($map['http'])  { return $map['http'] }
+            } else {
+                return $server
+            }
+        }
+    } catch { }
+
+    # WinHTTP proxy (netsh) as a last resort.
+    try {
+        $line = (netsh winhttp show proxy 2>$null) | Where-Object { $_ -match 'Proxy Server' }
+        if ($line -and ($line -match '(\S+:\d+)')) { return $Matches[1] }
+    } catch { }
+
+    return $null
+}
+
+$pipProxyArgs = @()
+if (-not $NoProxy) {
+    $pipProxy = Get-PipProxy
+    if ($pipProxy) {
+        # pip wants a scheme; add one if the detected value lacks it.
+        if ($pipProxy -notmatch '://') { $pipProxy = "http://$pipProxy" }
+        $pipProxyArgs = @('--proxy', $pipProxy)
+        Write-Host "Using pip proxy: $pipProxy" -ForegroundColor Cyan
+    } else {
+        Write-Host "No proxy detected (using a direct connection)." -ForegroundColor DarkGray
+    }
+}
+
 # Update pip, setuptools, and wheel using python -m pip
 Write-Host "Updating pip, setuptools, and wheel..." -ForegroundColor Yellow
-& $VenvPython -m pip install --upgrade pip setuptools wheel
+& $VenvPython -m pip install @pipProxyArgs --upgrade pip setuptools wheel
 Assert-LastExit "Failed to update pip/setuptools/wheel"
 
 # Install dependencies
 Write-Host "Installing dependencies..." -ForegroundColor Yellow
-& $VenvPython -m pip install -r $RequirementsFile
+& $VenvPython -m pip install @pipProxyArgs -r $RequirementsFile
 Assert-LastExit "Failed to install dependencies"
 Write-Host "  Dependencies installed" -ForegroundColor Green
 

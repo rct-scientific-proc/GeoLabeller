@@ -20,6 +20,21 @@ This directory contains build scripts for creating standalone executables using 
 .\build_windows.ps1 -Clean
 ```
 
+### Behind a corporate proxy
+
+`pip` needs the proxy to fetch dependencies. The script **auto-detects** it from
+(in order) the `HTTPS_PROXY`/`HTTP_PROXY` environment variables, the Windows
+Internet Options proxy (WinINET registry), then the WinHTTP proxy — and passes
+`--proxy` to pip. It prints the proxy it will use. Override or disable it:
+
+```powershell
+# Force a specific proxy
+.\build_windows.ps1 -Proxy "http://proxy.corp:8080"
+
+# Skip proxy detection (direct connection)
+.\build_windows.ps1 -NoProxy
+```
+
 ### Build MSI Installer
 
 ```powershell
