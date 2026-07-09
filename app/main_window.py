@@ -35,6 +35,7 @@ from .class_editor import ClassEditorDialog
 from .labels import LabelProject, ImageData, haversine_distance
 from .layer_panel import CombinedLayerPanel
 from .optimize_export import OptimizeExportDialog, OptimizeWorker, plan_output_path
+from .mosaic_export import MosaicExportDialog, MosaicWorker
 
 
 class GroupMemoryWorker(QObject):
@@ -222,6 +223,11 @@ class MainWindow(QMainWindow):
         self._optimize_worker: OptimizeWorker | None = None
         self._optimize_dialog = None
         self._optimize_total = 0
+
+        # Mosaic-export worker state.
+        self._mosaic_thread: QThread | None = None
+        self._mosaic_worker: MosaicWorker | None = None
+        self._mosaic_dialog = None
 
         self._setup_ui()
         self._setup_menu()
@@ -421,6 +427,11 @@ class MainWindow(QMainWindow):
         export_optimized_action = QAction("&Optimized GeoTIFFs...", self)
         export_optimized_action.triggered.connect(self._export_optimized)
         export_menu.addAction(export_optimized_action)
+
+        # Export Mosaic (combine layers into one raster)
+        export_mosaic_action = QAction("&Mosaic...", self)
+        export_mosaic_action.triggered.connect(self._export_mosaic)
+        export_menu.addAction(export_mosaic_action)
 
         # Options menu
         options_menu = menubar.addMenu("&Options")
@@ -1690,6 +1701,90 @@ class MainWindow(QMainWindow):
         self._optimize_thread = None
         self._optimize_worker = None
         self._optimize_dialog = None
+
+    def _export_mosaic(self):
+        """Combine the loaded georeferenced layers into a single mosaic."""
+        infos = [i for i in self.canvas.get_layer_infos() if i.get("geo")]
+        if not infos:
+            QMessageBox.information(
+                self, "Mosaic Export",
+                "No georeferenced layers are loaded to mosaic.")
+            return
+
+        # Default the output CRS to the first layer's CRS when available.
+        default_epsg = 3857
+        _, crs = self.canvas.get_layer_transform(infos[0]["layer_id"])
+        if crs is not None and crs.to_epsg():
+            default_epsg = crs.to_epsg()
+
+        dialog = MosaicExportDialog(infos, default_epsg=default_epsg, parent=self)
+        if not dialog.exec_():
+            return
+
+        sources = dialog.selected_sources()
+        out_path = dialog.output_path()
+        if not sources:
+            QMessageBox.information(
+                self, "Mosaic Export", "No layers selected to mosaic.")
+            return
+
+        self._start_mosaic_worker(sources, out_path, dialog.build_options())
+
+    def _start_mosaic_worker(self, sources, out_path, options):
+        """Run the mosaic build off the UI thread with a progress dialog."""
+        dlg = QProgressDialog("Preparing mosaic...", "Cancel", 0, 100, self)
+        dlg.setWindowTitle("Creating Mosaic")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+
+        thread = QThread(self)
+        worker = MosaicWorker(sources, out_path, options)
+        worker.moveToThread(thread)
+
+        self._mosaic_thread = thread
+        self._mosaic_worker = worker
+        self._mosaic_dialog = dlg
+
+        worker.progress.connect(self._on_mosaic_progress)
+        worker.finished.connect(self._on_mosaic_finished)
+        thread.started.connect(worker.process)
+        thread.finished.connect(self._on_mosaic_thread_finished)
+        dlg.canceled.connect(worker.cancel, Qt.DirectConnection)
+
+        thread.start()
+
+    def _on_mosaic_progress(self, message: str, percent: int):
+        """Update the mosaic progress dialog (runs on the main thread)."""
+        if self._mosaic_dialog is not None:
+            self._mosaic_dialog.setLabelText(message)
+            self._mosaic_dialog.setValue(percent)
+
+    def _on_mosaic_finished(self, result, error: str):
+        """Report the mosaic result and stop the worker thread (main thread)."""
+        if self._mosaic_dialog is not None:
+            self._mosaic_dialog.setValue(100)
+        if self._mosaic_thread is not None:
+            self._mosaic_thread.quit()
+
+        if error == "cancelled":
+            self.statusBar.showMessage("Mosaic cancelled", 4000)
+        elif error:
+            QMessageBox.warning(
+                self, "Mosaic Export", f"Mosaic failed:\n\n{error}")
+        elif result:
+            QMessageBox.information(
+                self, "Mosaic Export",
+                f"Mosaic created: {result['width']}x{result['height']} px, "
+                f"{result['count']} band(s).\n{result['path']}")
+            self.statusBar.showMessage(
+                f"Mosaic created: {result['path']}", 5000)
+
+    def _on_mosaic_thread_finished(self):
+        """Drop worker references after the thread ends (main thread)."""
+        self._mosaic_thread = None
+        self._mosaic_worker = None
+        self._mosaic_dialog = None
 
     @staticmethod
     def _ground_res_per_pixel(src, px: int, py: int) -> tuple[float, float]:

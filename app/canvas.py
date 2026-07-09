@@ -1675,6 +1675,7 @@ class MapCanvas(QGraphicsView):
                 "group_path": layer.group_path,
                 "name": layer.name,
                 "geo": layer.geo,
+                "visible": layer.visible,
             })
         return infos
 
