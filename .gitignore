@@ -45,3 +45,6 @@ Thumbs.db
 # Test scripts
 tests/
 todo/
+
+# Temp files (e.g. the .tif.tmp written during optimized/mosaic export)
+*.tmp
