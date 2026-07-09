@@ -304,6 +304,7 @@ class MainWindow(QMainWindow):
         self.canvas.link_mode_changed.connect(self._on_link_mode_changed)
         self.canvas.label_measured.connect(self._on_label_measured)
         self.canvas.measure_mode_changed.connect(self._on_measure_mode_changed)
+        self.canvas.ruler_changed.connect(self._on_ruler_changed)
         self.canvas.hide_layers_outside_view.connect(
             self.layer_panel.uncheck_layers)
         self.canvas.show_layers_in_view.connect(self.layer_panel.check_layers)
@@ -471,6 +472,13 @@ class MainWindow(QMainWindow):
             lambda: self._set_mode(CanvasMode.VIEW_CYCLE))
         toolbar.addAction(self.view_cycle_action)
 
+        self.ruler_action = QAction("Ruler", self)
+        self.ruler_action.setCheckable(True)
+        self.ruler_action.setShortcut("R")
+        self.ruler_action.triggered.connect(
+            lambda: self._set_mode(CanvasMode.RULER))
+        toolbar.addAction(self.ruler_action)
+
         toolbar.addSeparator()
 
         # Class selector
@@ -522,6 +530,7 @@ class MainWindow(QMainWindow):
         self.label_action.setChecked(mode == CanvasMode.LABEL)
         self.cycle_action.setChecked(mode == CanvasMode.CYCLE)
         self.view_cycle_action.setChecked(mode == CanvasMode.VIEW_CYCLE)
+        self.ruler_action.setChecked(mode == CanvasMode.RULER)
 
         # Handle cycle mode entry
         if mode == CanvasMode.CYCLE:
@@ -940,6 +949,13 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage(message, 0)  # 0 = no timeout
         elif message:
             self.statusBar.showMessage(message, 3000)
+        else:
+            self.statusBar.clearMessage()
+
+    def _on_ruler_changed(self, is_active: bool, message: str):
+        """Show the live ruler distance in the status bar."""
+        if is_active:
+            self.statusBar.showMessage(message, 0)  # 0 = no timeout
         else:
             self.statusBar.clearMessage()
 

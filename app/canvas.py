@@ -47,6 +47,7 @@ class CanvasMode(Enum):
     LABEL = auto()    # Point labeling mode
     CYCLE = auto()    # Cycle through layers in a group
     VIEW_CYCLE = auto()  # Cycle through layers visible in current view
+    RULER = auto()    # Measure ground distance by dragging
 
 
 class MeasureStage(Enum):
@@ -1126,6 +1127,9 @@ class MapCanvas(QGraphicsView):
     # Signal emitted when measure mode state changes: (is_active, message)
     measure_mode_changed = pyqtSignal(bool, str)
 
+    # Signal emitted while the ruler is measuring: (is_active, message)
+    ruler_changed = pyqtSignal(bool, str)
+
     # Signal emitted when user requests to hide layers outside view: (list of
     # layer_ids to hide)
     hide_layers_outside_view = pyqtSignal(list)
@@ -1199,6 +1203,15 @@ class MapCanvas(QGraphicsView):
         # Last mouse position over the viewport (view coords), used so the
         # 'M' shortcut can find the label under the cursor.
         self._last_mouse_view_pos = None
+
+        # Ruler mode state (drag to measure ground distance).
+        self._ruler_dragging = False
+        self._ruler_start = None  # QPointF: drag start in scene coords
+        self._ruler_line: QGraphicsLineItem | None = None
+        self._ruler_text: QGraphicsTextItem | None = None
+        # Right-drag panning while in ruler mode.
+        self._ruler_panning = False
+        self._ruler_pan_start = None  # QPoint: last pan position (view coords)
 
         # Label graphics items: label_id -> (ellipse_item, text_item)
         self._label_items: dict[int,
@@ -1782,6 +1795,8 @@ class MapCanvas(QGraphicsView):
 
     def set_mode(self, mode: CanvasMode):
         """Set the canvas interaction mode."""
+        # Switching modes ends any in-progress ruler measurement.
+        self._clear_ruler()
         self._mode = mode
         if mode == CanvasMode.PAN:
             # We handle panning manually
@@ -1791,6 +1806,11 @@ class MapCanvas(QGraphicsView):
         elif mode == CanvasMode.LABEL:
             self.setDragMode(QGraphicsView.NoDrag)
             self.setCursor(Qt.CrossCursor)
+        elif mode == CanvasMode.RULER:
+            # Ruler mode: left-drag to measure distance; wheel still zooms.
+            self.setDragMode(QGraphicsView.NoDrag)
+            self.setCursor(Qt.CrossCursor)
+            self._ruler_dragging = False
         elif mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
             # Cycle mode: left click labels, right drag pans, wheel zooms
             self.setDragMode(QGraphicsView.NoDrag)
@@ -1814,6 +1834,16 @@ class MapCanvas(QGraphicsView):
                 self._handle_measure_click(event.pos())
             elif event.button() == Qt.RightButton:
                 self._exit_measure_mode()
+            return
+
+        # Ruler mode: left-drag measures distance; right-drag pans the view.
+        if self._mode == CanvasMode.RULER:
+            if event.button() == Qt.LeftButton:
+                self._ruler_begin(event.pos())
+            elif event.button() == Qt.RightButton:
+                self._ruler_panning = True
+                self._ruler_pan_start = event.pos()
+                self.setCursor(Qt.ClosedHandCursor)
             return
 
         # PAN mode: manual left-click drag panning
@@ -1897,6 +1927,14 @@ class MapCanvas(QGraphicsView):
         # release so it can't reach pan/cycle release handling.
         if self._measure_active:
             return
+        # Ruler mode: end left-drag measurement or right-drag panning.
+        if self._mode == CanvasMode.RULER:
+            if event.button() == Qt.LeftButton:
+                self._ruler_dragging = False
+            elif event.button() == Qt.RightButton and self._ruler_panning:
+                self._ruler_panning = False
+                self.setCursor(Qt.CrossCursor)
+            return
         if self._mode == CanvasMode.PAN and event.button() == Qt.LeftButton:
             if hasattr(self, '_pan_active') and self._pan_active:
                 self._pan_active = False
@@ -1915,6 +1953,19 @@ class MapCanvas(QGraphicsView):
         # so the coordinate readout still updates.
         if self._measure_active and self._measure_start is not None:
             self._update_measure_preview(event.pos())
+
+        # Ruler mode: update the measurement line + readout while dragging.
+        if self._mode == CanvasMode.RULER and self._ruler_dragging:
+            self._ruler_update(event.pos())
+
+        # Ruler mode: right-drag pans the view (like cycle mode).
+        if self._mode == CanvasMode.RULER and self._ruler_panning:
+            delta = event.pos() - self._ruler_pan_start
+            self._ruler_pan_start = event.pos()
+            self.horizontalScrollBar().setValue(
+                self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(
+                self.verticalScrollBar().value() - delta.y())
 
         # Handle PAN mode left-click panning
         if self._mode == CanvasMode.PAN and hasattr(
@@ -1998,6 +2049,8 @@ class MapCanvas(QGraphicsView):
                     False, "Hover over a label, then press M to measure")
         elif event.key() == Qt.Key_Escape and self._link_mode_active:
             self._exit_link_mode()
+        elif event.key() == Qt.Key_Escape and self._mode == CanvasMode.RULER:
+            self._clear_ruler()
         elif event.key() == Qt.Key_Space and self._mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
             if event.modifiers() & Qt.ControlModifier:
                 # Ctrl+Space: go backwards
@@ -2199,6 +2252,9 @@ class MapCanvas(QGraphicsView):
             text.setScale(1 / view_scale)
             pos = ellipse.pos()
             text.setPos(pos.x() + marker_size / 2, pos.y() - marker_size / 2)
+
+        # Keep the ruler readout a constant on-screen size across zoom changes.
+        self._rescale_ruler_text()
 
     def _get_label_at_position(
             self, view_pos) -> tuple[int | None, str | None]:
@@ -2598,6 +2654,102 @@ class MapCanvas(QGraphicsView):
     def is_measure_mode_active(self) -> bool:
         """Check if measure mode is currently active."""
         return self._measure_active
+
+    # ------------------------------------------------------------------
+    # Ruler mode: drag to measure ground distance (metres), QGIS-style
+    # ------------------------------------------------------------------
+
+    def _ruler_begin(self, view_pos):
+        """Start a ruler measurement at the given view position."""
+        self._clear_ruler()
+        self._ruler_start = self.mapToScene(view_pos)
+        self._ruler_dragging = True
+
+        pen = QPen(QColor(255, 140, 0), 0)  # orange, cosmetic (constant width)
+        pen.setCosmetic(True)
+        self._ruler_line = QGraphicsLineItem(
+            QLineF(self._ruler_start, self._ruler_start))
+        self._ruler_line.setPen(pen)
+        self._ruler_line.setZValue(self._get_label_z_base() + 5)
+        self._scene.addItem(self._ruler_line)
+
+        self._ruler_text = QGraphicsTextItem()
+        self._ruler_text.setDefaultTextColor(QColor(255, 140, 0))
+        font = QFont("Arial", 9)
+        font.setBold(True)
+        self._ruler_text.setFont(font)
+        self._ruler_text.setZValue(self._get_label_z_base() + 6)
+        self._scene.addItem(self._ruler_text)
+
+        self._ruler_update(view_pos)
+
+    def _ruler_update(self, view_pos):
+        """Update the ruler line, on-canvas readout and status message."""
+        if self._ruler_line is None or self._ruler_start is None:
+            return
+        end = self.mapToScene(view_pos)
+        self._ruler_line.setLine(QLineF(self._ruler_start, end))
+
+        value, unit = self._ruler_measure(self._ruler_start, end)
+        text = self._format_ruler_distance(value, unit)
+        self._position_ruler_text(end, text)
+        self.ruler_changed.emit(True, f"Distance: {text}")
+
+    def _ruler_measure(self, start, end) -> tuple[float, str]:
+        """Return (distance, unit) for a ruler line.
+
+        Geo layers give geodesic metres (scene coords are Web Mercator, so both
+        endpoints are converted to WGS84 and measured with Haversine). The
+        non-georeferenced pixel zone has no real-world scale, so distance is
+        reported in source pixels instead.
+        """
+        if self.is_in_pixel_zone(start.x()):
+            d_scene = math.hypot(end.x() - start.x(), end.y() - start.y())
+            return d_scene / PIXEL_ZONE_SCALE, "px"
+        return self._line_distance_m(start, end), "m"
+
+    @staticmethod
+    def _format_ruler_distance(value: float, unit: str) -> str:
+        """Human-readable distance string (m / km, or px in the pixel zone)."""
+        if unit == "px":
+            return f"{value:,.1f} px"
+        if value >= 1000.0:
+            return f"{value / 1000.0:.3f} km"
+        return f"{value:.2f} m"
+
+    def _position_ruler_text(self, end_scene, text: str):
+        """Place the readout just off the ruler's end point, at constant size."""
+        if self._ruler_text is None:
+            return
+        self._ruler_text.setPlainText(text)
+        view_scale = self.transform().m11()
+        if view_scale > 0:
+            self._ruler_text.setScale(1.0 / view_scale)
+            offset = 12.0 / view_scale
+        else:
+            offset = 12.0
+        self._ruler_text.setPos(end_scene.x() + offset, end_scene.y() - offset)
+
+    def _rescale_ruler_text(self):
+        """Keep the ruler readout a constant on-screen size after a zoom."""
+        if self._ruler_text is None:
+            return
+        view_scale = self.transform().m11()
+        if view_scale > 0:
+            self._ruler_text.setScale(1.0 / view_scale)
+
+    def _clear_ruler(self):
+        """Remove the ruler line + readout and reset ruler state."""
+        had_ruler = self._ruler_line is not None
+        for item in (self._ruler_line, self._ruler_text):
+            if item is not None:
+                self._scene.removeItem(item)
+        self._ruler_line = None
+        self._ruler_text = None
+        self._ruler_start = None
+        self._ruler_dragging = False
+        if had_ruler:
+            self.ruler_changed.emit(False, "")
 
     def set_label_linked(self, label_id: int, is_linked: bool):
         """Update whether a label is linked to other labels."""
