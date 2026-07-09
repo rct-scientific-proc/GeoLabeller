@@ -118,6 +118,9 @@ class TiledLayer:
         # the level (if any) being loaded in a background thread.
         self._target_level = 1
         self._loading_level: int | None = None
+        # The in-flight background load runnable for this layer (if any), so it
+        # can be cancelled when superseded by a newer zoom or culled from view.
+        self._pending_runnable = None
 
 
         # Lazy loading state
@@ -602,10 +605,12 @@ class TiledLayer:
                 for tx in range(tx_min, tx_max + 1)]
 
     def create_tile_pixmap(self, tx: int, ty: int) -> QPixmap | None:
-        """Create a QPixmap for a specific tile."""
-        # Ensure full data is loaded before accessing pixels
-        self.ensure_loaded()
+        """Create a QPixmap for a specific tile.
 
+        Returns None if pixel data isn't loaded yet: loading is done off the UI
+        thread by the canvas LOD scheduler, and tiles are (re)built once the
+        data has been applied, so this must never block on a load.
+        """
         if self._rgba_data is None:
             return None
 
@@ -1032,10 +1037,64 @@ class ScaleBarWidget(QWidget):
                          self._format_mpp(self._meters_per_pixel))
 
 
+class ThrobberWidget(QWidget):
+    """A small self-contained spinner overlay shown while imagery is loading.
+
+    Draws a rotating arc with a QTimer (no image assets), so the user knows a
+    background load is in progress. Transparent to mouse events so it never
+    intercepts map interaction.
+    """
+
+    def __init__(self, parent=None):
+        """Create a hidden 44x44 spinner attached to *parent*."""
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setFixedSize(44, 44)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(80)  # ~12 fps rotation
+        self._timer.timeout.connect(self._advance)
+        self.hide()
+
+    def start(self):
+        """Show the spinner and start it animating (idempotent)."""
+        if not self._timer.isActive():
+            self._timer.start()
+        self.show()
+        self.raise_()
+
+    def stop(self):
+        """Stop animating and hide the spinner."""
+        self._timer.stop()
+        self.hide()
+
+    def _advance(self):
+        """Rotate the arc one step and repaint."""
+        self._angle = (self._angle + 30) % 360
+        self.update()
+
+    def paintEvent(self, event):
+        """Paint a translucent disc with a rotating white arc."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        # Translucent background disc for contrast over any imagery.
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 120))
+        painter.drawEllipse(self.rect())
+        # Rotating arc (a ~270 degree gap sweeps around).
+        arc_rect = self.rect().adjusted(11, 11, -11, -11)
+        pen = QPen(QColor(255, 255, 255, 235), 4)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.drawArc(arc_rect, -self._angle * 16, -270 * 16)
+        painter.end()
+
+
 class _LevelLoadSignals(QObject):
     """Signals for a background overview-level load."""
     finished = pyqtSignal(str, int, object)  # layer_id, level, result dict
-    error = pyqtSignal(str, str)             # layer_id, message
+    error = pyqtSignal(str, int, str)        # layer_id, level, message
+    cancelled = pyqtSignal(str, int)         # layer_id, level
 
 
 class _LevelLoadRunnable(QRunnable):
@@ -1055,10 +1114,21 @@ class _LevelLoadRunnable(QRunnable):
         self._geo = geo
         self._level = level
         self._signals = signals
+        self._cancelled = False
+
+    def cancel(self):
+        """Request cancellation. Checked before (and after) the expensive load;
+        a still-queued runnable then bails without touching the disk. Safe to
+        call from the UI thread (a plain bool flag under the GIL)."""
+        self._cancelled = True
 
     def run(self):
         """Compute the layer's RGBA data for the level off the UI thread and
-        emit the result (or an error) back to the main thread."""
+        emit the result (or an error/cancellation) back to the main thread."""
+        # Bail cheaply if superseded/culled while still queued.
+        if self._cancelled:
+            self._safe_emit(self._signals.cancelled, self._layer_id, self._level)
+            return
         try:
             tmp = TiledLayer(self._file_path, lazy=True, geo=self._geo)
             tmp.ensure_loaded(level=self._level)
@@ -1078,7 +1148,12 @@ class _LevelLoadRunnable(QRunnable):
                 'level': tmp._loaded_level,
             }
         except Exception as e:  # report any load failure back to the UI thread
-            self._safe_emit(self._signals.error, self._layer_id, str(e))
+            self._safe_emit(
+                self._signals.error, self._layer_id, self._level, str(e))
+            return
+        # Discard the result if the view moved on while we were reprojecting.
+        if self._cancelled:
+            self._safe_emit(self._signals.cancelled, self._layer_id, self._level)
             return
         self._safe_emit(self._signals.finished, self._layer_id, self._level, result)
 
@@ -1130,6 +1205,9 @@ class MapCanvas(QGraphicsView):
     # Signal emitted while the ruler is measuring: (is_active, message)
     ruler_changed = pyqtSignal(bool, str)
 
+    # Signal emitted when background imagery loading starts/stops: (is_loading)
+    loading_changed = pyqtSignal(bool)
+
     # Signal emitted when user requests to hide layers outside view: (list of
     # layer_ids to hide)
     hide_layers_outside_view = pyqtSignal(list)
@@ -1146,10 +1224,6 @@ class MapCanvas(QGraphicsView):
 
     # Signal emitted when Ctrl+Space is pressed in cycle mode (go backwards)
     cycle_prev_requested = pyqtSignal()
-
-    # Maximum RGBA pixel count to load synchronously on the UI thread. Larger
-    # levels load in a background thread with a coarse preview shown first.
-    _SYNC_LOAD_MAX_PIXELS = 500_000
 
     # Minimum on-screen separation (view pixels) between the two clicks of a
     # measurement line; shorter lines are treated as an accidental click and
@@ -1261,8 +1335,16 @@ class MapCanvas(QGraphicsView):
         # Background loader for expensive (fine) overview levels. `_level_load_
         # signals` keeps the per-job signal objects alive until they deliver.
         self._level_load_pool = QThreadPool(self)
-        self._level_load_pool.setMaxThreadCount(2)
+        self._level_load_pool.setMaxThreadCount(
+            min(4, max(1, QThread.idealThreadCount() - 1)))
         self._level_load_signals: set = set()
+
+        # Background-load tracking for the loading spinner. `_active_loads`
+        # counts in-flight overview loads; the throbber shows while > 0.
+        self._active_loads = 0
+        self._loading_active = False
+        self._throbber = ThrobberWidget(self)
+        self._throbber.move(12, 12)
 
     def add_layer(self, file_path: str, lazy: bool = False,
                   visible: bool = True) -> str | None:
@@ -1424,17 +1506,22 @@ class MapCanvas(QGraphicsView):
                 continue
 
             # Cull layers entirely outside the viewport: they must not trigger
-            # any pyramid loading. Drop any tiles they may still hold.
+            # any pyramid loading. Drop any tiles they may still hold and cancel
+            # an in-flight load so we don't keep reprojecting off-screen data.
             if not self._layer_intersects_view(layer, view_bounds):
                 if layer.tiles:
                     self._clear_layer_tiles(layer)
+                self._cancel_layer_load(layer)
                 continue
 
             # Level-of-detail: pick an overview level for the current zoom and
-            # (re)load this layer if it differs from what is currently loaded.
+            # (re)load this layer off-thread if it differs from what is loaded.
             self._apply_layer_lod(layer_id, layer, units_per_pixel)
 
-            self._rebuild_layer_tiles(layer)
+            # Only build tiles for layers that already have data; unloaded ones
+            # rebuild in _on_level_loaded once their background load lands.
+            if layer.is_fully_loaded():
+                self._rebuild_layer_tiles(layer)
 
     @staticmethod
     def _layer_intersects_view(
@@ -1494,70 +1581,103 @@ class MapCanvas(QGraphicsView):
 
     def _apply_layer_lod(self, layer_id: str, layer: TiledLayer,
                          units_per_pixel: float):
-        """Choose and apply the overview level for a layer at the current zoom.
+        """Choose the overview level for the current zoom and load it off-thread.
 
-        Cheap (coarse) levels load synchronously. Expensive (fine) levels load
-        in a background thread while a coarser preview stays on screen, so the
-        UI never freezes on zoom-in. Panning at a fixed zoom is a no-op.
+        Never blocks the UI thread: any (re)load is dispatched to the background
+        pool. Whatever is already loaded stays on screen as a preview until the
+        new level is applied by _on_level_loaded. Panning at a fixed zoom, once
+        loaded, is a no-op.
         """
         if not layer.has_overviews():
+            # No pyramids: load full resolution once, in the background.
+            if not layer.is_fully_loaded():
+                layer._target_level = 1
+                self._dispatch_level_load(layer_id, layer, 1)
             return
 
         desired = layer.select_overview_level(units_per_pixel)
         layer._target_level = desired
 
         if layer.is_fully_loaded() and layer._loaded_level == desired:
+            # Already showing the desired level. If a load for a *different*
+            # level is still in flight (e.g. a high-res refine the user just
+            # zoomed back out of), it's now obsolete - cancel it.
+            if (layer._loading_level is not None
+                    and layer._loading_level != desired):
+                self._cancel_layer_load(layer)
             return
-
-        expensive = layer.level_pixel_count(desired) > self._SYNC_LOAD_MAX_PIXELS
 
         if not layer.is_fully_loaded():
-            # Nothing on screen yet: show a cheap preview immediately, then
-            # refine to the target level in the background if it is expensive.
-            preview = layer.coarsest_level() if expensive else desired
-            self._clear_layer_tiles(layer)
-            layer.ensure_loaded(level=preview)
-            if expensive and layer._loaded_level != desired:
-                self._dispatch_level_load(layer_id, layer, desired)
+            # Nothing on screen yet: load the cheapest level first for a fast
+            # preview; _on_level_loaded then chases the desired level.
+            self._dispatch_level_load(layer_id, layer, layer.coarsest_level())
             return
 
-        if not expensive:
-            # Cheap swap: replace data now; the caller rebuilds the tiles.
-            self._clear_layer_tiles(layer)
-            layer.ensure_loaded(level=desired)
-        else:
-            # Keep the current tiles as a preview and load the target level in
-            # the background (swapped in by _on_level_loaded when ready).
-            self._dispatch_level_load(layer_id, layer, desired)
+        # Already showing a preview at another level: refine to the target
+        # while the current tiles stay on screen (swapped in when ready).
+        self._dispatch_level_load(layer_id, layer, desired)
 
     def _dispatch_level_load(self, layer_id: str, layer: TiledLayer, level: int):
-        """Start a background load of *layer* at *level* (if not already running)."""
+        """Start a background load of *layer* at *level*.
+
+        Supersedes any pending load for the same layer at a different level
+        (rapid zoom cancels the intermediate loads), so at most one load per
+        layer is ever active.
+        """
         if layer._loading_level == level:
-            return
+            return  # already loading exactly this level
+
+        # Cancel the previous in-flight load for this layer (different level).
+        if layer._pending_runnable is not None:
+            layer._pending_runnable.cancel()
+            layer._pending_runnable = None
+
         layer._loading_level = level
+
+        # Count this in-flight load and show the spinner. Each started runnable
+        # emits exactly one finished / error / cancelled, which decrements it.
+        self._active_loads += 1
+        self._update_throbber()
 
         signals = _LevelLoadSignals()
         self._level_load_signals.add(signals)
         signals.finished.connect(self._on_level_loaded)
         signals.error.connect(self._on_level_load_error)
+        signals.cancelled.connect(self._on_level_load_cancelled)
         # Keep the signals object alive until it has delivered, then release it.
-        signals.finished.connect(
-            lambda *_a, s=signals: self._level_load_signals.discard(s))
-        signals.error.connect(
-            lambda *_a, s=signals: self._level_load_signals.discard(s))
+        for sig in (signals.finished, signals.error, signals.cancelled):
+            sig.connect(lambda *_a, s=signals: self._level_load_signals.discard(s))
 
         runnable = _LevelLoadRunnable(
             layer_id, layer.file_path, layer.geo, level, signals)
+        layer._pending_runnable = runnable
         self._level_load_pool.start(runnable)
+
+    def _cancel_layer_load(self, layer: TiledLayer):
+        """Cancel a layer's in-flight background load, if any.
+
+        The runnable's cancelled signal still fires (decrementing the load
+        counter), so the spinner clears once the cancelled loads drain.
+        """
+        if layer._pending_runnable is not None:
+            layer._pending_runnable.cancel()
+            layer._pending_runnable = None
+            layer._loading_level = None
 
     def _on_level_loaded(self, layer_id: str, level: int, result: dict):
         """Apply a background-loaded overview level on the UI thread."""
+        # Balance the in-flight counter first (one per started runnable), even
+        # if the layer was removed while loading.
+        self._active_loads = max(0, self._active_loads - 1)
+        self._update_throbber()
+
         layer = self._layers.get(layer_id)
         if layer is None:
             return  # Layer was removed while loading.
 
         if layer._loading_level == level:
             layer._loading_level = None
+            layer._pending_runnable = None
 
         # A newer zoom may have superseded this level; if so, chase the new one.
         if level != layer._target_level:
@@ -1570,12 +1690,37 @@ class MapCanvas(QGraphicsView):
         self._clear_layer_tiles(layer)
         self._rebuild_layer_tiles(layer)
 
-    def _on_level_load_error(self, layer_id: str, message: str):
+    def _on_level_load_error(self, layer_id: str, level: int, message: str):
         """Handle a failed background level load."""
+        self._active_loads = max(0, self._active_loads - 1)
+        self._update_throbber()
+
         layer = self._layers.get(layer_id)
-        if layer is not None:
+        if layer is not None and layer._loading_level == level:
             layer._loading_level = None
+            layer._pending_runnable = None
         print(f"[pyramid] background level load failed for {layer_id}: {message}")
+
+    def _on_level_load_cancelled(self, layer_id: str, level: int):
+        """Handle a cancelled background level load (superseded or culled)."""
+        self._active_loads = max(0, self._active_loads - 1)
+        self._update_throbber()
+
+        layer = self._layers.get(layer_id)
+        if layer is not None and layer._loading_level == level:
+            layer._loading_level = None
+            layer._pending_runnable = None
+
+    def _update_throbber(self):
+        """Show/hide the loading spinner based on the in-flight load count."""
+        active = self._active_loads > 0
+        if active:
+            self._throbber.start()
+        else:
+            self._throbber.stop()
+        if active != self._loading_active:
+            self._loading_active = active
+            self.loading_changed.emit(active)
 
 
     def _schedule_tile_update(self):
@@ -1589,6 +1734,9 @@ class MapCanvas(QGraphicsView):
             layer.set_visibility(visible)
             if visible:
                 self._update_visible_tiles()
+            else:
+                # Hidden layers shouldn't keep loading in the background.
+                self._cancel_layer_load(layer)
             # For non-geo layers, toggle associated label markers
             if not layer.geo:
                 self._set_label_visibility_for_image(layer.file_path, visible)
@@ -1625,6 +1773,7 @@ class MapCanvas(QGraphicsView):
         """Remove a layer from the canvas."""
         if layer_id in self._layers:
             file_path = self._layers[layer_id].file_path
+            self._cancel_layer_load(self._layers[layer_id])
             self._layers[layer_id].remove_from_scene(self._scene)
             del self._layers[layer_id]
             if file_path in self._path_to_layer:
