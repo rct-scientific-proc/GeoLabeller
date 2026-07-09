@@ -1,0 +1,6 @@
+# List of Python dependencies for GeoLabeller version numbers left out for flexibility.
+pyqt5
+numpy
+pillow
+rasterio
+pyproj
