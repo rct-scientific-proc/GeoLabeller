@@ -79,9 +79,18 @@ class AxisRuler(QWidget):
 
         painter.end()
 
+    def _view_is_rotated(self) -> bool:
+        """True when the view is rotated, making lat/lon ticks meaningless.
+
+        Once rotated (image-up cycle mode) a constant longitude is no longer a
+        vertical screen line, so the ruler blanks itself rather than drawing
+        misleading ticks. The widget keeps its size so the layout is stable.
+        """
+        return abs(getattr(self.canvas, "view_rotation", lambda: 0.0)()) > 1e-6
+
     def _draw_horizontal_ticks(self, painter: QPainter):
         """Draw longitude tick marks."""
-        if not self.canvas._layers:
+        if not self.canvas._layers or self._view_is_rotated():
             return
 
         view_bounds = self.canvas._get_view_bounds()
@@ -133,7 +142,7 @@ class AxisRuler(QWidget):
 
     def _draw_vertical_ticks(self, painter: QPainter):
         """Draw latitude tick marks."""
-        if not self.canvas._layers:
+        if not self.canvas._layers or self._view_is_rotated():
             return
 
         view_bounds = self.canvas._get_view_bounds()
@@ -397,6 +406,11 @@ class MapCanvasWithAxes(QWidget):
 
         # Connect to canvas view changes to update rulers
         self._connect_view_updates()
+
+        # A rotated view (image-up cycle mode) breaks the lat/lon rulers: a
+        # constant longitude is no longer a vertical screen line, so they blank
+        # themselves out (see AxisRuler._view_is_rotated). Repaint on change.
+        canvas.view_rotation_changed.connect(lambda _deg: self._update_rulers())
 
     def _connect_view_updates(self):
         """Connect to canvas signals to update rulers on view change."""

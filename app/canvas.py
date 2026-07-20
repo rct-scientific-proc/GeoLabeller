@@ -7,7 +7,8 @@ from pathlib import Path
 import numpy as np
 import rasterio
 from PyQt5 import sip
-from PyQt5.QtCore import Qt, pyqtSignal, QRectF, QLineF, QTimer, QThread, QObject, QThreadPool, QRunnable
+from PyQt5.QtCore import (Qt, pyqtSignal, QRectF, QLineF, QPointF, QTimer,
+                          QThread, QObject, QThreadPool, QRunnable)
 from PyQt5.QtGui import (
     QImage,
     QPixmap,
@@ -20,7 +21,8 @@ from PyQt5.QtGui import (
     QPainter)
 from PyQt5.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
-    QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsTextItem, QMenu, QWidget
+    QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem, QGraphicsTextItem,
+    QMenu, QWidget
 )
 from pyproj import Transformer
 from rasterio.crs import CRS
@@ -49,6 +51,14 @@ class CanvasMode(Enum):
     CYCLE = auto()    # Cycle through layers in a group
     VIEW_CYCLE = auto()  # Cycle through layers visible in current view
     RULER = auto()    # Measure ground distance by dragging
+    IMAGE_CYCLE = auto()  # Cycle with the view rotated to each image's grid
+
+
+# Modes that step through layers one at a time (Space advances).
+CYCLE_MODES = (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE, CanvasMode.IMAGE_CYCLE)
+
+# Modes where a left click places a label.
+LABELING_MODES = (CanvasMode.LABEL,) + CYCLE_MODES
 
 
 class MeasureStage(Enum):
@@ -1045,6 +1055,10 @@ class MapCanvas(QGraphicsView):
     # Signal emitted when background imagery loading starts/stops: (is_loading)
     loading_changed = pyqtSignal(bool)
 
+    # Signal emitted when the view rotation changes: (degrees). Non-zero means
+    # the view no longer points north-up, so lat/lon rulers become meaningless.
+    view_rotation_changed = pyqtSignal(float)
+
     # Signal emitted when user requests to hide layers outside view: (list of
     # layer_ids to hide)
     hide_layers_outside_view = pyqtSignal(list)
@@ -1095,6 +1109,10 @@ class MapCanvas(QGraphicsView):
 
         # Canvas mode
         self._mode = CanvasMode.PAN
+
+        # Current absolute view rotation in degrees (0 = north-up). Non-zero in
+        # image-up cycle mode, where the view is rotated onto an image's grid.
+        self._view_rotation = 0.0
         self._current_class = ""  # Currently selected class for labeling
 
         # Link mode state
@@ -1293,6 +1311,16 @@ class MapCanvas(QGraphicsView):
         # Scene coords: X = easting, Y = -northing
         return (rect.left(), -rect.bottom(), rect.right(), -rect.top())
 
+    def _view_scale(self) -> float:
+        """Return the view's uniform scale factor (view pixels per scene unit).
+
+        ``transform().m11()`` is only the scale while the view is unrotated - it
+        becomes ``scale * cos(theta)`` once rotated (image-up cycle mode) - so
+        derive the scale from the transform's determinant instead.
+        """
+        det = abs(self.transform().determinant())
+        return math.sqrt(det) if det > 0 else 0.0
+
     def _scene_units_per_pixel(self) -> float:
         """Return the size of one on-screen pixel in scene units.
 
@@ -1300,8 +1328,8 @@ class MapCanvas(QGraphicsView):
         the view is more zoomed out. Derived from the view transform's
         horizontal scale factor (view-pixels per scene-unit).
         """
-        m11 = self.transform().m11()
-        return 1.0 / m11 if m11 > 0 else 0.0
+        scale = self._view_scale()
+        return 1.0 / scale if scale > 0 else 0.0
 
     def view_ground_resolution(self) -> float:
         """Return the view's true ground resolution in metres per pixel.
@@ -1684,6 +1712,66 @@ class MapCanvas(QGraphicsView):
             return layer._src_transform, layer._src_crs
         return None, None
 
+    # ------------------------------------------------------------------
+    # Image-up view: rotate the scene onto a chosen image's pixel grid
+    # ------------------------------------------------------------------
+
+    def _layer_scene_rotation(self, layer: TiledLayer) -> float:
+        """Return the on-screen angle (degrees) of a layer's pixel-row axis.
+
+        Measures the direction of the image's +column axis in scene coordinates
+        by projecting the first row's endpoints into Web Mercator. Rotating the
+        view by the negative of this angle renders the image "image-up" (rows
+        horizontal, in its native orientation).
+        """
+        if layer._src_transform is None or layer._src_crs is None:
+            return 0.0
+        try:
+            transformer = Transformer.from_crs(
+                layer._src_crs, WEB_MERCATOR, always_xy=True)
+            span = max(1, layer._src_width)
+            x0, y0 = layer._src_transform * (0, 0)
+            x1, y1 = layer._src_transform * (span, 0)
+            xs, ys = transformer.transform([x0, x1], [y0, y1])
+            # Scene Y is -northing, so flip the northing delta.
+            dx = xs[1] - xs[0]
+            dy = -(ys[1] - ys[0])
+            if dx == 0.0 and dy == 0.0:
+                return 0.0
+            return math.degrees(math.atan2(dy, dx))
+        except Exception:
+            return 0.0
+
+    def set_view_rotation(self, degrees: float):
+        """Set the absolute view rotation in degrees (0 = north-up).
+
+        Preserves the current zoom: only the difference from the currently
+        applied rotation is composed into the view transform.
+        """
+        delta = degrees - self._view_rotation
+        if abs(delta) > 1e-9:
+            self.rotate(delta)
+            self._view_rotation = degrees
+            self._schedule_tile_update()
+            self.update_label_markers_scale()
+            self.view_rotation_changed.emit(degrees)
+
+    def view_rotation(self) -> float:
+        """Return the current view rotation in degrees."""
+        return self._view_rotation
+
+    def zoom_to_layer_image_up(self, layer_id: str):
+        """Rotate the view onto a layer's pixel grid, then fit it in view.
+
+        Everything else (other layers, labels) is carried along by the same view
+        transform, so the whole scene is shown relative to this image.
+        """
+        layer = self._layers.get(layer_id)
+        if layer is None:
+            return
+        self.set_view_rotation(-self._layer_scene_rotation(layer))
+        self.zoom_to_layer(layer_id)
+
     def zoom_to_layer(self, layer_id: str):
         """Zoom the view to fit a specific layer's bounds."""
         if layer_id not in self._layers:
@@ -1749,8 +1837,12 @@ class MapCanvas(QGraphicsView):
         delta = old_pos - new_pos
         INT_MAX = 2**31 - 1
         INT_MIN = -(2**31)
-        h_delta = delta.x() * self.transform().m11()
-        v_delta = delta.y() * self.transform().m22()
+        # Map the scene-space delta through the view transform's linear part so
+        # this stays correct when the view is rotated.
+        t = self.transform()
+        view_delta = t.map(delta) - t.map(QPointF(0.0, 0.0))
+        h_delta = view_delta.x()
+        v_delta = view_delta.y()
         h_delta = max(INT_MIN, min(INT_MAX, h_delta))
         v_delta = max(INT_MIN, min(INT_MAX, v_delta))
         self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + int(h_delta))
@@ -1787,7 +1879,7 @@ class MapCanvas(QGraphicsView):
             self.setDragMode(QGraphicsView.NoDrag)
             self.setCursor(Qt.CrossCursor)
             self._ruler_dragging = False
-        elif mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
+        elif mode in CYCLE_MODES:
             # Cycle mode: left click labels, right drag pans, wheel zooms
             self.setDragMode(QGraphicsView.NoDrag)
             self.setCursor(Qt.CrossCursor)
@@ -1833,10 +1925,7 @@ class MapCanvas(QGraphicsView):
             return
 
         # Handle labeling in LABEL or CYCLE/VIEW_CYCLE mode
-        if self._mode in (
-                CanvasMode.LABEL,
-                CanvasMode.CYCLE,
-                CanvasMode.VIEW_CYCLE) and event.button() == Qt.LeftButton:
+        if self._mode in LABELING_MODES and event.button() == Qt.LeftButton:
             # Check if we're in link mode
             if self._link_mode_active:
                 label_id, image_path = self._get_label_at_position(event.pos())
@@ -1850,7 +1939,7 @@ class MapCanvas(QGraphicsView):
 
             # Ctrl+Left-click in CYCLE/VIEW_CYCLE mode shows label context menu (for
             # linking)
-            if self._mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE) and event.modifiers() & Qt.ControlModifier:
+            if self._mode in CYCLE_MODES and event.modifiers() & Qt.ControlModifier:
                 self._show_label_context_menu(event.pos())
                 return
 
@@ -1889,7 +1978,7 @@ class MapCanvas(QGraphicsView):
                 self._exit_link_mode()
             else:
                 self._show_label_context_menu(event.pos())
-        elif self._mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE) and event.button() == Qt.RightButton:
+        elif self._mode in CYCLE_MODES and event.button() == Qt.RightButton:
             # Right-click drag in cycle mode - start panning
             self._cycle_panning = True
             self._cycle_pan_start = event.pos()
@@ -1915,7 +2004,7 @@ class MapCanvas(QGraphicsView):
             if hasattr(self, '_pan_active') and self._pan_active:
                 self._pan_active = False
                 self.setCursor(Qt.OpenHandCursor)
-        elif self._mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE) and event.button() == Qt.RightButton:
+        elif self._mode in CYCLE_MODES and event.button() == Qt.RightButton:
             if hasattr(self, '_cycle_panning') and self._cycle_panning:
                 self._cycle_panning = False
                 self.setCursor(Qt.CrossCursor)
@@ -1954,7 +2043,7 @@ class MapCanvas(QGraphicsView):
             # Still update coordinates below
 
         # Handle cycle mode right-click panning
-        if self._mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE) and hasattr(
+        if self._mode in CYCLE_MODES and hasattr(
                 self, '_cycle_panning') and self._cycle_panning:
             delta = event.pos() - self._cycle_pan_start
             self._cycle_pan_start = event.pos()
@@ -2027,7 +2116,7 @@ class MapCanvas(QGraphicsView):
             self._exit_link_mode()
         elif event.key() == Qt.Key_Escape and self._mode == CanvasMode.RULER:
             self._clear_ruler()
-        elif event.key() == Qt.Key_Space and self._mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
+        elif event.key() == Qt.Key_Space and self._mode in CYCLE_MODES:
             if event.modifiers() & Qt.ControlModifier:
                 # Ctrl+Space: go backwards
                 self.cycle_prev_requested.emit()
@@ -2154,7 +2243,7 @@ class MapCanvas(QGraphicsView):
             x, y = self._wgs84_to_web_mercator(lon, lat)
 
         # Get current view scale to size markers appropriately
-        view_scale = self.transform().m11()  # Horizontal scale factor
+        view_scale = self._view_scale()
 
         # Marker size in scene coordinates (appears ~10 pixels on screen)
         marker_size = 10 / view_scale if view_scale > 0 else 10
@@ -2177,7 +2266,9 @@ class MapCanvas(QGraphicsView):
         font = QFont("Arial", 8)
         font.setBold(True)
         text.setFont(font)
-        text.setScale(1 / view_scale if view_scale > 0 else 1)
+        # Ignore the view transform so the label stays upright and a constant
+        # on-screen size even when the view is rotated (image-up cycle mode).
+        text.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
         text.setPos(x + marker_size / 2, -y - marker_size / 2)
         text.setZValue(self._get_label_z_base() + 1)
 
@@ -2208,7 +2299,7 @@ class MapCanvas(QGraphicsView):
 
     def update_label_markers_scale(self):
         """Update label marker sizes based on current zoom level."""
-        view_scale = self.transform().m11()
+        view_scale = self._view_scale()
         if view_scale <= 0:
             return
 
@@ -2224,8 +2315,8 @@ class MapCanvas(QGraphicsView):
             pen.setWidthF(marker_size / 5)
             ellipse.setPen(pen)
 
-            # Update text scale and position
-            text.setScale(1 / view_scale)
+            # Text ignores the view transform (constant size / upright), so it
+            # only needs repositioning as the marker size changes.
             pos = ellipse.pos()
             text.setPos(pos.x() + marker_size / 2, pos.y() - marker_size / 2)
 
@@ -2458,7 +2549,7 @@ class MapCanvas(QGraphicsView):
         self._link_source_label_id = None
 
         # Restore cursor based on mode
-        if self._mode in (CanvasMode.LABEL, CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
+        if self._mode in LABELING_MODES:
             self.setCursor(Qt.CrossCursor)
         else:
             self.setCursor(Qt.ArrowCursor)
@@ -2617,8 +2708,7 @@ class MapCanvas(QGraphicsView):
         self._measure_length_m = None
 
         # Restore the cursor for the underlying interaction mode.
-        if self._mode in (CanvasMode.LABEL, CanvasMode.CYCLE,
-                          CanvasMode.VIEW_CYCLE):
+        if self._mode in LABELING_MODES:
             self.setCursor(Qt.CrossCursor)
         elif self._mode == CanvasMode.PAN:
             self.setCursor(Qt.OpenHandCursor)
@@ -2698,7 +2788,7 @@ class MapCanvas(QGraphicsView):
         if self._ruler_text is None:
             return
         self._ruler_text.setPlainText(text)
-        view_scale = self.transform().m11()
+        view_scale = self._view_scale()
         if view_scale > 0:
             self._ruler_text.setScale(1.0 / view_scale)
             offset = 12.0 / view_scale
@@ -2710,7 +2800,7 @@ class MapCanvas(QGraphicsView):
         """Keep the ruler readout a constant on-screen size after a zoom."""
         if self._ruler_text is None:
             return
-        view_scale = self.transform().m11()
+        view_scale = self._view_scale()
         if view_scale > 0:
             self._ruler_text.setScale(1.0 / view_scale)
 

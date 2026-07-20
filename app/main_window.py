@@ -30,7 +30,8 @@ from PyQt5.QtWidgets import (
     QInputDialog)
 
 from .axis_ruler import MapCanvasWithAxes
-from .canvas import MapCanvas, CanvasMode, AsyncFileLoaderThread, TiledLayer
+from .canvas import (MapCanvas, CanvasMode, CYCLE_MODES,
+                     AsyncFileLoaderThread, TiledLayer)
 from .class_editor import ClassEditorDialog
 from .labels import LabelProject, ImageData, haversine_distance
 from .layer_panel import CombinedLayerPanel
@@ -511,6 +512,15 @@ class MainWindow(QMainWindow):
             lambda: self._set_mode(CanvasMode.VIEW_CYCLE))
         toolbar.addAction(self.view_cycle_action)
 
+        self.image_cycle_action = QAction("Image Cycle", self)
+        self.image_cycle_action.setCheckable(True)
+        self.image_cycle_action.setShortcut("I")
+        self.image_cycle_action.setToolTip(
+            "Cycle images with the view rotated to each image's own orientation")
+        self.image_cycle_action.triggered.connect(
+            lambda: self._set_mode(CanvasMode.IMAGE_CYCLE))
+        toolbar.addAction(self.image_cycle_action)
+
         self.ruler_action = QAction("Ruler", self)
         self.ruler_action.setCheckable(True)
         self.ruler_action.setShortcut("R")
@@ -533,7 +543,7 @@ class MainWindow(QMainWindow):
         Captures Space key when in cycle mode regardless of which widget has focus.
         Keys 1-9 switch to the corresponding class (first 9 classes).
         """
-        if event.key() == Qt.Key_Space and self.canvas._mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
+        if event.key() == Qt.Key_Space and self.canvas._mode in CYCLE_MODES:
             # Handle space in cycle mode globally
             self._cycle_to_next_layer()
             event.accept()
@@ -556,7 +566,7 @@ class MainWindow(QMainWindow):
         the tree from toggling checkboxes.
         """
         if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Space:
-            if self.canvas._mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
+            if self.canvas._mode in CYCLE_MODES:
                 # Handle space in cycle mode - don't let tree process it
                 self._cycle_to_next_layer()
                 return True  # Event consumed
@@ -570,17 +580,36 @@ class MainWindow(QMainWindow):
         self.cycle_action.setChecked(mode == CanvasMode.CYCLE)
         self.view_cycle_action.setChecked(mode == CanvasMode.VIEW_CYCLE)
         self.ruler_action.setChecked(mode == CanvasMode.RULER)
+        self.image_cycle_action.setChecked(mode == CanvasMode.IMAGE_CYCLE)
+
+        # Leaving image-up mode restores the normal north-up view.
+        if mode != CanvasMode.IMAGE_CYCLE:
+            self.canvas.set_view_rotation(0.0)
 
         # Handle cycle mode entry
         if mode == CanvasMode.CYCLE:
             self._start_cycle_mode()
         elif mode == CanvasMode.VIEW_CYCLE:
             self._start_view_cycle_mode()
+        elif mode == CanvasMode.IMAGE_CYCLE:
+            self._start_cycle_mode()
         else:
             # Clear cycle state when leaving cycle mode
             self._cycle_layers = []
             self._cycle_index = -1
             self.group_label.setText("")
+
+    def _cycle_zoom_to(self, layer_id: str):
+        """Zoom to a cycled layer, honouring image-up mode.
+
+        In IMAGE_CYCLE the view is rotated onto the layer's own pixel grid so
+        the image shows in its native orientation and everything else (other
+        images, labels) is carried along by the same view transform.
+        """
+        if self.canvas._mode == CanvasMode.IMAGE_CYCLE:
+            self.canvas.zoom_to_layer_image_up(layer_id)
+        else:
+            self.canvas.zoom_to_layer(layer_id)
 
     def _layer_name(self, layer_id: str) -> str:
         """Return a layer's display name for logging (falls back to its id)."""
@@ -606,7 +635,7 @@ class MainWindow(QMainWindow):
         self._cycle_index = len(self._cycle_layers) - 1
         layer_id = self._cycle_layers[self._cycle_index]
         self.layer_panel.check_layers([layer_id])
-        self.canvas.zoom_to_layer(layer_id)
+        self._cycle_zoom_to(layer_id)
         count = len(self._cycle_layers)
         debug(f"cycle start: group '{group_name}' - {count} images; "
               f"at {self._layer_name(layer_id)} [{self._cycle_index + 1}/{count}]")
@@ -636,7 +665,7 @@ class MainWindow(QMainWindow):
         self._cycle_index = len(self._cycle_layers) - 1
         layer_id = self._cycle_layers[self._cycle_index]
         self.layer_panel.check_layers([layer_id])
-        self.canvas.zoom_to_layer(layer_id)
+        self._cycle_zoom_to(layer_id)
         count = len(self._cycle_layers)
         debug(f"view cycle start: {count} images in view; "
               f"at {self._layer_name(layer_id)} [{self._cycle_index + 1}/{count}]")
@@ -677,7 +706,7 @@ class MainWindow(QMainWindow):
         # Turn on and zoom to next layer
         next_layer_id = self._cycle_layers[self._cycle_index]
         self.layer_panel.check_layers([next_layer_id])
-        self.canvas.zoom_to_layer(next_layer_id)
+        self._cycle_zoom_to(next_layer_id)
         count = len(self._cycle_layers)
         debug(f"cycle next: {self._layer_name(next_layer_id)} "
               f"[{self._cycle_index + 1}/{count}, {self._cycle_index} remaining]")
@@ -713,7 +742,7 @@ class MainWindow(QMainWindow):
         # Turn on and zoom to previous layer
         prev_layer_id = self._cycle_layers[self._cycle_index]
         self.layer_panel.check_layers([prev_layer_id])
-        self.canvas.zoom_to_layer(prev_layer_id)
+        self._cycle_zoom_to(prev_layer_id)
         count = len(self._cycle_layers)
         debug(f"cycle prev: {self._layer_name(prev_layer_id)} "
               f"[{self._cycle_index + 1}/{count}, {self._cycle_index} remaining]")
