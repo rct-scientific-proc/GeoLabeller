@@ -874,170 +874,6 @@ class AsyncFileLoaderThread(QThread):
         self._loader.process()
 
 
-class ScaleBarWidget(QWidget):
-    """Overlay widget showing a distance scale bar."""
-
-    # Nice round numbers for scale bar distances (in meters)
-    NICE_DISTANCES = [
-        1, 2, 5, 10, 20, 50, 100, 200, 500,
-        1000, 2000, 5000, 10000, 20000, 50000, 100000,
-        200000, 500000, 1000000
-    ]
-
-    def __init__(self, parent=None, orientation=Qt.Horizontal):
-        """Initialize the scale bar's orientation, size and default scale state."""
-        super().__init__(parent)
-        self._orientation = orientation
-        self._distance_meters = 100  # Current scale bar distance
-        self._bar_width_pixels = 100  # Current bar extent in pixels
-        self._meters_per_pixel = 0.0  # Ground metres per view pixel
-        if orientation == Qt.Horizontal:
-            self.setFixedSize(160, 54)
-        else:
-            self.setFixedSize(120, 170)
-        # Don't intercept mouse events
-        self.setAttribute(Qt.WA_TransparentForMouseEvents)
-
-    def set_scale(self, meters_per_pixel: float):
-        """Update the scale bar based on meters per pixel."""
-        if meters_per_pixel <= 0:
-            return
-
-        self._meters_per_pixel = meters_per_pixel
-
-        # Target bar width: 80-120 pixels
-        target_width = 100
-        target_meters = target_width * meters_per_pixel
-
-        # Find the best nice distance
-        best_distance = self.NICE_DISTANCES[0]
-        for d in self.NICE_DISTANCES:
-            if d <= target_meters * 1.5:
-                best_distance = d
-            else:
-                break
-
-        self._distance_meters = best_distance
-        self._bar_width_pixels = int(best_distance / meters_per_pixel)
-        self._bar_width_pixels = max(
-            30, min(140, self._bar_width_pixels))  # Clamp width
-        self.update()
-
-    def _format_mpp(self, mpp: float) -> str:
-        """Format ground resolution (metres per view pixel)."""
-        if mpp <= 0:
-            return "-- m/px"
-        if mpp >= 100:
-            return f"{mpp:.0f} m/px"
-        if mpp >= 1:
-            return f"{mpp:.2f} m/px"
-        if mpp >= 0.001:
-            return f"{mpp:.3f} m/px"
-        return f"{mpp:.2e} m/px"
-
-    def _format_distance(self, meters: float) -> str:
-        """Format distance with appropriate units."""
-        if meters >= 1000:
-            km = meters / 1000
-            if km == int(km):
-                return f"{int(km)} km"
-            return f"{km:.1f} km"
-        else:
-            if meters == int(meters):
-                return f"{int(meters)} m"
-            return f"{meters:.1f} m"
-
-    def paintEvent(self, event):
-        """Draw the scale bar."""
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        # Semi-transparent background
-        painter.setBrush(QColor(255, 255, 255, 200))
-        painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(0, 0, self.width(), self.height(), 5, 5)
-
-        if self._orientation == Qt.Horizontal:
-            self._paint_horizontal(painter)
-        else:
-            self._paint_vertical(painter)
-
-        painter.end()
-
-    def _paint_horizontal(self, painter):
-        """Draw the horizontal scale bar with distance above and m/px below."""
-        # Draw scale bar
-        bar_height = 6
-        bar_y = 22
-        bar_x = 10
-
-        painter.setPen(QPen(QColor(0, 0, 0), 2))
-        painter.setBrush(QColor(0, 0, 0))
-
-        # Main bar
-        painter.drawRect(bar_x, bar_y, self._bar_width_pixels, bar_height)
-
-        # End caps (vertical lines)
-        painter.drawLine(bar_x, bar_y - 2, bar_x, bar_y + bar_height + 2)
-        painter.drawLine(
-            bar_x + self._bar_width_pixels,
-            bar_y - 2,
-            bar_x + self._bar_width_pixels,
-            bar_y + bar_height + 2)
-
-        # Draw distance text (above the bar)
-        painter.setPen(QColor(0, 0, 0))
-        font = QFont("Arial", 10, QFont.Bold)
-        painter.setFont(font)
-        text = self._format_distance(self._distance_meters)
-        painter.drawText(bar_x, 2, self._bar_width_pixels + 30, 16,
-                         Qt.AlignLeft | Qt.AlignVCenter, text)
-
-        # Draw ground resolution (metres per view pixel) below the bar
-        res_font = QFont("Arial", 8)
-        painter.setFont(res_font)
-        painter.drawText(bar_x, bar_y + bar_height + 2,
-                         self.width() - bar_x - 4, 16,
-                         Qt.AlignLeft | Qt.AlignVCenter,
-                         self._format_mpp(self._meters_per_pixel))
-
-    def _paint_vertical(self, painter):
-        """Draw the vertical scale bar with distance and m/px beside it."""
-        bar_width = 6
-        bar_x = 12
-        bar_top = 12
-        length = self._bar_width_pixels
-
-        painter.setPen(QPen(QColor(0, 0, 0), 2))
-        painter.setBrush(QColor(0, 0, 0))
-
-        # Main bar (vertical)
-        painter.drawRect(bar_x, bar_top, bar_width, length)
-
-        # End caps (horizontal lines)
-        painter.drawLine(bar_x - 2, bar_top, bar_x + bar_width + 2, bar_top)
-        painter.drawLine(bar_x - 2, bar_top + length,
-                         bar_x + bar_width + 2, bar_top + length)
-
-        # Distance and resolution text to the right, centred on the bar
-        text_x = bar_x + bar_width + 8
-        text_w = self.width() - text_x - 4
-        center_y = bar_top + length / 2
-
-        painter.setPen(QColor(0, 0, 0))
-        font = QFont("Arial", 10, QFont.Bold)
-        painter.setFont(font)
-        painter.drawText(text_x, int(center_y) - 16, text_w, 16,
-                         Qt.AlignLeft | Qt.AlignVCenter,
-                         self._format_distance(self._distance_meters))
-
-        res_font = QFont("Arial", 8)
-        painter.setFont(res_font)
-        painter.drawText(text_x, int(center_y), text_w, 16,
-                         Qt.AlignLeft | Qt.AlignVCenter,
-                         self._format_mpp(self._meters_per_pixel))
-
-
 class ThrobberWidget(QWidget):
     """A small self-contained spinner overlay shown while imagery is loading.
 
@@ -1324,15 +1160,6 @@ class MapCanvas(QGraphicsView):
         self._pending_coords: tuple | None = None
         self._last_emitted_coords: tuple | None = None
 
-        # Scale bar overlay widget
-        self._scale_bar = ScaleBarWidget(self)
-        self._scale_bar.move(10, 10)  # Will be repositioned in resizeEvent
-
-        # Vertical scale bar (vertical distance + m/px), shown below the
-        # horizontal one.
-        self._scale_bar_v = ScaleBarWidget(self, orientation=Qt.Vertical)
-        self._scale_bar_v.move(10, 74)  # Will be repositioned in resizeEvent
-
         # Background loader for expensive (fine) overview levels. `_level_load_
         # signals` keeps the per-job signal objects alive until they deliver.
         self._level_load_pool = QThreadPool(self)
@@ -1381,7 +1208,6 @@ class MapCanvas(QGraphicsView):
                 west, south, east, north = layer.bounds
                 rect = QRectF(west, -north, east - west, north - south)
                 self.fitInView(rect, Qt.KeepAspectRatio)
-                self._update_scale_bar()
 
             return layer_id
 
@@ -1868,7 +1694,6 @@ class MapCanvas(QGraphicsView):
         rect = QRectF(west, -north, east - west, north - south)
         self.fitInView(rect, Qt.KeepAspectRatio)
         self._schedule_tile_update()
-        self._update_scale_bar()
 
     def zoom_to_point(self, lon: float, lat: float, size_meters: float = 10.0):
         """Zoom the view to center on a point with a given extent in meters.
@@ -1895,7 +1720,6 @@ class MapCanvas(QGraphicsView):
         self.fitInView(rect, Qt.KeepAspectRatio)
         self._schedule_tile_update()
         self.update_label_markers_scale()
-        self._update_scale_bar()
 
     def wheelEvent(self, event: QWheelEvent):
         """Zoom in/out with mouse wheel, centered on mouse position."""
@@ -1934,7 +1758,6 @@ class MapCanvas(QGraphicsView):
 
         self._schedule_tile_update()
         self.update_label_markers_scale()
-        self._update_scale_bar()
 
     def scrollContentsBy(self, dx: int, dy: int):
         """Called when view is scrolled (panned)."""
@@ -1945,31 +1768,6 @@ class MapCanvas(QGraphicsView):
         """Called when view is resized."""
         super().resizeEvent(event)
         self._schedule_tile_update()
-        self._position_scale_bar()
-        self._update_scale_bar()
-
-    def _position_scale_bar(self):
-        """Position the scale bar in the top-right corner."""
-        margin = 10
-        x = self.viewport().width() - self._scale_bar.width() - margin
-        y = margin
-        self._scale_bar.move(x, y)
-
-        # Vertical scale bar directly below the horizontal one, right-aligned.
-        vx = self.viewport().width() - self._scale_bar_v.width() - margin
-        vy = y + self._scale_bar.height() + margin
-        self._scale_bar_v.move(vx, vy)
-
-    def _update_scale_bar(self):
-        """Update scale bars based on current zoom level."""
-        # In Web Mercator, scene units are meters. m11()/m22() give the
-        # horizontal/vertical scale factors (view pixels per scene unit), so the
-        # inverse is meters per pixel along each axis.
-        transform = self.transform()
-        if transform.m11() != 0:
-            self._scale_bar.set_scale(1.0 / abs(transform.m11()))
-        if transform.m22() != 0:
-            self._scale_bar_v.set_scale(1.0 / abs(transform.m22()))
 
     def set_mode(self, mode: CanvasMode):
         """Set the canvas interaction mode."""
