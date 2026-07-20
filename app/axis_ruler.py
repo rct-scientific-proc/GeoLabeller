@@ -5,6 +5,30 @@ from PyQt5.QtGui import QPainter, QPen, QFont, QFontMetrics
 from PyQt5.QtCore import Qt
 
 
+def _nice_interval(range_val: float) -> float:
+    """Return a rounded tick interval (1/2/5 x 10^n) covering a range.
+
+    Targets roughly 5-10 ticks across the range.
+    """
+    if range_val <= 0:
+        return 1
+
+    rough_interval = range_val / 7
+    magnitude = math.pow(10, math.floor(math.log10(rough_interval)))
+    normalized = rough_interval / magnitude
+
+    if normalized < 1.5:
+        nice = 1
+    elif normalized < 3:
+        nice = 2
+    elif normalized < 7:
+        nice = 5
+    else:
+        nice = 10
+
+    return nice * magnitude
+
+
 class AxisRuler(QWidget):
     """A ruler widget that displays coordinate tick marks."""
 
@@ -195,26 +219,7 @@ class AxisRuler(QWidget):
 
     def _nice_interval(self, range_val: float) -> float:
         """Calculate a nice tick interval for the given range."""
-        if range_val <= 0:
-            return 1
-
-        # Target roughly 5-10 ticks
-        rough_interval = range_val / 7
-
-        # Round to a nice number
-        magnitude = math.pow(10, math.floor(math.log10(rough_interval)))
-        normalized = rough_interval / magnitude
-
-        if normalized < 1.5:
-            nice = 1
-        elif normalized < 3:
-            nice = 2
-        elif normalized < 7:
-            nice = 5
-        else:
-            nice = 10
-
-        return nice * magnitude
+        return _nice_interval(range_val)
 
     def _format_lon(self, lon: float) -> str:
         """Format longitude for display."""
@@ -231,6 +236,110 @@ class AxisRuler(QWidget):
             return f"{-lat:.6f}°S"
 
 
+class MeterRuler(QWidget):
+    """Ruler showing ground distance in metres across the visible canvas.
+
+    The origin (0) is the canvas viewport's top-left corner; values increase to
+    the right (horizontal ruler) and downward (vertical ruler), so the pair
+    reads out how large the visible canvas is on the ground. Unlike the lat/lon
+    rulers these values don't move with panning - they always measure the
+    current view extent.
+    """
+
+    RULER_SIZE = 26  # Width/height of the ruler in pixels
+
+    def __init__(self, orientation: Qt.Orientation, canvas):
+        """Initialize the metre ruler for the given orientation and canvas."""
+        super().__init__()
+        self.orientation = orientation
+        self.canvas = canvas
+
+        if orientation == Qt.Horizontal:
+            self.setFixedHeight(self.RULER_SIZE)
+            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        else:
+            self.setFixedWidth(self.RULER_SIZE)
+            self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+
+        self.setFont(QFont("Arial", 7))
+
+    def paintEvent(self, event):
+        """Draw the metre ruler with tick marks and labels."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), Qt.white)
+
+        pen = QPen(Qt.darkGray)
+        pen.setWidth(1)
+        painter.setPen(pen)
+        if self.orientation == Qt.Horizontal:
+            painter.drawLine(0, self.height() - 1, self.width(),
+                             self.height() - 1)
+        else:
+            painter.drawLine(self.width() - 1, 0, self.width() - 1,
+                             self.height())
+
+        self._draw_ticks(painter)
+        painter.end()
+
+    def _draw_ticks(self, painter: QPainter):
+        """Draw metre tick marks measured from the canvas's top-left corner."""
+        # True ground metres per view pixel (cos-latitude corrected).
+        mpp = self.canvas.view_ground_resolution()
+        if mpp <= 0:
+            return
+
+        extent_px = (self.width() if self.orientation == Qt.Horizontal
+                     else self.height())
+        if extent_px <= 0:
+            return
+
+        total_m = extent_px * mpp
+        interval = _nice_interval(total_m)
+        if interval <= 0:
+            return
+
+        painter.setPen(QPen(Qt.black))
+        fm = QFontMetrics(self.font())
+
+        step = 0
+        while True:
+            meters = step * interval
+            pos = meters / mpp  # pixels from the origin edge
+            if pos > extent_px:
+                break
+            label = self._format_meters(meters)
+            label_w = fm.horizontalAdvance(label)
+
+            if self.orientation == Qt.Horizontal:
+                x = int(pos)
+                painter.drawLine(x, self.height() - 7, x, self.height() - 1)
+                # Keep the label inside the widget at both ends.
+                tx = max(0, min(int(x - label_w / 2), self.width() - label_w))
+                painter.drawText(tx, self.height() - 9, label)
+            else:
+                y = int(pos)
+                painter.drawLine(self.width() - 7, y, self.width() - 1, y)
+                painter.save()
+                painter.translate(self.width() - 9,
+                                  min(y + label_w / 2, self.height()))
+                painter.rotate(-90)
+                painter.drawText(0, 0, label)
+                painter.restore()
+            step += 1
+
+    @staticmethod
+    def _format_meters(meters: float) -> str:
+        """Format a distance in metres compactly (m below 1 km, else km)."""
+        if meters == 0:
+            return "0"
+        if meters >= 1000:
+            return f"{meters / 1000:g} km"
+        if meters >= 1:
+            return f"{meters:g} m"
+        return f"{meters:.2f} m"
+
+
 class MapCanvasWithAxes(QWidget):
     """Widget that combines MapCanvas with axis rulers."""
 
@@ -239,32 +348,49 @@ class MapCanvasWithAxes(QWidget):
         super().__init__()
         self.canvas = canvas
 
-        # Create rulers
+        # Create rulers: lat/lon next to the canvas, metres outside them.
         self.h_ruler = AxisRuler(Qt.Horizontal, canvas)
         self.v_ruler = AxisRuler(Qt.Vertical, canvas)
+        self.h_meter_ruler = MeterRuler(Qt.Horizontal, canvas)
+        self.v_meter_ruler = MeterRuler(Qt.Vertical, canvas)
 
-        # Corner widget (fills the corner between rulers)
-        corner = QWidget()
-        corner.setFixedSize(AxisRuler.RULER_SIZE, AxisRuler.RULER_SIZE)
-        corner.setStyleSheet("background-color: white;")
+        # Corner fillers must span both vertical rulers so the horizontal
+        # rulers stay aligned with the canvas.
+        left_width = MeterRuler.RULER_SIZE + AxisRuler.RULER_SIZE
+
+        def _corner(height):
+            """Build a blank white corner filler of the given height."""
+            w = QWidget()
+            w.setFixedSize(left_width, height)
+            w.setStyleSheet("background-color: white;")
+            return w
 
         # Layout
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Top row: corner + horizontal ruler
+        # Row 1: corner + horizontal metre ruler (outermost)
+        meter_row = QHBoxLayout()
+        meter_row.setContentsMargins(0, 0, 0, 0)
+        meter_row.setSpacing(0)
+        meter_row.addWidget(_corner(MeterRuler.RULER_SIZE))
+        meter_row.addWidget(self.h_meter_ruler)
+        main_layout.addLayout(meter_row)
+
+        # Row 2: corner + horizontal lat/lon ruler
         top_layout = QHBoxLayout()
         top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.setSpacing(0)
-        top_layout.addWidget(corner)
+        top_layout.addWidget(_corner(AxisRuler.RULER_SIZE))
         top_layout.addWidget(self.h_ruler)
         main_layout.addLayout(top_layout)
 
-        # Bottom row: vertical ruler + canvas
+        # Row 3: vertical metre ruler + vertical lat/lon ruler + canvas
         bottom_layout = QHBoxLayout()
         bottom_layout.setContentsMargins(0, 0, 0, 0)
         bottom_layout.setSpacing(0)
+        bottom_layout.addWidget(self.v_meter_ruler)
         bottom_layout.addWidget(self.v_ruler)
         bottom_layout.addWidget(canvas)
         main_layout.addLayout(bottom_layout)
@@ -299,6 +425,8 @@ class MapCanvasWithAxes(QWidget):
         self.canvas.resizeEvent = resize_wrapper
 
     def _update_rulers(self):
-        """Update both rulers."""
+        """Repaint the lat/lon and metre rulers."""
         self.h_ruler.update()
         self.v_ruler.update()
+        self.h_meter_ruler.update()
+        self.v_meter_ruler.update()
