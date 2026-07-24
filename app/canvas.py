@@ -1081,6 +1081,14 @@ class MapCanvas(QGraphicsView):
     # ignored so a stray double-click never records a bogus sub-metre value.
     _MIN_MEASURE_PIXELS = 4
 
+    # Don't zoom past a ~10 m-wide view.
+    _MIN_VIEW_SIZE = 10.0
+    # Hard cap on zoom: QGraphicsView maps the scene to int device pixels for
+    # its scrollbars/painting, so if the whole scene rect maps beyond ~2^31 px
+    # the viewport overflows - tiles vanish and the cursor glitches over the
+    # canvas. Keep the mapped scene extent safely under 2^31 (~2.15e9).
+    _MAX_SAFE_DEVICE_EXTENT = 1.6e9
+
     def __init__(self):
         """Set up the graphics scene, view interaction, mode/link/measure state,
         layer storage, overlays and background level-loading pool."""
@@ -1816,15 +1824,22 @@ class MapCanvas(QGraphicsView):
 
         factor = 1.15
         if event.angleDelta().y() > 0:
-            # Zooming in - check if we'd exceed the minimum view size (10m)
-            # Get current view bounds in scene coordinates (Web Mercator = meters)
+            # Two guards against zooming in too far:
+            #   * a minimum ~10 m view size, and
+            #   * a device-coordinate cap so the scene never maps beyond Qt's
+            #     int range (past that, scrollbars/painting overflow: tiles
+            #     disappear and the cursor glitches). mapRect() uses the full
+            #     view transform, so this stays correct when the view is
+            #     rotated (image-up cycle mode).
             view_rect = self.mapToScene(self.viewport().rect()).boundingRect()
             new_width = view_rect.width() / factor
             new_height = view_rect.height() / factor
-            MIN_VIEW_SIZE = 10.0  # meters
-            if new_width < MIN_VIEW_SIZE or new_height < MIN_VIEW_SIZE:
-                # Don't zoom in further
-                return
+            mapped = self.transform().mapRect(self.sceneRect())
+            next_device_extent = max(mapped.width(), mapped.height()) * factor
+            if (new_width < self._MIN_VIEW_SIZE
+                    or new_height < self._MIN_VIEW_SIZE
+                    or next_device_extent > self._MAX_SAFE_DEVICE_EXTENT):
+                return  # already at the safe maximum zoom
             self.scale(factor, factor)
         else:
             self.scale(1 / factor, 1 / factor)
