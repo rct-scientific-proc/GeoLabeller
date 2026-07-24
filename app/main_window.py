@@ -36,6 +36,7 @@ from .class_editor import ClassEditorDialog
 from .labels import LabelProject, ImageData, haversine_distance
 from .layer_panel import CombinedLayerPanel
 from .optimize_export import OptimizeExportDialog, OptimizeWorker, plan_output_path
+from .h5_export import H5ExportDialog, H5ExportWorker, HARD_NEGATIVE
 from .debug_log import debug, debug_log, DebugConsole
 
 
@@ -229,6 +230,12 @@ class MainWindow(QMainWindow):
         self._optimize_worker: OptimizeWorker | None = None
         self._optimize_dialog = None
         self._optimize_total = 0
+
+        # HDF5-dataset export worker state.
+        self._h5_thread: QThread | None = None
+        self._h5_worker: H5ExportWorker | None = None
+        self._h5_dialog = None
+        self._h5_total = 0
 
 
         self._setup_ui()
@@ -429,6 +436,11 @@ class MainWindow(QMainWindow):
         export_optimized_action = QAction("&Optimized GeoTIFFs...", self)
         export_optimized_action.triggered.connect(self._export_optimized)
         export_menu.addAction(export_optimized_action)
+
+        # Export HDF5 Dataset (CNN training snippets)
+        export_h5_action = QAction("&HDF5 Dataset...", self)
+        export_h5_action.triggered.connect(self._export_h5)
+        export_menu.addAction(export_h5_action)
 
         # Options menu
         options_menu = menubar.addMenu("&Options")
@@ -1757,6 +1769,105 @@ class MainWindow(QMainWindow):
         self._optimize_thread = None
         self._optimize_worker = None
         self._optimize_dialog = None
+
+    def _export_h5(self):
+        """Export sliding-window snippets to the HDF5 CNN dataset format."""
+        infos = self.canvas.get_layer_infos()
+        if not infos:
+            QMessageBox.information(
+                self, "HDF5 Export", "No layers are loaded to export.")
+            return
+
+        all_count = len(infos)
+        visible_count = sum(1 for i in infos if i.get("visible"))
+        dialog = H5ExportDialog(all_count, visible_count, self)
+        if not dialog.exec_():
+            return
+
+        out_path = dialog.output_path()
+        visible_only = dialog.scope_visible_only()
+        images = []
+        for info in infos:
+            if visible_only and not info.get("visible"):
+                continue
+            path = info["file_path"]
+            img = self.project.images.get(path)
+            images.append((path, img.labels if img else []))
+        if not images:
+            QMessageBox.information(
+                self, "HDF5 Export", "No images in the selected scope.")
+            return
+
+        options = dialog.options()
+        options["classes"] = list(self.project.classes) + [HARD_NEGATIVE]
+        self._start_h5_worker(out_path, images, options)
+
+    def _start_h5_worker(self, out_path, images, options):
+        """Run the HDF5 export off the UI thread with a progress dialog."""
+        total = len(images)
+        dlg = QProgressDialog("Preparing HDF5 export...", "Cancel", 0, total, self)
+        dlg.setWindowTitle("Exporting HDF5 Dataset")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+
+        thread = QThread(self)
+        worker = H5ExportWorker(out_path, images, options)
+        worker.moveToThread(thread)
+
+        self._h5_thread = thread
+        self._h5_worker = worker
+        self._h5_dialog = dlg
+        self._h5_total = total
+
+        worker.progress.connect(self._on_h5_progress)
+        worker.finished.connect(self._on_h5_finished)
+        thread.started.connect(worker.process)
+        thread.finished.connect(self._on_h5_thread_finished)
+        dlg.canceled.connect(worker.cancel, Qt.DirectConnection)
+
+        thread.start()
+
+    def _on_h5_progress(self, index: int, total: int, samples: int):
+        """Update the HDF5 export progress dialog (runs on the main thread)."""
+        if self._h5_dialog is not None:
+            self._h5_dialog.setLabelText(
+                f"Image {index + 1}/{total}  ({samples:,} snippets so far)")
+            self._h5_dialog.setValue(index)
+
+    def _on_h5_finished(self, result, error: str):
+        """Report the HDF5 export result and stop the worker (main thread)."""
+        if self._h5_dialog is not None:
+            self._h5_dialog.setValue(self._h5_total)
+        if self._h5_thread is not None:
+            self._h5_thread.quit()
+
+        if error:
+            QMessageBox.warning(
+                self, "HDF5 Export", f"Export failed:\n\n{error}")
+            return
+
+        if not result:
+            return
+        msg = f"Wrote {result['total']:,} samples to\n{result['path']}"
+        if result.get("cancelled"):
+            msg = "Export cancelled. " + msg
+        errors = result.get("errors") or []
+        if errors:
+            msg += (f"\n\n{len(errors)} image error(s):\n"
+                    + "\n".join(f"- {os.path.basename(p)}: {e}"
+                                for p, e in errors[:5]))
+            QMessageBox.warning(self, "HDF5 Export", msg)
+        else:
+            QMessageBox.information(self, "HDF5 Export", msg)
+        self.statusBar.showMessage(
+            f"HDF5 dataset: {result['total']:,} samples", 5000)
+
+    def _on_h5_thread_finished(self):
+        """Drop worker references after the thread ends (main thread)."""
+        self._h5_thread = None
+        self._h5_worker = None
+        self._h5_dialog = None
 
     @staticmethod
     def _ground_res_per_pixel(src, px: int, py: int) -> tuple[float, float]:

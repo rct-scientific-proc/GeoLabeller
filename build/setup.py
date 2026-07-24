@@ -65,6 +65,7 @@ build_exe_options = {
         "numpy",
         "PIL",
         "PyQt5",
+        "h5py",
     ],
 
     "packages": [
@@ -76,6 +77,7 @@ build_exe_options = {
         "pyproj",
         "numpy",
         "PIL",
+        "h5py",
         "affine",
         "json",
         "math",

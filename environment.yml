@@ -9,3 +9,4 @@ dependencies:
   - numpy
   - pillow
   - pyproj
+  - h5py

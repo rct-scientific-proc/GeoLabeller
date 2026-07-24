@@ -6,6 +6,7 @@ numpy==2.5.0
 pillow==12.3.0
 rasterio==1.5.0
 pyproj==3.7.2
+h5py==3.16.0
 # cx_Freeze 7.2+ is required for the MSI options used in setup.py
 # (install_icon, all_users, summary_data, ProgramFiles64Folder handling).
 cx_Freeze>=7.2,<9
