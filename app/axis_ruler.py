@@ -202,11 +202,11 @@ class AxisRuler(QWidget):
         R = 6378137.0
         x_mercator = R * math.radians(lon)
 
-        # Convert to scene coordinates
-        scene_x = x_mercator
+        # Convert Web Mercator to scene coordinates (honours the floating origin)
+        scene_pt = self.canvas._web_to_scene(x_mercator, 0.0)
 
         # Map scene to viewport
-        view_pos = self.canvas.mapFromScene(scene_x, 0)
+        view_pos = self.canvas.mapFromScene(scene_pt)
 
         # Account for ruler offset (canvas is offset by ruler width)
         return view_pos.x()
@@ -218,11 +218,12 @@ class AxisRuler(QWidget):
         lat_rad = math.radians(lat)
         y_mercator = R * math.log(math.tan(math.pi / 4 + lat_rad / 2))
 
-        # Convert to scene coordinates (Y is flipped)
-        scene_y = -y_mercator
+        # Convert Web Mercator to scene coordinates (honours the floating origin,
+        # which also handles the Y flip)
+        scene_pt = self.canvas._web_to_scene(0.0, y_mercator)
 
         # Map scene to viewport
-        view_pos = self.canvas.mapFromScene(0, scene_y)
+        view_pos = self.canvas.mapFromScene(scene_pt)
 
         return view_pos.y()
 

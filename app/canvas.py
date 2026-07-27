@@ -22,7 +22,7 @@ from PyQt5.QtGui import (
 from PyQt5.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
     QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem, QGraphicsTextItem,
-    QMenu, QWidget
+    QGraphicsRectItem, QMenu, QWidget
 )
 from pyproj import Transformer
 from rasterio.crs import CRS
@@ -1081,13 +1081,21 @@ class MapCanvas(QGraphicsView):
     # ignored so a stray double-click never records a bogus sub-metre value.
     _MIN_MEASURE_PIXELS = 4
 
-    # Don't zoom past a ~10 m-wide view.
-    _MIN_VIEW_SIZE = 10.0
-    # Hard cap on zoom: QGraphicsView maps the scene to int device pixels for
-    # its scrollbars/painting, so if the whole scene rect maps beyond ~2^31 px
-    # the viewport overflows - tiles vanish and the cursor glitches over the
-    # canvas. Keep the mapped scene extent safely under 2^31 (~2.15e9).
-    _MAX_SAFE_DEVICE_EXTENT = 1.6e9
+    # Don't zoom past a very small view; small enough for metre-scale objects.
+    _MIN_VIEW_SIZE = 0.5
+    # Rolling scene rect: QGraphicsView maps the scene rect to int device pixels
+    # for its scrollbars/painting, so a huge fixed scene rect overflows int at
+    # high zoom (tiles vanish, cursor glitches). Instead we keep the scene rect
+    # only a few viewports large (in scene units) and re-centre it on the view -
+    # its device extent then stays tiny, so the view can zoom in arbitrarily far.
+    _SCENE_RECT_MARGIN = 2.0          # viewports of padding around the view
+    _SCENE_RECT_DEVICE_TARGET = 5e8   # re-roll once the rect maps beyond this
+    # A small scene rect keeps the *size* bounded, but Web Mercator positions are
+    # huge (~2.5e7), so `position * scale` still overflows int at deep zoom even
+    # for a tiny rect far from the origin. The floating origin fixes this: when
+    # the view centre's scene coordinate maps beyond this many device pixels, we
+    # rebase the origin onto the view so scene coordinates return to near zero.
+    _REBASE_DEVICE_THRESHOLD = 3e8
 
     def __init__(self):
         """Set up the graphics scene, view interaction, mode/link/measure state,
@@ -1095,6 +1103,21 @@ class MapCanvas(QGraphicsView):
         super().__init__()
         self._scene = QGraphicsScene()
         self.setScene(self._scene)
+
+        # Floating origin. Web Mercator coordinates are huge (up to ~2.5e7), and
+        # QGraphicsView maps scene->device through int scrollbars, so at deep
+        # zoom `scene_coord * scale` overflows 2^31 - the view jumps and images
+        # vanish. To avoid this, all geo-anchored items (tiles, labels) are
+        # children of `_origin_group`, positioned in world coordinates but
+        # shifted by `-_origin`, so their *scene* coordinates stay small no
+        # matter where in the world we are. `_origin` is the world coordinate
+        # currently sitting at scene (0, 0); rebased as needed while zooming.
+        #   scene = world - _origin     world = scene + _origin
+        # (world here means Web Mercator with Y flipped: x = easting, y = -north)
+        self._origin = QPointF(0.0, 0.0)
+        self._origin_group = QGraphicsRectItem()
+        self._origin_group.setFlag(QGraphicsItem.ItemHasNoContents, True)
+        self._scene.addItem(self._origin_group)
 
         # Enable pan and zoom
         self.setDragMode(QGraphicsView.ScrollHandDrag)
@@ -1108,15 +1131,23 @@ class MapCanvas(QGraphicsView):
         # Extended to include pixel zone (non-georeferenced images placed at X > 25M)
         WEB_MERCATOR_MAX = 20037508.34  # meters (at 180° longitude)
         SCENE_MAX = 30_000_000  # Enough to include pixel zone
-        self.setSceneRect(
-            -WEB_MERCATOR_MAX * 1.1,  # left (west)
-            -SCENE_MAX,               # top (remember Y is flipped: -north)
+        # The full pannable world (Web Mercator + pixel zone). The scene rect is
+        # rolled to a small window around the view for zoom (see
+        # _refresh_scene_rect), but panning is always clamped to this whole
+        # extent so you can move freely well beyond the loaded imagery.
+        self._world_rect_base = QRectF(
+            -WEB_MERCATOR_MAX * 1.1,             # left (west)
+            -SCENE_MAX,                          # top (Y is flipped: -north)
             WEB_MERCATOR_MAX * 1.1 + SCENE_MAX,  # width (extends into pixel zone)
-            SCENE_MAX * 2             # height
-        )
+            SCENE_MAX * 2)                       # height
+        self.setSceneRect(self._world_rect_base)
 
         # Canvas mode
         self._mode = CanvasMode.PAN
+
+        # Guard against re-entrancy while rolling the scene rect (setSceneRect
+        # can itself trigger scrollContentsBy).
+        self._suppress_scene_rect = False
 
         # Current absolute view rotation in degrees (0 = north-up). Non-zero in
         # image-up cycle mode, where the view is rotated onto an image's grid.
@@ -1232,7 +1263,10 @@ class MapCanvas(QGraphicsView):
             # Fit view on first layer
             if len(self._layers) == 1:
                 west, south, east, north = layer.bounds
-                rect = QRectF(west, -north, east - west, north - south)
+                self._reset_origin_group(
+                    QPointF((west + east) / 2.0, -(south + north) / 2.0))
+                rect = self._world_rect_to_scene(
+                    QRectF(west, -north, east - west, north - south))
                 self.fitInView(rect, Qt.KeepAspectRatio)
 
             return layer_id
@@ -1313,11 +1347,32 @@ class MapCanvas(QGraphicsView):
         """Check if a scene X coordinate is in the pixel zone."""
         return easting >= PIXEL_ZONE_ORIGIN_X
 
+    def _scene_to_web(self, scene_pt: QPointF) -> tuple[float, float]:
+        """Convert a scene point to Web Mercator (easting, northing).
+
+        Accounts for the floating origin: world = scene + _origin, and scene Y
+        is -northing. See the _origin docstring in __init__.
+        """
+        return (scene_pt.x() + self._origin.x(),
+                -(scene_pt.y() + self._origin.y()))
+
+    def _web_to_scene(self, easting: float, northing: float) -> QPointF:
+        """Convert Web Mercator (easting, northing) to a scene point."""
+        return QPointF(easting - self._origin.x(),
+                       -northing - self._origin.y())
+
+    def _world_rect_to_scene(self, rect_world: QRectF) -> QRectF:
+        """Translate a rect expressed in world coords (x=easting, y=-north) into
+        scene coords by subtracting the floating origin."""
+        return rect_world.translated(-self._origin.x(), -self._origin.y())
+
     def _get_view_bounds(self) -> tuple[float, float, float, float]:
         """Get current view bounds in Web Mercator coordinates."""
         rect = self.mapToScene(self.viewport().rect()).boundingRect()
-        # Scene coords: X = easting, Y = -northing
-        return (rect.left(), -rect.bottom(), rect.right(), -rect.top())
+        # Scene coords -> world (easting, northing), honouring the floating origin.
+        west, north = self._scene_to_web(rect.topLeft())
+        east, south = self._scene_to_web(rect.bottomRight())
+        return (west, south, east, north)
 
     def _view_scale(self) -> float:
         """Return the view's uniform scale factor (view pixels per scene unit).
@@ -1355,7 +1410,7 @@ class MapCanvas(QGraphicsView):
 
         # View-centre latitude in WGS84 (scene Y is -northing in Web Mercator).
         rect = self.mapToScene(self.viewport().rect()).boundingRect()
-        center_northing = -rect.center().y()
+        _easting, center_northing = self._scene_to_web(rect.center())
         _lon, lat = self._web_mercator_to_wgs84(0.0, center_northing)
         return units_per_pixel * math.cos(math.radians(lat))
 
@@ -1415,7 +1470,9 @@ class MapCanvas(QGraphicsView):
             if pixmap is None:
                 continue
 
-            item = self._scene.addPixmap(pixmap)
+            # Parent to the floating-origin group so the tile's *scene*
+            # position stays small at deep zoom (setPos below is in world coords).
+            item = QGraphicsPixmapItem(pixmap, self._origin_group)
 
             # Standard axis-aligned scaling for GeoTIFF layers
             px_left, px_top, px_right, px_bottom, tile_west, tile_south, tile_east, tile_north = layer.get_tile_bounds(
@@ -1787,8 +1844,14 @@ class MapCanvas(QGraphicsView):
 
         bounds = self._layers[layer_id].bounds
         west, south, east, north = bounds
-        rect = QRectF(west, -north, east - west, north - south)
+        # Rebase the floating origin onto the layer so its scene coords are near
+        # zero (allows zooming in arbitrarily far afterwards without overflow).
+        self._reset_origin_group(
+            QPointF((west + east) / 2.0, -(south + north) / 2.0))
+        rect = self._world_rect_to_scene(
+            QRectF(west, -north, east - west, north - south))
         self.fitInView(rect, Qt.KeepAspectRatio)
+        self._refresh_scene_rect()
         self._schedule_tile_update()
 
     def zoom_to_point(self, lon: float, lat: float, size_meters: float = 10.0):
@@ -1811,69 +1874,205 @@ class MapCanvas(QGraphicsView):
         south = center_y - half_size
         north = center_y + half_size
 
-        # Create rect (Y is flipped in scene coordinates)
-        rect = QRectF(west, -north, east - west, north - south)
+        # Rebase the floating origin onto the point so scene coords stay small.
+        self._reset_origin_group(QPointF(center_x, -center_y))
+        # Create rect in world coords (Y flipped), then shift to scene coords.
+        rect = self._world_rect_to_scene(
+            QRectF(west, -north, east - west, north - south))
         self.fitInView(rect, Qt.KeepAspectRatio)
+        self._refresh_scene_rect()
         self._schedule_tile_update()
         self.update_label_markers_scale()
 
     def wheelEvent(self, event: QWheelEvent):
-        """Zoom in/out with mouse wheel, centered on mouse position."""
-        # Get the scene position under the mouse before scaling
-        old_pos = self.mapToScene(event.pos())
+        """Zoom in/out with the mouse wheel, centred on the cursor.
 
+        Zoom depth is only limited by a tiny minimum view size (metre-scale is
+        fine); overflow is avoided by the rolling scene rect below rather than a
+        zoom cap.
+
+        The point under the cursor is kept fixed by manual anchoring based on
+        event.pos() (NOT Qt's AnchorUnderMouse, which reads the OS cursor and
+        misbehaves with our rolling scene rect): record the scene point under
+        the cursor, scale about nothing, then re-centre so that same point lands
+        back under the cursor. The floating origin keeps scene coordinates small,
+        so centerOn never clamps and this stays accurate at any zoom. Done in
+        scene coordinates, so it is unaffected by view rotation.
+        """
         factor = 1.15
         if event.angleDelta().y() > 0:
-            # Two guards against zooming in too far:
-            #   * a minimum ~10 m view size, and
-            #   * a device-coordinate cap so the scene never maps beyond Qt's
-            #     int range (past that, scrollbars/painting overflow: tiles
-            #     disappear and the cursor glitches). mapRect() uses the full
-            #     view transform, so this stays correct when the view is
-            #     rotated (image-up cycle mode).
             view_rect = self.mapToScene(self.viewport().rect()).boundingRect()
-            new_width = view_rect.width() / factor
-            new_height = view_rect.height() / factor
-            mapped = self.transform().mapRect(self.sceneRect())
-            next_device_extent = max(mapped.width(), mapped.height()) * factor
-            if (new_width < self._MIN_VIEW_SIZE
-                    or new_height < self._MIN_VIEW_SIZE
-                    or next_device_extent > self._MAX_SAFE_DEVICE_EXTENT):
-                return  # already at the safe maximum zoom
-            self.scale(factor, factor)
+            if (view_rect.width() / factor < self._MIN_VIEW_SIZE
+                    or view_rect.height() / factor < self._MIN_VIEW_SIZE):
+                return  # at the minimum view size
+            zoom = factor
         else:
-            self.scale(1 / factor, 1 / factor)
+            zoom = 1 / factor
 
-        # Get the new scene position under the mouse after scaling
-        new_pos = self.mapToScene(event.pos())
+        # Scene point under the cursor before zooming.
+        anchor_scene = self.mapToScene(event.pos())
+        # Scale + anchor correction with the scene-rect roll suppressed so it
+        # can't re-enter (via scrollContentsBy) mid-correction.
+        self._suppress_scene_rect = True
+        try:
+            prev_anchor = self.transformationAnchor()
+            self.setTransformationAnchor(QGraphicsView.NoAnchor)
+            self.scale(zoom, zoom)
+            self.setTransformationAnchor(prev_anchor)
+            # Shift the view so the same scene point sits back under the cursor.
+            # centerOn(P) maps the cursor to P + K (K constant at this scale);
+            # currently it maps to anchor + drift, so target P = center - drift.
+            drift = self.mapToScene(event.pos()) - anchor_scene
+            if not drift.isNull():
+                center = self.mapToScene(self.viewport().rect().center())
+                self.centerOn(center - drift)
+        finally:
+            self._suppress_scene_rect = False
 
-        # Adjust scrollbars to keep the point under the mouse fixed
-        # Clamp values to prevent integer overflow when zoomed in extremely far
-        delta = old_pos - new_pos
-        INT_MAX = 2**31 - 1
-        INT_MIN = -(2**31)
-        # Map the scene-space delta through the view transform's linear part so
-        # this stays correct when the view is rotated.
-        t = self.transform()
-        view_delta = t.map(delta) - t.map(QPointF(0.0, 0.0))
-        h_delta = view_delta.x()
-        v_delta = view_delta.y()
-        h_delta = max(INT_MIN, min(INT_MAX, h_delta))
-        v_delta = max(INT_MIN, min(INT_MAX, v_delta))
-        self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + int(h_delta))
-        self.verticalScrollBar().setValue(self.verticalScrollBar().value() + int(v_delta))
-
+        # Now roll the scene rect once (view-preserving) so deep zoom never
+        # overflows Qt's int coordinates without disturbing the anchor.
+        self._refresh_scene_rect()
         self._schedule_tile_update()
         self.update_label_markers_scale()
+
+    def _world_scene_rect(self) -> QRectF:
+        """Outer bound the pannable area is clamped to.
+
+        This is the full Web Mercator + pixel-zone extent (so you can pan
+        freely into empty space well beyond the loaded imagery, just like the
+        old fixed scene rect), expanded to include any loaded layers in case a
+        pixel-zone image was placed past the base extent.
+        """
+        rect = QRectF(self._world_rect_base)
+        for layer in self._layers.values():
+            if layer.bounds is None:
+                continue
+            west, south, east, north = layer.bounds
+            rect = rect.united(QRectF(west, -north, east - west, north - south))
+        # _world_rect_base and layer bounds are in world coords; the clamp is
+        # used in scene coords, so shift by the floating origin.
+        return self._world_rect_to_scene(rect)
+
+    def _reset_origin_group(self, world_pt: QPointF):
+        """Set the floating origin to `world_pt` without preserving the view.
+
+        Used before an explicit fitInView (zoom-to-layer/point), which sets the
+        view itself. `world_pt` is in world coords (x=easting, y=-northing).
+        """
+        self._origin = QPointF(world_pt)
+        self._origin_group.setPos(-world_pt.x(), -world_pt.y())
+
+    def _rebase_origin(self, world_pt: QPointF):
+        """Move the floating origin to `world_pt`, keeping the view on the same
+        world location. Keeps scene coordinates near zero so `coord * scale`
+        never overflows Qt's int device coordinates at deep zoom."""
+        vc_scene = self.mapToScene(self.viewport().rect().center())
+        vc_world = QPointF(vc_scene.x() + self._origin.x(),
+                           vc_scene.y() + self._origin.y())
+        view = self.mapToScene(self.viewport().rect()).boundingRect()
+        # How far the scene shifts under everything (the origin group moves by
+        # -delta; transient overlay items in raw scene coords must follow).
+        dx = world_pt.x() - self._origin.x()
+        dy = world_pt.y() - self._origin.y()
+        self._origin = QPointF(world_pt)
+        self._origin_group.setPos(-world_pt.x(), -world_pt.y())
+        for item in (self._ruler_line, self._ruler_text,
+                     self._measure_temp_line, self._measure_committed_line):
+            if item is not None:
+                item.moveBy(-dx, -dy)
+        new_center = QPointF(vc_world.x() - world_pt.x(),
+                             vc_world.y() - world_pt.y())
+        w = max(view.width(), 1e-9)
+        h = max(view.height(), 1e-9)
+        window = QRectF(new_center.x() - 3 * w, new_center.y() - 3 * h,
+                        6 * w, 6 * h)
+        self._suppress_scene_rect = True
+        try:
+            self.setSceneRect(window)
+            self.centerOn(new_center)
+        finally:
+            self._suppress_scene_rect = False
+
+    def _maybe_rebase_origin(self, scale: float):
+        """Rebase the floating origin onto the view if the view centre's scene
+        coordinate has wandered far enough that `coord * scale` risks overflow.
+        Skipped mid measure/ruler drag (their items live in raw scene coords)."""
+        if self._measure_active or self._ruler_dragging:
+            return
+        vc = self.mapToScene(self.viewport().rect().center())
+        if max(abs(vc.x()), abs(vc.y())) * scale > self._REBASE_DEVICE_THRESHOLD:
+            self._rebase_origin(QPointF(vc.x() + self._origin.x(),
+                                        vc.y() + self._origin.y()))
+
+    def _refresh_scene_rect(self):
+        """Roll the scene rect to a bounded window around the current view.
+
+        Only re-rolls when the view nears the current rect's edge or the rect
+        maps to too many device pixels (i.e. after zooming in), so ordinary
+        panning within the window is a no-op. Clamped to the full world extent
+        (Web Mercator + pixel zone) so you can still pan freely into empty
+        space around the imagery.
+        """
+        if self._suppress_scene_rect:
+            return
+        scale = self._view_scale()
+        if scale <= 0:
+            return
+        # Keep the view near the scene origin so scene_coord * scale stays within
+        # int range (prevents the deep-zoom overflow for far-from-origin data).
+        self._maybe_rebase_origin(scale)
+        view = self.mapToScene(self.viewport().rect()).boundingRect()
+        if view.width() <= 0 or view.height() <= 0:
+            return
+
+        cur = self.sceneRect()
+        # Comfortable if the view sits >1 viewport inside the rect and the rect
+        # still maps to a safe device extent.
+        inset = cur.adjusted(view.width(), view.height(),
+                             -view.width(), -view.height())
+        device_extent = max(cur.width(), cur.height()) * scale
+        if (inset.width() > 0 and inset.height() > 0 and inset.contains(view)
+                and device_extent <= self._SCENE_RECT_DEVICE_TARGET):
+            return
+
+        margin = self._SCENE_RECT_MARGIN
+        window = QRectF(
+            view.left() - margin * view.width(),
+            view.top() - margin * view.height(),
+            view.width() * (1 + 2 * margin),
+            view.height() * (1 + 2 * margin))
+        target = window
+        world = self._world_scene_rect()
+        if world is not None:
+            if world.width() <= window.width() and world.height() <= window.height():
+                target = world  # whole world fits: no rolling needed
+            else:
+                clipped = window.intersected(world)
+                if not clipped.isEmpty():
+                    target = clipped
+
+        # Changing the scene rect changes the scrollbar ranges, which otherwise
+        # shifts the view (the same scrollbar value maps to a new scene point).
+        # Re-centre on the current scene centre afterwards so rolling the rect
+        # never moves the view - callers rely on this to keep the cursor anchor.
+        view_center = self.mapToScene(self.viewport().rect().center())
+        self._suppress_scene_rect = True
+        try:
+            self.setSceneRect(target)
+            self.centerOn(view_center)
+        finally:
+            self._suppress_scene_rect = False
 
     def scrollContentsBy(self, dx: int, dy: int):
         """Called when view is scrolled (panned)."""
         super().scrollContentsBy(dx, dy)
+        self._refresh_scene_rect()
         self._schedule_tile_update()
 
     def resizeEvent(self, event):
         """Called when view is resized."""
         super().resizeEvent(event)
+        self._refresh_scene_rect()
         self._schedule_tile_update()
 
     def set_mode(self, mode: CanvasMode):
@@ -1962,8 +2161,7 @@ class MapCanvas(QGraphicsView):
                 return  # No class selected
 
             scene_pos = self.mapToScene(event.pos())
-            easting = scene_pos.x()
-            northing = -scene_pos.y()
+            easting, northing = self._scene_to_web(scene_pos)
 
             # Get image at this position and the layer object
             layer, layer_name, group_path = self._get_layer_and_info_at_position(
@@ -2068,8 +2266,7 @@ class MapCanvas(QGraphicsView):
             # Still update coordinates below
 
         scene_pos = self.mapToScene(event.pos())
-        easting = scene_pos.x()
-        northing = -scene_pos.y()
+        easting, northing = self._scene_to_web(scene_pos)
 
         if self.is_in_pixel_zone(easting):
             # In the pixel zone: find the layer and compute pixel coords
@@ -2287,8 +2484,10 @@ class MapCanvas(QGraphicsView):
         text.setPos(x + marker_size / 2, -y - marker_size / 2)
         text.setZValue(self._get_label_z_base() + 1)
 
-        self._scene.addItem(ellipse)
-        self._scene.addItem(text)
+        # Parent to the floating-origin group so scene coords stay small at
+        # deep zoom (positions above are in world coords).
+        ellipse.setParentItem(self._origin_group)
+        text.setParentItem(self._origin_group)
 
         self._label_items[label_id] = (ellipse, text)
 
@@ -2349,18 +2548,12 @@ class MapCanvas(QGraphicsView):
 
         # Check each label marker
         for label_id, (ellipse, text) in self._label_items.items():
-            # Get ellipse bounding rect in scene coordinates
-            item_pos = ellipse.pos()
-            rect = ellipse.boundingRect()
-            scene_rect = QRectF(
-                item_pos.x() + rect.x(),
-                item_pos.y() + rect.y(),
-                rect.width(),
-                rect.height()
-            )
+            # Bounding rect in scene coordinates (sceneBoundingRect accounts for
+            # the floating-origin parent transform).
+            scene_rect = ellipse.sceneBoundingRect()
 
             # Expand hit area slightly for easier clicking
-            hit_margin = rect.width() * 0.5
+            hit_margin = scene_rect.width() * 0.5
             scene_rect.adjust(-hit_margin, -hit_margin, hit_margin, hit_margin)
 
             if scene_rect.contains(scene_pos):
@@ -2702,10 +2895,10 @@ class MapCanvas(QGraphicsView):
         formula so the result is a true ground distance rather than the
         latitude-inflated planar Web Mercator distance.
         """
-        lon1, lat1 = self._web_mercator_to_wgs84(
-            start_scene.x(), -start_scene.y())
-        lon2, lat2 = self._web_mercator_to_wgs84(
-            end_scene.x(), -end_scene.y())
+        e1, n1 = self._scene_to_web(start_scene)
+        e2, n2 = self._scene_to_web(end_scene)
+        lon1, lat1 = self._web_mercator_to_wgs84(e1, n1)
+        lon2, lat2 = self._web_mercator_to_wgs84(e2, n2)
         return haversine_distance(lat1, lon1, lat2, lon2)
 
     def _exit_measure_mode(self):
@@ -2784,7 +2977,10 @@ class MapCanvas(QGraphicsView):
         non-georeferenced pixel zone has no real-world scale, so distance is
         reported in source pixels instead.
         """
-        if self.is_in_pixel_zone(start.x()):
+        start_easting = self._scene_to_web(start)[0]
+        if self.is_in_pixel_zone(start_easting):
+            # Coordinate differences are origin-invariant, so raw scene deltas
+            # give the correct pixel distance.
             d_scene = math.hypot(end.x() - start.x(), end.y() - start.y())
             return d_scene / PIXEL_ZONE_SCALE, "px"
         return self._line_distance_m(start, end), "m"
