@@ -12,6 +12,10 @@ export can be huge without exhausting memory, and a later export can **append**
 to the same file - e.g. export the visible "Train" layers, then turn on the
 "Validate" layers and append them with a different split value.
 
+A file records the settings it was written with, so re-exporting into it (say
+after adding more labels) reuses the same tiling instead of making the user
+re-enter it - see ``read_settings``.
+
 Contents:
 - ``H5DatasetWriter`` - create/append + streamed writes (no Qt).
 - ``export_image`` - slide over one raster, add snippets to a writer.
@@ -48,6 +52,36 @@ _FLUSH_BATCH = 512
 # The 1-D label/gt/split datasets are tiny per element, so a larger chunk keeps
 # metadata overhead low with negligible read amplification.
 _META_CHUNK = 4096
+
+
+def read_settings(path) -> dict | None:
+    """Return the settings an existing dataset was written with, else ``None``.
+
+    Snippet size, channels, chunking and compression are read back from the
+    ``images`` dataset itself (so files written before the overlap attribute
+    existed still work); the overlap is only available as an attribute. Any
+    unreadable or non-dataset file gives ``None``.
+    """
+    if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    try:
+        with h5py.File(path, "r") as f:
+            if "images" not in f or f["images"].ndim != 4:
+                return None
+            images = f["images"]
+            _, height, width, channels = images.shape
+            settings = {
+                "height": int(height),
+                "width": int(width),
+                "channels": int(channels),
+                "chunk": int(images.chunks[0]) if images.chunks else _DEFAULT_CHUNK,
+                "compression": images.compression,
+            }
+            if "overlap" in f.attrs:
+                settings["overlap"] = float(f.attrs["overlap"])
+            return settings
+    except Exception:  # noqa: BLE001 - a bad/locked file just has no settings
+        return None
 
 
 def _snippet_positions(total: int, window: int, step: int) -> list[int]:
@@ -92,12 +126,14 @@ class H5DatasetWriter:
     """
 
     def __init__(self, path, height, width, channels, classes,
-                 chunk=_DEFAULT_CHUNK, compression=None):
+                 chunk=_DEFAULT_CHUNK, compression=None, overlap=None):
         """Open ``path`` for create-or-append and prepare the datasets.
 
         ``chunk`` and ``compression`` apply only when the file is *created*;
         appending reuses the existing datasets' storage properties (chunking and
-        compression are fixed at creation time).
+        compression are fixed at creation time). ``overlap`` is recorded as an
+        attribute - it doesn't affect storage, it is kept so a later export into
+        this file can offer the same tiling (see ``read_settings``).
         """
         self.height, self.width, self.channels = height, width, channels
         self.classes = list(classes)
@@ -113,6 +149,10 @@ class H5DatasetWriter:
             self._n = self._f["images"].shape[0]
         else:
             self._create()
+        if overlap is not None:
+            # Most recently used, so an append with a different overlap becomes
+            # the default next time round.
+            self._f.attrs["overlap"] = float(overlap)
 
     def _create(self):
         """Create the resizable, chunked datasets."""
@@ -272,7 +312,8 @@ class H5ExportWorker(QObject):
                 self._out_path, opts["height"], opts["width"],
                 opts["channels"], classes,
                 chunk=opts.get("chunk", _DEFAULT_CHUNK),
-                compression=opts.get("compression"))
+                compression=opts.get("compression"),
+                overlap=opts.get("overlap"))
             total_images = len(self._images)
             samples = 0
             for i, (path, labels) in enumerate(self._images):
@@ -304,14 +345,29 @@ class H5ExportWorker(QObject):
             self.finished.emit(None, str(e))
 
 
-class H5ExportDialog(QDialog):
-    """Setup dialog for the HDF5 dataset export."""
+def _choice_label(choices: dict, value):
+    """Reverse-lookup a combo label from its value, or None."""
+    for label, choice in choices.items():
+        if choice == value:
+            return label
+    return None
 
-    def __init__(self, all_count, visible_count, parent=None):
+
+class H5ExportDialog(QDialog):
+    """Setup dialog for the HDF5 dataset export.
+
+    Settings carry over between exports: ``defaults`` pre-fills the widgets
+    (the caller's last-used options), and once the output path points at an
+    existing dataset its own recorded settings take over - the ones that are
+    fixed at creation time are shown but locked.
+    """
+
+    def __init__(self, all_count, visible_count, parent=None, defaults=None):
         """Build the dialog. ``*_count`` size the scope radio labels."""
         super().__init__(parent)
         self._all_count = all_count
         self._visible_count = visible_count
+        self._defaults = dict(defaults or {})
         self.setWindowTitle("Export HDF5 Dataset")
         self.setMinimumWidth(500)
         self._build_ui()
@@ -393,7 +449,7 @@ class H5ExportDialog(QDialog):
         out_row.addWidget(QLabel("Output .h5:"))
         self.out_edit = QLineEdit()
         self.out_edit.setPlaceholderText("dataset.h5 (existing file is appended)")
-        self.out_edit.textChanged.connect(self._update_ok_enabled)
+        self.out_edit.textChanged.connect(self._on_out_path_changed)
         out_row.addWidget(self.out_edit, 1)
         browse = QPushButton("Browse...")
         browse.clicked.connect(self._choose_file)
@@ -411,7 +467,61 @@ class H5ExportDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
 
-        self._update_ok_enabled()
+        # Last: setting the path fires _on_out_path_changed, which needs every
+        # widget above to exist, and lets the file's own settings win over the
+        # caller's defaults.
+        self._apply_settings(self._defaults)
+        self.out_edit.setText(self._defaults.get("out_path", ""))
+        self._on_out_path_changed()
+
+    def _apply_settings(self, settings):
+        """Set the widgets from a settings dict; missing keys are left alone."""
+        if not settings:
+            return
+        for key, spin in (("height", self.height_spin),
+                          ("width", self.width_spin),
+                          ("chunk", self.chunk_spin)):
+            if settings.get(key) is not None:
+                spin.setValue(int(settings[key]))
+        if settings.get("overlap") is not None:
+            self.overlap_spin.setValue(int(round(float(settings["overlap"]) * 100)))
+        for key, choices, combo in (
+                ("channels", CHANNEL_CHOICES, self.channel_combo),
+                ("split_value", SPLIT_CHOICES, self.split_combo),
+                ("compression", COMPRESSION_CHOICES, self.compress_combo)):
+            if key in settings:
+                label = _choice_label(choices, settings[key])
+                if label is not None:
+                    combo.setCurrentText(label)
+
+    def _fixed_widgets(self):
+        """The widgets an existing file's storage layout dictates."""
+        return (self.height_spin, self.width_spin, self.channel_combo,
+                self.chunk_spin, self.compress_combo)
+
+    def _on_out_path_changed(self):
+        """Adopt an existing target file's settings and enable/disable Export."""
+        text = self.out_edit.text().strip()
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(bool(text))
+
+        settings = read_settings(text)
+        if settings is not None:
+            # Snippet size, channels and storage are fixed once the datasets
+            # exist; overlap is only a default, so it stays editable.
+            self._apply_settings(settings)
+            for widget in self._fixed_widgets():
+                widget.setEnabled(False)
+            self._append_note.setText(
+                "Existing dataset - snippets will be appended using its "
+                "snippet size, channels and storage settings.")
+            return
+
+        for widget in self._fixed_widgets():
+            widget.setEnabled(True)
+        if text and os.path.exists(text):
+            self._append_note.setText("Existing file - snippets will be appended.")
+        else:
+            self._append_note.setText("")
 
     def _choose_file(self):
         """Pick an output .h5 (new or existing to append to)."""
@@ -422,15 +532,6 @@ class H5ExportDialog(QDialog):
             if not path.lower().endswith((".h5", ".hdf5")):
                 path += ".h5"
             self.out_edit.setText(path)
-
-    def _update_ok_enabled(self):
-        """Enable Export only once an output path is set; note append mode."""
-        text = self.out_edit.text().strip()
-        self.buttons.button(QDialogButtonBox.Ok).setEnabled(bool(text))
-        if text and os.path.exists(text):
-            self._append_note.setText("Existing file - snippets will be appended.")
-        else:
-            self._append_note.setText("")
 
     def scope_visible_only(self) -> bool:
         """Return True if only visible layers should be exported."""

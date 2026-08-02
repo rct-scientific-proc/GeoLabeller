@@ -236,6 +236,9 @@ class MainWindow(QMainWindow):
         self._h5_worker: H5ExportWorker | None = None
         self._h5_dialog = None
         self._h5_total = 0
+        # Last-used export settings, so a re-export doesn't start from scratch.
+        # An existing target file's own settings still take precedence.
+        self._h5_last_options: dict = {}
 
 
         self._setup_ui()
@@ -1780,7 +1783,8 @@ class MainWindow(QMainWindow):
 
         all_count = len(infos)
         visible_count = sum(1 for i in infos if i.get("visible"))
-        dialog = H5ExportDialog(all_count, visible_count, self)
+        dialog = H5ExportDialog(all_count, visible_count, self,
+                                defaults=self._h5_last_options)
         if not dialog.exec_():
             return
 
@@ -1799,6 +1803,7 @@ class MainWindow(QMainWindow):
             return
 
         options = dialog.options()
+        self._h5_last_options = dict(options, out_path=out_path)
         options["classes"] = list(self.project.classes) + [HARD_NEGATIVE]
         self._start_h5_worker(out_path, images, options)
 
