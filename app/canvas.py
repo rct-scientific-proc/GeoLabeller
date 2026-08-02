@@ -2118,6 +2118,15 @@ class MapCanvas(QGraphicsView):
                 self._exit_measure_mode()
             return
 
+        # Shift+left-drag measures from whatever mode is active, so reaching for
+        # the ruler never costs a mode switch - and in cycle modes, never costs
+        # the cycle queue.
+        if (event.button() == Qt.LeftButton
+                and event.modifiers() & Qt.ShiftModifier
+                and self._mode != CanvasMode.RULER):
+            self._ruler_begin(event.pos())
+            return
+
         # Ruler mode: left-drag measures distance; right-drag pans the view.
         if self._mode == CanvasMode.RULER:
             if event.button() == Qt.LeftButton:
@@ -2205,6 +2214,12 @@ class MapCanvas(QGraphicsView):
         # release so it can't reach pan/cycle release handling.
         if self._measure_active:
             return
+        # Finish a Shift+drag measurement started from another mode, before that
+        # mode's own release handling can act on the same click.
+        if self._ruler_dragging and event.button() == Qt.LeftButton:
+            self._ruler_dragging = False
+            if self._mode != CanvasMode.RULER:
+                return
         # Ruler mode: end left-drag measurement or right-drag panning.
         if self._mode == CanvasMode.RULER:
             if event.button() == Qt.LeftButton:
@@ -2232,8 +2247,9 @@ class MapCanvas(QGraphicsView):
         if self._measure_active and self._measure_start is not None:
             self._update_measure_preview(event.pos())
 
-        # Ruler mode: update the measurement line + readout while dragging.
-        if self._mode == CanvasMode.RULER and self._ruler_dragging:
+        # Update the measurement line + readout while dragging, whether the
+        # ruler was reached by its mode or by Shift+drag.
+        if self._ruler_dragging:
             self._ruler_update(event.pos())
 
         # Ruler mode: right-drag pans the view (like cycle mode).
@@ -2326,7 +2342,8 @@ class MapCanvas(QGraphicsView):
                     False, "Hover over a label, then press M to measure")
         elif event.key() == Qt.Key_Escape and self._link_mode_active:
             self._exit_link_mode()
-        elif event.key() == Qt.Key_Escape and self._mode == CanvasMode.RULER:
+        elif event.key() == Qt.Key_Escape and self._ruler_line is not None:
+            # Clears a Shift+drag measurement too, not just ruler mode's.
             self._clear_ruler()
         elif event.key() == Qt.Key_Space and self._mode in CYCLE_MODES:
             if event.modifiers() & Qt.ControlModifier:
@@ -3027,6 +3044,10 @@ class MapCanvas(QGraphicsView):
         self._ruler_dragging = False
         if had_ruler:
             self.ruler_changed.emit(False, "")
+
+    def clear_ruler(self):
+        """Remove any ruler measurement currently on the canvas."""
+        self._clear_ruler()
 
     def set_label_linked(self, label_id: int, is_linked: bool):
         """Update whether a label is linked to other labels."""

@@ -205,6 +205,9 @@ class MainWindow(QMainWindow):
         self._cycle_layers: list[str] = []  # Layer IDs to cycle through
         # Current position in cycle (-1 means not started)
         self._cycle_index: int = -1
+        # (layers, index) kept while the user steps out of a cycle mode, so
+        # the cycle resumes instead of restarting. See _suspend_cycle.
+        self._cycle_parked: tuple[list[str], int] | None = None
 
         # Auto-save timer for crash recovery
         self._autosave_timer = QTimer()
@@ -530,6 +533,9 @@ class MainWindow(QMainWindow):
         self.ruler_action = QAction("Ruler", self)
         self.ruler_action.setCheckable(True)
         self.ruler_action.setShortcut("R")
+        self.ruler_action.setToolTip(
+            "Ruler mode: left-drag measures, right-drag pans (R).\n"
+            "Shift+drag measures from any mode without leaving it.")
         self.ruler_action.triggered.connect(
             lambda: self._set_mode(CanvasMode.RULER))
         toolbar.addAction(self.ruler_action)
@@ -600,10 +606,35 @@ class MainWindow(QMainWindow):
         elif mode == CanvasMode.IMAGE_CYCLE:
             self._start_cycle_mode()
         else:
-            # Clear cycle state when leaving cycle mode
-            self._cycle_layers = []
-            self._cycle_index = -1
-            self.group_label.setText("")
+            self._suspend_cycle()
+
+    def _suspend_cycle(self):
+        """Park the cycle on leaving it, so a detour can be resumed.
+
+        Reaching for the ruler or the pan tool part-way through a group used to
+        throw the queue away, and coming back restarted it from the top - on a
+        few hundred images that is a lot of progress to lose over one
+        measurement.
+        """
+        if self._cycle_layers and self._cycle_index >= 0:
+            self._cycle_parked = (list(self._cycle_layers), self._cycle_index)
+        self._cycle_layers = []
+        self._cycle_index = -1
+        self.group_label.setText("")
+
+    def _parked_cycle_index(self, layers: list[str]) -> int | None:
+        """Where to resume in ``layers``, or None to start the cycle fresh.
+
+        Only resumes into the identical queue: change the group, or load or
+        remove a layer, and the parked position no longer refers to the same
+        run, so the cycle starts over.
+        """
+        if not self._cycle_parked:
+            return None
+        parked_layers, parked_index = self._cycle_parked
+        if parked_layers != layers or not 0 <= parked_index < len(layers):
+            return None
+        return parked_index
 
     def _cycle_zoom_to(self, layer_id: str):
         """Zoom to a cycled layer, honouring image-up mode.
@@ -612,6 +643,9 @@ class MainWindow(QMainWindow):
         the image shows in its native orientation and everything else (other
         images, labels) is carried along by the same view transform.
         """
+        # A measurement belongs to the image it was taken on; leaving that
+        # image behind should not leave the line hanging over the next one.
+        self.canvas.clear_ruler()
         if self.canvas._mode == CanvasMode.IMAGE_CYCLE:
             self.canvas.zoom_to_layer_image_up(layer_id)
         else:
@@ -637,19 +671,20 @@ class MainWindow(QMainWindow):
             self._cycle_index = -1
             return
 
-        # Start at the last layer (end of list)
-        self._cycle_index = len(self._cycle_layers) - 1
+        # Pick up where a detour left off, else start at the last layer.
+        resumed = self._parked_cycle_index(self._cycle_layers)
+        self._cycle_index = (resumed if resumed is not None
+                             else len(self._cycle_layers) - 1)
         layer_id = self._cycle_layers[self._cycle_index]
         self.layer_panel.check_layers([layer_id])
         self._cycle_zoom_to(layer_id)
         count = len(self._cycle_layers)
-        debug(f"cycle start: group '{group_name}' - {count} images; "
+        debug(f"cycle {'resume' if resumed is not None else 'start'}: group "
+              f"'{group_name}' - {count} images; "
               f"at {self._layer_name(layer_id)} [{self._cycle_index + 1}/{count}]")
         self.statusBar.showMessage(
-            f"Cycle mode: Layer {
-                self._cycle_index + 1}/{
-                len(
-                    self._cycle_layers)} - Space=next, Ctrl+Space=prev",
+            f"Cycle {'resumed' if resumed is not None else 'mode'}: Layer "
+            f"{self._cycle_index + 1}/{count} - Space=next, Ctrl+Space=prev",
             0  # No timeout
         )
 
@@ -667,19 +702,20 @@ class MainWindow(QMainWindow):
 
         self.group_label.setText("View Cycle")
 
-        # Start at the last layer (end of list)
-        self._cycle_index = len(self._cycle_layers) - 1
+        # Pick up where a detour left off, else start at the last layer.
+        resumed = self._parked_cycle_index(self._cycle_layers)
+        self._cycle_index = (resumed if resumed is not None
+                             else len(self._cycle_layers) - 1)
         layer_id = self._cycle_layers[self._cycle_index]
         self.layer_panel.check_layers([layer_id])
         self._cycle_zoom_to(layer_id)
         count = len(self._cycle_layers)
-        debug(f"view cycle start: {count} images in view; "
+        debug(f"view cycle {'resume' if resumed is not None else 'start'}: "
+              f"{count} images in view; "
               f"at {self._layer_name(layer_id)} [{self._cycle_index + 1}/{count}]")
         self.statusBar.showMessage(
-            f"View Cycle: Layer {
-                self._cycle_index + 1}/{
-                len(
-                    self._cycle_layers)} - Space=next, Ctrl+Space=prev",
+            f"View Cycle{' resumed' if resumed is not None else ''}: Layer "
+            f"{self._cycle_index + 1}/{count} - Space=next, Ctrl+Space=prev",
             0  # No timeout
         )
 
@@ -706,6 +742,8 @@ class MainWindow(QMainWindow):
                 "Cycle complete - all layers processed", 3000)
             self._cycle_layers = []
             self._cycle_index = -1
+            # Nothing left to come back to, so the next C starts a fresh run.
+            self._cycle_parked = None
             self.group_label.setText("")
             return
 
@@ -1164,6 +1202,7 @@ class MainWindow(QMainWindow):
         # Clear cycle mode state
         self._cycle_layers.clear()
         self._cycle_index = -1
+        self._cycle_parked = None
 
         # Clear canvas and UI
         self.canvas.clear_label_markers()
