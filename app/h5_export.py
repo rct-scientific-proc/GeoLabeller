@@ -57,6 +57,9 @@ _FLUSH_BATCH = 512
 # The 1-D label/gt/split datasets are tiny per element, so a larger chunk keeps
 # metadata overhead low with negligible read amplification.
 _META_CHUNK = 4096
+# Label rows read at a time when re-indexing an existing file's classes; 1M
+# uint16 is a couple of MB, so even a huge dataset migrates in bounded memory.
+_SCAN_BLOCK = 1 << 20
 
 
 def read_settings(path) -> dict | None:
@@ -126,8 +129,10 @@ class H5DatasetWriter:
     """Create or append to the HDF5 dataset, buffering and streaming rows.
 
     ``classes`` is the full ordered class list (project classes with
-    ``"hard_negative"`` last). On append the existing file's H/W/C and class
-    list must match, so label indices stay consistent.
+    ``"hard_negative"`` last). On append the existing file's H/W/C must match;
+    a class list that has since gained or moved classes is migrated in place
+    (see ``_reconcile_classes``), and what changed is reported on
+    ``added_classes`` / ``dropped_classes`` / ``classes_remapped``.
     """
 
     def __init__(self, path, height, width, channels, classes,
@@ -146,6 +151,9 @@ class H5DatasetWriter:
         self._compression = compression
         self._n = 0
         self._img_buf, self._lbl_buf, self._gt_buf, self._split_buf = [], [], [], []
+        # Set when appending to a file whose class list has since changed.
+        self.added_classes, self.dropped_classes = [], []
+        self.classes_remapped = False
 
         already = os.path.exists(path) and os.path.getsize(path) > 0
         self._f = h5py.File(path, "a")
@@ -198,12 +206,71 @@ class H5DatasetWriter:
                 f"{f.attrs.get('channels')}, not "
                 f"{self.height}x{self.width}x{self.channels}.")
         existing = list(f["classes"].asstr()[:]) if "classes" in f else []
-        if existing and existing != self.classes:
-            raise ValueError(
-                "Cannot append: the existing file's class list differs from "
-                "the current project's classes (label indices would be "
-                "inconsistent). Keep the project's classes stable across "
-                "appends.")
+        if existing != self.classes:
+            self._reconcile_classes(existing)
+
+    def _reconcile_classes(self, existing):
+        """Bring an existing file's label indices onto the new class list.
+
+        ``labels`` holds indices into ``classes``, so adding a class renumbers
+        the ones after it - and since ``hard_negative`` is always last, *any*
+        new class shifts it. Left alone, the file's existing hard negatives
+        would silently read as examples of some other class.
+
+        Rows are therefore remapped by class *name*, which makes appending
+        safe across added, inserted and reordered classes. The one case with
+        no answer is a class that has left the project while rows in the file
+        still use it: those rows can't be renamed, so that is still refused.
+        """
+        f = self._f
+        labels = f["labels"] if "labels" in f else None
+        new_index = {name: i for i, name in enumerate(self.classes)}
+        missing = [name for name in existing if name not in new_index]
+
+        if missing and labels is not None and labels.shape[0]:
+            gone = [existing.index(name) for name in missing]
+            in_use = self._used_indices(labels, gone)
+            stranded = sorted(name for name, i in zip(missing, gone)
+                              if i in in_use)
+            if stranded:
+                raise ValueError(
+                    "Cannot append: the file has samples labelled "
+                    f"{', '.join(repr(n) for n in stranded)}, which the "
+                    "project no longer has. Add the class back under the same "
+                    "name, or export to a new file.")
+
+        # Missing classes that no row uses just fall off the list.
+        self.dropped_classes = list(missing)
+        self.added_classes = [n for n in self.classes if n not in existing]
+
+        if labels is not None and labels.shape[0] and existing:
+            lut = np.array([new_index.get(name, 0) for name in existing],
+                           dtype="uint16")
+            if not np.array_equal(lut, np.arange(lut.size, dtype="uint16")):
+                total = labels.shape[0]
+                for start in range(0, total, _SCAN_BLOCK):
+                    stop = min(start + _SCAN_BLOCK, total)
+                    block = labels[start:stop]
+                    # clip guards a corrupt index rather than raising deep in
+                    # the middle of a rewrite.
+                    labels[start:stop] = lut[np.clip(block, 0, lut.size - 1)]
+                self.classes_remapped = True
+        self._write_classes()
+
+    @staticmethod
+    def _used_indices(labels, candidates):
+        """Which of ``candidates`` actually appear in the labels dataset."""
+        remaining, found = set(candidates), set()
+        total = labels.shape[0]
+        for start in range(0, total, _SCAN_BLOCK):
+            block = labels[start:min(start + _SCAN_BLOCK, total)]
+            for index in list(remaining):
+                if bool(np.any(block == index)):
+                    found.add(index)
+                    remaining.discard(index)
+            if not remaining:
+                break
+        return found
 
     def add(self, image_hwc, label_index, gt, split_value):
         """Buffer one sample; flushes to disk when a chunk has accumulated."""
@@ -336,11 +403,15 @@ class H5ExportWorker(QObject):
                         cancel_check=lambda: self._cancelled)
                 except Exception as e:  # noqa: BLE001 - report, keep going
                     errors.append((path, str(e)))
+            added_classes = writer.added_classes
+            dropped_classes = writer.dropped_classes
             total = writer.close()
             writer = None
             self.finished.emit(
                 {"total": total, "path": self._out_path,
-                 "cancelled": self._cancelled, "errors": errors}, "")
+                 "cancelled": self._cancelled, "errors": errors,
+                 "added_classes": added_classes,
+                 "dropped_classes": dropped_classes}, "")
         except Exception as e:  # noqa: BLE001 - surfaced to the user
             if writer is not None:
                 try:

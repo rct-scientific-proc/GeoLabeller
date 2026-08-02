@@ -1875,6 +1875,15 @@ class MainWindow(QMainWindow):
         msg = f"Wrote {result['total']:,} samples to\n{result['path']}"
         if result.get("cancelled"):
             msg = "Export cancelled. " + msg
+        added = result.get("added_classes") or []
+        dropped = result.get("dropped_classes") or []
+        if added:
+            msg += ("\n\nThe file's class list gained "
+                    + ", ".join(added)
+                    + "; its existing labels were re-indexed to match.")
+        if dropped:
+            msg += ("\n\nUnused class(es) dropped from the file's class list: "
+                    + ", ".join(dropped) + ".")
         errors = result.get("errors") or []
         if errors:
             msg += (f"\n\n{len(errors)} image error(s):\n"
