@@ -37,6 +37,11 @@ from PyQt5.QtWidgets import (
 
 HARD_NEGATIVE = "hard_negative"
 
+# Which layers an export covers.
+SCOPE_ALL = "all"
+SCOPE_VISIBLE = "visible"
+SCOPE_LABELLED = "labelled"  # visible *and* carrying at least one label
+
 SPLIT_CHOICES = {"Train (0)": 0, "Validate (1)": 1, "Test (2)": 2}
 CHANNEL_CHOICES = {"RGB (3 channels)": 3, "Grayscale (1 channel)": 1}
 COMPRESSION_CHOICES = {"None": None, "gzip": "gzip", "lzf": "lzf"}
@@ -362,11 +367,13 @@ class H5ExportDialog(QDialog):
     fixed at creation time are shown but locked.
     """
 
-    def __init__(self, all_count, visible_count, parent=None, defaults=None):
+    def __init__(self, all_count, visible_count, labelled_count=0, parent=None,
+                 defaults=None):
         """Build the dialog. ``*_count`` size the scope radio labels."""
         super().__init__(parent)
         self._all_count = all_count
         self._visible_count = visible_count
+        self._labelled_count = labelled_count
         self._defaults = dict(defaults or {})
         self.setWindowTitle("Export HDF5 Dataset")
         self.setMinimumWidth(500)
@@ -390,14 +397,20 @@ class H5ExportDialog(QDialog):
         self.scope_all = QRadioButton(f"All loaded layers ({self._all_count})")
         self.scope_visible = QRadioButton(
             f"Only visible (ON) layers ({self._visible_count})")
+        self.scope_labelled = QRadioButton(
+            f"Only visible (ON) layers with labels ({self._labelled_count})")
+        self.scope_labelled.setToolTip(
+            "Skips visible layers that have no labels, so the export contains "
+            "no images made up entirely of hard negatives.")
         self.scope_all.setChecked(True)
         if self._visible_count == 0:
             self.scope_visible.setEnabled(False)
+        if self._labelled_count == 0:
+            self.scope_labelled.setEnabled(False)
         self._scope_group = QButtonGroup(self)
-        self._scope_group.addButton(self.scope_all)
-        self._scope_group.addButton(self.scope_visible)
-        scope_layout.addWidget(self.scope_all)
-        scope_layout.addWidget(self.scope_visible)
+        for button in (self.scope_all, self.scope_visible, self.scope_labelled):
+            self._scope_group.addButton(button)
+            scope_layout.addWidget(button)
         layout.addWidget(scope_box)
 
         # Options
@@ -533,9 +546,13 @@ class H5ExportDialog(QDialog):
                 path += ".h5"
             self.out_edit.setText(path)
 
-    def scope_visible_only(self) -> bool:
-        """Return True if only visible layers should be exported."""
-        return self.scope_visible.isChecked()
+    def scope(self) -> str:
+        """Return which layers to export: one of the ``SCOPE_*`` constants."""
+        if self.scope_labelled.isChecked():
+            return SCOPE_LABELLED
+        if self.scope_visible.isChecked():
+            return SCOPE_VISIBLE
+        return SCOPE_ALL
 
     def output_path(self) -> str:
         """Return the chosen output .h5 path."""

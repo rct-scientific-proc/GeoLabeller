@@ -36,7 +36,8 @@ from .class_editor import ClassEditorDialog
 from .labels import LabelProject, ImageData, haversine_distance
 from .layer_panel import CombinedLayerPanel
 from .optimize_export import OptimizeExportDialog, OptimizeWorker, plan_output_path
-from .h5_export import H5ExportDialog, H5ExportWorker, HARD_NEGATIVE
+from .h5_export import (H5ExportDialog, H5ExportWorker, HARD_NEGATIVE,
+                        SCOPE_ALL, SCOPE_LABELLED)
 from .debug_log import debug, debug_log, DebugConsole
 
 
@@ -1773,6 +1774,19 @@ class MainWindow(QMainWindow):
         self._optimize_worker = None
         self._optimize_dialog = None
 
+    def _h5_labels_for(self, path: str) -> list:
+        """Labels on ``path`` that the export can actually use.
+
+        Labels of a class the project no longer has are dropped here rather
+        than silently inside the export, so a layer only counts as labelled
+        when it would really contribute genuine (non-hard-negative) examples.
+        """
+        img = self.project.images.get(path)
+        if img is None:
+            return []
+        classes = set(self.project.classes)
+        return [l for l in img.labels if l.class_name in classes]
+
     def _export_h5(self):
         """Export sliding-window snippets to the HDF5 CNN dataset format."""
         infos = self.canvas.get_layer_infos()
@@ -1783,20 +1797,24 @@ class MainWindow(QMainWindow):
 
         all_count = len(infos)
         visible_count = sum(1 for i in infos if i.get("visible"))
-        dialog = H5ExportDialog(all_count, visible_count, self,
+        labelled_count = sum(1 for i in infos if i.get("visible")
+                             and self._h5_labels_for(i["file_path"]))
+        dialog = H5ExportDialog(all_count, visible_count, labelled_count, self,
                                 defaults=self._h5_last_options)
         if not dialog.exec_():
             return
 
         out_path = dialog.output_path()
-        visible_only = dialog.scope_visible_only()
+        scope = dialog.scope()
         images = []
         for info in infos:
-            if visible_only and not info.get("visible"):
+            if scope != SCOPE_ALL and not info.get("visible"):
                 continue
             path = info["file_path"]
-            img = self.project.images.get(path)
-            images.append((path, img.labels if img else []))
+            labels = self._h5_labels_for(path)
+            if scope == SCOPE_LABELLED and not labels:
+                continue
+            images.append((path, labels))
         if not images:
             QMessageBox.information(
                 self, "HDF5 Export", "No images in the selected scope.")
