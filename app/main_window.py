@@ -33,6 +33,7 @@ from .axis_ruler import MapCanvasWithAxes
 from .canvas import (MapCanvas, CanvasMode, CYCLE_MODES,
                      AsyncFileLoaderThread, TiledLayer)
 from .class_editor import ClassEditorDialog
+from .goto_location import GoToLocationDialog, format_lat_lon
 from .labels import LabelProject, ImageData, haversine_distance
 from .layer_panel import CombinedLayerPanel
 from .optimize_export import OptimizeExportDialog, OptimizeWorker, plan_output_path
@@ -208,6 +209,9 @@ class MainWindow(QMainWindow):
         # (layers, index) kept while the user steps out of a cycle mode, so
         # the cycle resumes instead of restarting. See _suspend_cycle.
         self._cycle_parked: tuple[list[str], int] | None = None
+
+        # Last "Go to Coordinates" entry, re-filled next time it opens.
+        self._goto_defaults: dict = {}
 
         # Auto-save timer for crash recovery
         self._autosave_timer = QTimer()
@@ -416,6 +420,20 @@ class MainWindow(QMainWindow):
         clear_labels_action = QAction("Clear All Labels", self)
         clear_labels_action.triggered.connect(self._clear_all_labels)
         labels_menu.addAction(clear_labels_action)
+
+        # View menu
+        view_menu = menubar.addMenu("&View")
+
+        # Go to a typed latitude/longitude
+        goto_action = QAction("&Go to Coordinates...", self)
+        goto_action.setShortcut("Ctrl+G")
+        goto_action.triggered.connect(self._go_to_coordinates)
+        view_menu.addAction(goto_action)
+
+        # Remove the crosshair that Go to Coordinates leaves behind
+        clear_marker_action = QAction("Clear Coordinate &Marker", self)
+        clear_marker_action.triggered.connect(self._clear_coordinate_marker)
+        view_menu.addAction(clear_marker_action)
 
         # Export menu
         export_menu = menubar.addMenu("&Export")
@@ -1097,6 +1115,35 @@ class MainWindow(QMainWindow):
     def _on_zoom_to_label(self, lon: float, lat: float):
         """Zoom to a label by its coordinates."""
         self.canvas.zoom_to_point(lon, lat, size_meters=10.0)
+
+    def _go_to_coordinates(self):
+        """Move the view to a latitude/longitude the user types in."""
+        dialog = GoToLocationDialog(self, defaults=self._goto_defaults)
+        if not dialog.exec_():
+            return
+        coords = dialog.coordinates()
+        if coords is None:
+            return
+        lat, lon = coords
+        width_m = dialog.view_width_m()
+        self._goto_defaults = {"text": dialog.entered_text(), "width": width_m}
+
+        # zoom_to_point sizes the view in Web Mercator units, which are
+        # stretched by 1/cos(latitude); undo that so the width the user asked
+        # for is the width they get on the ground.
+        mercator_width = width_m / max(math.cos(math.radians(lat)), 1e-6)
+        self.canvas.zoom_to_point(lon, lat, size_meters=mercator_width)
+        self.canvas.mark_location(lon, lat)
+        # Focus the map so Escape reaches it without needing a click first.
+        self.canvas.setFocus()
+        self.statusBar.showMessage(
+            f"Moved to {format_lat_lon(lat, lon)} - press Escape to clear the "
+            "marker", 8000)
+
+    def _clear_coordinate_marker(self):
+        """Remove the go-to crosshair from the map."""
+        self.canvas.clear_location_marker()
+        self.canvas.setFocus()
         self.statusBar.showMessage(
             f"Zoomed to label at ({lon:.6f}, {lat:.6f})", 3000
         )
@@ -2909,6 +2956,7 @@ class MainWindow(QMainWindow):
 <tr><td><b>Mouse Wheel</b></td><td>Zoom in/out</td></tr>
 <tr><td><b>Click + Drag</b></td><td>Pan (in Pan mode)</td></tr>
 <tr><td><b>Right-click</b></td><td>Context menu</td></tr>
+<tr><td><b>Ctrl+G</b></td><td>Go to a latitude/longitude</td></tr>
 </table>
 
 <h3>Mode Switching</h3>
@@ -2917,6 +2965,15 @@ class MainWindow(QMainWindow):
 <tr><td><b>L</b></td><td>Label mode</td></tr>
 <tr><td><b>C</b></td><td>Cycle mode (group-based)</td></tr>
 <tr><td><b>V</b></td><td>View Cycle mode (layers in current view)</td></tr>
+<tr><td><b>I</b></td><td>Image Cycle mode (image-up orientation)</td></tr>
+<tr><td><b>R</b></td><td>Ruler mode</td></tr>
+</table>
+
+<h3>Measuring</h3>
+<table>
+<tr><td><b>Shift + Drag</b></td><td>Measure ground distance without leaving the current mode</td></tr>
+<tr><td><b>M</b></td><td>Measure the label under the cursor (length, then width)</td></tr>
+<tr><td><b>Escape</b></td><td>Clear the measurement or the go-to marker</td></tr>
 </table>
 
 <h3>Labeling</h3>

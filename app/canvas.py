@@ -18,11 +18,12 @@ from PyQt5.QtGui import (
     QBrush,
     QColor,
     QFont,
-    QPainter)
+    QPainter,
+    QPainterPath)
 from PyQt5.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
     QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem, QGraphicsTextItem,
-    QGraphicsRectItem, QMenu, QWidget
+    QGraphicsPathItem, QGraphicsRectItem, QMenu, QWidget
 )
 from pyproj import Transformer
 from rasterio.crs import CRS
@@ -1177,6 +1178,8 @@ class MapCanvas(QGraphicsView):
         self._ruler_start = None  # QPointF: drag start in scene coords
         self._ruler_line: QGraphicsLineItem | None = None
         self._ruler_text: QGraphicsTextItem | None = None
+        # Crosshair dropped by "Go to Coordinates" (see mark_location).
+        self._location_marker: QGraphicsPathItem | None = None
         # Right-drag panning while in ruler mode.
         self._ruler_panning = False
         self._ruler_pan_start = None  # QPoint: last pan position (view coords)
@@ -2342,9 +2345,13 @@ class MapCanvas(QGraphicsView):
                     False, "Hover over a label, then press M to measure")
         elif event.key() == Qt.Key_Escape and self._link_mode_active:
             self._exit_link_mode()
-        elif event.key() == Qt.Key_Escape and self._ruler_line is not None:
-            # Clears a Shift+drag measurement too, not just ruler mode's.
+        elif event.key() == Qt.Key_Escape and (
+                self._ruler_line is not None
+                or self._location_marker is not None):
+            # One press clears the transient overlays: a measurement (from
+            # ruler mode or Shift+drag) and the go-to crosshair.
             self._clear_ruler()
+            self.clear_location_marker()
         elif event.key() == Qt.Key_Space and self._mode in CYCLE_MODES:
             if event.modifiers() & Qt.ControlModifier:
                 # Ctrl+Space: go backwards
@@ -3048,6 +3055,44 @@ class MapCanvas(QGraphicsView):
     def clear_ruler(self):
         """Remove any ruler measurement currently on the canvas."""
         self._clear_ruler()
+
+    def mark_location(self, lon: float, lat: float):
+        """Drop a crosshair on a WGS84 coordinate, replacing any previous one.
+
+        Parented to the origin group, so it is positioned in world coordinates
+        and rides along with every floating-origin rebase for free. It ignores
+        the view transform, so it stays the same size on screen at any zoom and
+        upright when the view is rotated in image-up mode.
+        """
+        self.clear_location_marker()
+        easting, northing = self._wgs84_to_web_mercator(lon, lat)
+
+        arm, radius = 14.0, 6.0  # screen pixels
+        path = QPainterPath()
+        path.moveTo(-arm, 0.0)
+        path.lineTo(-radius, 0.0)
+        path.moveTo(radius, 0.0)
+        path.lineTo(arm, 0.0)
+        path.moveTo(0.0, -arm)
+        path.lineTo(0.0, -radius)
+        path.moveTo(0.0, radius)
+        path.lineTo(0.0, arm)
+        path.addEllipse(QPointF(0.0, 0.0), radius, radius)
+
+        marker = QGraphicsPathItem(path, self._origin_group)
+        pen = QPen(QColor(0, 200, 255), 2)
+        pen.setCosmetic(True)
+        marker.setPen(pen)
+        marker.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        marker.setZValue(self._get_label_z_base() + 7)
+        marker.setPos(easting, -northing)
+        self._location_marker = marker
+
+    def clear_location_marker(self):
+        """Remove the go-to crosshair, if one is showing."""
+        if self._location_marker is not None:
+            self._scene.removeItem(self._location_marker)
+            self._location_marker = None
 
     def set_label_linked(self, label_id: int, is_linked: bool):
         """Update whether a label is linked to other labels."""
