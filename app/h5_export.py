@@ -32,7 +32,7 @@ from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox, QLabel,
     QLineEdit, QSpinBox, QComboBox, QRadioButton, QButtonGroup, QPushButton,
-    QDialogButtonBox, QFileDialog,
+    QDialogButtonBox, QFileDialog, QCheckBox,
 )
 
 HARD_NEGATIVE = "hard_negative"
@@ -87,6 +87,11 @@ def read_settings(path) -> dict | None:
             }
             if "overlap" in f.attrs:
                 settings["overlap"] = float(f.attrs["overlap"])
+            if "split_negatives" in f.attrs:
+                settings["split_negatives"] = bool(f.attrs["split_negatives"])
+            if "negative_ratio" in f.attrs:
+                settings["negative_ratio"] = tuple(
+                    float(v) for v in f.attrs["negative_ratio"])
             return settings
     except Exception:  # noqa: BLE001 - a bad/locked file just has no settings
         return None
@@ -136,7 +141,8 @@ class H5DatasetWriter:
     """
 
     def __init__(self, path, height, width, channels, classes,
-                 chunk=_DEFAULT_CHUNK, compression=None, overlap=None):
+                 chunk=_DEFAULT_CHUNK, compression=None, overlap=None,
+                 split_negatives=None, negative_ratio=None):
         """Open ``path`` for create-or-append and prepare the datasets.
 
         ``chunk`` and ``compression`` apply only when the file is *created*;
@@ -162,10 +168,15 @@ class H5DatasetWriter:
             self._n = self._f["images"].shape[0]
         else:
             self._create()
+        # Most recently used, so an append made with different settings becomes
+        # the default next time round.
         if overlap is not None:
-            # Most recently used, so an append with a different overlap becomes
-            # the default next time round.
             self._f.attrs["overlap"] = float(overlap)
+        if split_negatives is not None:
+            self._f.attrs["split_negatives"] = bool(split_negatives)
+        if negative_ratio is not None:
+            self._f.attrs["negative_ratio"] = np.asarray(
+                negative_ratio, dtype="float64")
 
     def _create(self):
         """Create the resizable, chunked datasets."""
@@ -309,15 +320,63 @@ class H5DatasetWriter:
         return total
 
 
+def _label_grid(pts, xs, ys, width, height):
+    """Boolean (len(ys), len(xs)) grid: does each window contain a label?
+
+    A label at ``x`` falls in the windows whose left edge lies in
+    ``(x - width, x]``, which is a contiguous run of the sorted offsets - so
+    each label marks its own block instead of every window testing every
+    label.
+    """
+    grid = np.zeros((len(ys), len(xs)), dtype=bool)
+    if not pts or grid.size == 0:
+        return grid
+    xs_arr, ys_arr = np.asarray(xs), np.asarray(ys)
+    for x, y, _ci in pts:
+        ix0 = int(np.searchsorted(xs_arr, x - width, side="right"))
+        ix1 = int(np.searchsorted(xs_arr, x, side="right"))
+        iy0 = int(np.searchsorted(ys_arr, y - height, side="right"))
+        iy1 = int(np.searchsorted(ys_arr, y, side="right"))
+        grid[iy0:iy1, ix0:ix1] = True
+    return grid
+
+
+def _negative_split_pool(count, ratio, rng):
+    """A shuffled array of ``count`` split values in the given proportions.
+
+    Quotas are exact rather than rolled per snippet, so an image with a
+    handful of hard negatives still splits 70/15/15 instead of landing them
+    all in one set by chance. Cumulative boundaries keep every share
+    non-negative whatever the ratio rounds to.
+    """
+    if count <= 0:
+        return np.empty(0, dtype="uint8")
+    train = min(int(round(count * ratio[0])), count)
+    upto_validate = min(max(int(round(count * (ratio[0] + ratio[1]))), train),
+                        count)
+    pool = np.empty(count, dtype="uint8")
+    pool[:train] = 0
+    pool[train:upto_validate] = 1
+    pool[upto_validate:] = 2
+    rng.shuffle(pool)
+    return pool
+
+
 def export_image(writer, path, labels, height, width, overlap, channels,
                  split_value, class_to_index, hard_negative_index,
-                 cancel_check=None) -> int:
+                 cancel_check=None, negative_ratio=None, rng=None):
     """Slide over one raster, adding every snippet to ``writer``.
 
-    Returns the number of snippets added. Windows never cross the image edge
-    (a final window is shifted to fit), so every snippet is exactly HxW.
+    Returns ``(added, negative_counts)`` - the number of snippets added and
+    how many hard negatives went to each split. Windows never cross the image
+    edge (a final window is shifted to fit), so every snippet is exactly HxW.
+
+    With ``negative_ratio`` set, this image's hard negatives are shared out
+    over train/validate/test in those proportions instead of all taking
+    ``split_value``; genuine examples always take ``split_value``.
     """
     added = 0
+    negative_counts = [0, 0, 0]
     step_x = max(1, int(round(width * (1.0 - overlap))))
     step_y = max(1, int(round(height * (1.0 - overlap))))
 
@@ -332,25 +391,44 @@ def export_image(writer, path, labels, height, width, overlap, channels,
         nodata = src.nodata
         xs = _snippet_positions(src.width, width, step_x)
         ys = _snippet_positions(src.height, height, step_y)
-        for y0 in ys:
-            for x0 in xs:
+        has_label = _label_grid(pts, xs, ys, width, height)
+
+        pool, taken = None, 0
+        if negative_ratio is not None:
+            # Quotas cover every label-free window. Windows dropped for being
+            # all nodata simply leave the tail of the shuffled pool unused,
+            # which takes a random share from each split rather than skewing.
+            pool = _negative_split_pool(
+                int(has_label.size - has_label.sum()), negative_ratio,
+                rng if rng is not None else np.random.default_rng())
+
+        for iy, y0 in enumerate(ys):
+            for ix, x0 in enumerate(xs):
                 if cancel_check and cancel_check():
-                    return added
+                    return added, negative_counts
                 arr = _window_pixels(
                     src, Window(x0, y0, width, height), channels, nodata)
                 if arr is None:
                     continue  # entirely nodata
-                inside = [(x, y, ci) for (x, y, ci) in pts
-                          if x0 <= x < x0 + width and y0 <= y < y0 + height]
+                inside = []
+                if has_label[iy, ix]:
+                    inside = [(x, y, ci) for (x, y, ci) in pts
+                              if x0 <= x < x0 + width
+                              and y0 <= y < y0 + height]
                 if inside:
                     cx, cy = x0 + width / 2.0, y0 + height / 2.0
                     _x, _y, ci = min(
                         inside, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
                     writer.add(arr, ci, True, split_value)
                 else:
-                    writer.add(arr, hard_negative_index, False, split_value)
+                    negative_split = split_value
+                    if pool is not None and taken < pool.size:
+                        negative_split = int(pool[taken])
+                        taken += 1
+                    writer.add(arr, hard_negative_index, False, negative_split)
+                    negative_counts[negative_split] += 1
                 added += 1
-    return added
+    return added, negative_counts
 
 
 class H5ExportWorker(QObject):
@@ -379,13 +457,21 @@ class H5ExportWorker(QObject):
         hard_negative_index = classes.index(HARD_NEGATIVE)
         writer = None
         errors = []
+        negative_ratio = (opts.get("negative_ratio")
+                          if opts.get("split_negatives") else None)
+        # One generator for the whole export, so each image's negatives are
+        # shuffled independently but the run stays self-contained.
+        rng = np.random.default_rng()
+        negative_counts = [0, 0, 0]
         try:
             writer = H5DatasetWriter(
                 self._out_path, opts["height"], opts["width"],
                 opts["channels"], classes,
                 chunk=opts.get("chunk", _DEFAULT_CHUNK),
                 compression=opts.get("compression"),
-                overlap=opts.get("overlap"))
+                overlap=opts.get("overlap"),
+                split_negatives=opts.get("split_negatives"),
+                negative_ratio=opts.get("negative_ratio"))
             total_images = len(self._images)
             samples = 0
             for i, (path, labels) in enumerate(self._images):
@@ -396,11 +482,15 @@ class H5ExportWorker(QObject):
                     errors.append((path, "file not found"))
                     continue
                 try:
-                    samples += export_image(
+                    added, negatives = export_image(
                         writer, path, labels, opts["height"], opts["width"],
                         opts["overlap"], opts["channels"], opts["split_value"],
                         class_to_index, hard_negative_index,
-                        cancel_check=lambda: self._cancelled)
+                        cancel_check=lambda: self._cancelled,
+                        negative_ratio=negative_ratio, rng=rng)
+                    samples += added
+                    for i, count in enumerate(negatives):
+                        negative_counts[i] += count
                 except Exception as e:  # noqa: BLE001 - report, keep going
                     errors.append((path, str(e)))
             added_classes = writer.added_classes
@@ -411,7 +501,9 @@ class H5ExportWorker(QObject):
                 {"total": total, "path": self._out_path,
                  "cancelled": self._cancelled, "errors": errors,
                  "added_classes": added_classes,
-                 "dropped_classes": dropped_classes}, "")
+                 "dropped_classes": dropped_classes,
+                 "split_negatives": bool(negative_ratio),
+                 "negative_counts": negative_counts}, "")
         except Exception as e:  # noqa: BLE001 - surfaced to the user
             if writer is not None:
                 try:
@@ -510,6 +602,9 @@ class H5ExportDialog(QDialog):
 
         self.split_combo = QComboBox()
         self.split_combo.addItems(list(SPLIT_CHOICES.keys()))
+        self.split_combo.setToolTip(
+            "Which set this batch's snippets belong to. Hard negatives take "
+            "this too, unless they are split by the ratio below.")
         form.addRow("Split (this batch):", self.split_combo)
 
         self.chunk_spin = QSpinBox()
@@ -527,6 +622,39 @@ class H5ExportDialog(QDialog):
             "(New files only.)")
         form.addRow("Image compression:", self.compress_combo)
         layout.addWidget(opts)
+
+        # Hard-negative split
+        neg_box = QGroupBox("Hard negatives")
+        neg_layout = QVBoxLayout(neg_box)
+        self.split_negatives_check = QCheckBox(
+            "Split hard negatives across train / validate / test")
+        self.split_negatives_check.setToolTip(
+            "Share each image's hard negatives out over all three sets in the "
+            "ratio below, instead of putting them all in the batch's split. "
+            "Labelled snippets are unaffected. Quotas are per image, so every "
+            "image is represented in every set.")
+        self.split_negatives_check.toggled.connect(self._on_split_negatives)
+        neg_layout.addWidget(self.split_negatives_check)
+
+        ratio_row = QHBoxLayout()
+        self.negative_ratio_spins = {}
+        for name, default in (("Train", 70), ("Validate", 15), ("Test", 15)):
+            ratio_row.addWidget(QLabel(f"{name}:"))
+            spin = QSpinBox()
+            spin.setRange(0, 100)
+            spin.setValue(default)
+            spin.setSuffix(" %")
+            spin.setEnabled(False)  # the checkbox starts clear
+            spin.valueChanged.connect(self._update_ok_enabled)
+            self.negative_ratio_spins[name] = spin
+            ratio_row.addWidget(spin)
+        ratio_row.addStretch(1)
+        neg_layout.addLayout(ratio_row)
+
+        self._ratio_note = QLabel("")
+        self._ratio_note.setStyleSheet("color: #cc0000;")
+        neg_layout.addWidget(self._ratio_note)
+        layout.addWidget(neg_box)
 
         # Output file
         out_row = QHBoxLayout()
@@ -569,6 +697,16 @@ class H5ExportDialog(QDialog):
                 spin.setValue(int(settings[key]))
         if settings.get("overlap") is not None:
             self.overlap_spin.setValue(int(round(float(settings["overlap"]) * 100)))
+        if settings.get("split_negatives") is not None:
+            self.split_negatives_check.setChecked(
+                bool(settings["split_negatives"]))
+        ratio = settings.get("negative_ratio")
+        if ratio is not None and len(ratio) == 3:
+            for spin, share in zip(
+                    (self.negative_ratio_spins["Train"],
+                     self.negative_ratio_spins["Validate"],
+                     self.negative_ratio_spins["Test"]), ratio):
+                spin.setValue(int(round(float(share) * 100)))
         for key, choices, combo in (
                 ("channels", CHANNEL_CHOICES, self.channel_combo),
                 ("split_value", SPLIT_CHOICES, self.split_combo),
@@ -583,10 +721,31 @@ class H5ExportDialog(QDialog):
         return (self.height_spin, self.width_spin, self.channel_combo,
                 self.chunk_spin, self.compress_combo)
 
+    def _on_split_negatives(self, enabled):
+        """Enable the ratio inputs only while the split is switched on."""
+        for spin in self.negative_ratio_spins.values():
+            spin.setEnabled(enabled)
+        self._update_ok_enabled()
+
+    def _ratio_total(self) -> int:
+        """The three ratio percentages summed."""
+        return sum(s.value() for s in self.negative_ratio_spins.values())
+
+    def _update_ok_enabled(self):
+        """Export needs an output path and, if used, a ratio totalling 100%."""
+        has_path = bool(self.out_edit.text().strip())
+        ratio_ok = (not self.split_negatives_check.isChecked()
+                    or self._ratio_total() == 100)
+        self._ratio_note.setText(
+            "" if ratio_ok
+            else f"The three shares must add up to 100% (currently "
+                 f"{self._ratio_total()}%).")
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(has_path and ratio_ok)
+
     def _on_out_path_changed(self):
         """Adopt an existing target file's settings and enable/disable Export."""
         text = self.out_edit.text().strip()
-        self.buttons.button(QDialogButtonBox.Ok).setEnabled(bool(text))
+        self._update_ok_enabled()
 
         settings = read_settings(text)
         if settings is not None:
@@ -639,4 +798,8 @@ class H5ExportDialog(QDialog):
             "split_value": SPLIT_CHOICES[self.split_combo.currentText()],
             "chunk": self.chunk_spin.value(),
             "compression": COMPRESSION_CHOICES[self.compress_combo.currentText()],
+            "split_negatives": self.split_negatives_check.isChecked(),
+            "negative_ratio": tuple(
+                self.negative_ratio_spins[name].value() / 100.0
+                for name in ("Train", "Validate", "Test")),
         }

@@ -1875,6 +1875,11 @@ class MainWindow(QMainWindow):
         msg = f"Wrote {result['total']:,} samples to\n{result['path']}"
         if result.get("cancelled"):
             msg = "Export cancelled. " + msg
+        if result.get("split_negatives"):
+            counts = result.get("negative_counts") or [0, 0, 0]
+            msg += ("\n\nHard negatives split "
+                    f"{counts[0]:,} train / {counts[1]:,} validate / "
+                    f"{counts[2]:,} test.")
         added = result.get("added_classes") or []
         dropped = result.get("dropped_classes") or []
         if added:
