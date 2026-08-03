@@ -1961,6 +1961,9 @@ class MainWindow(QMainWindow):
         msg = f"Wrote {result['total']:,} samples to\n{result['path']}"
         if result.get("cancelled"):
             msg = "Export cancelled. " + msg
+        if result.get("skipped"):
+            msg += (f"\n\n{result['skipped']:,} snippet(s) left out for "
+                    "clipping an object without containing it.")
         if result.get("split_negatives"):
             counts = result.get("negative_counts") or [0, 0, 0]
             msg += ("\n\nHard negatives split "

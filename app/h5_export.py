@@ -37,6 +37,12 @@ from PyQt5.QtWidgets import (
 
 HARD_NEGATIVE = "hard_negative"
 
+# Half-size, in pixels, of the objects being labelled. Snippets must hold a
+# label this far inside their edge to count as an example of it - see
+# _label_grids. Small enough to keep plenty of positives at the default 64px
+# snippet, large enough that objects stop being sliced by the window edge.
+DEFAULT_OBJECT_RADIUS = 8
+
 # Which layers an export covers.
 SCOPE_ALL = "all"
 SCOPE_VISIBLE = "visible"
@@ -92,6 +98,8 @@ def read_settings(path) -> dict | None:
             if "negative_ratio" in f.attrs:
                 settings["negative_ratio"] = tuple(
                     float(v) for v in f.attrs["negative_ratio"])
+            if "object_radius" in f.attrs:
+                settings["object_radius"] = int(f.attrs["object_radius"])
             return settings
     except Exception:  # noqa: BLE001 - a bad/locked file just has no settings
         return None
@@ -142,7 +150,8 @@ class H5DatasetWriter:
 
     def __init__(self, path, height, width, channels, classes,
                  chunk=_DEFAULT_CHUNK, compression=None, overlap=None,
-                 split_negatives=None, negative_ratio=None):
+                 split_negatives=None, negative_ratio=None,
+                 object_radius=None):
         """Open ``path`` for create-or-append and prepare the datasets.
 
         ``chunk`` and ``compression`` apply only when the file is *created*;
@@ -177,6 +186,8 @@ class H5DatasetWriter:
         if negative_ratio is not None:
             self._f.attrs["negative_ratio"] = np.asarray(
                 negative_ratio, dtype="float64")
+        if object_radius is not None:
+            self._f.attrs["object_radius"] = int(object_radius)
 
     def _create(self):
         """Create the resizable, chunked datasets."""
@@ -320,25 +331,58 @@ class H5DatasetWriter:
         return total
 
 
-def _label_grid(pts, xs, ys, width, height):
-    """Boolean (len(ys), len(xs)) grid: does each window contain a label?
+def _span(offsets, low, high):
+    """Index range of window offsets lying in ``(low, high]``."""
+    return (int(np.searchsorted(offsets, low, side="right")),
+            int(np.searchsorted(offsets, high, side="right")))
 
-    A label at ``x`` falls in the windows whose left edge lies in
-    ``(x - width, x]``, which is a contiguous run of the sorted offsets - so
-    each label marks its own block instead of every window testing every
-    label.
+
+def _label_grids(pts, xs, ys, width, height, radius):
+    """Which windows own a label, and which merely clip one.
+
+    Returns ``(owns, touches)``, both (len(ys), len(xs)) boolean grids.
+
+    ``owns`` marks windows holding a label at least ``radius`` px inside every
+    edge, so an object of that radius is comfortably within the crop and the
+    window is a clean example. ``touches`` also covers windows lying within
+    ``radius`` of a label without owning it: part of an object is visible, but
+    not enough to call it an example - and calling it a hard negative would
+    teach the network that a plainly visible object is *not* the class. Those
+    windows are dropped instead.
+
+    A label falls in the windows whose left edge lies in ``(x - width, x]``,
+    which is a contiguous run of the sorted offsets - so each label marks its
+    own block rather than every window testing every label.
+
+    A label too close to the image edge to be ``radius``-inside any window
+    would otherwise vanish from the dataset, so it falls back to the window
+    holding it most centrally.
     """
-    grid = np.zeros((len(ys), len(xs)), dtype=bool)
-    if not pts or grid.size == 0:
-        return grid
+    owns = np.zeros((len(ys), len(xs)), dtype=bool)
+    touches = np.zeros_like(owns)
+    if not pts or owns.size == 0:
+        return owns, touches
     xs_arr, ys_arr = np.asarray(xs), np.asarray(ys)
     for x, y, _ci in pts:
-        ix0 = int(np.searchsorted(xs_arr, x - width, side="right"))
-        ix1 = int(np.searchsorted(xs_arr, x, side="right"))
-        iy0 = int(np.searchsorted(ys_arr, y - height, side="right"))
-        iy1 = int(np.searchsorted(ys_arr, y, side="right"))
-        grid[iy0:iy1, ix0:ix1] = True
-    return grid
+        tx0, tx1 = _span(xs_arr, x - width - radius, x + radius)
+        ty0, ty1 = _span(ys_arr, y - height - radius, y + radius)
+        touches[ty0:ty1, tx0:tx1] = True
+
+        ox0, ox1 = _span(xs_arr, x - width + radius, x - radius)
+        oy0, oy1 = _span(ys_arr, y - height + radius, y - radius)
+        if ox1 > ox0 and oy1 > oy0:
+            owns[oy0:oy1, ox0:ox1] = True
+            continue
+        # Too near an image edge: keep the most central window that holds it.
+        cx0, cx1 = _span(xs_arr, x - width, x)
+        cy0, cy1 = _span(ys_arr, y - height, y)
+        if cx1 > cx0 and cy1 > cy0:
+            ix = cx0 + int(np.argmin(
+                np.abs(xs_arr[cx0:cx1] + width / 2.0 - x)))
+            iy = cy0 + int(np.argmin(
+                np.abs(ys_arr[cy0:cy1] + height / 2.0 - y)))
+            owns[iy, ix] = True
+    return owns, touches
 
 
 def _negative_split_pool(count, ratio, rng):
@@ -364,18 +408,27 @@ def _negative_split_pool(count, ratio, rng):
 
 def export_image(writer, path, labels, height, width, overlap, channels,
                  split_value, class_to_index, hard_negative_index,
-                 cancel_check=None, negative_ratio=None, rng=None):
+                 cancel_check=None, negative_ratio=None, rng=None,
+                 object_radius=0):
     """Slide over one raster, adding every snippet to ``writer``.
 
-    Returns ``(added, negative_counts)`` - the number of snippets added and
-    how many hard negatives went to each split. Windows never cross the image
-    edge (a final window is shifted to fit), so every snippet is exactly HxW.
+    Returns ``(added, negative_counts, skipped)`` - the number of snippets
+    added, how many hard negatives went to each split, and how many windows
+    were dropped as neither clean example nor clean negative. Windows never
+    cross the image edge (a final window is shifted to fit), so every snippet
+    is exactly HxW.
+
+    ``object_radius`` is how far inside a window a label must sit for the
+    window to count as an example; windows that clip an object without
+    containing it are dropped rather than written as hard negatives. Zero
+    restores the plain "label anywhere in the window" rule.
 
     With ``negative_ratio`` set, this image's hard negatives are shared out
     over train/validate/test in those proportions instead of all taking
     ``split_value``; genuine examples always take ``split_value``.
     """
     added = 0
+    skipped = 0
     negative_counts = [0, 0, 0]
     step_x = max(1, int(round(width * (1.0 - overlap))))
     step_y = max(1, int(round(height * (1.0 - overlap))))
@@ -391,27 +444,34 @@ def export_image(writer, path, labels, height, width, overlap, channels,
         nodata = src.nodata
         xs = _snippet_positions(src.width, width, step_x)
         ys = _snippet_positions(src.height, height, step_y)
-        has_label = _label_grid(pts, xs, ys, width, height)
+        radius = max(0, int(object_radius))
+        owns, touches = _label_grids(pts, xs, ys, width, height, radius)
 
         pool, taken = None, 0
         if negative_ratio is not None:
-            # Quotas cover every label-free window. Windows dropped for being
-            # all nodata simply leave the tail of the shuffled pool unused,
-            # which takes a random share from each split rather than skewing.
+            # Quotas cover every window that will be a hard negative. Windows
+            # dropped for being all nodata simply leave the tail of the
+            # shuffled pool unused, which takes a random share from each split
+            # rather than skewing one.
             pool = _negative_split_pool(
-                int(has_label.size - has_label.sum()), negative_ratio,
+                int(touches.size - touches.sum()), negative_ratio,
                 rng if rng is not None else np.random.default_rng())
 
         for iy, y0 in enumerate(ys):
             for ix, x0 in enumerate(xs):
                 if cancel_check and cancel_check():
-                    return added, negative_counts
+                    return added, negative_counts, skipped
+                if touches[iy, ix] and not owns[iy, ix]:
+                    # Clips an object without containing it - ambiguous, so it
+                    # trains nothing rather than training the wrong thing.
+                    skipped += 1
+                    continue
                 arr = _window_pixels(
                     src, Window(x0, y0, width, height), channels, nodata)
                 if arr is None:
                     continue  # entirely nodata
                 inside = []
-                if has_label[iy, ix]:
+                if owns[iy, ix]:
                     inside = [(x, y, ci) for (x, y, ci) in pts
                               if x0 <= x < x0 + width
                               and y0 <= y < y0 + height]
@@ -428,7 +488,7 @@ def export_image(writer, path, labels, height, width, overlap, channels,
                     writer.add(arr, hard_negative_index, False, negative_split)
                     negative_counts[negative_split] += 1
                 added += 1
-    return added, negative_counts
+    return added, negative_counts, skipped
 
 
 class H5ExportWorker(QObject):
@@ -463,6 +523,7 @@ class H5ExportWorker(QObject):
         # shuffled independently but the run stays self-contained.
         rng = np.random.default_rng()
         negative_counts = [0, 0, 0]
+        skipped = 0
         try:
             writer = H5DatasetWriter(
                 self._out_path, opts["height"], opts["width"],
@@ -471,7 +532,8 @@ class H5ExportWorker(QObject):
                 compression=opts.get("compression"),
                 overlap=opts.get("overlap"),
                 split_negatives=opts.get("split_negatives"),
-                negative_ratio=opts.get("negative_ratio"))
+                negative_ratio=opts.get("negative_ratio"),
+                object_radius=opts.get("object_radius"))
             total_images = len(self._images)
             samples = 0
             for i, (path, labels) in enumerate(self._images):
@@ -482,13 +544,15 @@ class H5ExportWorker(QObject):
                     errors.append((path, "file not found"))
                     continue
                 try:
-                    added, negatives = export_image(
+                    added, negatives, dropped = export_image(
                         writer, path, labels, opts["height"], opts["width"],
                         opts["overlap"], opts["channels"], opts["split_value"],
                         class_to_index, hard_negative_index,
                         cancel_check=lambda: self._cancelled,
-                        negative_ratio=negative_ratio, rng=rng)
+                        negative_ratio=negative_ratio, rng=rng,
+                        object_radius=opts.get("object_radius", 0))
                     samples += added
+                    skipped += dropped
                     for i, count in enumerate(negatives):
                         negative_counts[i] += count
                 except Exception as e:  # noqa: BLE001 - report, keep going
@@ -503,7 +567,8 @@ class H5ExportWorker(QObject):
                  "added_classes": added_classes,
                  "dropped_classes": dropped_classes,
                  "split_negatives": bool(negative_ratio),
-                 "negative_counts": negative_counts}, "")
+                 "negative_counts": negative_counts,
+                 "skipped": skipped}, "")
         except Exception as e:  # noqa: BLE001 - surfaced to the user
             if writer is not None:
                 try:
@@ -600,6 +665,18 @@ class H5ExportDialog(QDialog):
         self.channel_combo.addItems(list(CHANNEL_CHOICES.keys()))
         form.addRow("Channels:", self.channel_combo)
 
+        self.radius_spin = QSpinBox()
+        self.radius_spin.setRange(0, 4096)
+        self.radius_spin.setValue(DEFAULT_OBJECT_RADIUS)
+        self.radius_spin.setSuffix(" px")
+        self.radius_spin.setToolTip(
+            "Roughly half an object's size. A snippet counts as an example "
+            "only when its label sits at least this far inside the edge, so "
+            "objects are not sliced in half. Snippets that clip an object "
+            "without containing it are left out altogether rather than "
+            "written as hard negatives. 0 = any label anywhere counts.")
+        form.addRow("Object radius:", self.radius_spin)
+
         self.split_combo = QComboBox()
         self.split_combo.addItems(list(SPLIT_CHOICES.keys()))
         self.split_combo.setToolTip(
@@ -692,7 +769,8 @@ class H5ExportDialog(QDialog):
             return
         for key, spin in (("height", self.height_spin),
                           ("width", self.width_spin),
-                          ("chunk", self.chunk_spin)):
+                          ("chunk", self.chunk_spin),
+                          ("object_radius", self.radius_spin)):
             if settings.get(key) is not None:
                 spin.setValue(int(settings[key]))
         if settings.get("overlap") is not None:
@@ -717,9 +795,15 @@ class H5ExportDialog(QDialog):
                     combo.setCurrentText(label)
 
     def _fixed_widgets(self):
-        """The widgets an existing file's storage layout dictates."""
+        """The widgets an existing file dictates.
+
+        Storage layout (size, channels, chunking, compression) is fixed once
+        the datasets exist. The object radius is not, but changing it would
+        mix two extraction rules in one dataset, so a file keeps the one it
+        was built with.
+        """
         return (self.height_spin, self.width_spin, self.channel_combo,
-                self.chunk_spin, self.compress_combo)
+                self.chunk_spin, self.compress_combo, self.radius_spin)
 
     def _on_split_negatives(self, enabled):
         """Enable the ratio inputs only while the split is switched on."""
@@ -756,7 +840,7 @@ class H5ExportDialog(QDialog):
                 widget.setEnabled(False)
             self._append_note.setText(
                 "Existing dataset - snippets will be appended using its "
-                "snippet size, channels and storage settings.")
+                "snippet size, channels, object radius and storage settings.")
             return
 
         for widget in self._fixed_widgets():
@@ -797,6 +881,7 @@ class H5ExportDialog(QDialog):
             "channels": CHANNEL_CHOICES[self.channel_combo.currentText()],
             "split_value": SPLIT_CHOICES[self.split_combo.currentText()],
             "chunk": self.chunk_spin.value(),
+            "object_radius": self.radius_spin.value(),
             "compression": COMPRESSION_CHOICES[self.compress_combo.currentText()],
             "split_negatives": self.split_negatives_check.isChecked(),
             "negative_ratio": tuple(
