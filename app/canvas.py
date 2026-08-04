@@ -18,6 +18,7 @@ from PyQt5.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QCursor,
     QPainter,
     QPainterPath)
 from PyQt5.QtWidgets import (
@@ -66,6 +67,35 @@ class MeasureStage(Enum):
     """Which measurement line the user is currently drawing."""
     LENGTH = auto()   # First line drawn -> label.length_m
     WIDTH = auto()    # Second line drawn -> label.width_m
+
+
+_crosshair = None
+
+
+def _crosshair_cursor() -> QCursor:
+    """A crosshair cursor that stays visible on any background.
+
+    ``Qt.CrossCursor`` is a bare black cross on Windows, which all but
+    vanishes against the dark canvas outside the loaded imagery; this one
+    draws a white underlay beneath the black cross so it carries its own
+    contrast. Built once, on first use (a QPixmap needs the QApplication).
+    """
+    global _crosshair
+    if _crosshair is None:
+        size = 25  # odd, so the hotspot is an exact pixel centre
+        centre = size // 2
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setPen(QPen(QColor(255, 255, 255), 3))
+        painter.drawLine(centre, 0, centre, size - 1)
+        painter.drawLine(0, centre, size - 1, centre)
+        painter.setPen(QPen(QColor(0, 0, 0), 1))
+        painter.drawLine(centre, 0, centre, size - 1)
+        painter.drawLine(0, centre, size - 1, centre)
+        painter.end()
+        _crosshair = QCursor(pixmap, centre, centre)
+    return _crosshair
 
 
 class TiledLayer:
@@ -2090,16 +2120,16 @@ class MapCanvas(QGraphicsView):
             self._pan_active = False
         elif mode == CanvasMode.LABEL:
             self.setDragMode(QGraphicsView.NoDrag)
-            self.setCursor(Qt.CrossCursor)
+            self.setCursor(_crosshair_cursor())
         elif mode == CanvasMode.RULER:
             # Ruler mode: left-drag to measure distance; wheel still zooms.
             self.setDragMode(QGraphicsView.NoDrag)
-            self.setCursor(Qt.CrossCursor)
+            self.setCursor(_crosshair_cursor())
             self._ruler_dragging = False
         elif mode in CYCLE_MODES:
             # Cycle mode: left click labels, right drag pans, wheel zooms
             self.setDragMode(QGraphicsView.NoDrag)
-            self.setCursor(Qt.CrossCursor)
+            self.setCursor(_crosshair_cursor())
             self._cycle_panning = False
 
     def set_current_class(self, class_name: str):
@@ -2229,7 +2259,7 @@ class MapCanvas(QGraphicsView):
                 self._ruler_dragging = False
             elif event.button() == Qt.RightButton and self._ruler_panning:
                 self._ruler_panning = False
-                self.setCursor(Qt.CrossCursor)
+                self.setCursor(_crosshair_cursor())
             return
         if self._mode == CanvasMode.PAN and event.button() == Qt.LeftButton:
             if hasattr(self, '_pan_active') and self._pan_active:
@@ -2238,7 +2268,7 @@ class MapCanvas(QGraphicsView):
         elif self._mode in CYCLE_MODES and event.button() == Qt.RightButton:
             if hasattr(self, '_cycle_panning') and self._cycle_panning:
                 self._cycle_panning = False
-                self.setCursor(Qt.CrossCursor)
+                self.setCursor(_crosshair_cursor())
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -2749,7 +2779,7 @@ class MapCanvas(QGraphicsView):
         """Enter link mode with the given label as the source."""
         self._link_mode_active = True
         self._link_source_label_id = source_label_id
-        self.setCursor(Qt.CrossCursor)
+        self.setCursor(_crosshair_cursor())
 
         # Highlight the source label
         if source_label_id in self._label_items:
@@ -2782,7 +2812,7 @@ class MapCanvas(QGraphicsView):
 
         # Restore cursor based on mode
         if self._mode in LABELING_MODES:
-            self.setCursor(Qt.CrossCursor)
+            self.setCursor(_crosshair_cursor())
         else:
             self.setCursor(Qt.ArrowCursor)
 
@@ -2826,7 +2856,7 @@ class MapCanvas(QGraphicsView):
         self._measure_stage = MeasureStage.LENGTH
         self._measure_start = None
         self._measure_length_m = None
-        self.setCursor(Qt.CrossCursor)
+        self.setCursor(_crosshair_cursor())
         self.measure_mode_changed.emit(
             True, "Measure LENGTH: click start, then end (Esc to cancel)")
 
@@ -2941,7 +2971,7 @@ class MapCanvas(QGraphicsView):
 
         # Restore the cursor for the underlying interaction mode.
         if self._mode in LABELING_MODES:
-            self.setCursor(Qt.CrossCursor)
+            self.setCursor(_crosshair_cursor())
         elif self._mode == CanvasMode.PAN:
             self.setCursor(Qt.OpenHandCursor)
         else:
