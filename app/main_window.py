@@ -570,12 +570,16 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, event: QKeyEvent):
         """Handle global key press events.
 
-        Captures Space key when in cycle mode regardless of which widget has focus.
-        Keys 1-9 switch to the corresponding class (first 9 classes).
+        Captures Space (next) / Ctrl+Space (previous) in cycle mode regardless of
+        which widget has focus. Keys 1-9 switch to the corresponding class.
         """
         if event.key() == Qt.Key_Space and self.canvas._mode in CYCLE_MODES:
-            # Handle space in cycle mode globally
-            self._cycle_to_next_layer()
+            # Handle space in cycle mode globally. Ctrl+Space steps backwards,
+            # matching the canvas handler and the documented shortcut.
+            if event.modifiers() & Qt.ControlModifier:
+                self._cycle_to_prev_layer()
+            else:
+                self._cycle_to_next_layer()
             event.accept()
             return
 
@@ -597,8 +601,12 @@ class MainWindow(QMainWindow):
         """
         if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Space:
             if self.canvas._mode in CYCLE_MODES:
-                # Handle space in cycle mode - don't let tree process it
-                self._cycle_to_next_layer()
+                # Handle space in cycle mode - don't let tree process it.
+                # Ctrl+Space steps backwards, consistent with the canvas handler.
+                if event.modifiers() & Qt.ControlModifier:
+                    self._cycle_to_prev_layer()
+                else:
+                    self._cycle_to_next_layer()
                 return True  # Event consumed
         return super().eventFilter(obj, event)
 
@@ -2979,19 +2987,22 @@ class MainWindow(QMainWindow):
 <tr><td><b>Escape</b></td><td>Clear the measurement or the go-to marker</td></tr>
 </table>
 
-<h3>Labeling</h3>
+<h3>Labeling (Label &amp; Cycle modes)</h3>
 <table>
-<tr><td><b>Left-click</b></td><td>Place label (in Label/Cycle mode)</td></tr>
-<tr><td><b>Right-click label</b></td><td>Label options (remove, link)</td></tr>
-<tr><td><b>Ctrl+Left-click</b></td><td>Label options in Cycle mode</td></tr>
+<tr><td><b>Left-click</b></td><td>Place label</td></tr>
+<tr><td><b>Right-click label</b></td><td>Label options (remove, link, measure)</td></tr>
+<tr><td><b>Right-click + drag</b></td><td>Pan the view</td></tr>
+<tr><td><b>Ctrl+Left-click label</b></td><td>Label options (alias, Cycle modes)</td></tr>
 <tr><td><b>1&ndash;9</b></td><td>Quick-switch to class 1&ndash;9</td></tr>
 <tr><td><b>Escape</b></td><td>Cancel link mode</td></tr>
 </table>
 
-<h3>Cycle / View Cycle Mode</h3>
+<h3>Cycle Modes (Cycle / View Cycle / Image Cycle)</h3>
 <table>
 <tr><td><b>Space</b></td><td>Advance to next layer (unchecks current)</td></tr>
 <tr><td><b>Ctrl+Space</b></td><td>Go back to previous layer</td></tr>
+<tr><td><b>Left-click</b></td><td>Place label</td></tr>
+<tr><td><b>Right-click label</b></td><td>Label options (remove, link, measure)</td></tr>
 <tr><td><b>Right-click + drag</b></td><td>Pan around</td></tr>
 <tr><td><b>Mouse wheel</b></td><td>Zoom in/out</td></tr>
 </table>

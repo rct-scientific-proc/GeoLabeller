@@ -1112,6 +1112,11 @@ class MapCanvas(QGraphicsView):
     # ignored so a stray double-click never records a bogus sub-metre value.
     _MIN_MEASURE_PIXELS = 4
 
+    # How far (view pixels) the right button must move before a right-press in a
+    # labeling mode counts as a pan-drag rather than a click. Below this, the
+    # release opens the label context menu; at or above it, the view pans.
+    _RIGHT_DRAG_PIXELS = 4
+
     # Don't zoom past a very small view; small enough for metre-scale objects.
     _MIN_VIEW_SIZE = 0.5
     # Rolling scene rect: QGraphicsView maps the scene rect to int device pixels
@@ -2226,18 +2231,18 @@ class MapCanvas(QGraphicsView):
                     layer_name,
                     group_path,
                     layer.file_path)
-        elif self._mode == CanvasMode.LABEL and event.button() == Qt.RightButton:
-            # Right-click in label mode - exit link mode if active, otherwise
-            # show context menu
+        elif self._mode in LABELING_MODES and event.button() == Qt.RightButton:
+            # Right button in any labeling mode (Label + Cycle): a right-click
+            # without dragging opens the label context menu; a right-drag pans.
+            # We can't tell which yet, so begin a potential pan and decide on
+            # release based on whether the cursor moved (see mouseReleaseEvent).
             if self._link_mode_active:
                 self._exit_link_mode()
             else:
-                self._show_label_context_menu(event.pos())
-        elif self._mode in CYCLE_MODES and event.button() == Qt.RightButton:
-            # Right-click drag in cycle mode - start panning
-            self._cycle_panning = True
-            self._cycle_pan_start = event.pos()
-            self.setCursor(Qt.ClosedHandCursor)
+                self._cycle_panning = True
+                self._cycle_pan_start = event.pos()
+                self._cycle_pan_moved = False
+                self.setCursor(Qt.ClosedHandCursor)
         else:
             super().mousePressEvent(event)
 
@@ -2265,10 +2270,14 @@ class MapCanvas(QGraphicsView):
             if hasattr(self, '_pan_active') and self._pan_active:
                 self._pan_active = False
                 self.setCursor(Qt.OpenHandCursor)
-        elif self._mode in CYCLE_MODES and event.button() == Qt.RightButton:
-            if hasattr(self, '_cycle_panning') and self._cycle_panning:
+        elif self._mode in LABELING_MODES and event.button() == Qt.RightButton:
+            if getattr(self, '_cycle_panning', False):
                 self._cycle_panning = False
                 self.setCursor(_crosshair_cursor())
+                if not getattr(self, '_cycle_pan_moved', False):
+                    # A right-click without dragging: open the label context menu
+                    # (consistent across Label and Cycle modes).
+                    self._show_label_context_menu(event.pos())
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -2304,14 +2313,26 @@ class MapCanvas(QGraphicsView):
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
             # Still update coordinates below
 
-        # Handle cycle mode right-click panning
-        if self._mode in CYCLE_MODES and hasattr(
-                self, '_cycle_panning') and self._cycle_panning:
-            delta = event.pos() - self._cycle_pan_start
-            self._cycle_pan_start = event.pos()
-            self.horizontalScrollBar().setValue(
-                self.horizontalScrollBar().value() - delta.x())
-            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+        # Handle right-click panning in labeling modes (Label + Cycle). Only
+        # starts panning once the cursor has moved past a small threshold, so a
+        # stationary right-click stays a click (opens the context menu on
+        # release) instead of nudging the view.
+        if self._mode in LABELING_MODES and getattr(
+                self, '_cycle_panning', False):
+            if not self._cycle_pan_moved:
+                d = event.pos() - self._cycle_pan_start
+                if abs(d.x()) + abs(d.y()) >= self._RIGHT_DRAG_PIXELS:
+                    # Crossed the drag threshold: reset the origin here so the
+                    # pan doesn't jump by the threshold distance.
+                    self._cycle_pan_moved = True
+                    self._cycle_pan_start = event.pos()
+            if self._cycle_pan_moved:
+                delta = event.pos() - self._cycle_pan_start
+                self._cycle_pan_start = event.pos()
+                self.horizontalScrollBar().setValue(
+                    self.horizontalScrollBar().value() - delta.x())
+                self.verticalScrollBar().setValue(
+                    self.verticalScrollBar().value() - delta.y())
             # Still update coordinates below
 
         scene_pos = self.mapToScene(event.pos())
