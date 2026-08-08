@@ -683,6 +683,38 @@ class LayerPanel(QWidget):
             elif child_type == "group":
                 self._collect_all_layers(child, layers)
 
+    def selected_group_is_bottom_level(self) -> "bool | None":
+        """Check whether the selected group contains no nested sub-groups.
+
+        Waterfall mode only works on bottom-level groups (a flat run of
+        images); a group holding other groups has no single well-defined
+        image sequence to stack.
+
+        Returns:
+            True if the selected group (or the selected layer's parent group)
+            has no child groups, False if it has at least one, or None when no
+            group can be resolved from the selection.
+        """
+        selected = self.tree.selectedItems()
+        if not selected:
+            return None
+
+        item = selected[0]
+        item_type = item.data(0, Qt.UserRole + 1)
+        if item_type == "group":
+            group_item = item
+        elif item_type == "layer":
+            group_item = item.parent()
+            if group_item is None:
+                return None
+        else:
+            return None
+
+        for i in range(group_item.childCount()):
+            if group_item.child(i).data(0, Qt.UserRole + 1) == "group":
+                return False
+        return True
+
     def get_selected_group_name(self) -> str:
         """Get the name of the currently selected group.
 
@@ -1475,6 +1507,10 @@ class CombinedLayerPanel(QWidget):
     def get_selected_group_name(self) -> str:
         """Get the name of the currently selected group."""
         return self.main_panel.get_selected_group_name()
+
+    def selected_group_is_bottom_level(self) -> "bool | None":
+        """Check whether the selected group contains no nested sub-groups."""
+        return self.main_panel.selected_group_is_bottom_level()
 
     def get_or_create_nongeo_root(self):
         """Get or create the 'Non-Georeferenced' top-level group."""

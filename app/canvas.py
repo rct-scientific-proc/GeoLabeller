@@ -45,6 +45,15 @@ PIXEL_ZONE_ORIGIN_Y = 0.0
 PIXEL_ZONE_SCALE = 50.0  # Scene units per pixel (makes images ~similar size to geo layers)
 PIXEL_ZONE_GROUP_GAP = 5000.0  # Gap between group columns in scene units
 
+# Waterfall mode: a bottom-level group's images are stacked vertically in the
+# pixel zone (raw pixels, no reprojection) so the view can glide through them
+# like a filmstrip. Vertical gap between stacked images, in scene units.
+WATERFALL_GAP = 2000.0
+# Hold-to-glide navigation: while Space (up) / Ctrl+Space (down) is held, the
+# view scrolls this many view pixels every timer tick.
+WATERFALL_GLIDE_INTERVAL_MS = 16   # ~60 fps
+WATERFALL_GLIDE_PX = 8             # view pixels per tick (~480 px/s)
+
 
 class CanvasMode(Enum):
     """Canvas interaction modes."""
@@ -53,11 +62,15 @@ class CanvasMode(Enum):
     CYCLE = auto()    # Cycle through layers in a group
     VIEW_CYCLE = auto()  # Cycle through layers visible in current view
     RULER = auto()    # Measure ground distance by dragging
-    IMAGE_CYCLE = auto()  # Cycle with the view rotated to each image's grid
+    WATERFALL = auto()  # Group's images stacked vertically; hold Space to glide
 
 
-# Modes that step through layers one at a time (Space advances).
-CYCLE_MODES = (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE, CanvasMode.IMAGE_CYCLE)
+# Cycle-style modes: left click labels, right-drag pans, wheel zooms. WATERFALL
+# shares these interactions but navigates by gliding rather than stepping.
+CYCLE_MODES = (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE, CanvasMode.WATERFALL)
+
+# Modes that step through layers one at a time (Space advances one layer).
+STEP_CYCLE_MODES = (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE)
 
 # Modes where a left click places a label.
 LABELING_MODES = (CanvasMode.LABEL,) + CYCLE_MODES
@@ -134,6 +147,10 @@ class TiledLayer:
         # transformer inside rasterio.warp.transform.
         self._wgs84_to_native_transformer: Transformer | None = None
         self._wgs84_to_native_crs = None
+        # Cached transformer for the reverse direction (native CRS -> WGS84),
+        # used to map a clicked pixel back to lat/lon in waterfall mode.
+        self._native_to_wgs84_transformer: Transformer | None = None
+        self._native_to_wgs84_crs = None
 
         # Image data (kept in memory after reprojection)
         self._rgba_data: np.ndarray | None = None
@@ -488,6 +505,10 @@ class TiledLayer:
         with rasterio.open(self.file_path) as src:
             self._src_width = src.width
             self._src_height = src.height
+            # Capture georeferencing if present so a clicked pixel can still be
+            # mapped to lat/lon while the image is displayed raw (waterfall).
+            self._src_crs = src.crs
+            self._src_transform = src.transform
             self._read_overview_metadata(src)
 
             width = src.width
@@ -518,6 +539,9 @@ class TiledLayer:
         with rasterio.open(self.file_path) as src:
             self._src_width = src.width
             self._src_height = src.height
+            # Keep any georeferencing so pixel -> lat/lon works in waterfall mode.
+            self._src_crs = src.crs
+            self._src_transform = src.transform
             self._read_overview_metadata(src)
 
             self._full_width = src.width
@@ -771,6 +795,28 @@ class TiledLayer:
         col, row = ~self._src_transform * (x_native, y_native)
 
         return (col, row)
+
+    def _get_native_to_wgs84_transformer(self) -> Transformer:
+        """Cached transformer from the source CRS to WGS84 (lon/lat)."""
+        if (self._native_to_wgs84_transformer is None
+                or self._native_to_wgs84_crs is not self._src_crs):
+            self._native_to_wgs84_transformer = Transformer.from_crs(
+                self._src_crs, 4326, always_xy=True)
+            self._native_to_wgs84_crs = self._src_crs
+        return self._native_to_wgs84_transformer
+
+    def pixel_to_latlon(self, px: float, py: float) -> "tuple[float, float] | None":
+        """Convert a source pixel (col, row) to WGS84 (lon, lat).
+
+        Returns None when the image has no georeferencing (a plain raster), in
+        which case a pixel has no meaningful lat/lon.
+        """
+        if self._src_transform is None or self._src_crs is None:
+            return None
+        x_native, y_native = self._src_transform * (px, py)
+        lon, lat = self._get_native_to_wgs84_transformer().transform(
+            x_native, y_native)
+        return (lon, lat)
 
     def scene_to_pixel(self, easting: float, northing: float) -> tuple[float, float]:
         """Convert scene coordinates to pixel coordinates for non-geo layers.
@@ -1239,6 +1285,24 @@ class MapCanvas(QGraphicsView):
         self._pixel_zone_groups: dict[str, tuple[float, float]] = {}
         self._pixel_zone_next_x = PIXEL_ZONE_ORIGIN_X
 
+        # Waterfall mode state: while active, a group's layers are re-laid-out
+        # stacked vertically in the pixel zone. Original bounds are saved so the
+        # normal layout can be restored on exit; layers that were georeferenced
+        # are switched to raw display and flipped back afterwards.
+        self._waterfall_active = False
+        self._waterfall_saved_bounds: dict[str, tuple] = {}
+        self._waterfall_layer_order: list[str] = []
+        self._waterfall_was_geo: set[str] = set()
+        # Projected label markers (labels shown on other images that contain
+        # them): list of (label_id, ellipse_item, text_item).
+        self._waterfall_projection_items: list = []
+        # Hold-to-glide navigation timer. Direction: -1 glides up, +1 down.
+        self._waterfall_glide_dir = 0
+        self._waterfall_glide_timer = QTimer()
+        self._waterfall_glide_timer.setInterval(WATERFALL_GLIDE_INTERVAL_MS)
+        self._waterfall_glide_timer.timeout.connect(
+            self._on_waterfall_glide_tick)
+
         # Tile update timer (debounce rapid view changes)
         self._tile_update_timer = QTimer()
         self._tile_update_timer.setSingleShot(True)
@@ -1384,6 +1448,105 @@ class MapCanvas(QGraphicsView):
     def is_in_pixel_zone(self, easting: float) -> bool:
         """Check if a scene X coordinate is in the pixel zone."""
         return easting >= PIXEL_ZONE_ORIGIN_X
+
+    # ------------------------------------------------------------------
+    # Waterfall mode: stack a group's images vertically (raw pixels, no
+    # reprojection) so the view can glide through them like a filmstrip.
+    # ------------------------------------------------------------------
+
+    def layout_waterfall(self, layer_ids: list[str]) -> float:
+        """Stack the given layers vertically (tree order, top to bottom).
+
+        Georeferenced layers are switched to RAW pixel display (no reprojection
+        or warping); their source CRS/geotransform is kept so a clicked pixel
+        can still be mapped to lat/lon. Each layer's bounds are overwritten
+        with a stacked position in the pixel zone (originals saved for restore
+        on exit) and all images share a common left edge.
+
+        Returns the total stack height in scene units.
+        """
+        self._waterfall_active = True
+        self._waterfall_layer_order = []
+        origin_x = PIXEL_ZONE_ORIGIN_X
+        # Scene Y grows downward and scene north = -y: the first image's top
+        # sits at north=0 and each subsequent image is placed below it.
+        north = 0.0
+        for layer_id in layer_ids:
+            layer = self._layers.get(layer_id)
+            if layer is None:
+                continue
+            # Show georeferenced images as raw pixels while stacked.
+            if layer.geo:
+                self._waterfall_was_geo.add(layer_id)
+                layer.geo = False
+                layer._fully_loaded = False
+                self._cancel_layer_load(layer)
+            # The stack is sized from source pixel dimensions; read them if
+            # this (lazy) layer has never been opened.
+            if layer._src_width <= 0 or layer._src_height <= 0:
+                try:
+                    layer.ensure_loaded(1)
+                except Exception:
+                    continue
+            if layer._src_width <= 0 or layer._src_height <= 0:
+                continue
+            if layer_id not in self._waterfall_saved_bounds:
+                self._waterfall_saved_bounds[layer_id] = layer.bounds
+            w = layer._src_width * PIXEL_ZONE_SCALE
+            h = layer._src_height * PIXEL_ZONE_SCALE
+            south = north - h
+            layer.bounds = (origin_x, south, origin_x + w, north)
+            # Old tiles were positioned from the previous bounds; drop them so
+            # they rebuild at the stacked location (with raw data).
+            self._clear_layer_tiles(layer)
+            self._waterfall_layer_order.append(layer_id)
+            north = south - WATERFALL_GAP
+        total_height = -north  # from y=0 down to the bottom of the last image
+        self._update_visible_tiles()
+        return total_height
+
+    def clear_waterfall(self):
+        """Restore the normal layout after leaving waterfall mode."""
+        self.stop_waterfall_glide()
+        self.clear_waterfall_projections()
+        for layer_id, bounds in self._waterfall_saved_bounds.items():
+            layer = self._layers.get(layer_id)
+            if layer is None:
+                continue
+            layer.bounds = bounds
+            # Layers shown raw go back to reprojected display.
+            if layer_id in self._waterfall_was_geo:
+                layer.geo = True
+                layer._fully_loaded = False
+                self._cancel_layer_load(layer)
+            self._clear_layer_tiles(layer)
+        self._waterfall_was_geo.clear()
+        self._waterfall_saved_bounds.clear()
+        self._waterfall_layer_order = []
+        self._waterfall_active = False
+        self._update_visible_tiles()
+
+    def start_waterfall_glide(self, direction: int):
+        """Begin gliding the view while a nav key is held (-1 up, +1 down)."""
+        if not self._waterfall_active or direction == 0:
+            return
+        self._waterfall_glide_dir = direction
+        if not self._waterfall_glide_timer.isActive():
+            self._waterfall_glide_timer.start()
+
+    def stop_waterfall_glide(self):
+        """Stop the waterfall glide (nav key released, or mode left)."""
+        self._waterfall_glide_dir = 0
+        self._waterfall_glide_timer.stop()
+
+    def _on_waterfall_glide_tick(self):
+        """Scroll the view a small step in the current glide direction."""
+        if self._waterfall_glide_dir == 0 or not self._waterfall_active:
+            self._waterfall_glide_timer.stop()
+            return
+        bar = self.verticalScrollBar()
+        bar.setValue(bar.value()
+                     + self._waterfall_glide_dir * WATERFALL_GLIDE_PX)
 
     def _scene_to_web(self, scene_pt: QPointF) -> tuple[float, float]:
         """Convert a scene point to Web Mercator (easting, northing).
@@ -1815,36 +1978,6 @@ class MapCanvas(QGraphicsView):
             return layer._src_transform, layer._src_crs
         return None, None
 
-    # ------------------------------------------------------------------
-    # Image-up view: rotate the scene onto a chosen image's pixel grid
-    # ------------------------------------------------------------------
-
-    def _layer_scene_rotation(self, layer: TiledLayer) -> float:
-        """Return the on-screen angle (degrees) of a layer's pixel-row axis.
-
-        Measures the direction of the image's +column axis in scene coordinates
-        by projecting the first row's endpoints into Web Mercator. Rotating the
-        view by the negative of this angle renders the image "image-up" (rows
-        horizontal, in its native orientation).
-        """
-        if layer._src_transform is None or layer._src_crs is None:
-            return 0.0
-        try:
-            transformer = Transformer.from_crs(
-                layer._src_crs, WEB_MERCATOR, always_xy=True)
-            span = max(1, layer._src_width)
-            x0, y0 = layer._src_transform * (0, 0)
-            x1, y1 = layer._src_transform * (span, 0)
-            xs, ys = transformer.transform([x0, x1], [y0, y1])
-            # Scene Y is -northing, so flip the northing delta.
-            dx = xs[1] - xs[0]
-            dy = -(ys[1] - ys[0])
-            if dx == 0.0 and dy == 0.0:
-                return 0.0
-            return math.degrees(math.atan2(dy, dx))
-        except Exception:
-            return 0.0
-
     def set_view_rotation(self, degrees: float):
         """Set the absolute view rotation in degrees (0 = north-up).
 
@@ -1862,18 +1995,6 @@ class MapCanvas(QGraphicsView):
     def view_rotation(self) -> float:
         """Return the current view rotation in degrees."""
         return self._view_rotation
-
-    def zoom_to_layer_image_up(self, layer_id: str):
-        """Rotate the view onto a layer's pixel grid, then fit it in view.
-
-        Everything else (other layers, labels) is carried along by the same view
-        transform, so the whole scene is shown relative to this image.
-        """
-        layer = self._layers.get(layer_id)
-        if layer is None:
-            return
-        self.set_view_rotation(-self._layer_scene_rotation(layer))
-        self.zoom_to_layer(layer_id)
 
     def zoom_to_layer(self, layer_id: str):
         """Zoom the view to fit a specific layer's bounds."""
@@ -1976,11 +2097,27 @@ class MapCanvas(QGraphicsView):
     def _world_scene_rect(self) -> QRectF:
         """Outer bound the pannable area is clamped to.
 
-        This is the full Web Mercator + pixel-zone extent (so you can pan
-        freely into empty space well beyond the loaded imagery, just like the
-        old fixed scene rect), expanded to include any loaded layers in case a
-        pixel-zone image was placed past the base extent.
+        Normally this is the full Web Mercator + pixel-zone extent (so you can
+        pan freely into empty space well beyond the loaded imagery), expanded
+        to include any loaded layers. In waterfall mode it is just the stacked
+        images plus a small margin, so panning stays within the stack while
+        zooming is unaffected.
         """
+        if self._waterfall_active and self._waterfall_layer_order:
+            rect = None
+            for layer_id in self._waterfall_layer_order:
+                layer = self._layers.get(layer_id)
+                if layer is None or layer.bounds is None:
+                    continue
+                west, south, east, north = layer.bounds
+                r = QRectF(west, -north, east - west, north - south)
+                rect = r if rect is None else rect.united(r)
+            if rect is not None:
+                mx = rect.width() * 0.05
+                my = rect.height() * 0.02
+                return self._world_rect_to_scene(
+                    rect.adjusted(-mx, -my, mx, my))
+
         rect = QRectF(self._world_rect_base)
         for layer in self._layers.values():
             if layer.bounds is None:
@@ -2117,6 +2254,9 @@ class MapCanvas(QGraphicsView):
         """Set the canvas interaction mode."""
         # Switching modes ends any in-progress ruler measurement.
         self._clear_ruler()
+        # Leaving waterfall stops any active glide immediately.
+        if mode != CanvasMode.WATERFALL:
+            self.stop_waterfall_glide()
         self._mode = mode
         if mode == CanvasMode.PAN:
             # We handle panning manually
@@ -2220,9 +2360,13 @@ class MapCanvas(QGraphicsView):
                     lon, lat = self._web_mercator_to_wgs84(easting, northing)
                     pixel_x, pixel_y = layer.latlon_to_pixel(lon, lat)
                 else:
-                    # Non-georeferenced: scene coords map directly to pixels
+                    # Raw/non-geo display (incl. waterfall): scene coords map
+                    # directly to pixels. If the file carries georeferencing,
+                    # derive the true lat/lon from the clicked pixel; plain
+                    # images have no meaningful lat/lon.
                     pixel_x, pixel_y = layer.scene_to_pixel(easting, northing)
-                    lon, lat = 0.0, 0.0
+                    latlon = layer.pixel_to_latlon(pixel_x, pixel_y)
+                    lon, lat = latlon if latlon is not None else (0.0, 0.0)
                 self.label_placed.emit(
                     pixel_x,
                     pixel_y,
@@ -2403,7 +2547,14 @@ class MapCanvas(QGraphicsView):
             # ruler mode or Shift+drag) and the go-to crosshair.
             self._clear_ruler()
             self.clear_location_marker()
-        elif event.key() == Qt.Key_Space and self._mode in CYCLE_MODES:
+        elif event.key() == Qt.Key_Space and self._mode == CanvasMode.WATERFALL:
+            # Hold Space to glide the view up the stack, Ctrl+Space to glide
+            # back down. Ignore auto-repeat so the glide runs continuously from
+            # physical press to release.
+            if not event.isAutoRepeat():
+                direction = 1 if (event.modifiers() & Qt.ControlModifier) else -1
+                self.start_waterfall_glide(direction)
+        elif event.key() == Qt.Key_Space and self._mode in STEP_CYCLE_MODES:
             if event.modifiers() & Qt.ControlModifier:
                 # Ctrl+Space: go backwards
                 self.cycle_prev_requested.emit()
@@ -2412,6 +2563,15 @@ class MapCanvas(QGraphicsView):
                 self.cycle_next_requested.emit()
         else:
             super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        """Stop the waterfall glide when the Space key is physically released."""
+        if (self._mode == CanvasMode.WATERFALL
+                and event.key() == Qt.Key_Space
+                and not event.isAutoRepeat()):
+            self.stop_waterfall_glide()
+        else:
+            super().keyReleaseEvent(event)
 
     def _web_mercator_to_wgs84(
             self, x: float, y: float) -> tuple[float, float]:
@@ -2529,6 +2689,17 @@ class MapCanvas(QGraphicsView):
             # Geo layer: convert lat/lon to Web Mercator
             x, y = self._wgs84_to_web_mercator(lon, lat)
 
+        ellipse, text = self._make_label_marker_items(
+            x, y, class_name, color, image_path)
+        self._label_items[label_id] = (ellipse, text)
+
+    def _make_label_marker_items(self, x: float, y: float, class_name: str,
+                                 color: QColor, image_path: str):
+        """Create the (ellipse, text) items of a label marker at world (x, y).
+
+        Shared by real label markers and waterfall projections so both render
+        identically. Items are parented to the floating-origin group.
+        """
         # Get current view scale to size markers appropriately
         view_scale = self._view_scale()
 
@@ -2554,7 +2725,7 @@ class MapCanvas(QGraphicsView):
         font.setBold(True)
         text.setFont(font)
         # Ignore the view transform so the label stays upright and a constant
-        # on-screen size even when the view is rotated (image-up cycle mode).
+        # on-screen size regardless of zoom.
         text.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
         text.setPos(x + marker_size / 2, -y - marker_size / 2)
         text.setZValue(self._get_label_z_base() + 1)
@@ -2563,8 +2734,57 @@ class MapCanvas(QGraphicsView):
         # deep zoom (positions above are in world coords).
         ellipse.setParentItem(self._origin_group)
         text.setParentItem(self._origin_group)
+        return ellipse, text
 
-        self._label_items[label_id] = (ellipse, text)
+    def set_waterfall_projections(self, label_infos: list):
+        """Display labels on every stacked image whose bounds contain them.
+
+        In the normal (geographic) canvas a label sits at one lat/lon, so it
+        naturally appears "on" every overlapping image. The waterfall pulls
+        those images apart vertically, so this restores the effect: each label
+        with a real lat/lon is drawn on every OTHER stacked, georeferenced
+        image whose pixel bounds contain that position - rendered exactly like
+        a normal label and hit-testable as its source label (so the standard
+        context menu / link flow applies).
+
+        label_infos: list of (label_id, lon, lat, class_name, color,
+        source_image_path) tuples.
+        """
+        self.clear_waterfall_projections()
+        if not self._waterfall_active:
+            return
+        for label_id, lon, lat, class_name, color, source_path in label_infos:
+            for layer_id in self._waterfall_layer_order:
+                layer = self._layers.get(layer_id)
+                if (layer is None or layer.bounds is None
+                        or layer._src_crs is None
+                        or layer.file_path == source_path):
+                    continue
+                try:
+                    px, py = layer.latlon_to_pixel(lon, lat)
+                except Exception:
+                    continue
+                if not (0 <= px < layer._src_width
+                        and 0 <= py < layer._src_height):
+                    continue  # position not within this image
+                west, _south, _east, north = layer.bounds
+                x = west + px * PIXEL_ZONE_SCALE
+                y = north - py * PIXEL_ZONE_SCALE
+                # data(0) carries the SOURCE image path so context-menu actions
+                # (remove, link, measure) operate on the real label.
+                ellipse, text = self._make_label_marker_items(
+                    x, y, class_name,
+                    color if color is not None else QColor(255, 50, 50),
+                    source_path)
+                self._waterfall_projection_items.append(
+                    (label_id, ellipse, text))
+
+    def clear_waterfall_projections(self):
+        """Remove all projected label markers."""
+        for _label_id, ellipse, text in self._waterfall_projection_items:
+            self._scene.removeItem(ellipse)
+            self._scene.removeItem(text)
+        self._waterfall_projection_items = []
 
     def remove_label_marker(self, label_id: int):
         """Remove a label marker from the canvas."""
@@ -2594,7 +2814,11 @@ class MapCanvas(QGraphicsView):
 
         marker_size = 10 / view_scale
 
-        for ellipse, text in self._label_items.values():
+        markers = list(self._label_items.values())
+        # Waterfall projections rescale exactly like real label markers.
+        markers.extend((ellipse, text) for _lid, ellipse, text
+                       in self._waterfall_projection_items)
+        for ellipse, text in markers:
             # Update ellipse size
             ellipse.setRect(
                 -marker_size / 2, -marker_size / 2,
@@ -2639,6 +2863,15 @@ class MapCanvas(QGraphicsView):
                 # We'll store image_path in the ellipse
                 image_path = ellipse.data(0)
                 return label_id, image_path
+
+        # Waterfall projections hit-test as their source label, so the normal
+        # context menu / link flow works on them transparently.
+        for label_id, ellipse, _text in self._waterfall_projection_items:
+            scene_rect = ellipse.sceneBoundingRect()
+            hit_margin = scene_rect.width() * 0.5
+            scene_rect.adjust(-hit_margin, -hit_margin, hit_margin, hit_margin)
+            if scene_rect.contains(scene_pos):
+                return label_id, ellipse.data(0)
 
         return None, None
 

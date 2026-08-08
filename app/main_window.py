@@ -30,7 +30,7 @@ from PyQt5.QtWidgets import (
     QInputDialog)
 
 from .axis_ruler import MapCanvasWithAxes
-from .canvas import (MapCanvas, CanvasMode, CYCLE_MODES,
+from .canvas import (MapCanvas, CanvasMode, CYCLE_MODES, STEP_CYCLE_MODES,
                      AsyncFileLoaderThread, TiledLayer)
 from .class_editor import ClassEditorDialog
 from .goto_location import GoToLocationDialog, format_lat_lon
@@ -539,14 +539,16 @@ class MainWindow(QMainWindow):
             lambda: self._set_mode(CanvasMode.VIEW_CYCLE))
         toolbar.addAction(self.view_cycle_action)
 
-        self.image_cycle_action = QAction("Image Cycle", self)
-        self.image_cycle_action.setCheckable(True)
-        self.image_cycle_action.setShortcut("I")
-        self.image_cycle_action.setToolTip(
-            "Cycle images with the view rotated to each image's own orientation")
-        self.image_cycle_action.triggered.connect(
-            lambda: self._set_mode(CanvasMode.IMAGE_CYCLE))
-        toolbar.addAction(self.image_cycle_action)
+        self.waterfall_action = QAction("Waterfall", self)
+        self.waterfall_action.setCheckable(True)
+        self.waterfall_action.setShortcut("W")
+        self.waterfall_action.setToolTip(
+            "Waterfall mode: stack a bottom-level group's images vertically.\n"
+            "Hold Space to glide up, Ctrl+Space to glide down. Starts at the\n"
+            "bottom of the stack; all labels stay visible.")
+        self.waterfall_action.triggered.connect(
+            lambda: self._set_mode(CanvasMode.WATERFALL))
+        toolbar.addAction(self.waterfall_action)
 
         self.ruler_action = QAction("Ruler", self)
         self.ruler_action.setCheckable(True)
@@ -573,9 +575,10 @@ class MainWindow(QMainWindow):
         Captures Space (next) / Ctrl+Space (previous) in cycle mode regardless of
         which widget has focus. Keys 1-9 switch to the corresponding class.
         """
-        if event.key() == Qt.Key_Space and self.canvas._mode in CYCLE_MODES:
-            # Handle space in cycle mode globally. Ctrl+Space steps backwards,
-            # matching the canvas handler and the documented shortcut.
+        if event.key() == Qt.Key_Space and self.canvas._mode in STEP_CYCLE_MODES:
+            # Handle space in stepping cycle modes globally. Ctrl+Space steps
+            # backwards, matching the canvas handler and the documented
+            # shortcut. (Waterfall handles Space itself via hold-to-glide.)
             if event.modifiers() & Qt.ControlModifier:
                 self._cycle_to_prev_layer()
             else:
@@ -596,12 +599,24 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, event: QEvent) -> bool:
         """Filter events from child widgets.
 
-        Intercepts Space key on the layer tree when in cycle mode to prevent
-        the tree from toggling checkboxes.
+        Intercepts the Space key on the layer tree when in a cycle/waterfall
+        mode so the tree never toggles checkboxes: in stepping cycle modes it
+        advances the cycle; in waterfall mode it drives the hold-to-glide
+        (press starts, release stops), matching the canvas handler.
         """
-        if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Space:
-            if self.canvas._mode in CYCLE_MODES:
-                # Handle space in cycle mode - don't let tree process it.
+        etype = event.type()
+        if (etype in (QEvent.KeyPress, QEvent.KeyRelease)
+                and event.key() == Qt.Key_Space):
+            mode = self.canvas._mode
+            if mode == CanvasMode.WATERFALL:
+                if etype == QEvent.KeyPress and not event.isAutoRepeat():
+                    direction = (1 if event.modifiers() & Qt.ControlModifier
+                                 else -1)
+                    self.canvas.start_waterfall_glide(direction)
+                elif etype == QEvent.KeyRelease and not event.isAutoRepeat():
+                    self.canvas.stop_waterfall_glide()
+                return True  # Event consumed either way
+            if etype == QEvent.KeyPress and mode in STEP_CYCLE_MODES:
                 # Ctrl+Space steps backwards, consistent with the canvas handler.
                 if event.modifiers() & Qt.ControlModifier:
                     self._cycle_to_prev_layer()
@@ -612,25 +627,27 @@ class MainWindow(QMainWindow):
 
     def _set_mode(self, mode: CanvasMode):
         """Set the canvas interaction mode."""
+        was_waterfall = self.canvas._waterfall_active
         self.canvas.set_mode(mode)
         self.pan_action.setChecked(mode == CanvasMode.PAN)
         self.label_action.setChecked(mode == CanvasMode.LABEL)
         self.cycle_action.setChecked(mode == CanvasMode.CYCLE)
         self.view_cycle_action.setChecked(mode == CanvasMode.VIEW_CYCLE)
         self.ruler_action.setChecked(mode == CanvasMode.RULER)
-        self.image_cycle_action.setChecked(mode == CanvasMode.IMAGE_CYCLE)
+        self.waterfall_action.setChecked(mode == CanvasMode.WATERFALL)
 
-        # Leaving image-up mode restores the normal north-up view.
-        if mode != CanvasMode.IMAGE_CYCLE:
-            self.canvas.set_view_rotation(0.0)
+        # Leaving waterfall: restore the normal layout and re-place labels.
+        if was_waterfall and mode != CanvasMode.WATERFALL:
+            self.canvas.clear_waterfall()
+            self._refresh_label_markers()
 
-        # Handle cycle mode entry
+        # Handle mode entry
         if mode == CanvasMode.CYCLE:
             self._start_cycle_mode()
         elif mode == CanvasMode.VIEW_CYCLE:
             self._start_view_cycle_mode()
-        elif mode == CanvasMode.IMAGE_CYCLE:
-            self._start_cycle_mode()
+        elif mode == CanvasMode.WATERFALL:
+            self._start_waterfall_mode()
         else:
             self._suspend_cycle()
 
@@ -663,19 +680,11 @@ class MainWindow(QMainWindow):
         return parked_index
 
     def _cycle_zoom_to(self, layer_id: str):
-        """Zoom to a cycled layer, honouring image-up mode.
-
-        In IMAGE_CYCLE the view is rotated onto the layer's own pixel grid so
-        the image shows in its native orientation and everything else (other
-        images, labels) is carried along by the same view transform.
-        """
+        """Zoom to a cycled layer."""
         # A measurement belongs to the image it was taken on; leaving that
         # image behind should not leave the line hanging over the next one.
         self.canvas.clear_ruler()
-        if self.canvas._mode == CanvasMode.IMAGE_CYCLE:
-            self.canvas.zoom_to_layer_image_up(layer_id)
-        else:
-            self.canvas.zoom_to_layer(layer_id)
+        self.canvas.zoom_to_layer(layer_id)
 
     def _layer_name(self, layer_id: str) -> str:
         """Return a layer's display name for logging (falls back to its id)."""
@@ -747,6 +756,51 @@ class MainWindow(QMainWindow):
 
         # Give canvas keyboard focus so Space key works immediately
         self.canvas.setFocus()
+
+    def _start_waterfall_mode(self):
+        """Stack the selected bottom-level group's images vertically.
+
+        All the group's images become visible and are re-laid-out top-to-bottom
+        as raw pixels; labels are re-rendered so each lands on its own image
+        (every label in the group stays visible at once) and geo labels are
+        projected onto the other images that contain them. The view starts at
+        the BOTTOM of the stack; holding Space glides up, Ctrl+Space back down.
+        """
+        # Waterfall only works on bottom-level groups: a group of groups has no
+        # single well-defined image sequence to stack.
+        if self.layer_panel.selected_group_is_bottom_level() is False:
+            self.statusBar.showMessage(
+                "Waterfall needs a bottom-level group (no sub-groups) - "
+                "select one and try again", 5000)
+            self._set_mode(CanvasMode.PAN)
+            return
+
+        group_name = self.layer_panel.get_selected_group_name()
+        self.group_label.setText(f"Group: {group_name}" if group_name else "")
+
+        layer_ids = self.layer_panel.get_all_layers_in_selected_group()
+        if not layer_ids:
+            self.statusBar.showMessage("No layers in selected group", 3000)
+            self._set_mode(CanvasMode.PAN)
+            return
+
+        # Show the whole group so the entire stack renders while gliding.
+        self.layer_panel.check_layers(layer_ids)
+        self.canvas.layout_waterfall(layer_ids)
+        # Re-place every label onto its (now stacked) image, then project geo
+        # labels onto the other images that also contain them.
+        self._refresh_label_markers()
+        self._update_waterfall_projections()
+        # Start at the BOTTOM of the stack (the same image the cycle modes
+        # start on) and give the canvas focus so Space glides immediately.
+        self.canvas.zoom_to_layer(layer_ids[-1])
+        self.canvas.setFocus()
+
+        debug(f"waterfall: group '{group_name}' - "
+              f"{len(layer_ids)} images stacked")
+        self.statusBar.showMessage(
+            f"Waterfall: {len(layer_ids)} images - hold Space to glide up, "
+            "Ctrl+Space to glide down", 0)
 
     def _cycle_to_next_layer(self):
         """Toggle off current layer, turn on and zoom to the next layer in the cycle."""
@@ -897,6 +951,9 @@ class MainWindow(QMainWindow):
         if image:
             self.layer_panel.add_label_to_panel(label, image)
 
+        # In waterfall, show this label on the other images that contain it.
+        self._update_waterfall_projections()
+
         # Show appropriate message for geo vs pixel layers
         layer = self.canvas.get_layer(self.canvas._path_to_layer.get(image_path, ""))
         if layer and not layer.geo:
@@ -924,7 +981,30 @@ class MainWindow(QMainWindow):
         # Remove from labeled images panel incrementally (O(1) instead of full refresh)
         self.layer_panel.remove_label_from_panel(label_id)
 
+        # Projections may reference the removed label.
+        self._update_waterfall_projections()
+
         self.statusBar.showMessage(f"Removed label", 3000)
+
+    def _update_waterfall_projections(self):
+        """Refresh the projected label markers in waterfall mode.
+
+        Gathers every label whose source image carries georeferencing (only
+        those have a real lat/lon) and asks the canvas to display each one on
+        the other stacked images that geographically contain it. No-op outside
+        waterfall mode.
+        """
+        if not self.canvas._waterfall_active:
+            return
+        infos = []
+        for image, label in self.project.get_all_labels():
+            layer = self.canvas.get_layer(
+                self.canvas._path_to_layer.get(image.path, ""))
+            if layer is None or layer._src_crs is None:
+                continue  # plain image - a pixel has no meaningful lat/lon
+            infos.append((label.id, label.lon, label.lat, label.class_name,
+                          self._get_class_color(label.class_name), image.path))
+        self.canvas.set_waterfall_projections(infos)
 
     def _sync_measurements_in_group(self, label_id1: int, label_id2: int) -> int:
         """Make a just-linked object group share one measurement.
@@ -2976,7 +3056,7 @@ class MainWindow(QMainWindow):
 <tr><td><b>L</b></td><td>Label mode</td></tr>
 <tr><td><b>C</b></td><td>Cycle mode (group-based)</td></tr>
 <tr><td><b>V</b></td><td>View Cycle mode (layers in current view)</td></tr>
-<tr><td><b>I</b></td><td>Image Cycle mode (image-up orientation)</td></tr>
+<tr><td><b>W</b></td><td>Waterfall mode (stack a group's images vertically)</td></tr>
 <tr><td><b>R</b></td><td>Ruler mode</td></tr>
 </table>
 
@@ -2997,13 +3077,23 @@ class MainWindow(QMainWindow):
 <tr><td><b>Escape</b></td><td>Cancel link mode</td></tr>
 </table>
 
-<h3>Cycle Modes (Cycle / View Cycle / Image Cycle)</h3>
+<h3>Cycle Modes (Cycle / View Cycle)</h3>
 <table>
 <tr><td><b>Space</b></td><td>Advance to next layer (unchecks current)</td></tr>
 <tr><td><b>Ctrl+Space</b></td><td>Go back to previous layer</td></tr>
 <tr><td><b>Left-click</b></td><td>Place label</td></tr>
 <tr><td><b>Right-click label</b></td><td>Label options (remove, link, measure)</td></tr>
 <tr><td><b>Right-click + drag</b></td><td>Pan around</td></tr>
+<tr><td><b>Mouse wheel</b></td><td>Zoom in/out</td></tr>
+</table>
+
+<h3>Waterfall Mode</h3>
+<table>
+<tr><td><b>Hold Space</b></td><td>Glide up through the image stack</td></tr>
+<tr><td><b>Hold Ctrl+Space</b></td><td>Glide back down (view starts at the bottom)</td></tr>
+<tr><td><b>Left-click</b></td><td>Place label (all group labels stay visible)</td></tr>
+<tr><td><b>Right-click label</b></td><td>Label options (remove, link, measure)</td></tr>
+<tr><td><b>Right-click + drag</b></td><td>Pan within the stack</td></tr>
 <tr><td><b>Mouse wheel</b></td><td>Zoom in/out</td></tr>
 </table>
 
