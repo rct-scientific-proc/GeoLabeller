@@ -345,6 +345,15 @@ class MainWindow(QMainWindow):
             self.layer_panel.toggle_layer_visibility)
         self.canvas.cycle_next_requested.connect(self._cycle_to_next_layer)
         self.canvas.cycle_prev_requested.connect(self._cycle_to_prev_layer)
+        self.canvas.chain_link_changed.connect(self._on_chain_link_changed)
+
+    def _on_chain_link_changed(self, active: bool, message: str):
+        """Sync the Chain Link toolbar toggle and status bar with the canvas."""
+        self.chain_link_action.setChecked(active)
+        if message:
+            self.statusBar.showMessage(message, 0)
+        elif not active:
+            self.statusBar.clearMessage()
 
     def _setup_menu(self):
         """Set up the menu bar."""
@@ -549,6 +558,17 @@ class MainWindow(QMainWindow):
         self.waterfall_action.triggered.connect(
             lambda: self._set_mode(CanvasMode.WATERFALL))
         toolbar.addAction(self.waterfall_action)
+
+        self.chain_link_action = QAction("Chain Link", self)
+        self.chain_link_action.setCheckable(True)
+        self.chain_link_action.setShortcut("K")
+        self.chain_link_action.setToolTip(
+            "Chain link (K): click labels to link them all into one object.\n"
+            "N starts a new chain, Esc finishes. Works in any labeling mode.")
+        # The canvas is created after the toolbar; defer the attribute lookup.
+        self.chain_link_action.triggered.connect(
+            lambda checked: self.canvas.set_chain_link_mode(checked))
+        toolbar.addAction(self.chain_link_action)
 
         self.ruler_action = QAction("Ruler", self)
         self.ruler_action.setCheckable(True)
@@ -3075,6 +3095,14 @@ class MainWindow(QMainWindow):
 <tr><td><b>Ctrl+Left-click label</b></td><td>Label options (alias, Cycle modes)</td></tr>
 <tr><td><b>1&ndash;9</b></td><td>Quick-switch to class 1&ndash;9</td></tr>
 <tr><td><b>Escape</b></td><td>Cancel link mode</td></tr>
+</table>
+
+<h3>Chain Linking</h3>
+<table>
+<tr><td><b>K</b></td><td>Toggle chain-link mode (works in any labeling mode)</td></tr>
+<tr><td><b>Left-click label</b></td><td>Link it into the current chain (first click anchors)</td></tr>
+<tr><td><b>N</b></td><td>Finish this chain, start a new one</td></tr>
+<tr><td><b>Escape</b></td><td>Exit chain-link mode (links made are kept)</td></tr>
 </table>
 
 <h3>Cycle Modes (Cycle / View Cycle)</h3>

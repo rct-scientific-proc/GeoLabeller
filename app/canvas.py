@@ -1122,6 +1122,10 @@ class MapCanvas(QGraphicsView):
     # Signal emitted when link mode state changes: (is_active, message)
     link_mode_changed = pyqtSignal(bool, str)
 
+    # Signal emitted when chain-link mode state changes: (is_active, message).
+    # Lets the main window sync the toolbar toggle and the status bar.
+    chain_link_changed = pyqtSignal(bool, str)
+
     # Signal emitted when a label's length/width has been measured:
     # (label_id, length_m, width_m). Values are floats in metres; `object`
     # payloads allow None (e.g. when clearing measurements later).
@@ -1243,6 +1247,15 @@ class MapCanvas(QGraphicsView):
         # Link mode state
         self._link_mode_active = False
         self._link_source_label_id: int | None = None
+
+        # Chain-link mode state: while active, left-clicking labels links them
+        # all into one object (each click links immediately); N starts a new
+        # chain. Highlighted items are remembered with their original pens so
+        # the highlight can be undone.
+        self._chain_link_active = False
+        self._chain_link_anchor: int | None = None
+        self._chain_members: set[int] = set()
+        self._chain_highlighted: list = []
 
         # Measure mode state (drawing length/width lines on a label). Only
         # active for georeferenced labels; see _enter_measure_mode.
@@ -2284,6 +2297,9 @@ class MapCanvas(QGraphicsView):
         # Leaving waterfall stops any active glide immediately.
         if mode != CanvasMode.WATERFALL:
             self.stop_waterfall_glide()
+        # Chain linking only makes sense while labels are clickable.
+        if mode not in LABELING_MODES and self._chain_link_active:
+            self.set_chain_link_mode(False)
         self._mode = mode
         if mode == CanvasMode.PAN:
             # We handle panning manually
@@ -2363,6 +2379,14 @@ class MapCanvas(QGraphicsView):
                         self._link_source_label_id, label_id)
                 # Exit link mode regardless
                 self._exit_link_mode()
+                return
+
+            # Chain-link overlay: clicks select labels to link instead of
+            # placing new labels (a miss on empty canvas does nothing).
+            if self._chain_link_active:
+                label_id, _ = self._get_label_at_position(event.pos())
+                if label_id is not None:
+                    self._chain_link_click(label_id)
                 return
 
             # Ctrl+Left-click in CYCLE/VIEW_CYCLE mode shows label context menu (for
@@ -2567,6 +2591,11 @@ class MapCanvas(QGraphicsView):
                     False, "Hover over a label, then press M to measure")
         elif event.key() == Qt.Key_Escape and self._link_mode_active:
             self._exit_link_mode()
+        elif event.key() == Qt.Key_N and self._chain_link_active:
+            # Close the current chain; next click anchors a new one.
+            self.chain_link_new_chain()
+        elif event.key() == Qt.Key_Escape and self._chain_link_active:
+            self.set_chain_link_mode(False)
         elif event.key() == Qt.Key_Escape and (
                 self._ruler_line is not None
                 or self._location_marker is not None):
@@ -2820,6 +2849,10 @@ class MapCanvas(QGraphicsView):
             self._scene.removeItem(ellipse)
             self._scene.removeItem(text)
             del self._label_items[label_id]
+        # A removed chain anchor can't take more links; the next chain-link
+        # click anchors a fresh chain.
+        if self._chain_link_active and label_id == self._chain_link_anchor:
+            self._chain_link_anchor = None
 
     def clear_label_markers(self):
         """Remove all label markers from the canvas."""
@@ -3102,6 +3135,114 @@ class MapCanvas(QGraphicsView):
     def is_link_mode_active(self) -> bool:
         """Check if link mode is currently active."""
         return self._link_mode_active
+
+    # ------------------------------------------------------------------
+    # Chain-link mode: click labels one after another to link them all
+    # into one object; N starts a new chain, Esc/K exits.
+    # ------------------------------------------------------------------
+
+    def set_chain_link_mode(self, active: bool):
+        """Enter or leave chain-link mode.
+
+        While active, left-clicking labels links them all into one object
+        (links are created immediately, click by click, so there is nothing to
+        commit or lose). Works in any labeling mode, including on waterfall
+        projections. Pressing N starts a new chain.
+        """
+        if active == self._chain_link_active:
+            return
+        if active:
+            # Chain mode takes over the mouse: end the single-pair link mode
+            # and any measurement first.
+            if self._link_mode_active:
+                self._exit_link_mode()
+            if self._measure_active:
+                self._exit_measure_mode()
+            self._chain_link_active = True
+            self._chain_link_anchor = None
+            self._chain_members = set()
+            self.setCursor(_crosshair_cursor())
+            self.chain_link_changed.emit(
+                True, "Chain link: click a label to anchor a chain - "
+                      "N = new chain, Esc = done")
+        else:
+            self._chain_link_active = False
+            self._chain_link_anchor = None
+            self._chain_members = set()
+            self._chain_restore_highlights()
+            if self._mode in LABELING_MODES:
+                self.setCursor(_crosshair_cursor())
+            elif self._mode == CanvasMode.PAN:
+                self.setCursor(Qt.OpenHandCursor)
+            else:
+                self.setCursor(Qt.ArrowCursor)
+            self.chain_link_changed.emit(False, "")
+
+    def is_chain_link_mode_active(self) -> bool:
+        """Check if chain-link mode is currently active."""
+        return self._chain_link_active
+
+    def chain_link_new_chain(self):
+        """Close the current chain; the next label clicked anchors a new one."""
+        if not self._chain_link_active:
+            return
+        self._chain_restore_highlights()
+        self._chain_link_anchor = None
+        self._chain_members = set()
+        self.chain_link_changed.emit(
+            True, "Chain link: new chain - click a label to anchor it")
+
+    def _chain_link_click(self, label_id: int):
+        """Handle a click on a label while chain-link mode is active."""
+        # First click (or the anchor was removed): anchor a new chain.
+        if (self._chain_link_anchor is None
+                or self._chain_link_anchor not in self._label_items):
+            self._chain_link_anchor = label_id
+            self._chain_members = {label_id}
+            self._chain_highlight_label(label_id)
+            self.chain_link_changed.emit(
+                True, "Chain link: anchored - click labels to link them, "
+                      "N = new chain, Esc = done")
+            return
+        if label_id in self._chain_members:
+            return  # already part of this chain
+        self._chain_members.add(label_id)
+        self._chain_highlight_label(label_id)
+        # Link immediately; project-side handling merges object groups and
+        # updates linked indicators (and measurement wiring) right away.
+        self.labels_linked.emit(self._chain_link_anchor, label_id)
+        self.chain_link_changed.emit(
+            True, f"Chain link: {len(self._chain_members)} labels in this "
+                  "chain - N = new chain, Esc = done")
+
+    _CHAIN_HIGHLIGHT_COLOR = QColor(255, 255, 0)
+
+    def _chain_highlight_label(self, label_id: int):
+        """Yellow-highlight a chained label (and any waterfall projections)."""
+        items = []
+        if label_id in self._label_items:
+            items.append(self._label_items[label_id][0])
+        for lid, ellipse, _text in self._waterfall_projection_items:
+            if lid == label_id:
+                items.append(ellipse)
+        for ellipse in items:
+            pen = ellipse.pen()
+            if pen.color() == self._CHAIN_HIGHLIGHT_COLOR:
+                continue  # already highlighted
+            self._chain_highlighted.append((ellipse, QPen(pen)))
+            ellipse.setPen(QPen(self._CHAIN_HIGHLIGHT_COLOR,
+                                pen.widthF() * 2))
+
+    def _chain_restore_highlights(self):
+        """Undo the chain highlights, preserving pens changed in the meantime
+        (e.g. a measured label's cyan outline set while the chain was open)."""
+        for ellipse, pen in self._chain_highlighted:
+            try:
+                if ellipse.pen().color() == self._CHAIN_HIGHLIGHT_COLOR:
+                    ellipse.setPen(pen)
+            except RuntimeError:
+                pass  # item was deleted with its label
+        self._chain_highlighted = []
 
     # ------------------------------------------------------------------
     # Measure mode: draw two lines on a label to record length + width (m)
