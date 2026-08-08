@@ -53,6 +53,10 @@ WATERFALL_GAP = 2000.0
 # view scrolls this many view pixels every timer tick.
 WATERFALL_GLIDE_INTERVAL_MS = 16   # ~60 fps
 WATERFALL_GLIDE_PX = 8             # view pixels per tick (~480 px/s)
+# Prefetch/retention margin while gliding: layers and tiles within this many
+# viewport heights above/below the view are loaded ahead of arrival and kept
+# resident after leaving, so gliding (and reversing) shows no pop-in gaps.
+WATERFALL_PREFETCH_VIEWPORTS = 1.5
 
 
 class CanvasMode(Enum):
@@ -1615,19 +1619,37 @@ class MapCanvas(QGraphicsView):
         _lon, lat = self._web_mercator_to_wgs84(0.0, center_northing)
         return units_per_pixel * math.cos(math.radians(lat))
 
+    def _effective_cull_bounds(self) -> tuple[float, float, float, float]:
+        """View bounds used for layer/tile culling decisions.
+
+        Normally the exact viewport. In waterfall mode the bounds are inflated
+        vertically by WATERFALL_PREFETCH_VIEWPORTS viewport heights in both
+        directions, which does two things while gliding:
+        - prefetch: the next images start loading before they scroll on-screen;
+        - retention: images just scrolled past keep their tiles, so reversing
+          direction shows them instantly instead of re-loading.
+        """
+        west, south, east, north = self._get_view_bounds()
+        if self._waterfall_active:
+            margin = (north - south) * WATERFALL_PREFETCH_VIEWPORTS
+            south -= margin
+            north += margin
+        return (west, south, east, north)
+
     def _update_visible_tiles(self):
         """Load tiles that are visible, unload tiles that aren't."""
-        view_bounds = self._get_view_bounds()
+        cull_bounds = self._effective_cull_bounds()
         units_per_pixel = self._scene_units_per_pixel()
 
         for layer_id, layer in self._layers.items():
             if not layer.visible:
                 continue
 
-            # Cull layers entirely outside the viewport: they must not trigger
-            # any pyramid loading. Drop any tiles they may still hold and cancel
-            # an in-flight load so we don't keep reprojecting off-screen data.
-            if not self._layer_intersects_view(layer, view_bounds):
+            # Cull layers entirely outside the (possibly inflated) viewport:
+            # they must not trigger any pyramid loading. Drop any tiles they
+            # may still hold and cancel an in-flight load so we don't keep
+            # decoding off-screen data.
+            if not self._layer_intersects_view(layer, cull_bounds):
                 if layer.tiles:
                     self._clear_layer_tiles(layer)
                 self._cancel_layer_load(layer)
@@ -1654,8 +1676,13 @@ class MapCanvas(QGraphicsView):
         return not (le < vw or lw > ve or ln < vs or ls > vn)
 
     def _rebuild_layer_tiles(self, layer: TiledLayer):
-        """Add/remove a single layer's tiles to match the current view."""
-        view_bounds = self._get_view_bounds()
+        """Add/remove a single layer's tiles to match the current view.
+
+        Uses the effective cull bounds, so in waterfall mode tiles within the
+        prefetch margin are built ahead of scrolling in and retained after
+        scrolling out.
+        """
+        view_bounds = self._effective_cull_bounds()
         visible_indices = set(layer.get_visible_tile_indices(view_bounds))
         current_indices = set(layer.tiles.keys())
 
