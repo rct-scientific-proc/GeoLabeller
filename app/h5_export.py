@@ -677,16 +677,23 @@ class H5ExportDialog(QDialog):
         self.channel_combo.addItems(list(CHANNEL_CHOICES.keys()))
         form.addRow("Channels:", self.channel_combo)
 
+        self.offset_check = QCheckBox("Add 8 offset copies of each example")
+        self.offset_check.setChecked(True)
+        self.offset_check.setToolTip(
+            "When on, every label yields the centred snippet plus eight more "
+            "shifted by the offset below - up, down, left, right and the "
+            "diagonals - so the object appears at nine known positions. When "
+            "off, only the centred snippet is exported.")
+        self.offset_check.toggled.connect(self._on_offset_toggled)
+        form.addRow("", self.offset_check)
+
         self.offset_spin = QSpinBox()
-        self.offset_spin.setRange(0, 4096)
+        self.offset_spin.setRange(1, 4096)
         self.offset_spin.setValue(DEFAULT_POSITIVE_OFFSET)
         self.offset_spin.setSuffix(" px")
         self.offset_spin.setToolTip(
-            "Every label yields a snippet centred on it plus eight more "
-            "shifted this far - up, down, left, right and the diagonals - so "
-            "the object appears at nine known positions. Hard negatives that "
-            "would overlap any of them are left out. 0 = the centred snippet "
-            "only.")
+            "Shift distance for the eight offset copies. Hard negatives that "
+            "would overlap any example crop are left out.")
         self.offset_spin.valueChanged.connect(self._update_ok_enabled)
         form.addRow("Example offset:", self.offset_spin)
 
@@ -787,10 +794,15 @@ class H5ExportDialog(QDialog):
             return
         for key, spin in (("height", self.height_spin),
                           ("width", self.width_spin),
-                          ("chunk", self.chunk_spin),
-                          ("positive_offset", self.offset_spin)):
+                          ("chunk", self.chunk_spin)):
             if settings.get(key) is not None:
                 spin.setValue(int(settings[key]))
+        if settings.get("positive_offset") is not None:
+            offset = int(settings["positive_offset"])
+            # 0 means the file was built without the eight offset copies.
+            self.offset_check.setChecked(offset > 0)
+            if offset > 0:
+                self.offset_spin.setValue(offset)
         if settings.get("overlap") is not None:
             self.overlap_spin.setValue(int(round(float(settings["overlap"]) * 100)))
         if settings.get("split_negatives") is not None:
@@ -821,12 +833,18 @@ class H5ExportDialog(QDialog):
         was built with.
         """
         return (self.height_spin, self.width_spin, self.channel_combo,
-                self.chunk_spin, self.compress_combo, self.offset_spin)
+                self.chunk_spin, self.compress_combo, self.offset_spin,
+                self.offset_check)
 
     def _on_split_negatives(self, enabled):
         """Enable the ratio inputs only while the split is switched on."""
         for spin in self.negative_ratio_spins.values():
             spin.setEnabled(enabled)
+        self._update_ok_enabled()
+
+    def _on_offset_toggled(self, enabled):
+        """Enable the offset distance only while the copies are switched on."""
+        self.offset_spin.setEnabled(enabled)
         self._update_ok_enabled()
 
     def _ratio_total(self) -> int:
@@ -844,9 +862,11 @@ class H5ExportDialog(QDialog):
                  f"{self._ratio_total()}%).")
 
         # Past half the snippet the label falls outside its own offset crops,
-        # which would file snippets of empty ground as examples.
+        # which would file snippets of empty ground as examples. Only applies
+        # while the offset copies are switched on.
         limit = min(self.height_spin.value(), self.width_spin.value()) // 2
-        offset_ok = self.offset_spin.value() < limit
+        offset_ok = (not self.offset_check.isChecked()
+                     or self.offset_spin.value() < limit)
         self._offset_note.setText(
             "" if offset_ok
             else f"Offset must be under half the snippet ({limit} px), or the "
@@ -909,7 +929,9 @@ class H5ExportDialog(QDialog):
             "channels": CHANNEL_CHOICES[self.channel_combo.currentText()],
             "split_value": SPLIT_CHOICES[self.split_combo.currentText()],
             "chunk": self.chunk_spin.value(),
-            "positive_offset": self.offset_spin.value(),
+            # 0 disables the eight offset copies (centred snippet only).
+            "positive_offset": (self.offset_spin.value()
+                                if self.offset_check.isChecked() else 0),
             "compression": COMPRESSION_CHOICES[self.compress_combo.currentText()],
             "split_negatives": self.split_negatives_check.isChecked(),
             "negative_ratio": tuple(
