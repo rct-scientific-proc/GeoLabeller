@@ -50,6 +50,11 @@ DEFAULT_POSITIVE_OFFSET = 16
 SCOPE_ALL = "all"
 SCOPE_VISIBLE = "visible"
 SCOPE_LABELLED = "labelled"  # visible *and* carrying at least one label
+# Examples-only scopes: only snippets containing a label are exported - the
+# hard-negative sliding window never runs.
+SCOPE_ALL_EXAMPLES = "all_examples"          # every loaded layer with labels
+SCOPE_VISIBLE_EXAMPLES = "visible_examples"  # visible layers with labels
+EXAMPLES_ONLY_SCOPES = (SCOPE_ALL_EXAMPLES, SCOPE_VISIBLE_EXAMPLES)
 
 SPLIT_CHOICES = {"Train (0)": 0, "Validate (1)": 1, "Test (2)": 2}
 CHANNEL_CHOICES = {"RGB (3 channels)": 3, "Grayscale (1 channel)": 1}
@@ -416,7 +421,8 @@ def _negative_split_pool(count, ratio, rng):
 def export_image(writer, path, labels, height, width, overlap, channels,
                  split_value, class_to_index, hard_negative_index,
                  cancel_check=None, negative_ratio=None, rng=None,
-                 positive_offset=DEFAULT_POSITIVE_OFFSET):
+                 positive_offset=DEFAULT_POSITIVE_OFFSET,
+                 examples_only=False):
     """Extract one raster's examples and hard negatives into ``writer``.
 
     Returns ``(added, negative_counts, excluded)`` - the number of snippets
@@ -436,6 +442,9 @@ def export_image(writer, path, labels, height, width, overlap, channels,
     With ``negative_ratio`` set, this image's hard negatives are shared out
     over train/validate/test in those proportions instead of all taking
     ``split_value``; examples always take ``split_value``.
+
+    With ``examples_only`` set, only the label-bearing example crops are
+    written - the hard-negative sliding window never runs.
     """
     added = 0
     negative_counts = [0, 0, 0]
@@ -464,6 +473,10 @@ def export_image(writer, path, labels, height, width, overlap, channels,
                 continue  # entirely nodata
             writer.add(arr, class_index, True, split_value)
             added += 1
+
+        if examples_only:
+            # No hard negatives wanted: the sliding window never runs.
+            return added, negative_counts, 0
 
         xs = _snippet_positions(src.width, width, step_x)
         ys = _snippet_positions(src.height, height, step_y)
@@ -559,7 +572,8 @@ class H5ExportWorker(QObject):
                         cancel_check=lambda: self._cancelled,
                         negative_ratio=negative_ratio, rng=rng,
                         positive_offset=opts.get(
-                            "positive_offset", DEFAULT_POSITIVE_OFFSET))
+                            "positive_offset", DEFAULT_POSITIVE_OFFSET),
+                        examples_only=opts.get("examples_only", False))
                     samples += added
                     excluded += dropped
                     for i, count in enumerate(negatives):
@@ -605,12 +619,13 @@ class H5ExportDialog(QDialog):
     """
 
     def __init__(self, all_count, visible_count, labelled_count=0, parent=None,
-                 defaults=None):
+                 defaults=None, all_labelled_count=0):
         """Build the dialog. ``*_count`` size the scope radio labels."""
         super().__init__(parent)
         self._all_count = all_count
         self._visible_count = visible_count
         self._labelled_count = labelled_count
+        self._all_labelled_count = all_labelled_count
         self._defaults = dict(defaults or {})
         self.setWindowTitle("Export HDF5 Dataset")
         self.setMinimumWidth(500)
@@ -639,15 +654,35 @@ class H5ExportDialog(QDialog):
         self.scope_labelled.setToolTip(
             "Skips visible layers that have no labels, so the export contains "
             "no images made up entirely of hard negatives.")
+        self.scope_all_examples = QRadioButton(
+            "Labelled snippets ONLY - all loaded layers "
+            f"({self._all_labelled_count})")
+        self.scope_all_examples.setToolTip(
+            "Export only the snippets that contain a label centre, from every "
+            "loaded layer that has labels (visible or not). No hard negatives "
+            "are written at all.")
+        self.scope_visible_examples = QRadioButton(
+            "Labelled snippets ONLY - visible (ON) layers "
+            f"({self._labelled_count})")
+        self.scope_visible_examples.setToolTip(
+            "Export only the snippets that contain a label centre, from the "
+            "layers toggled on in the viewer. No hard negatives are written "
+            "at all.")
         self.scope_all.setChecked(True)
         if self._visible_count == 0:
             self.scope_visible.setEnabled(False)
         if self._labelled_count == 0:
             self.scope_labelled.setEnabled(False)
+            self.scope_visible_examples.setEnabled(False)
+        if self._all_labelled_count == 0:
+            self.scope_all_examples.setEnabled(False)
         self._scope_group = QButtonGroup(self)
-        for button in (self.scope_all, self.scope_visible, self.scope_labelled):
+        for button in (self.scope_all, self.scope_visible, self.scope_labelled,
+                       self.scope_all_examples, self.scope_visible_examples):
             self._scope_group.addButton(button)
             scope_layout.addWidget(button)
+            # Examples-only scopes make the hard-negative options irrelevant.
+            button.toggled.connect(self._on_scope_changed)
         layout.addWidget(scope_box)
 
         # Options
@@ -727,6 +762,7 @@ class H5ExportDialog(QDialog):
 
         # Hard-negative split
         neg_box = QGroupBox("Hard negatives")
+        self._neg_box = neg_box  # greyed out for examples-only scopes
         neg_layout = QVBoxLayout(neg_box)
         self.split_negatives_check = QCheckBox(
             "Split hard negatives across train / validate / test")
@@ -842,6 +878,16 @@ class H5ExportDialog(QDialog):
             spin.setEnabled(enabled)
         self._update_ok_enabled()
 
+    def _on_scope_changed(self, _checked=False):
+        """Grey out the hard-negative options for the examples-only scopes."""
+        self._neg_box.setEnabled(not self.examples_only())
+        self._update_ok_enabled()
+
+    def examples_only(self) -> bool:
+        """True when the selected scope exports labelled snippets only."""
+        return (self.scope_all_examples.isChecked()
+                or self.scope_visible_examples.isChecked())
+
     def _on_offset_toggled(self, enabled):
         """Enable the offset distance only while the copies are switched on."""
         self.offset_spin.setEnabled(enabled)
@@ -854,7 +900,9 @@ class H5ExportDialog(QDialog):
     def _update_ok_enabled(self):
         """Export needs a path, a ratio totalling 100% and a usable offset."""
         has_path = bool(self.out_edit.text().strip())
-        ratio_ok = (not self.split_negatives_check.isChecked()
+        # With an examples-only scope no negatives exist, so the ratio is moot.
+        ratio_ok = (self.examples_only()
+                    or not self.split_negatives_check.isChecked()
                     or self._ratio_total() == 100)
         self._ratio_note.setText(
             "" if ratio_ok
@@ -910,6 +958,10 @@ class H5ExportDialog(QDialog):
 
     def scope(self) -> str:
         """Return which layers to export: one of the ``SCOPE_*`` constants."""
+        if self.scope_all_examples.isChecked():
+            return SCOPE_ALL_EXAMPLES
+        if self.scope_visible_examples.isChecked():
+            return SCOPE_VISIBLE_EXAMPLES
         if self.scope_labelled.isChecked():
             return SCOPE_LABELLED
         if self.scope_visible.isChecked():
@@ -933,7 +985,11 @@ class H5ExportDialog(QDialog):
             "positive_offset": (self.offset_spin.value()
                                 if self.offset_check.isChecked() else 0),
             "compression": COMPRESSION_CHOICES[self.compress_combo.currentText()],
-            "split_negatives": self.split_negatives_check.isChecked(),
+            # Examples-only scopes write no hard negatives, so there is
+            # nothing to split either.
+            "examples_only": self.examples_only(),
+            "split_negatives": (self.split_negatives_check.isChecked()
+                                and not self.examples_only()),
             "negative_ratio": tuple(
                 self.negative_ratio_spins[name].value() / 100.0
                 for name in ("Train", "Validate", "Test")),

@@ -38,7 +38,8 @@ from .labels import LabelProject, ImageData, haversine_distance
 from .layer_panel import CombinedLayerPanel
 from .optimize_export import OptimizeExportDialog, OptimizeWorker, plan_output_path
 from .h5_export import (H5ExportDialog, H5ExportWorker, HARD_NEGATIVE,
-                        SCOPE_ALL, SCOPE_LABELLED)
+                        SCOPE_ALL, SCOPE_LABELLED, SCOPE_VISIBLE,
+                        SCOPE_ALL_EXAMPLES, SCOPE_VISIBLE_EXAMPLES)
 from .debug_log import debug, debug_log, DebugConsole
 
 
@@ -1993,20 +1994,29 @@ class MainWindow(QMainWindow):
         visible_count = sum(1 for i in infos if i.get("visible"))
         labelled_count = sum(1 for i in infos if i.get("visible")
                              and self._h5_labels_for(i["file_path"]))
+        all_labelled_count = sum(1 for i in infos
+                                 if self._h5_labels_for(i["file_path"]))
         dialog = H5ExportDialog(all_count, visible_count, labelled_count, self,
-                                defaults=self._h5_last_options)
+                                defaults=self._h5_last_options,
+                                all_labelled_count=all_labelled_count)
         if not dialog.exec_():
             return
 
         out_path = dialog.output_path()
         scope = dialog.scope()
+        # Which images the scope covers. The examples-only scopes only need
+        # labelled images (unlabelled ones would contribute nothing anyway).
+        needs_visible = scope in (SCOPE_VISIBLE, SCOPE_LABELLED,
+                                  SCOPE_VISIBLE_EXAMPLES)
+        needs_labels = scope in (SCOPE_LABELLED, SCOPE_ALL_EXAMPLES,
+                                 SCOPE_VISIBLE_EXAMPLES)
         images = []
         for info in infos:
-            if scope != SCOPE_ALL and not info.get("visible"):
+            if needs_visible and not info.get("visible"):
                 continue
             path = info["file_path"]
             labels = self._h5_labels_for(path)
-            if scope == SCOPE_LABELLED and not labels:
+            if needs_labels and not labels:
                 continue
             images.append((path, labels))
         if not images:
