@@ -123,11 +123,58 @@ def _snippet_positions(total: int, window: int, step: int) -> list[int]:
     return positions
 
 
-def _window_pixels(src, window, channels, nodata):
-    """Read a window as an (H, W, C) uint8 array, or None if entirely nodata."""
+def _band_scaling(src):
+    """Per-band (low, high) stretch for a non-uint8 raster, else ``None``.
+
+    The HDF5 dataset stores uint8, but a plain ``astype`` cast of 16-bit or
+    float imagery wraps values modulo 256 into noise. Instead, sample the
+    raster once (a decimated read, served from overviews when present, with
+    nodata masked out) and derive a per-band 2-98 percentile window - the
+    same idea as a viewer's default contrast stretch. Every snippet of the
+    image is then scaled through this one linear mapping, so snippets stay
+    consistent with each other and with how the imagery looks on screen.
+    """
+    if np.dtype(src.dtypes[0]) == np.uint8:
+        return None
+    bands = min(src.count, 3)
+    out_h = min(src.height, 1024)
+    out_w = min(src.width, 1024)
+    sample = src.read(indexes=list(range(1, bands + 1)),
+                      out_shape=(bands, out_h, out_w), masked=True)
+    sample = np.ma.filled(sample.astype("float32"), np.nan)
+    lows = np.empty(bands, dtype="float32")
+    highs = np.empty(bands, dtype="float32")
+    for b in range(bands):
+        band = sample[b]
+        with np.errstate(all="ignore"):
+            lo = np.nanpercentile(band, 2.0)
+            hi = np.nanpercentile(band, 98.0)
+            if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+                # Degenerate percentiles (e.g. a rare bright object on a flat
+                # background): fall back to the full data range.
+                lo, hi = np.nanmin(band), np.nanmax(band)
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+            lo, hi = 0.0, 1.0  # fully empty/flat band - nothing to stretch
+        lows[b], highs[b] = lo, hi
+    return lows, highs
+
+
+def _window_pixels(src, window, channels, nodata, scaling=None):
+    """Read a window as an (H, W, C) uint8 array, or None if entirely nodata.
+
+    ``scaling`` is the per-band stretch from :func:`_band_scaling` for
+    non-uint8 sources (uint8 data passes through byte-exact).
+    """
     data = src.read(window=window)  # (bands, h, w)
     if nodata is not None and bool(np.all(data == nodata)):
         return None
+    if scaling is not None:
+        lo, hi = scaling
+        nb = min(data.shape[0], lo.size)
+        scaled = data[:nb].astype("float32")
+        scaled -= lo[:, None, None]
+        scaled *= (255.0 / np.maximum(hi - lo, 1e-6))[:, None, None]
+        data = np.clip(scaled, 0.0, 255.0)
     bands = data.shape[0]
     if channels == 1:
         if bands >= 3:
@@ -460,6 +507,9 @@ def export_image(writer, path, labels, height, width, overlap, channels,
 
     with rasterio.open(path) as src:
         nodata = src.nodata
+        # One contrast stretch per raster (None for uint8), so every snippet
+        # of this image is scaled identically - see _band_scaling.
+        scaling = _band_scaling(src)
         positives = _positive_windows(
             pts, src.width, src.height, width, height,
             max(0, int(positive_offset)))
@@ -468,7 +518,8 @@ def export_image(writer, path, labels, height, width, overlap, channels,
             if cancel_check and cancel_check():
                 return added, negative_counts, 0
             arr = _window_pixels(
-                src, Window(x0, y0, width, height), channels, nodata)
+                src, Window(x0, y0, width, height), channels, nodata,
+                scaling=scaling)
             if arr is None:
                 continue  # entirely nodata
             writer.add(arr, class_index, True, split_value)
@@ -499,7 +550,8 @@ def export_image(writer, path, labels, height, width, overlap, channels,
                 if excluded[iy, ix]:
                     continue  # shares ground with an example
                 arr = _window_pixels(
-                    src, Window(x0, y0, width, height), channels, nodata)
+                    src, Window(x0, y0, width, height), channels, nodata,
+                    scaling=scaling)
                 if arr is None:
                     continue  # entirely nodata
                 negative_split = split_value
