@@ -35,6 +35,43 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.h5_export import centered_window, _band_scaling, _window_pixels
 
 
+def locate_snippet(src, snippet, max_dim: int = 256):
+    """Find where a snippet actually came from in the source raster.
+
+    Template-matches the snippet against a decimated copy of band 1 using
+    normalised cross-correlation, so it works even when the snippet's pixel
+    values were scaled differently from the source (a contrast stretch, or the
+    old modulo-wrapped uint8 cast). Returns ``(x, y, score, step)`` - the
+    best-matching top-left corner in source pixels, the correlation in
+    [-1, 1], and the search precision in pixels.
+    """
+    step = max(1, int(np.ceil(max(src.width, src.height) / max_dim)))
+    base = np.asarray(src.read(1, out_shape=(max(1, src.height // step),
+                                  max(1, src.width // step)))).astype("float32")
+    tmpl = snippet[::step, ::step, 0].astype("float32")
+    th, tw = tmpl.shape
+    if th < 2 or tw < 2 or base.shape[0] < th or base.shape[1] < tw:
+        return None
+    tmpl = tmpl - tmpl.mean()
+    tnorm = float(np.sqrt((tmpl ** 2).sum()))
+    if tnorm == 0:
+        return None
+    from numpy.lib.stride_tricks import sliding_window_view
+    win = sliding_window_view(base, (th, tw))
+    # Correlate in blocks of rows to keep the materialised window small.
+    best = (-2.0, 0, 0)
+    for r in range(win.shape[0]):
+        block = win[r].reshape(win.shape[1], -1).astype("float32")
+        block = block - block.mean(axis=1, keepdims=True)
+        norms = np.sqrt((block ** 2).sum(axis=1))
+        norms[norms == 0] = np.inf
+        scores = (block @ tmpl.ravel()) / (norms * tnorm)
+        c = int(np.argmax(scores))
+        if scores[c] > best[0]:
+            best = (float(scores[c]), c * step, r * step)
+    return best[1], best[2], best[0], step
+
+
 def load_project(path: Path):
     """Yield (image_path, width, height, [(label_id, class, px, py), ...])."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -68,6 +105,11 @@ def main() -> int:
                     help="Exported HDF5 dataset to check.")
     ap.add_argument("--dump", type=Path,
                     help="Directory to write expected/actual crops as PNGs.")
+    ap.add_argument("--locate", type=int, default=0, metavar="N",
+                    help="Template-match the first N example snippets back "
+                         "against the source raster to find the window the "
+                         "export actually used (works even if the pixel "
+                         "values were scaled differently).")
     args = ap.parse_args()
 
     with h5py.File(args.h5, "r") as f:
@@ -141,6 +183,45 @@ def main() -> int:
                               else images[hit][:, :, :3])
                         Image.fromarray(a2).save(
                             args.dump / f"label{lid}_h5row{hit}.png")
+
+            # Where did the .h5's own snippets actually come from?
+            if args.locate:
+                print(f"   -- locating the first {args.locate} example "
+                      "snippet(s) of this image in the source --")
+                expected_origins = {
+                    centered_window(px, py, W, H, src.width, src.height)
+                    for _lid, _c, px, py in labels}
+                for i in ex_idx[:args.locate]:
+                    found_at = locate_snippet(src, images[i])
+                    if found_at is None:
+                        print(f"      h5 row {i}: could not locate")
+                        continue
+                    fx, fy, score, stp = found_at
+                    near = min((abs(fx - ex) + abs(fy - ey), (ex, ey))
+                               for ex, ey in expected_origins)
+                    if score < 0.5:
+                        verdict = ("LOW SCORE - the pixel VALUES don't match "
+                                   "the source, so this row was written with a "
+                                   "different dtype conversion (an old export "
+                                   "before the contrast-stretch fix). Its "
+                                   "location above is unreliable.")
+                    elif near[0] <= 2 * stp:
+                        verdict = "matches the expected centred window - OK"
+                    else:
+                        verdict = ("WRONG WINDOW - values match the source but "
+                                   "the crop was taken somewhere else.")
+                    print(f"      h5 row {i}: matches source window "
+                          f"~({fx},{fy}) +/-{stp}px (score {score:.3f}); "
+                          f"nearest expected centre window {near[1]}, "
+                          f"off by ~{near[0]}px\n"
+                          f"          -> {verdict}")
+                if args.dump:
+                    from PIL import Image
+                    for i in ex_idx[:args.locate]:
+                        a2 = (images[i][:, :, 0] if C == 1
+                              else images[i][:, :, :3])
+                        Image.fromarray(a2).save(
+                            args.dump / f"h5row{i}_actual.png")
 
     stale = [i for i in ex_idx if i not in matched_rows]
     print(f"\nlabels: {total} | centred (not edge-shifted): {centred} | "
