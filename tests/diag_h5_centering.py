@@ -72,6 +72,50 @@ def locate_snippet(src, snippet, max_dim: int = 256):
     return best[1], best[2], best[0], step
 
 
+def _normalised(arr):
+    """Flatten band 0 to zero-mean unit-norm, for value-independent matching."""
+    a = arr[:, :, 0].astype("float32")
+    a = a - a.mean()
+    n = float(np.sqrt((a ** 2).sum()))
+    return (a / n).ravel() if n else a.ravel()
+
+
+def best_h5_match(expect, images, ex_idx):
+    """The h5 example row whose PATTERN best matches ``expect``.
+
+    Uses normalised correlation, so a row holding the right ground still
+    matches even when its pixel values were scaled differently (an older
+    export, or a different contrast stretch). Returns ``(row, score)``.
+    """
+    if not ex_idx:
+        return None, 0.0
+    target = _normalised(expect)
+    best_row, best_score = None, -2.0
+    for i in ex_idx:
+        score = float(_normalised(images[i]) @ target)
+        if score > best_score:
+            best_row, best_score = i, score
+    return best_row, best_score
+
+
+def save_png(path: Path, arr, channels: int):
+    """Write an (H, W, C) uint8 snippet as a PNG."""
+    from PIL import Image
+    data = arr[:, :, 0] if channels == 1 else arr[:, :, :3]
+    Image.fromarray(np.ascontiguousarray(data)).save(path)
+
+
+def side_by_side(left, right, channels: int, gap: int = 6):
+    """Join two equally sized snippets with a white separator between them."""
+    h = max(left.shape[0], right.shape[0])
+    c = left.shape[2]
+    out = np.full((h, left.shape[1] + gap + right.shape[1], c), 255,
+                  dtype="uint8")
+    out[:left.shape[0], :left.shape[1]] = left
+    out[:right.shape[0], left.shape[1] + gap:] = right
+    return out
+
+
 def load_project(path: Path):
     """Yield (image_path, width, height, [(label_id, class, px, py), ...])."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -174,15 +218,23 @@ def main() -> int:
                       f"{hit if hit is not None else 'NOT FOUND'}"
                       f"{' [' + cls + ']' if cls else ''}")
                 if args.dump and expect is not None:
-                    from PIL import Image
-                    arr = expect[:, :, 0] if C == 1 else expect[:, :, :3]
-                    Image.fromarray(arr).save(
-                        args.dump / f"label{lid}_expected.png")
-                    if hit is not None:
-                        a2 = (images[hit][:, :, 0] if C == 1
-                              else images[hit][:, :, :3])
-                        Image.fromarray(a2).save(
-                            args.dump / f"label{lid}_h5row{hit}.png")
+                    # Always write BOTH crops: the expected one cut straight
+                    # from the source, and the h5's own snippet for the same
+                    # label - matched by pattern (not byte equality) so a row
+                    # written with different scaling is still paired up.
+                    row, score = (hit, 1.0) if hit is not None else \
+                        best_h5_match(expect, images, ex_idx)
+                    save_png(args.dump / f"label{lid}_1_expected.png", expect, C)
+                    if row is not None:
+                        save_png(
+                            args.dump / f"label{lid}_2_h5row{row}.png",
+                            images[row], C)
+                        save_png(
+                            args.dump / f"label{lid}_3_compare.png",
+                            side_by_side(expect, images[row], C), C)
+                        print(f"      dumped: expected vs h5 row {row} "
+                              f"(pattern match {score:.3f}) -> "
+                              f"label{lid}_3_compare.png")
 
             # Where did the .h5's own snippets actually come from?
             if args.locate:
@@ -199,12 +251,17 @@ def main() -> int:
                     fx, fy, score, stp = found_at
                     near = min((abs(fx - ex) + abs(fy - ey), (ex, ey))
                                for ex, ey in expected_origins)
-                    if score < 0.5:
-                        verdict = ("LOW SCORE - the pixel VALUES don't match "
-                                   "the source, so this row was written with a "
-                                   "different dtype conversion (an old export "
-                                   "before the contrast-stretch fix). Its "
-                                   "location above is unreliable.")
+                    if i in matched_rows:
+                        verdict = ("byte-identical to a label's expected crop "
+                                   "- correct")
+                    elif score < 0.35:
+                        verdict = ("LOW SCORE - the pixel VALUES look unrelated "
+                                   "to the source, suggesting this row was "
+                                   "written with a different dtype conversion "
+                                   "(an old export before the contrast-stretch "
+                                   "fix). The location above is unreliable. "
+                                   "Note textured imagery scores lower simply "
+                                   "because the match runs on a decimated copy.")
                     elif near[0] <= 2 * stp:
                         verdict = "matches the expected centred window - OK"
                     else:
