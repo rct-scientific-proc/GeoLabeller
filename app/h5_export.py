@@ -113,6 +113,24 @@ def read_settings(path) -> dict | None:
         return None
 
 
+def centered_window(px: float, py: float, width: int, height: int,
+                    img_width: int, img_height: int) -> tuple[int, int]:
+    """Top-left of the ``width`` x ``height`` window centred on a label pixel.
+
+    This is the one definition of "centred on a label" shared by the HDF5
+    snippet export and the sub-image GeoTIFF export, so both frame identical
+    ground for the same label: the label pixel is rounded to a whole pixel, the
+    window is placed symmetrically around it, then shifted (never cropped) to
+    stay inside the raster - so every snippet is exactly HxW, and the label
+    sits dead centre except where that edge shift moves it.
+    """
+    x0 = int(round(px)) - width // 2
+    y0 = int(round(py)) - height // 2
+    x0 = min(max(x0, 0), max(0, img_width - width))
+    y0 = min(max(y0, 0), max(0, img_height - height))
+    return x0, y0
+
+
 def _snippet_positions(total: int, window: int, step: int) -> list[int]:
     """Top-left offsets tiling ``[0, total)`` with a final shifted-to-fit one."""
     if total < window:
@@ -410,11 +428,14 @@ def _positive_windows(pts, img_width, img_height, width, height, offset):
         return {}
     shifts = (-offset, 0, offset) if offset > 0 else (0,)
     for x, y, class_index in pts:
-        left, top = x - width / 2.0, y - height / 2.0
+        # Same centring as the sub-image GeoTIFF export, so a snippet of a
+        # given label frames exactly the ground that export would write.
+        base_x, base_y = centered_window(
+            x, y, width, height, img_width, img_height)
         for dy in shifts:
             for dx in shifts:
-                x0 = min(max(int(round(left + dx)), 0), max_x)
-                y0 = min(max(int(round(top + dy)), 0), max_y)
+                x0 = min(max(base_x + dx, 0), max_x)
+                y0 = min(max(base_y + dy, 0), max_y)
                 away = max(abs(x - (x0 + width / 2.0)),
                            abs(y - (y0 + height / 2.0)))
                 held = windows.get((x0, y0))

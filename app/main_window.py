@@ -39,7 +39,8 @@ from .layer_panel import CombinedLayerPanel
 from .optimize_export import OptimizeExportDialog, OptimizeWorker, plan_output_path
 from .h5_export import (H5ExportDialog, H5ExportWorker, HARD_NEGATIVE,
                         SCOPE_ALL, SCOPE_LABELLED, SCOPE_VISIBLE,
-                        SCOPE_ALL_EXAMPLES, SCOPE_VISIBLE_EXAMPLES)
+                        SCOPE_ALL_EXAMPLES, SCOPE_VISIBLE_EXAMPLES,
+                        centered_window)
 from .debug_log import debug, debug_log, DebugConsole
 
 
@@ -2237,41 +2238,15 @@ class MainWindow(QMainWindow):
                     full_size_px_x = half_size_px_x * 2
                     full_size_px_y = half_size_px_y * 2
 
-                    # Calculate initial window bounds (centered on label)
-                    col_start = pixel_x - half_size_px_x
-                    col_end = pixel_x + half_size_px_x
-                    row_start = pixel_y - half_size_px_y
-                    row_end = pixel_y + half_size_px_y
-
-                    # Handle edge cases by shifting the window to stay within bounds
-                    # while maintaining the full requested size if possible
-                    if col_start < 0:
-                        # Shift window right
-                        shift = -col_start
-                        col_start = 0
-                        col_end = min(src.width, col_end + shift)
-                    if col_end > src.width:
-                        # Shift window left
-                        shift = col_end - src.width
-                        col_end = src.width
-                        col_start = max(0, col_start - shift)
-
-                    if row_start < 0:
-                        # Shift window down
-                        shift = -row_start
-                        row_start = 0
-                        row_end = min(src.height, row_end + shift)
-                    if row_end > src.height:
-                        # Shift window up
-                        shift = row_end - src.height
-                        row_end = src.height
-                        row_start = max(0, row_start - shift)
-
-                    # Final clamp to ensure we're within bounds
-                    col_start = max(0, col_start)
-                    col_end = min(src.width, col_end)
-                    row_start = max(0, row_start)
-                    row_end = min(src.height, row_end)
+                    # Centre the window on the label using the shared rule the
+                    # HDF5 snippet export also uses, so a given label frames
+                    # exactly the same ground in both exports. The window is
+                    # shifted (not cropped) to stay inside the raster.
+                    col_start, row_start = centered_window(
+                        label.pixel_x, label.pixel_y,
+                        full_size_px_x, full_size_px_y, src.width, src.height)
+                    col_end = min(src.width, col_start + full_size_px_x)
+                    row_end = min(src.height, row_start + full_size_px_y)
 
                     window_width = col_end - col_start
                     window_height = row_end - row_start
