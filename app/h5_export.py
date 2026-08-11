@@ -38,6 +38,8 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox, QFileDialog, QCheckBox,
 )
 
+from .debug_log import debug
+
 HARD_NEGATIVE = "hard_negative"
 
 # How far, in pixels, the eight surrounding example crops sit from the one
@@ -426,21 +428,43 @@ def _positive_windows(pts, img_width, img_height, width, height, offset):
     max_x, max_y = img_width - width, img_height - height
     if max_x < 0 or max_y < 0:
         return {}
-    shifts = (-offset, 0, offset) if offset > 0 else (0,)
+
+    def offer(x0, y0, x, y, class_index):
+        """Record a crop, keeping whichever label sits nearest its centre."""
+        x0 = min(max(x0, 0), max_x)
+        y0 = min(max(y0, 0), max_y)
+        away = max(abs(x - (x0 + width / 2.0)), abs(y - (y0 + height / 2.0)))
+        held = windows.get((x0, y0))
+        if held is None or away < held[1]:
+            windows[(x0, y0)] = (class_index, away)
+
+    # Pass 1: the exactly-centred crop for every label, using the same centring
+    # rule as the sub-image GeoTIFF export. Dicts keep insertion order, so these
+    # are written to the dataset before any shifted copy - the first snippet of
+    # each label is the one framed exactly like its sub-image.
+    bases = []
     for x, y, class_index in pts:
-        # Same centring as the sub-image GeoTIFF export, so a snippet of a
-        # given label frames exactly the ground that export would write.
         base_x, base_y = centered_window(
             x, y, width, height, img_width, img_height)
-        for dy in shifts:
-            for dx in shifts:
-                x0 = min(max(base_x + dx, 0), max_x)
-                y0 = min(max(base_y + dy, 0), max_y)
-                away = max(abs(x - (x0 + width / 2.0)),
-                           abs(y - (y0 + height / 2.0)))
-                held = windows.get((x0, y0))
-                if held is None or away < held[1]:
-                    windows[(x0, y0)] = (class_index, away)
+        bases.append((base_x, base_y, x, y, class_index))
+        offer(base_x, base_y, x, y, class_index)
+        # Where the label lands inside its centred crop. Anything other than
+        # (width//2, height//2) means the crop was shifted off an image edge -
+        # log it so a real off-centre export can be traced to its label.
+        debug(f"h5 centre crop: label px ({x:.1f}, {y:.1f}) on "
+              f"{img_width}x{img_height} -> window ({base_x}, {base_y}), "
+              f"label at ({x - base_x:.1f}, {y - base_y:.1f}) of "
+              f"{width}x{height}")
+
+    # Pass 2: the eight offsets, measured from each label's centred crop.
+    if offset > 0:
+        for base_x, base_y, x, y, class_index in bases:
+            for dy in (-offset, 0, offset):
+                for dx in (-offset, 0, offset):
+                    if dx == 0 and dy == 0:
+                        continue  # already placed in pass 1
+                    offer(base_x + dx, base_y + dy, x, y, class_index)
+
     return {pos: held[0] for pos, held in windows.items()}
 
 
