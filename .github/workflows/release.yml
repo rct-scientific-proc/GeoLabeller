@@ -1,0 +1,109 @@
+# Build the Windows MSI installer and publish it as a GitHub Release.
+#
+# Push a semver tag to cut a release:
+#     git tag -a v1.2.0 -m "GeoLabeller 1.2.0"
+#     git push origin v1.2.0
+#
+# The tag name (minus the leading "v") becomes the MSI's ProductVersion, which
+# is what lets Windows Installer upgrade an existing install in place - so the
+# version must increase with every release, or the installer refuses with
+# "Another version of this product is already installed".
+#
+# The workflow can also be run by hand from the Actions tab ("Run workflow")
+# with a version typed in; that builds and uploads the MSI as a build artifact
+# without publishing a release, which is handy for testing the pipeline.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, X.Y.Z (e.g. 1.2.0). No release is published."
+        required: true
+
+# The job creates a release, which needs write access to repository contents.
+permissions:
+  contents: write
+
+jobs:
+  windows-msi:
+    name: Windows MSI
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # cx_Freeze bakes this interpreter into the executable, so pin it rather
+      # than inheriting whatever the runner image happens to ship.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          } else {
+            $version = '${{ inputs.version }}'
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Version must be X.Y.Z (got '$version'). Tag releases as v1.2.0."
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Building GeoLabeller $version"
+
+      # -NoProxy skips the corporate-proxy autodetection, which has nothing to
+      # find on a hosted runner and only costs time.
+      - name: Build the MSI
+        shell: pwsh
+        run: >
+          ./build/build_windows.ps1
+          -Msi
+          -Clean
+          -NoProxy
+          -Version ${{ steps.version.outputs.version }}
+          -Author "RCT Scientific Processing"
+          -Url "https://github.com/${{ github.repository }}"
+
+      - name: Check the MSI was produced
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem build/dist/*.msi -ErrorAction SilentlyContinue
+          if (-not $msi) { throw "No .msi found in build/dist" }
+          $msi | ForEach-Object {
+            "{0}  ({1:N1} MB)" -f $_.Name, ($_.Length / 1MB) | Write-Host
+          }
+
+      # Kept for every run, including manual ones, so a build can be downloaded
+      # and tested before any release exists.
+      - name: Upload the installer as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeoLabeller-${{ steps.version.outputs.version }}-windows-msi
+          path: |
+            build/dist/*.msi
+            build/dist/*.msi.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      # Only tag pushes publish. gh is preinstalled on GitHub runners, so this
+      # needs no third-party action.
+      - name: Publish the GitHub Release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = Get-ChildItem build/dist/*.msi, build/dist/*.msi.sha256 |
+            ForEach-Object { $_.FullName }
+          gh release create $env:GITHUB_REF_NAME @files `
+            --title "GeoLabeller $($env:GITHUB_REF_NAME)" `
+            --generate-notes
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
