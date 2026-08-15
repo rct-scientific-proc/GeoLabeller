@@ -1119,6 +1119,14 @@ class MapCanvas(QGraphicsView):
     # Signal emitted when user wants to highlight linked labels: (label_id)
     show_linked_requested = pyqtSignal(int)
 
+    # Waypoint requests raised from the canvas, handled by the main window
+    # (which owns the project). Add carries a WGS84 (lon, lat); the rest carry
+    # a waypoint id.
+    waypoint_add_requested = pyqtSignal(float, float)
+    waypoint_goto_requested = pyqtSignal(int)
+    waypoint_rename_requested = pyqtSignal(int)
+    waypoint_remove_requested = pyqtSignal(int)
+
     # Signal emitted when link mode state changes: (is_active, message)
     link_mode_changed = pyqtSignal(bool, str)
 
@@ -1278,6 +1286,14 @@ class MapCanvas(QGraphicsView):
         self._ruler_text: QGraphicsTextItem | None = None
         # Crosshair dropped by "Go to Coordinates" (see mark_location).
         self._location_marker: QGraphicsPathItem | None = None
+        # Waypoint markers: waypoint_id -> (marker, name text). Parented to the
+        # floating-origin group, so they ride along with every rebase.
+        self._waypoint_items: dict = {}
+        # User toggle from the waypoints panel.
+        self._waypoints_visible = True
+        # Suppressed while waterfall mode is active: the stacked images are raw
+        # pixels with no geography, so a geographic marker means nothing there.
+        self._waypoints_suppressed = False
         # Right-drag panning while in ruler mode.
         self._ruler_panning = False
         self._ruler_pan_start = None  # QPoint: last pan position (view coords)
@@ -1483,6 +1499,9 @@ class MapCanvas(QGraphicsView):
         Returns the total stack height in scene units.
         """
         self._waterfall_active = True
+        # The stack is raw pixels in the pixel zone, so geographic waypoints
+        # have nothing to point at here; hide them until the mode is left.
+        self._suppress_waypoints(True)
         self._waterfall_layer_order = []
         origin_x = PIXEL_ZONE_ORIGIN_X
         # Scene Y grows downward and scene north = -y: the first image's top
@@ -1541,6 +1560,8 @@ class MapCanvas(QGraphicsView):
         self._waterfall_saved_bounds.clear()
         self._waterfall_layer_order = []
         self._waterfall_active = False
+        # Geography applies again, so waypoints come back.
+        self._suppress_waypoints(False)
         self._update_visible_tiles()
 
     def start_waterfall_glide(self, direction: int):
@@ -2997,16 +3018,57 @@ class MapCanvas(QGraphicsView):
                     layer_id = self._path_to_layer[image_path]
                     self.toggle_layer_visibility_requested.emit(layer_id)
 
-    def _show_pan_context_menu(self, view_pos):
-        """Show context menu for pan mode."""
+    def _show_waypoint_context_menu(self, view_pos, waypoint_id: int):
+        """Context menu for a waypoint marker under the cursor."""
         menu = QMenu(self)
+        goto_action = menu.addAction("Go to Waypoint")
+        rename_action = menu.addAction("Rename Waypoint...")
+        menu.addSeparator()
+        remove_action = menu.addAction("Remove Waypoint")
+
+        action = menu.exec_(self.mapToGlobal(view_pos))
+        if action == goto_action:
+            self.waypoint_goto_requested.emit(waypoint_id)
+        elif action == rename_action:
+            self.waypoint_rename_requested.emit(waypoint_id)
+        elif action == remove_action:
+            self.waypoint_remove_requested.emit(waypoint_id)
+
+    def _show_pan_context_menu(self, view_pos):
+        """Show context menu for pan mode.
+
+        A waypoint under the cursor takes precedence and gets its own menu,
+        mirroring how a label marker claims the right click in labeling modes.
+        """
+        waypoint_id = self._waypoint_at_position(view_pos)
+        if waypoint_id is not None:
+            self._show_waypoint_context_menu(view_pos, waypoint_id)
+            return
+
+        menu = QMenu(self)
+
+        # Waypoints are geographic, so the pixel zone (non-georeferenced
+        # images) has no coordinate to record - offer the action greyed out
+        # with the reason rather than silently storing a meaningless position.
+        easting, northing = self._scene_to_web(self.mapToScene(view_pos))
+        in_pixel_zone = self.is_in_pixel_zone(easting)
+        if in_pixel_zone:
+            add_waypoint_action = menu.addAction(
+                "Add waypoint here (needs a georeferenced location)")
+            add_waypoint_action.setEnabled(False)
+        else:
+            add_waypoint_action = menu.addAction("Add waypoint here")
+        menu.addSeparator()
 
         show_in_view_action = menu.addAction("Select layers in view")
         hide_outside_action = menu.addAction("Unselect layers outside view")
 
         action = menu.exec_(self.mapToGlobal(view_pos))
 
-        if action == show_in_view_action:
+        if action == add_waypoint_action and not in_pixel_zone:
+            lon, lat = self._web_mercator_to_wgs84(easting, northing)
+            self.waypoint_add_requested.emit(lon, lat)
+        elif action == show_in_view_action:
             self._show_layers_in_view()
         elif action == hide_outside_action:
             self._hide_layers_outside_view()
@@ -3518,8 +3580,18 @@ class MapCanvas(QGraphicsView):
         """
         self.clear_location_marker()
         easting, northing = self._wgs84_to_web_mercator(lon, lat)
+        marker = self._make_crosshair_marker(
+            easting, northing, QColor(0, 200, 255),
+            self._get_label_z_base() + 7)
+        self._location_marker = marker
 
-        arm, radius = 14.0, 6.0  # screen pixels
+    @staticmethod
+    def _crosshair_path(arm: float = 14.0, radius: float = 6.0) -> QPainterPath:
+        """A circle with four gapped arms, sized in screen pixels.
+
+        Shared by the go-to marker and waypoints so the two can never drift
+        apart visually; the colour is what tells them apart.
+        """
         path = QPainterPath()
         path.moveTo(-arm, 0.0)
         path.lineTo(-radius, 0.0)
@@ -3530,21 +3602,106 @@ class MapCanvas(QGraphicsView):
         path.moveTo(0.0, radius)
         path.lineTo(0.0, arm)
         path.addEllipse(QPointF(0.0, 0.0), radius, radius)
+        return path
 
-        marker = QGraphicsPathItem(path, self._origin_group)
-        pen = QPen(QColor(0, 200, 255), 2)
+    def _make_crosshair_marker(self, easting: float, northing: float,
+                               color: QColor, z: float) -> QGraphicsPathItem:
+        """Place a crosshair at a Web Mercator position.
+
+        Parented to the origin group, so it is positioned in world coordinates
+        and rides along with every floating-origin rebase for free. It ignores
+        the view transform, so it stays the same size on screen at any zoom and
+        upright when the view is rotated.
+        """
+        marker = QGraphicsPathItem(self._crosshair_path(), self._origin_group)
+        pen = QPen(color, 2)
         pen.setCosmetic(True)
         marker.setPen(pen)
         marker.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
-        marker.setZValue(self._get_label_z_base() + 7)
+        marker.setZValue(z)
         marker.setPos(easting, -northing)
-        self._location_marker = marker
+        return marker
 
     def clear_location_marker(self):
         """Remove the go-to crosshair, if one is showing."""
         if self._location_marker is not None:
             self._scene.removeItem(self._location_marker)
             self._location_marker = None
+
+    # ------------------------------------------------------------------
+    # Waypoints: named geographic bookmarks drawn on the map
+    # ------------------------------------------------------------------
+
+    _WAYPOINT_COLOR = QColor(255, 170, 0)   # amber, vs the go-to marker's cyan
+
+    def add_waypoint_marker(self, waypoint_id: int, name: str,
+                            lon: float, lat: float):
+        """Draw (or redraw) the marker and name for one waypoint."""
+        self.remove_waypoint_marker(waypoint_id)
+        easting, northing = self._wgs84_to_web_mercator(lon, lat)
+        z = self._get_label_z_base() + 6
+        marker = self._make_crosshair_marker(
+            easting, northing, self._WAYPOINT_COLOR, z)
+
+        text = QGraphicsTextItem(name)
+        text.setDefaultTextColor(self._WAYPOINT_COLOR)
+        font = QFont("Arial", 8)
+        font.setBold(True)
+        text.setFont(font)
+        # Constant on-screen size and upright, like the label text.
+        text.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        text.setZValue(z)
+        text.setParentItem(self._origin_group)
+        text.setPos(easting, -northing)
+        # Nudge clear of the crosshair arms (screen pixels, transform-ignored).
+        text.setTransform(QTransform.fromTranslate(10.0, -22.0), True)
+
+        visible = self._waypoints_visible and not self._waypoints_suppressed
+        marker.setVisible(visible)
+        text.setVisible(visible)
+        self._waypoint_items[waypoint_id] = (marker, text)
+
+    def remove_waypoint_marker(self, waypoint_id: int):
+        """Remove one waypoint's marker, if present."""
+        items = self._waypoint_items.pop(waypoint_id, None)
+        if items is not None:
+            for item in items:
+                self._scene.removeItem(item)
+
+    def clear_waypoint_markers(self):
+        """Remove every waypoint marker from the canvas."""
+        for waypoint_id in list(self._waypoint_items):
+            self.remove_waypoint_marker(waypoint_id)
+
+    def set_waypoints_visible(self, visible: bool):
+        """Show or hide all waypoint markers (the panel's "Show on map")."""
+        self._waypoints_visible = bool(visible)
+        self._apply_waypoint_visibility()
+
+    def _suppress_waypoints(self, suppressed: bool):
+        """Hide waypoints for a mode where geography doesn't apply."""
+        self._waypoints_suppressed = bool(suppressed)
+        self._apply_waypoint_visibility()
+
+    def _apply_waypoint_visibility(self):
+        """Apply the combined user toggle and mode suppression to the items."""
+        visible = self._waypoints_visible and not self._waypoints_suppressed
+        for marker, text in self._waypoint_items.values():
+            marker.setVisible(visible)
+            text.setVisible(visible)
+
+    def _waypoint_at_position(self, view_pos) -> "int | None":
+        """Return the id of the waypoint under a view position, or None."""
+        if not self._waypoint_items or self._waypoints_suppressed:
+            return None
+        if not self._waypoints_visible:
+            return None
+        scene_pos = self.mapToScene(view_pos)
+        for waypoint_id, (marker, _text) in self._waypoint_items.items():
+            rect = marker.sceneBoundingRect()
+            if rect.contains(scene_pos):
+                return waypoint_id
+        return None
 
     def set_label_linked(self, label_id: int, is_linked: bool):
         """Update whether a label is linked to other labels."""

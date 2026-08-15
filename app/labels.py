@@ -142,6 +142,46 @@ class PointLabel:
 
 
 @dataclass
+class Waypoint:
+    """A named geographic bookmark, independent of any image.
+
+    Waypoints record a place worth returning to (a site to revisit, a
+    reference point, somewhere to check later). Unlike labels they belong to
+    the project rather than to an image, carry no class, and are never
+    exported as training data - they exist purely for navigation.
+    """
+
+    # Sequential identifier, unique within the project.
+    id: int
+
+    # Short user-facing name; auto-generated as "WP n" and freely renamed.
+    name: str
+
+    # Position in WGS84 degrees.
+    lat: float
+    lon: float
+
+    def to_dict(self) -> dict:
+        """Convert to a dictionary for serialization."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "lat": self.lat,
+            "lon": self.lon,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Waypoint":
+        """Create from a serialized dictionary."""
+        return cls(
+            id=int(data.get("id", 0)),
+            name=str(data.get("name", "")),
+            lat=float(data.get("lat", 0.0)),
+            lon=float(data.get("lon", 0.0)),
+        )
+
+
+@dataclass
 class ImageData:
     """Data for a single image including its labels."""
 
@@ -413,8 +453,14 @@ class LabelProject:
     # Images with their labels (keyed by path for easy lookup)
     images: dict[str, ImageData] = field(default_factory=dict)
 
+    # Named geographic bookmarks, in the order they were added
+    waypoints: list[Waypoint] = field(default_factory=list)
+
     # Auto-increment ID counter for labels
     _next_id: int = 1
+
+    # Auto-increment ID counter for waypoints (independent of labels)
+    _next_waypoint_id: int = 1
 
     # Index mapping object_id -> set of label_ids for O(1) linked label lookup
     _object_id_index: dict[str, set[int]] = field(default_factory=dict)
@@ -669,13 +715,60 @@ class LabelProject:
         """Get total number of labels across all images."""
         return sum(len(img.labels) for img in self.images.values())
 
+    # ------------------------------------------------------------------
+    # Waypoints: named geographic bookmarks, independent of the images
+    # ------------------------------------------------------------------
+
+    def add_waypoint(self, lat: float, lon: float,
+                     name: str = "") -> Waypoint:
+        """Add a waypoint, auto-naming it "WP n" when no name is given."""
+        wp = Waypoint(
+            id=self._next_waypoint_id,
+            name=name.strip() or f"WP {self._next_waypoint_id}",
+            lat=lat,
+            lon=lon,
+        )
+        self._next_waypoint_id += 1
+        self.waypoints.append(wp)
+        return wp
+
+    def get_waypoint(self, waypoint_id: int) -> Optional[Waypoint]:
+        """Return the waypoint with this id, or None."""
+        for wp in self.waypoints:
+            if wp.id == waypoint_id:
+                return wp
+        return None
+
+    def remove_waypoint(self, waypoint_id: int) -> bool:
+        """Remove a waypoint by id. Returns True if one was removed."""
+        for i, wp in enumerate(self.waypoints):
+            if wp.id == waypoint_id:
+                del self.waypoints[i]
+                return True
+        return False
+
+    def rename_waypoint(self, waypoint_id: int, name: str) -> bool:
+        """Rename a waypoint. Blank names are ignored, keeping the old one."""
+        wp = self.get_waypoint(waypoint_id)
+        if wp is None or not name.strip():
+            return False
+        wp.name = name.strip()
+        return True
+
+    @property
+    def waypoint_count(self) -> int:
+        """Number of waypoints in the project."""
+        return len(self.waypoints)
+
     def save(self, file_path: str | Path):
         """Save project to JSON file."""
         data = {
-            "version": "3.2",
+            "version": "3.3",
             "classes": self.classes,
             "images": [img.to_dict() for img in self.images.values()],
-            "_next_id": self._next_id
+            "waypoints": [wp.to_dict() for wp in self.waypoints],
+            "_next_id": self._next_id,
+            "_next_waypoint_id": self._next_waypoint_id
         }
         with open(file_path, 'w') as f:
             json.dump(data, f, indent=2)
@@ -689,6 +782,15 @@ class LabelProject:
         project = cls()
         project.classes = data.get("classes", [])
         project._next_id = data.get("_next_id", 1)
+
+        # Waypoints arrived in 3.3; older projects simply have none. The id
+        # counter is rebuilt from the data when absent, so a hand-edited file
+        # can never hand out an id that is already taken.
+        project.waypoints = [Waypoint.from_dict(w)
+                             for w in data.get("waypoints", [])]
+        project._next_waypoint_id = data.get(
+            "_next_waypoint_id",
+            max((w.id for w in project.waypoints), default=0) + 1)
 
         version = data.get("version", "1.0")
 

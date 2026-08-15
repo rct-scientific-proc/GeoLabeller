@@ -1,9 +1,9 @@
 """Layer panel for managing loaded layers and groups."""
 import os
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QTreeWidget, QTreeWidgetItem,
+    QWidget, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem,
     QMenu, QInputDialog, QMessageBox, QStyle, QApplication,
-    QLabel, QSplitter
+    QLabel, QSplitter, QCheckBox, QPushButton
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
@@ -1315,6 +1315,130 @@ class LabeledLayerPanel(QWidget):
         self._layer_id_map.clear()
 
 
+class WaypointPanel(QWidget):
+    """Panel listing the project's waypoints - named geographic bookmarks.
+
+    Waypoints belong to the project rather than to an image, so this is a flat
+    list rather than a tree. Double-clicking (or "Go to") flies the map there.
+    """
+
+    # Signals
+    goto_requested = pyqtSignal(int)      # waypoint_id
+    remove_requested = pyqtSignal(int)    # waypoint_id
+    rename_requested = pyqtSignal(int)    # waypoint_id
+    add_requested = pyqtSignal()          # open the "add by coordinates" dialog
+    visibility_changed = pyqtSignal(bool)  # show/hide markers on the map
+
+    _ID_ROLE = Qt.UserRole
+
+    def __init__(self):
+        """Initialize the waypoint panel."""
+        super().__init__()
+        self._setup_ui()
+
+    def _setup_ui(self):
+        """Set up the panel UI."""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        header_row = QHBoxLayout()
+        header = QLabel("Waypoints")
+        header.setStyleSheet("font-weight: bold; padding: 4px;")
+        header_row.addWidget(header)
+        header_row.addStretch()
+        self.show_check = QCheckBox("Show on map")
+        self.show_check.setChecked(True)
+        self.show_check.setToolTip("Show or hide every waypoint marker.")
+        self.show_check.toggled.connect(self.visibility_changed)
+        header_row.addWidget(self.show_check)
+        layout.addLayout(header_row)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Name", "Coordinates"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setSelectionMode(QTreeWidget.SingleSelection)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._show_context_menu)
+        self.tree.itemDoubleClicked.connect(self._on_double_clicked)
+        layout.addWidget(self.tree)
+
+        button_row = QHBoxLayout()
+        self.add_button = QPushButton("Add by coordinates...")
+        self.add_button.setToolTip(
+            "Add a waypoint by typing a latitude/longitude.")
+        self.add_button.clicked.connect(self.add_requested)
+        self.remove_button = QPushButton("Remove")
+        self.remove_button.setToolTip("Remove the selected waypoint.")
+        self.remove_button.clicked.connect(self._remove_selected)
+        self.remove_button.setEnabled(False)
+        self.tree.itemSelectionChanged.connect(self._sync_remove_enabled)
+        button_row.addWidget(self.add_button)
+        button_row.addWidget(self.remove_button)
+        button_row.addStretch()
+        layout.addLayout(button_row)
+
+    def refresh(self, waypoints, format_coords):
+        """Rebuild the list from the project's waypoints.
+
+        ``format_coords(lat, lon)`` renders the coordinate the same way the
+        rest of the app does, so the panel and the status bar agree.
+        """
+        selected = self.selected_waypoint_id()
+        self.tree.clear()
+        for wp in waypoints:
+            item = QTreeWidgetItem([wp.name, format_coords(wp.lat, wp.lon)])
+            item.setData(0, self._ID_ROLE, wp.id)
+            self.tree.addTopLevelItem(item)
+            if wp.id == selected:
+                self.tree.setCurrentItem(item)
+        self.tree.resizeColumnToContents(0)
+        self._sync_remove_enabled()
+
+    def selected_waypoint_id(self) -> "int | None":
+        """Id of the selected waypoint, or None."""
+        items = self.tree.selectedItems()
+        if not items:
+            return None
+        return items[0].data(0, self._ID_ROLE)
+
+    def _sync_remove_enabled(self):
+        """Remove only applies to a selection."""
+        self.remove_button.setEnabled(self.selected_waypoint_id() is not None)
+
+    def _remove_selected(self):
+        """Ask to remove whichever waypoint is selected."""
+        waypoint_id = self.selected_waypoint_id()
+        if waypoint_id is not None:
+            self.remove_requested.emit(waypoint_id)
+
+    def _on_double_clicked(self, item, _column):
+        """Double-click flies the map to that waypoint."""
+        waypoint_id = item.data(0, self._ID_ROLE)
+        if waypoint_id is not None:
+            self.goto_requested.emit(waypoint_id)
+
+    def _show_context_menu(self, position):
+        """Per-waypoint menu, matching the marker's own right-click menu."""
+        item = self.tree.itemAt(position)
+        if item is None:
+            return
+        waypoint_id = item.data(0, self._ID_ROLE)
+        if waypoint_id is None:
+            return
+        menu = QMenu(self)
+        goto_action = menu.addAction("Go to Waypoint")
+        rename_action = menu.addAction("Rename Waypoint...")
+        menu.addSeparator()
+        remove_action = menu.addAction("Remove Waypoint")
+        action = menu.exec_(self.tree.viewport().mapToGlobal(position))
+        if action == goto_action:
+            self.goto_requested.emit(waypoint_id)
+        elif action == rename_action:
+            self.rename_requested.emit(waypoint_id)
+        elif action == remove_action:
+            self.remove_requested.emit(waypoint_id)
+
+
 class CombinedLayerPanel(QWidget):
     """Combined panel with both the main layer panel and labeled images panel."""
 
@@ -1334,6 +1458,13 @@ class CombinedLayerPanel(QWidget):
     batch_visibility_started = pyqtSignal(int)  # total items
     batch_visibility_progress = pyqtSignal(int)  # current progress
     batch_visibility_finished = pyqtSignal()
+
+    # Waypoint signals, forwarded from the waypoint panel
+    waypoint_goto_requested = pyqtSignal(int)
+    waypoint_remove_requested = pyqtSignal(int)
+    waypoint_rename_requested = pyqtSignal(int)
+    waypoint_add_requested = pyqtSignal()
+    waypoints_visibility_changed = pyqtSignal(bool)
 
     def __init__(self):
         """Initialize the combined panel wrapping the main and labeled panels."""
@@ -1357,10 +1488,25 @@ class CombinedLayerPanel(QWidget):
         self.labeled_panel = LabeledLayerPanel()
         splitter.addWidget(self.labeled_panel)
 
+        # Waypoints panel (project-wide geographic bookmarks)
+        self.waypoint_panel = WaypointPanel()
+        splitter.addWidget(self.waypoint_panel)
+
         # Set initial sizes (main panel takes more space)
-        splitter.setSizes([400, 200])
+        splitter.setSizes([400, 200, 150])
 
         layout.addWidget(splitter)
+
+        # Forward waypoint signals
+        self.waypoint_panel.goto_requested.connect(
+            self.waypoint_goto_requested)
+        self.waypoint_panel.remove_requested.connect(
+            self.waypoint_remove_requested)
+        self.waypoint_panel.rename_requested.connect(
+            self.waypoint_rename_requested)
+        self.waypoint_panel.add_requested.connect(self.waypoint_add_requested)
+        self.waypoint_panel.visibility_changed.connect(
+            self.waypoints_visibility_changed)
 
         # Forward signals from main panel
         self.main_panel.layer_visibility_changed.connect(
@@ -1511,6 +1657,14 @@ class CombinedLayerPanel(QWidget):
     def selected_group_is_bottom_level(self) -> "bool | None":
         """Check whether the selected group contains no nested sub-groups."""
         return self.main_panel.selected_group_is_bottom_level()
+
+    def refresh_waypoints(self, waypoints, format_coords):
+        """Rebuild the waypoint list from the project."""
+        self.waypoint_panel.refresh(waypoints, format_coords)
+
+    def waypoints_shown(self) -> bool:
+        """Whether the "Show on map" toggle is on."""
+        return self.waypoint_panel.show_check.isChecked()
 
     def get_or_create_nongeo_root(self):
         """Get or create the 'Non-Georeferenced' top-level group."""

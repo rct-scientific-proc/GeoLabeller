@@ -9,6 +9,7 @@ Contents:
 - ``parse_lat_lon`` - text to (lat, lon), or None (no Qt).
 - ``format_lat_lon`` - the reverse, for confirming what was understood.
 - ``GoToLocationDialog`` - the entry dialog.
+- ``WaypointDialog`` - the same coordinate entry, plus a name, for waypoints.
 """
 import re
 
@@ -216,3 +217,87 @@ class GoToLocationDialog(QDialog):
     def entered_text(self) -> str:
         """What the user actually typed, for re-filling next time."""
         return self.coord_edit.text().strip()
+
+
+class WaypointDialog(QDialog):
+    """Ask for a waypoint's name and coordinate.
+
+    Uses the same coordinate parsing and live echo as ``GoToLocationDialog``,
+    so anything that works in "Go to Coordinates" works here too. The name is
+    optional - blank means the project auto-names it "WP n".
+    """
+
+    def __init__(self, parent=None, name: str = "", coord_text: str = ""):
+        """Build the dialog, optionally pre-filled for editing."""
+        super().__init__(parent)
+        self._parsed: tuple[float, float] | None = None
+        self.setWindowTitle("Add Waypoint")
+        self.setMinimumWidth(420)
+        self._build_ui(name, coord_text)
+
+    def _build_ui(self, name: str, coord_text: str):
+        """Assemble the dialog widgets."""
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Name (optional):"))
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Left blank, this becomes \"WP 1\"")
+        self.name_edit.setText(name)
+        layout.addWidget(self.name_edit)
+
+        layout.addWidget(QLabel("Latitude / longitude:"))
+        self.coord_edit = QLineEdit()
+        self.coord_edit.setPlaceholderText("40.7536, -73.9832")
+        self.coord_edit.setToolTip(
+            "Decimal degrees, hemisphere letters or degrees/minutes/seconds:\n"
+            "  40.7536, -73.9832\n"
+            "  40.7536N 73.9832W\n"
+            "  40 45 12.9 N, 73 58 59.5 W")
+        self.coord_edit.textChanged.connect(self._on_text_changed)
+        layout.addWidget(self.coord_edit)
+
+        self._echo = QLabel("")
+        self._echo.setWordWrap(True)
+        layout.addWidget(self._echo)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.button(QDialogButtonBox.Ok).setText("Add")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self.coord_edit.setText(coord_text)
+        self._on_text_changed()
+
+    def _on_text_changed(self):
+        """Re-parse as the user types and echo back what was understood."""
+        text = self.coord_edit.text().strip()
+        self._parsed = parse_lat_lon(text)
+        if self._parsed is not None:
+            lat, lon = self._parsed
+            if abs(lat) > MAX_LATITUDE:
+                self._echo.setStyleSheet("color: #cc0000;")
+                self._echo.setText(
+                    f"Latitude must be within {MAX_LATITUDE:g}° of the "
+                    "equator - the map projection has no pixels beyond it.")
+                self._parsed = None
+            else:
+                self._echo.setStyleSheet("color: #007700;")
+                self._echo.setText(format_lat_lon(lat, lon))
+        elif text:
+            self._echo.setStyleSheet("color: #cc0000;")
+            self._echo.setText("Could not read a latitude and longitude here.")
+        else:
+            self._echo.setStyleSheet("")
+            self._echo.setText("")
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(
+            self._parsed is not None)
+
+    def coordinates(self) -> tuple[float, float] | None:
+        """The parsed (latitude, longitude), or None if nothing valid."""
+        return self._parsed
+
+    def waypoint_name(self) -> str:
+        """The typed name, blank if the user left it empty."""
+        return self.name_edit.text().strip()

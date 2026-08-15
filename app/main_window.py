@@ -33,7 +33,8 @@ from .axis_ruler import MapCanvasWithAxes
 from .canvas import (MapCanvas, CanvasMode, CYCLE_MODES, STEP_CYCLE_MODES,
                      AsyncFileLoaderThread, TiledLayer)
 from .class_editor import ClassEditorDialog
-from .goto_location import GoToLocationDialog, format_lat_lon
+from .goto_location import (GoToLocationDialog, WaypointDialog,
+                            format_lat_lon)
 from .labels import LabelProject, ImageData, haversine_distance
 from .layer_panel import CombinedLayerPanel
 from .optimize_export import OptimizeExportDialog, OptimizeWorker, plan_output_path
@@ -349,6 +350,21 @@ class MainWindow(QMainWindow):
         self.canvas.cycle_prev_requested.connect(self._cycle_to_prev_layer)
         self.canvas.chain_link_changed.connect(self._on_chain_link_changed)
 
+        # Waypoints: raised either from the map (right-click) or the panel.
+        self.canvas.waypoint_add_requested.connect(self._add_waypoint_at)
+        self.canvas.waypoint_goto_requested.connect(self._goto_waypoint)
+        self.canvas.waypoint_rename_requested.connect(self._rename_waypoint)
+        self.canvas.waypoint_remove_requested.connect(self._remove_waypoint)
+        self.layer_panel.waypoint_add_requested.connect(
+            self._add_waypoint_by_coordinates)
+        self.layer_panel.waypoint_goto_requested.connect(self._goto_waypoint)
+        self.layer_panel.waypoint_rename_requested.connect(
+            self._rename_waypoint)
+        self.layer_panel.waypoint_remove_requested.connect(
+            self._remove_waypoint)
+        self.layer_panel.waypoints_visibility_changed.connect(
+            self.canvas.set_waypoints_visible)
+
     def _on_chain_link_changed(self, active: bool, message: str):
         """Sync the Chain Link toolbar toggle and status bar with the canvas."""
         self.chain_link_action.setChecked(active)
@@ -440,6 +456,14 @@ class MainWindow(QMainWindow):
         goto_action.setShortcut("Ctrl+G")
         goto_action.triggered.connect(self._go_to_coordinates)
         view_menu.addAction(goto_action)
+
+        # Waypoints: named bookmarks, also addable by right-clicking the map
+        add_waypoint_action = QAction("Add &Waypoint...", self)
+        add_waypoint_action.setShortcut("Ctrl+Shift+W")
+        add_waypoint_action.setStatusTip(
+            "Save a named latitude/longitude to return to later")
+        add_waypoint_action.triggered.connect(self._add_waypoint_by_coordinates)
+        view_menu.addAction(add_waypoint_action)
 
         # Remove the crosshair that Go to Coordinates leaves behind
         clear_marker_action = QAction("Clear Coordinate &Marker", self)
@@ -1250,6 +1274,86 @@ class MainWindow(QMainWindow):
             f"Moved to {format_lat_lon(lat, lon)} - press Escape to clear the "
             "marker", 8000)
 
+    # ------------------------------------------------------------------
+    # Waypoints: named geographic bookmarks kept with the project
+    # ------------------------------------------------------------------
+
+    def _refresh_waypoints(self):
+        """Redraw every waypoint marker and rebuild the panel list."""
+        self.canvas.clear_waypoint_markers()
+        for wp in self.project.waypoints:
+            self.canvas.add_waypoint_marker(wp.id, wp.name, wp.lon, wp.lat)
+        self.canvas.set_waypoints_visible(self.layer_panel.waypoints_shown())
+        self.layer_panel.refresh_waypoints(
+            self.project.waypoints, format_lat_lon)
+
+    def _add_waypoint_at(self, lon: float, lat: float, name: str = ""):
+        """Add a waypoint at a WGS84 position (from the map right-click)."""
+        wp = self.project.add_waypoint(lat, lon, name=name)
+        self.canvas.add_waypoint_marker(wp.id, wp.name, wp.lon, wp.lat)
+        self.layer_panel.refresh_waypoints(
+            self.project.waypoints, format_lat_lon)
+        debug(f"waypoint added: #{wp.id} '{wp.name}' at "
+              f"({wp.lat:.6f}, {wp.lon:.6f})")
+        self.statusBar.showMessage(
+            f"Added waypoint '{wp.name}' at {format_lat_lon(wp.lat, wp.lon)}",
+            5000)
+
+    def _add_waypoint_by_coordinates(self):
+        """Add a waypoint from a typed latitude/longitude."""
+        dialog = WaypointDialog(self)
+        if not dialog.exec_():
+            return
+        coords = dialog.coordinates()
+        if coords is None:
+            return
+        lat, lon = coords
+        self._add_waypoint_at(lon, lat, name=dialog.waypoint_name())
+
+    def _goto_waypoint(self, waypoint_id: int):
+        """Fly the view to a waypoint."""
+        wp = self.project.get_waypoint(waypoint_id)
+        if wp is None:
+            return
+        # zoom_to_point sizes the view in Web Mercator units, which are
+        # stretched by 1/cos(latitude); undo that so the view covers the
+        # ground width intended.
+        width_m = float(self._goto_defaults.get("width", 200))
+        mercator_width = width_m / max(math.cos(math.radians(wp.lat)), 1e-6)
+        self.canvas.zoom_to_point(wp.lon, wp.lat, size_meters=mercator_width)
+        self.canvas.setFocus()
+        self.statusBar.showMessage(
+            f"Moved to waypoint '{wp.name}' - "
+            f"{format_lat_lon(wp.lat, wp.lon)}", 5000)
+
+    def _rename_waypoint(self, waypoint_id: int):
+        """Prompt for a new name for a waypoint."""
+        wp = self.project.get_waypoint(waypoint_id)
+        if wp is None:
+            return
+        name, accepted = QInputDialog.getText(
+            self, "Rename Waypoint", "Name:", text=wp.name)
+        if not accepted or not name.strip():
+            return
+        self.project.rename_waypoint(waypoint_id, name)
+        self.canvas.add_waypoint_marker(wp.id, wp.name, wp.lon, wp.lat)
+        self.layer_panel.refresh_waypoints(
+            self.project.waypoints, format_lat_lon)
+        self.statusBar.showMessage(f"Renamed waypoint to '{wp.name}'", 3000)
+
+    def _remove_waypoint(self, waypoint_id: int):
+        """Remove a waypoint from the project and the map."""
+        wp = self.project.get_waypoint(waypoint_id)
+        if wp is None:
+            return
+        name = wp.name
+        self.project.remove_waypoint(waypoint_id)
+        self.canvas.remove_waypoint_marker(waypoint_id)
+        self.layer_panel.refresh_waypoints(
+            self.project.waypoints, format_lat_lon)
+        debug(f"waypoint removed: #{waypoint_id} '{name}'")
+        self.statusBar.showMessage(f"Removed waypoint '{name}'", 3000)
+
     def _clear_coordinate_marker(self):
         """Remove the go-to crosshair from the map."""
         self.canvas.clear_location_marker()
@@ -1365,6 +1469,7 @@ class MainWindow(QMainWindow):
         self.canvas.clear_label_markers()
         self.canvas.clear_layers()
         self.layer_panel.clear()
+        self._refresh_waypoints()  # the new project has none
         self._update_class_combo()
         self.setWindowTitle("GeoLabel")
         self.statusBar.showMessage("New project created", 3000)
@@ -1396,6 +1501,7 @@ class MainWindow(QMainWindow):
                 else:
                     self._update_class_combo()
                     self._refresh_label_markers()
+                    self._refresh_waypoints()
                     self.setWindowTitle(
                         f"GeoLabel - {self._project_path.name}")
                     self.statusBar.showMessage(
@@ -1583,6 +1689,7 @@ class MainWindow(QMainWindow):
             else:
                 self._update_class_combo()
                 self._refresh_label_markers()
+                self._refresh_waypoints()
 
             self.setWindowTitle("GeoLabel - Recovered Session (unsaved)")
             self.statusBar.showMessage(
@@ -2828,6 +2935,7 @@ class MainWindow(QMainWindow):
         # Update UI for project
         self._update_class_combo()
         self._refresh_label_markers()
+        self._refresh_waypoints()
 
         # Update window title (handle recovery case where _project_path is None)
         if self._project_path:
@@ -3053,6 +3161,16 @@ class MainWindow(QMainWindow):
 <tr><td><b>Click + Drag</b></td><td>Pan (in Pan mode)</td></tr>
 <tr><td><b>Right-click</b></td><td>Context menu</td></tr>
 <tr><td><b>Ctrl+G</b></td><td>Go to a latitude/longitude</td></tr>
+<tr><td><b>Ctrl+Shift+W</b></td><td>Add a waypoint by coordinates</td></tr>
+</table>
+
+<h3>Waypoints</h3>
+<table>
+<tr><td><b>Right-click map</b></td><td>"Add waypoint here" (Pan mode, georeferenced ground)</td></tr>
+<tr><td><b>Ctrl+Shift+W</b></td><td>Add a waypoint by typing a coordinate</td></tr>
+<tr><td><b>Right-click marker</b></td><td>Go to / Rename / Remove</td></tr>
+<tr><td><b>Double-click in panel</b></td><td>Fly the view to that waypoint</td></tr>
+<tr><td><b>Show on map</b></td><td>Hide or show every waypoint marker</td></tr>
 </table>
 
 <h3>Mode Switching</h3>
