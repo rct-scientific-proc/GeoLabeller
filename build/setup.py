@@ -91,7 +91,11 @@ build_exe_options = {
         "tkinter",
         "unittest",
         "email",
-        "html",
+        # NOT "html": app/shortcuts.py imports html.escape, and main_window
+        # imports that at module scope, so excluding it does not trim a rarely
+        # used corner - it stops the application starting at all. It shipped
+        # that way in 1.2.1 and 1.3.0. build/check_frozen_imports.py now
+        # fails the build if anything here is imported by the application.
         "pydoc",
         "doctest",
         "asyncio",
