@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
 )
 from pyproj import Transformer
 from rasterio.crs import CRS
-from rasterio.warp import calculate_default_transform, reproject, Resampling, transform as transform_coords
+from rasterio.warp import calculate_default_transform, reproject, Resampling
 
 from .labels import haversine_distance
 from .debug_log import debug

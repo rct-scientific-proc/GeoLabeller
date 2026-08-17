@@ -9,7 +9,6 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import rasterio
 from pyproj import Transformer
 from PyQt5.QtCore import Qt, Qt as QtCore_Qt, QTimer, QEvent, QThread, QObject, pyqtSignal
@@ -30,7 +29,7 @@ from PyQt5.QtWidgets import (
     QInputDialog)
 
 from .axis_ruler import MapCanvasWithAxes
-from .canvas import (MapCanvas, CanvasMode, CYCLE_MODES, STEP_CYCLE_MODES,
+from .canvas import (MapCanvas, CanvasMode, STEP_CYCLE_MODES,
                      AsyncFileLoaderThread, TiledLayer)
 from .class_editor import ClassEditorDialog
 from .goto_location import (GoToLocationDialog, WaypointDialog,
@@ -39,7 +38,7 @@ from .labels import LabelProject, ImageData, haversine_distance
 from .layer_panel import CombinedLayerPanel
 from .optimize_export import OptimizeExportDialog, OptimizeWorker, plan_output_path
 from .h5_export import (H5ExportDialog, H5ExportWorker, HARD_NEGATIVE,
-                        SCOPE_ALL, SCOPE_LABELLED, SCOPE_VISIBLE,
+                        SCOPE_LABELLED, SCOPE_VISIBLE,
                         SCOPE_ALL_EXAMPLES, SCOPE_VISIBLE_EXAMPLES,
                         centered_window)
 from .debug_log import debug, debug_log, DebugConsole
@@ -1031,7 +1030,7 @@ class MainWindow(QMainWindow):
         # Projections may reference the removed label.
         self._update_waterfall_projections()
 
-        self.statusBar.showMessage(f"Removed label", 3000)
+        self.statusBar.showMessage("Removed label", 3000)
 
     def _update_waterfall_projections(self):
         """Refresh the projected label markers in waterfall mode.
@@ -1359,9 +1358,7 @@ class MainWindow(QMainWindow):
         """Remove the go-to crosshair from the map."""
         self.canvas.clear_location_marker()
         self.canvas.setFocus()
-        self.statusBar.showMessage(
-            f"Zoomed to label at ({lon:.6f}, {lat:.6f})", 3000
-        )
+        self.statusBar.showMessage("Cleared the coordinate marker", 3000)
 
     def _refresh_label_markers(self):
         """Refresh all label markers on the canvas."""

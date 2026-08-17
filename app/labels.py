@@ -9,7 +9,6 @@ from typing import Optional
 from affine import Affine
 from pyproj import Transformer
 from rasterio.crs import CRS
-from rasterio.warp import transform as transform_coords
 
 # WGS84 CRS (EPSG:4326)
 WGS84 = CRS.from_epsg(4326)
