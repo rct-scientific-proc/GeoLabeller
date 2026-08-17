@@ -1867,6 +1867,19 @@ class MapCanvas(QGraphicsView):
 
         # A newer zoom may have superseded this level; if so, chase the new one.
         if level != layer._target_level:
+            # Show it anyway when the layer has nothing on screen. This is the
+            # normal first-load path: _apply_layer_lod deliberately asks for the
+            # coarsest level as a quick preview while the target level loads, so
+            # discarding it here would bin the very preview it just paid for and
+            # leave the canvas blank until the (slow) full-resolution read lands.
+            # Once something is displayed, a stale level is genuinely obsolete.
+            if not layer.is_fully_loaded():
+                layer.apply_level_result(result)
+                debug(f"preview level {level}: {layer.name} "
+                      f"{layer._width}x{layer._height} "
+                      f"(target {layer._target_level})")
+                self._clear_layer_tiles(layer)
+                self._rebuild_layer_tiles(layer)
             if (layer.has_overviews()
                     and layer._target_level != layer._loaded_level):
                 self._dispatch_level_load(layer_id, layer, layer._target_level)
