@@ -43,6 +43,7 @@ from .h5_export import (H5ExportDialog, H5ExportWorker, HARD_NEGATIVE,
                         centered_window)
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
+from .version import app_title
 
 
 class GroupMemoryWorker(QObject):
@@ -173,7 +174,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         """Initialize the window, canvas, layer panel, menus, and project state."""
         super().__init__()
-        self.setWindowTitle("GeoLabel")
+        self.setWindowTitle(app_title())
         self.setMinimumSize(1024, 768)
 
         # Create the debug logger on the UI thread up front (before any
@@ -1509,7 +1510,7 @@ class MainWindow(QMainWindow):
         self.layer_panel.clear()
         self._refresh_waypoints()  # the new project has none
         self._update_class_combo()
-        self.setWindowTitle("GeoLabel")
+        self.setWindowTitle(app_title())
         self.statusBar.showMessage("New project created", 3000)
 
     def _open_project(self):
@@ -1541,7 +1542,7 @@ class MainWindow(QMainWindow):
                     self._refresh_label_markers()
                     self._refresh_waypoints()
                     self.setWindowTitle(
-                        f"GeoLabel - {self._project_path.name}")
+                        f"{app_title()} - {self._project_path.name}")
                     self.statusBar.showMessage(
                         f"Opened project with {
                             self.project.label_count} labels", 3000)
@@ -1655,7 +1656,7 @@ class MainWindow(QMainWindow):
                 self._refresh_label_markers()
                 self._refresh_waypoints()
 
-            self.setWindowTitle("GeoLabel - Recovered Session (unsaved)")
+            self.setWindowTitle(f"{app_title()} - Recovered Session (unsaved)")
             self.statusBar.showMessage(
                 f"Restored {self.project.label_count} labels from recovery", 5000)
 
@@ -1762,7 +1763,7 @@ class MainWindow(QMainWindow):
         try:
             self.project.save(path)
             self._project_path = path
-            self.setWindowTitle(f"GeoLabel - {path.name}")
+            self.setWindowTitle(f"{app_title()} - {path.name}")
             self.statusBar.showMessage(
                 f"Saved {
                     self.project.label_count} labels to {
@@ -2903,9 +2904,9 @@ class MainWindow(QMainWindow):
 
         # Update window title (handle recovery case where _project_path is None)
         if self._project_path:
-            self.setWindowTitle(f"GeoLabel - {self._project_path.name}")
+            self.setWindowTitle(f"{app_title()} - {self._project_path.name}")
         else:
-            self.setWindowTitle("GeoLabel - Recovered Session (unsaved)")
+            self.setWindowTitle(f"{app_title()} - Recovered Session (unsaved)")
 
         # Build status message
         msg = f"Opened project with {self.project.label_count} labels"

@@ -49,6 +49,13 @@ if proj_data_dir.exists():
 if gdal_data_dir.exists():
     include_files.append((str(gdal_data_dir), "gdal_data"))
 
+# app/version.py reads this to put the version in the window title, and a
+# frozen build has no repository to read it from. Without it the application
+# still runs, but calls itself plain "GeoLabeller".
+_version_file = Path(__file__).resolve().parent.parent / "VERSION"
+if _version_file.exists():
+    include_files.append((str(_version_file), "VERSION"))
+
 # Dependencies to include
 build_exe_options = {
     # Optimization level: 0=none, 1=basic (-O), 2=full (-OO removes docstrings)
