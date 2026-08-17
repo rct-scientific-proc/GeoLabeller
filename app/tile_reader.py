@@ -52,21 +52,35 @@ EDGE_MARGIN_PX = 4
 WARP_TOLERANCE = 0.0
 
 
+def level_grid_for(src_crs, src_transform, src_width: int, src_height: int,
+                   dst_crs, level: int):
+    """``(transform, width, height)`` of a level's grid, without an open file.
+
+    The canvas keeps a layer's source CRS, transform and size, so it can work
+    out which tiles a view needs - and where they belong - without touching
+    the disk. Only the actual pixel read needs the file open.
+    """
+    level = max(1, int(level))
+    bounds = rasterio.transform.array_bounds(
+        src_height, src_width, src_transform)
+    transform, width, height = calculate_default_transform(
+        src_crs, dst_crs, src_width, src_height, *bounds)
+    if level > 1:
+        transform, width, height = calculate_default_transform(
+            src_crs, dst_crs, src_width, src_height, *bounds,
+            dst_width=max(1, width // level),
+            dst_height=max(1, height // level))
+    return transform, width, height
+
+
 def level_grid(src, dst_crs, level: int):
     """Return ``(transform, width, height)`` of the whole image at ``level``.
 
     This mirrors the whole-image loader exactly, so tiles cut from this grid
     line up with what that path produces.
     """
-    level = max(1, int(level))
-    transform, width, height = calculate_default_transform(
-        src.crs, dst_crs, src.width, src.height, *src.bounds)
-    if level > 1:
-        transform, width, height = calculate_default_transform(
-            src.crs, dst_crs, src.width, src.height, *src.bounds,
-            dst_width=max(1, width // level),
-            dst_height=max(1, height // level))
-    return transform, width, height
+    return level_grid_for(src.crs, src.transform, src.width, src.height,
+                          dst_crs, level)
 
 
 def tile_span(width: int, height: int, tx: int, ty: int,

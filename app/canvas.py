@@ -32,6 +32,8 @@ from rasterio.warp import calculate_default_transform, reproject, Resampling, tr
 
 from .labels import haversine_distance
 from .debug_log import debug
+from .tile_reader import (TILE_SIZE as DETAIL_TILE_SIZE, level_grid_for,
+                          read_tile, tile_bounds, tile_span, tiles_for_bounds)
 
 
 # Web Mercator CRS
@@ -62,6 +64,13 @@ PIXEL_ZONE_GROUP_GAP = 5000.0  # Gap between group columns in scene units
 # The real fix is to read only the visible window per tile, which would make
 # memory independent of image size and retire this cap.
 MAX_LEVEL_PIXELS = 150_000_000
+
+# Ceiling for the whole-image array of a layer whose detail comes from windowed
+# tiles. That array is then only a backdrop - it fills the gaps until tiles
+# arrive and behind anything they don't cover - so it wants to be cheap and
+# quick rather than detailed. Chasing the zoom with it would reintroduce the
+# very cost the tiles exist to avoid.
+BACKDROP_MAX_PIXELS = 4_000_000
 
 # Waterfall mode: a bottom-level group's images are stacked vertically in the
 # pixel zone (raw pixels, no reprojection) so the view can glide through them
@@ -155,6 +164,12 @@ class TiledLayer:
         self.visible = True
         self.bounds = None  # (west, south, east, north) in Web Mercator or pixel coords
         self.tiles: dict[tuple[int, int], QGraphicsPixmapItem] = {}
+        # Full-resolution detail read a tile at a time, drawn over the coarse
+        # whole-image tiles above. Keyed by (level, tx, ty); only populated for
+        # images too large to hold whole (see MapCanvas._uses_detail_tiles).
+        self.detail_tiles: dict[tuple[int, int, int], QGraphicsPixmapItem] = {}
+        # Destination grid per level, so tile geometry needs no file access.
+        self._level_grid_cache: dict[int, tuple] = {}
         self.z_value = 0
         self.geo = geo  # Whether this is a georeferenced layer
 
@@ -320,7 +335,47 @@ class TiledLayer:
                 break
         return self.budget_level(best)
 
-    def budget_level(self, level: int) -> int:
+    def resolution_level(self, scene_units_per_pixel: float) -> int:
+        """The level the zoom wants, ignoring the whole-image memory cap.
+
+        Detail tiles are bounded by the viewport rather than the image, so they
+        can honour the zoom even where holding that level whole never could -
+        which is the entire point of reading them windowed.
+        """
+        full_width = self._full_width or self._width
+        if (not self._overviews or full_width <= 0
+                or scene_units_per_pixel <= 0 or self.bounds is None):
+            return 1
+        west, _south, east, _north = self.bounds
+        native_res = (east - west) / full_width
+        if native_res <= 0:
+            return 1
+        best = 1
+        for factor in self._overviews:
+            if native_res * factor <= scene_units_per_pixel:
+                best = factor
+            else:
+                break
+        return best
+
+    def detail_grid(self, level: int):
+        """Cached ``(transform, width, height)`` of this layer's level grid.
+
+        Needs no file access - the source CRS, transform and size are already
+        known - so working out which tiles a view needs is pure arithmetic.
+        """
+        level = max(1, int(level))
+        cached = self._level_grid_cache.get(level)
+        if cached is None:
+            if self._src_crs is None or self._src_transform is None:
+                return None
+            cached = level_grid_for(
+                self._src_crs, self._src_transform, self._src_width,
+                self._src_height, WEB_MERCATOR, level)
+            self._level_grid_cache[level] = cached
+        return cached
+
+    def budget_level(self, level: int, max_pixels: int | None = None) -> int:
         """Coarsen ``level`` until the whole reprojected array fits in memory.
 
         The zoom decides how much detail is *wanted*; this decides how much can
@@ -329,23 +384,22 @@ class TiledLayer:
         cap only engages on the very large mosaics that would otherwise exhaust
         memory and take the process down.
         """
+        limit = MAX_LEVEL_PIXELS if max_pixels is None else max(1, max_pixels)
         level = max(1, level)
-        if self.level_pixel_count(level) <= MAX_LEVEL_PIXELS:
+        if self.level_pixel_count(level) <= limit:
             return level
 
         # Prefer a real overview factor: those are cheap to read, since GDAL
         # serves them straight from the pyramid.
         for factor in self._overviews:
-            if (factor > level
-                    and self.level_pixel_count(factor) <= MAX_LEVEL_PIXELS):
+            if factor > level and self.level_pixel_count(factor) <= limit:
                 return factor
 
         # The pyramid doesn't go coarse enough (or there isn't one). Decimating
         # by an arbitrary factor still works - a windowed read with out_shape
         # uses the nearest overview and reduces from there - it is just slower.
         factor = level
-        while (factor < 1 << 20
-               and self.level_pixel_count(factor) > MAX_LEVEL_PIXELS):
+        while factor < 1 << 20 and self.level_pixel_count(factor) > limit:
             factor *= 2
         return factor
 
@@ -786,12 +840,16 @@ class TiledLayer:
         self.visible = visible
         for item in self.tiles.values():
             item.setVisible(visible)
+        for item in self.detail_tiles.values():
+            item.setVisible(visible)
 
     def set_z_value(self, z: float):
-        """Set z-value for all tiles."""
+        """Set z-value for all tiles, keeping detail above the coarse ones."""
         self.z_value = z
         for item in self.tiles.values():
             item.setZValue(z)
+        for item in self.detail_tiles.values():
+            item.setZValue(z + 0.5)
 
     def free_data(self, scene: QGraphicsScene | None = None):
         """Release pixel data from memory, keeping bounds and metadata.
@@ -803,6 +861,9 @@ class TiledLayer:
             for item in self.tiles.values():
                 scene.removeItem(item)
             self.tiles.clear()
+            for item in self.detail_tiles.values():
+                scene.removeItem(item)
+            self.detail_tiles.clear()
         self._rgba_data = None
         self._fully_loaded = False
 
@@ -811,6 +872,9 @@ class TiledLayer:
         for item in self.tiles.values():
             scene.removeItem(item)
         self.tiles.clear()
+        for item in self.detail_tiles.values():
+            scene.removeItem(item)
+        self.detail_tiles.clear()
 
     def contains_point(self, easting: float, northing: float) -> bool:
         """Check if a point (in Web Mercator) is within this layer's bounds."""
@@ -1085,6 +1149,80 @@ class ThrobberWidget(QWidget):
         painter.end()
 
 
+def _emit_safely(signal, *args):
+    """Emit a signal, ignoring a receiver that has already been torn down.
+
+    Background jobs can finish after the canvas (or the whole app) has gone,
+    leaving the signal's C++ object deleted; that is not an error worth
+    reporting.
+    """
+    try:
+        signal.emit(*args)
+    except RuntimeError:
+        pass
+
+
+class _TileLoadSignals(QObject):
+    """Signals for one background detail-tile read."""
+    # layer_id, level, tx, ty, rgba array (or None when the tile is empty)
+    finished = pyqtSignal(str, int, int, int, object)
+    failed = pyqtSignal(str, int, int, int)
+
+
+class _TileLoadRunnable(QRunnable):
+    """Reproject a single detail tile off the UI thread.
+
+    Opens its own dataset handle: GDAL datasets are not safe to share between
+    threads, and the open is cheap next to the read itself.
+    """
+
+    def __init__(self, layer_id: str, file_path: str, level: int,
+                 tx: int, ty: int, signals: "_TileLoadSignals"):
+        """Store the tile identity and the signal group to report through."""
+        super().__init__()
+        self._layer_id = layer_id
+        self._file_path = file_path
+        self._level = level
+        self._tx = tx
+        self._ty = ty
+        self._signals = signals
+        self._cancelled = False
+
+    def cancel(self):
+        """Request cancellation; checked before the read and again after."""
+        self._cancelled = True
+
+    def run(self):
+        """Read and reproject the tile, handing the array to the UI thread.
+
+        The whole body is guarded: an exception escaping a QRunnable dies in
+        the worker thread without a trace, and the tile would then stay
+        "pending" forever, never retried and never reported.
+        """
+        try:
+            if self._cancelled:
+                self._fail()
+                return
+            with rasterio.open(self._file_path) as src:
+                rgba = read_tile(src, WEB_MERCATOR, self._level,
+                                 self._tx, self._ty)
+            if self._cancelled:
+                self._fail()
+                return
+            _emit_safely(self._signals.finished, self._layer_id, self._level,
+                         self._tx, self._ty, rgba)
+        except Exception as exc:  # noqa: BLE001 - reported, never fatal
+            debug(f"tile read FAILED: {Path(self._file_path).name} "
+                  f"level={self._level} ({self._tx},{self._ty}): "
+                  f"{type(exc).__name__}: {exc}")
+            self._fail()
+
+    def _fail(self):
+        """Report that this tile produced nothing, so it stops being pending."""
+        _emit_safely(self._signals.failed, self._layer_id, self._level,
+                     self._tx, self._ty)
+
+
 class _LevelLoadSignals(QObject):
     """Signals for a background overview-level load."""
     finished = pyqtSignal(str, int, object)  # layer_id, level, result dict
@@ -1154,13 +1292,8 @@ class _LevelLoadRunnable(QRunnable):
 
     @staticmethod
     def _safe_emit(signal, *args):
-        """Emit a signal, ignoring the case where the receiver was already
-        deleted (e.g. the canvas/app was torn down while this load was running).
-        """
-        try:
-            signal.emit(*args)
-        except RuntimeError:
-            pass
+        """Emit a signal, ignoring a receiver that was already torn down."""
+        _emit_safely(signal, *args)
 
 
 class MapCanvas(QGraphicsView):
@@ -1253,6 +1386,14 @@ class MapCanvas(QGraphicsView):
     # high zoom (tiles vanish, cursor glitches). Instead we keep the scene rect
     # only a few viewports large (in scene units) and re-centre it on the view -
     # its device extent then stays tiny, so the view can zoom in arbitrarily far.
+    # Detail tiles are drawn this far above their layer's coarse tiles, which
+    # sit at z = layer index. Comfortably below the label base (layer count +
+    # offset), so labels and waypoints still render on top.
+    _DETAIL_Z_OFFSET = 0.5
+    # Guard against a runaway request: a viewport plus its prefetch margin is a
+    # few dozen tiles, so this only ever trims pathological cases.
+    _MAX_DETAIL_TILES = 200
+
     _SCENE_RECT_MARGIN = 2.0          # viewports of padding around the view
     _SCENE_RECT_DEVICE_TARGET = 5e8   # re-roll once the rect maps beyond this
     # A small scene rect keeps the *size* bounded, but Web Mercator positions are
@@ -1425,6 +1566,17 @@ class MapCanvas(QGraphicsView):
         self._level_load_pool.setMaxThreadCount(
             min(4, max(1, QThread.idealThreadCount() - 1)))
         self._level_load_signals: set = set()
+
+        # Detail tiles: full-resolution pixels for the visible area only, used
+        # where an image is too large to hold whole. Separate pool from the
+        # whole-image loads so a queue of tiles can't starve the coarse
+        # backdrop that keeps the canvas populated.
+        self._tile_pool = QThreadPool(self)
+        self._tile_pool.setMaxThreadCount(
+            min(4, max(1, QThread.idealThreadCount() - 1)))
+        self._tile_signals: set = set()
+        # (layer_id, level, tx, ty) -> runnable, for cancelling on scroll-out.
+        self._pending_tiles: dict = {}
 
         # Background-load tracking for the loading spinner. `_active_loads`
         # counts in-flight overview loads; the throbber shows while > 0.
@@ -1765,6 +1917,8 @@ class MapCanvas(QGraphicsView):
             if not self._layer_intersects_view(layer, cull_bounds):
                 if layer.tiles:
                     self._clear_layer_tiles(layer)
+                if layer.detail_tiles:
+                    self._clear_detail_tiles(layer_id, layer)
                 self._cancel_layer_load(layer)
                 continue
 
@@ -1776,6 +1930,10 @@ class MapCanvas(QGraphicsView):
             # rebuild in _on_level_loaded once their background load lands.
             if layer.is_fully_loaded():
                 self._rebuild_layer_tiles(layer)
+
+            # Then the windowed detail on top, where the whole-image array
+            # cannot reach the zoom's level.
+            self._update_detail_tiles(layer_id, layer)
 
     @staticmethod
     def _layer_intersects_view(
@@ -1840,6 +1998,144 @@ class MapCanvas(QGraphicsView):
             self._scene.removeItem(item)
         layer.tiles.clear()
 
+    # ------------------------------------------------------------------
+    # Detail tiles: full-resolution pixels for the visible area only.
+    #
+    # An image small enough to hold whole is served entirely by the tiles above,
+    # cut from one reprojected array. That array is what limits how far a very
+    # large mosaic can be zoomed, since it covers the WHOLE image at the
+    # displayed level. For those, the coarse array stays on as a backdrop and
+    # the detail the zoom actually asks for is read a tile at a time here, so
+    # the cost follows the viewport instead of the image.
+    # ------------------------------------------------------------------
+
+    def _uses_detail_tiles(self, layer: TiledLayer) -> bool:
+        """Whether this layer needs windowed detail rather than the whole image.
+
+        Only for georeferenced images big enough that the whole-image path
+        cannot reach full resolution. Waterfall mode is excluded: it rewrites
+        bounds into the pixel zone, so the geographic tile grid means nothing
+        there.
+        """
+        return (not self._waterfall_active
+                and layer.geo
+                and layer.bounds is not None
+                and layer._src_crs is not None
+                and layer.level_pixel_count(1) > MAX_LEVEL_PIXELS)
+
+    def _update_detail_tiles(self, layer_id: str, layer: TiledLayer):
+        """Bring a layer's detail tiles in line with the current view."""
+        if not self._uses_detail_tiles(layer) or not layer.visible:
+            self._clear_detail_tiles(layer_id, layer)
+            return
+
+        level = layer.resolution_level(self._scene_units_per_pixel())
+        if level >= layer.budget_level(1):
+            # The coarse whole-image array is already at least this detailed,
+            # so tiles would add nothing.
+            self._clear_detail_tiles(layer_id, layer)
+            return
+
+        grid = layer.detail_grid(level)
+        if grid is None:
+            return
+        grid_transform, grid_w, grid_h = grid
+
+        view = self._effective_cull_bounds()
+        wanted = set()
+        for tx, ty in tiles_for_bounds(grid_transform, grid_w, grid_h, view,
+                                       DETAIL_TILE_SIZE):
+            wanted.add((level, tx, ty))
+        # A pathological zoom could ask for thousands; the viewport plus its
+        # prefetch margin is a few dozen, so a cap here only ever trims runaway
+        # requests (and keeps the pool from being swamped).
+        if len(wanted) > self._MAX_DETAIL_TILES:
+            wanted = set(sorted(wanted)[:self._MAX_DETAIL_TILES])
+
+        # Drop what is no longer wanted - including every tile at another
+        # level, since the zoom has moved on.
+        for key in list(layer.detail_tiles):
+            if key not in wanted:
+                self._scene.removeItem(layer.detail_tiles.pop(key))
+        for key in list(self._pending_tiles):
+            if key[0] == layer_id and key[1:] not in wanted:
+                self._pending_tiles.pop(key).cancel()
+
+        for key in wanted:
+            if key in layer.detail_tiles:
+                continue
+            if (layer_id,) + key in self._pending_tiles:
+                continue
+            self._dispatch_tile_load(layer_id, layer, *key)
+
+    def _dispatch_tile_load(self, layer_id: str, layer: TiledLayer,
+                            level: int, tx: int, ty: int):
+        """Queue one detail tile for background reading."""
+        signals = _TileLoadSignals()
+        self._tile_signals.add(signals)
+        signals.finished.connect(self._on_detail_tile_loaded)
+        signals.failed.connect(self._on_detail_tile_failed)
+        for signal in (signals.finished, signals.failed):
+            signal.connect(
+                lambda *_a, s=signals: self._tile_signals.discard(s))
+
+        runnable = _TileLoadRunnable(
+            layer_id, layer.file_path, level, tx, ty, signals)
+        self._pending_tiles[(layer_id, level, tx, ty)] = runnable
+        self._tile_pool.start(runnable)
+
+    def _on_detail_tile_loaded(self, layer_id: str, level: int, tx: int,
+                               ty: int, rgba):
+        """Place a finished detail tile above the coarse backdrop."""
+        self._pending_tiles.pop((layer_id, level, tx, ty), None)
+        layer = self._layers.get(layer_id)
+        if layer is None or rgba is None:
+            return
+        # The view may have moved on while this was reading.
+        if not self._uses_detail_tiles(layer) or not layer.visible:
+            return
+        grid = layer.detail_grid(level)
+        if grid is None:
+            return
+        grid_transform, grid_w, grid_h = grid
+        x0, y0, x1, y1 = tile_span(grid_w, grid_h, tx, ty, DETAIL_TILE_SIZE)
+        if x1 <= x0 or y1 <= y0:
+            return
+
+        height, width = rgba.shape[:2]
+        image = QImage(rgba.data, width, height, 4 * width,
+                       QImage.Format_RGBA8888)
+        item = QGraphicsPixmapItem(QPixmap.fromImage(image.copy()),
+                                   self._origin_group)
+        west, south, east, north = tile_bounds(
+            grid_transform, x0, y0, x1, y1)
+        transform = QTransform()
+        transform.scale((east - west) / width, (north - south) / height)
+        item.setTransform(transform)
+        item.setPos(west, -north)
+        # Above the coarse tiles of every layer, below the labels.
+        item.setZValue(layer.z_value + self._DETAIL_Z_OFFSET)
+        item.setVisible(layer.visible)
+
+        old = layer.detail_tiles.pop((level, tx, ty), None)
+        if old is not None:
+            self._scene.removeItem(old)
+        layer.detail_tiles[(level, tx, ty)] = item
+
+    def _on_detail_tile_failed(self, layer_id: str, level: int, tx: int,
+                               ty: int):
+        """Forget a cancelled or failed tile so it can be retried later."""
+        self._pending_tiles.pop((layer_id, level, tx, ty), None)
+
+    def _clear_detail_tiles(self, layer_id: str, layer: TiledLayer):
+        """Remove a layer's detail tiles and cancel any still reading."""
+        for item in layer.detail_tiles.values():
+            self._scene.removeItem(item)
+        layer.detail_tiles.clear()
+        for key in list(self._pending_tiles):
+            if key[0] == layer_id:
+                self._pending_tiles.pop(key).cancel()
+
     def _apply_layer_lod(self, layer_id: str, layer: TiledLayer,
                          units_per_pixel: float):
         """Choose the overview level for the current zoom and load it off-thread.
@@ -1863,7 +2159,12 @@ class MapCanvas(QGraphicsView):
                 self._dispatch_level_load(layer_id, layer, level)
             return
 
-        desired = layer.select_overview_level(units_per_pixel)
+        if self._uses_detail_tiles(layer):
+            # Windowed tiles carry the detail; this array only has to be a
+            # cheap backdrop behind them.
+            desired = layer.budget_level(1, BACKDROP_MAX_PIXELS)
+        else:
+            desired = layer.select_overview_level(units_per_pixel)
         if desired > 1 and layer.level_pixel_count(1) > MAX_LEVEL_PIXELS:
             # Detail is capped rather than zoom-limited; say so once per change
             # so "it stops getting sharper" has a visible reason.
@@ -2026,11 +2327,14 @@ class MapCanvas(QGraphicsView):
         if layer_id in self._layers:
             layer = self._layers[layer_id]
             layer.set_visibility(visible)
+            for item in layer.detail_tiles.values():
+                item.setVisible(visible)
             if visible:
                 self._update_visible_tiles()
             else:
                 # Hidden layers shouldn't keep loading in the background.
                 self._cancel_layer_load(layer)
+                self._clear_detail_tiles(layer_id, layer)
             # For non-geo layers, toggle associated label markers
             if not layer.geo:
                 self._set_label_visibility_for_image(layer.file_path, visible)
@@ -2068,6 +2372,7 @@ class MapCanvas(QGraphicsView):
         if layer_id in self._layers:
             file_path = self._layers[layer_id].file_path
             self._cancel_layer_load(self._layers[layer_id])
+            self._clear_detail_tiles(layer_id, self._layers[layer_id])
             self._layers[layer_id].remove_from_scene(self._scene)
             del self._layers[layer_id]
             if file_path in self._path_to_layer:
@@ -2078,6 +2383,7 @@ class MapCanvas(QGraphicsView):
     def clear_layers(self):
         """Remove all layers from the canvas."""
         for layer_id in list(self._layers.keys()):
+            self._clear_detail_tiles(layer_id, self._layers[layer_id])
             self._layers[layer_id].remove_from_scene(self._scene)
         self._layers.clear()
         self._layer_order.clear()
