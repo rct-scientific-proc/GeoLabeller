@@ -43,6 +43,7 @@ from .h5_export import (H5ExportDialog, H5ExportWorker, HARD_NEGATIVE,
                         SCOPE_ALL_EXAMPLES, SCOPE_VISIBLE_EXAMPLES,
                         centered_window)
 from .debug_log import debug, debug_log, DebugConsole
+from .shortcuts import ShortcutsDialog
 
 
 class GroupMemoryWorker(QObject):
@@ -3140,129 +3141,8 @@ class MainWindow(QMainWindow):
             self.project.update_image_group(file_path, group_path)
 
     def _show_shortcuts(self):
-        """Show keyboard shortcuts dialog."""
-        shortcuts_text = """
-<h2>Keyboard Shortcuts</h2>
-
-<h3>File Operations</h3>
-<table>
-<tr><td><b>Ctrl+N</b></td><td>New Project</td></tr>
-<tr><td><b>Ctrl+Shift+P</b></td><td>Open Project</td></tr>
-<tr><td><b>Ctrl+S</b></td><td>Save Project</td></tr>
-<tr><td><b>Ctrl+Shift+S</b></td><td>Save Project As</td></tr>
-<tr><td><b>Ctrl+O</b></td><td>Add Image (GeoTIFF + custom formats)</td></tr>
-<tr><td><b>Ctrl+Shift+O</b></td><td>Add Directory</td></tr>
-<tr><td><b>Ctrl+Q</b></td><td>Exit</td></tr>
-</table>
-
-<h3>Navigation</h3>
-<table>
-<tr><td><b>Mouse Wheel</b></td><td>Zoom in/out</td></tr>
-<tr><td><b>Click + Drag</b></td><td>Pan (in Pan mode)</td></tr>
-<tr><td><b>Right-click</b></td><td>Context menu</td></tr>
-<tr><td><b>Ctrl+G</b></td><td>Go to a latitude/longitude</td></tr>
-<tr><td><b>Ctrl+Shift+W</b></td><td>Add a waypoint by coordinates</td></tr>
-</table>
-
-<h3>Waypoints</h3>
-<table>
-<tr><td><b>Right-click map</b></td><td>"Add waypoint here" (Pan mode, georeferenced ground)</td></tr>
-<tr><td><b>Ctrl+Shift+W</b></td><td>Add a waypoint by typing a coordinate</td></tr>
-<tr><td><b>Right-click marker</b></td><td>Go to / Rename / Remove</td></tr>
-<tr><td><b>Double-click in panel</b></td><td>Fly the view to that waypoint</td></tr>
-<tr><td><b>Show on map</b></td><td>Hide or show every waypoint marker</td></tr>
-</table>
-
-<h3>Mode Switching</h3>
-<table>
-<tr><td><b>P</b></td><td>Pan mode</td></tr>
-<tr><td><b>L</b></td><td>Label mode</td></tr>
-<tr><td><b>C</b></td><td>Cycle mode (group-based)</td></tr>
-<tr><td><b>V</b></td><td>View Cycle mode (layers in current view)</td></tr>
-<tr><td><b>W</b></td><td>Waterfall mode (stack a group's images vertically)</td></tr>
-<tr><td><b>R</b></td><td>Ruler mode</td></tr>
-</table>
-
-<h3>Measuring</h3>
-<table>
-<tr><td><b>Shift + Drag</b></td><td>Measure ground distance without leaving the current mode</td></tr>
-<tr><td><b>M</b></td><td>Measure the label under the cursor (length, then width)</td></tr>
-<tr><td><b>Escape</b></td><td>Clear the measurement or the go-to marker</td></tr>
-</table>
-
-<h3>Labeling (Label &amp; Cycle modes)</h3>
-<table>
-<tr><td><b>Left-click</b></td><td>Place label</td></tr>
-<tr><td><b>Right-click label</b></td><td>Label options (remove, link, measure)</td></tr>
-<tr><td><b>Right-click + drag</b></td><td>Pan the view</td></tr>
-<tr><td><b>Ctrl+Left-click label</b></td><td>Label options (alias, Cycle modes)</td></tr>
-<tr><td><b>1&ndash;9</b></td><td>Quick-switch to class 1&ndash;9</td></tr>
-<tr><td><b>Escape</b></td><td>Cancel link mode</td></tr>
-</table>
-
-<h3>Chain Linking</h3>
-<table>
-<tr><td><b>K</b></td><td>Toggle chain-link mode (works in any labeling mode)</td></tr>
-<tr><td><b>Left-click label</b></td><td>Link it into the current chain (first click anchors)</td></tr>
-<tr><td><b>N</b></td><td>Finish this chain, start a new one</td></tr>
-<tr><td><b>Escape</b></td><td>Exit chain-link mode (links made are kept)</td></tr>
-</table>
-
-<h3>Cycle Modes (Cycle / View Cycle)</h3>
-<table>
-<tr><td><b>Space</b></td><td>Advance to next layer (unchecks current)</td></tr>
-<tr><td><b>Ctrl+Space</b></td><td>Go back to previous layer</td></tr>
-<tr><td><b>Left-click</b></td><td>Place label</td></tr>
-<tr><td><b>Right-click label</b></td><td>Label options (remove, link, measure)</td></tr>
-<tr><td><b>Right-click + drag</b></td><td>Pan around</td></tr>
-<tr><td><b>Mouse wheel</b></td><td>Zoom in/out</td></tr>
-</table>
-
-<h3>Waterfall Mode</h3>
-<table>
-<tr><td><b>Hold Space</b></td><td>Glide up through the image stack</td></tr>
-<tr><td><b>Hold Ctrl+Space</b></td><td>Glide back down (view starts at the bottom)</td></tr>
-<tr><td><b>Left-click</b></td><td>Place label (all group labels stay visible)</td></tr>
-<tr><td><b>Right-click label</b></td><td>Label options (remove, link, measure)</td></tr>
-<tr><td><b>Right-click + drag</b></td><td>Pan within the stack</td></tr>
-<tr><td><b>Mouse wheel</b></td><td>Zoom in/out</td></tr>
-</table>
-
-<h3>Layer Panel</h3>
-<table>
-<tr><td><b>Checkbox</b></td><td>Toggle layer/group visibility</td></tr>
-<tr><td><b>Right-click group</b></td><td>Select/Unselect all, Expand/Collapse All</td></tr>
-<tr><td><b>Right-click layer</b></td><td>Zoom to layer, Remove</td></tr>
-<tr><td><b>Drag &amp; Drop</b></td><td>Reorder layers/groups</td></tr>
-</table>
-
-<h3>Labeled Images Panel</h3>
-<table>
-<tr><td><b>Checkbox</b></td><td>Toggle image visibility (synced with layers)</td></tr>
-<tr><td><b>Right-click label</b></td><td>Zoom to label or layer</td></tr>
-<tr><td><b>Right-click group</b></td><td>Select/Unselect all in group</td></tr>
-</table>
-
-<h3>Help</h3>
-<table>
-<tr><td><b>F1</b></td><td>Show this help</td></tr>
-</table>
-
-<h3>Tips</h3>
-<ul>
-<li>Layers default to hidden when loading &mdash; expand groups and check to display</li>
-<li>Turning on a layer automatically checks its parent groups</li>
-<li>Add Directory creates a root group named after the selected folder</li>
-<li>Visibility syncs between Layer Panel and Labeled Images Panel</li>
-<li>Custom file readers are auto-detected &mdash; registered formats appear in file dialogs</li>
-</ul>
-"""
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Keyboard Shortcuts & Tips")
-        msg.setTextFormat(Qt.RichText)
-        msg.setText(shortcuts_text)
-        msg.setIcon(QMessageBox.Information)
-        msg.exec_()
+        """Show the keyboard shortcut reference."""
+        ShortcutsDialog(self).exec_()
 
     def _show_about(self):
         """Show about dialog."""
