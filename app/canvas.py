@@ -72,6 +72,10 @@ MAX_LEVEL_PIXELS = 150_000_000
 # very cost the tiles exist to avoid.
 BACKDROP_MAX_PIXELS = 4_000_000
 
+# Ceiling on the pixels held for images that are loaded but not on screen -
+# the cycle's neighbours and the images just stepped off. ~256 MB of RGBA.
+WARM_MAX_PIXELS = 64_000_000
+
 # Waterfall mode: a bottom-level group's images are stacked vertically in the
 # pixel zone (raw pixels, no reprojection) so the view can glide through them
 # like a filmstrip. Vertical gap between stacked images, in scene units.
@@ -1604,6 +1608,11 @@ class MapCanvas(QGraphicsView):
         # (layer_id, level, tx, ty) -> runnable, for cancelling on scroll-out.
         self._pending_tiles: dict = {}
 
+        # Images held in memory while off screen, so stepping onto them is
+        # instant (see warm_layers). Insertion order is least-recently-wanted
+        # first, which is the order they are released in.
+        self._warmed: dict[str, None] = {}
+
         # Background-load tracking for the loading spinner. `_active_loads`
         # counts in-flight overview loads; the throbber shows while > 0.
         self._active_loads = 0
@@ -2162,6 +2171,20 @@ class MapCanvas(QGraphicsView):
             if key[0] == layer_id:
                 self._pending_tiles.pop(key).cancel()
 
+    def _desired_level(self, layer: TiledLayer, units_per_pixel: float) -> int:
+        """The overview level this layer should be holding at this zoom."""
+        if not layer.has_overviews():
+            # No pyramids: full resolution, or the coarsest decimation that
+            # fits in memory for an image too big to hold whole (without a
+            # pyramid there is nothing cheaper to show in the meantime, so
+            # this is the only load it gets).
+            return layer.budget_level(1)
+        if self._uses_detail_tiles(layer):
+            # Windowed tiles carry the detail; this array only has to be a
+            # cheap backdrop behind them.
+            return layer.budget_level(1, BACKDROP_MAX_PIXELS)
+        return layer.select_overview_level(units_per_pixel)
+
     def _apply_layer_lod(self, layer_id: str, layer: TiledLayer,
                          units_per_pixel: float):
         """Choose the overview level for the current zoom and load it off-thread.
@@ -2172,12 +2195,8 @@ class MapCanvas(QGraphicsView):
         loaded, is a no-op.
         """
         if not layer.has_overviews():
-            # No pyramids: load full resolution once, in the background - or
-            # the coarsest decimation that fits in memory, for an image too big
-            # to hold whole (without a pyramid there is nothing cheaper to show
-            # in the meantime, so this is the only load it gets).
             if not layer.is_fully_loaded():
-                level = layer.budget_level(1)
+                level = self._desired_level(layer, units_per_pixel)
                 if level > 1:
                     debug(f"memory cap: {layer.name} has no pyramids and is "
                           f"too large for full resolution; loading at 1/{level}")
@@ -2185,12 +2204,7 @@ class MapCanvas(QGraphicsView):
                 self._dispatch_level_load(layer_id, layer, level)
             return
 
-        if self._uses_detail_tiles(layer):
-            # Windowed tiles carry the detail; this array only has to be a
-            # cheap backdrop behind them.
-            desired = layer.budget_level(1, BACKDROP_MAX_PIXELS)
-        else:
-            desired = layer.select_overview_level(units_per_pixel)
+        desired = self._desired_level(layer, units_per_pixel)
         if desired > 1 and layer.level_pixel_count(1) > MAX_LEVEL_PIXELS:
             # Detail is capped rather than zoom-limited; say so once per change
             # so "it stops getting sharper" has a visible reason.
@@ -2218,6 +2232,76 @@ class MapCanvas(QGraphicsView):
         # Already showing a preview at another level: refine to the target
         # while the current tiles stay on screen (swapped in when ready).
         self._dispatch_level_load(layer_id, layer, desired)
+
+    def _fit_units_per_pixel(self, layer: TiledLayer) -> float | None:
+        """Scene units per screen pixel once ``zoom_to_layer`` frames *layer*.
+
+        Mirrors the ``fitInView(..., KeepAspectRatio)`` there, so a layer warmed
+        with this lands on the same overview level it will ask for when shown.
+        """
+        if layer.bounds is None:
+            return None
+        west, south, east, north = layer.bounds
+        view_width = max(1, self.viewport().width())
+        view_height = max(1, self.viewport().height())
+        return max((east - west) / view_width, (north - south) / view_height)
+
+    def warm_layers(self, layer_ids: list[str]):
+        """Read hidden layers now so showing them later is instant.
+
+        Cycle modes call this with the images either side of the current one.
+        Nothing is drawn: the pixels are read on the background pool and held
+        on the layer, so stepping onto one only has to build tiles from memory.
+
+        Held images are trimmed to WARM_MAX_PIXELS afterwards, oldest first.
+        That bounds a walk through a large group, which nothing did before -
+        every image visited stayed in memory until the window closed - while
+        still leaving several steps' worth of small images loaded, so stepping
+        back through them stays as immediate as it was.
+        """
+        for layer_id in layer_ids:
+            layer = self._layers.get(layer_id)
+            # A visible layer is the user's, or the cycle's; not ours to hold.
+            if layer is None or layer.visible:
+                continue
+            units_per_pixel = self._fit_units_per_pixel(layer)
+            if units_per_pixel is None:
+                continue
+            if layer.level_pixel_count(
+                    self._desired_level(layer, units_per_pixel)) > WARM_MAX_PIXELS:
+                # One image that fills the whole budget would be evicted again
+                # on the next step; leave it to load when it is reached.
+                debug(f"prefetch: {layer.name} too large to hold ahead")
+                continue
+            self._warmed.pop(layer_id, None)
+            self._warmed[layer_id] = None          # most recently wanted, last
+            self._apply_layer_lod(layer_id, layer, units_per_pixel)
+        self._trim_warmed(set(layer_ids))
+
+    def _trim_warmed(self, protect: set):
+        """Free held images, least recently wanted first, until within budget."""
+        held = 0
+        for layer_id in reversed(list(self._warmed)):     # newest first
+            layer = self._layers.get(layer_id)
+            if layer is None or layer.visible:
+                # Gone, or switched on since - either way not ours any more.
+                del self._warmed[layer_id]
+                continue
+            held += layer.level_pixel_count(layer._target_level or 1)
+            if held <= WARM_MAX_PIXELS or layer_id in protect:
+                continue
+            self._cancel_layer_load(layer)
+            layer.free_data(self._scene)
+            del self._warmed[layer_id]
+
+    def clear_warmed_layers(self):
+        """Release everything held by warm_layers (on leaving a cycle mode)."""
+        for layer_id in list(self._warmed):
+            layer = self._layers.get(layer_id)
+            if layer is not None and not layer.visible:
+                self._cancel_layer_load(layer)
+                layer.free_data(self._scene)
+        self._warmed.clear()
 
     def _dispatch_level_load(self, layer_id: str, layer: TiledLayer, level: int):
         """Start a background load of *layer* at *level*.
@@ -2309,7 +2393,10 @@ class MapCanvas(QGraphicsView):
         debug(f"applied level {level}: {layer.name} "
               f"{layer._width}x{layer._height}")
         self._clear_layer_tiles(layer)
-        self._rebuild_layer_tiles(layer)
+        # A layer warmed ahead of its turn has no tiles to build yet; they are
+        # built from this data the moment it is shown.
+        if layer.visible:
+            self._rebuild_layer_tiles(layer)
 
     def _on_level_load_error(self, layer_id: str, level: int, message: str):
         """Handle a failed background level load."""
@@ -2405,6 +2492,7 @@ class MapCanvas(QGraphicsView):
                 del self._path_to_layer[file_path]
             if layer_id in self._layer_order:
                 self._layer_order.remove(layer_id)
+            self._warmed.pop(layer_id, None)
 
     def clear_layers(self):
         """Remove all layers from the canvas."""
@@ -2412,6 +2500,7 @@ class MapCanvas(QGraphicsView):
             self._clear_detail_tiles(layer_id, self._layers[layer_id])
             self._layers[layer_id].remove_from_scene(self._scene)
         self._layers.clear()
+        self._warmed.clear()
         self._layer_order.clear()
         self._path_to_layer.clear()
         self._pixel_zone_groups.clear()

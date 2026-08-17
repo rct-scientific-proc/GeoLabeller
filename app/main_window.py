@@ -130,6 +130,11 @@ CRASH_MARKER_FILE = RECOVERY_DIR / ".running"
 # Auto-save interval in milliseconds (60 seconds)
 AUTOSAVE_INTERVAL_MS = 60000
 
+# How many images either side of the current one a cycle mode reads ahead.
+# What is then kept in memory is capped by the canvas (WARM_MAX_PIXELS), so
+# raising this widens the read-ahead without uncapping what it costs.
+CYCLE_PREFETCH_RADIUS = 1
+
 
 def _write_recovery_snapshot(
         snapshot: dict, recovery_path: Path, crash_marker_path: Path):
@@ -207,6 +212,9 @@ class MainWindow(QMainWindow):
 
         # Cycle mode state
         self._cycle_layers: list[str] = []  # Layer IDs to cycle through
+        # Which way the last step went: -1 forward (Space), +1 back. Only
+        # orders the prefetch, so the likelier image is read first.
+        self._cycle_direction = -1
         # Current position in cycle (-1 means not started)
         self._cycle_index: int = -1
         # (layers, index) kept while the user steps out of a cycle mode, so
@@ -705,6 +713,8 @@ class MainWindow(QMainWindow):
         few hundred images that is a lot of progress to lose over one
         measurement.
         """
+        # Warmed neighbours are only worth their memory inside the cycle.
+        self.canvas.clear_warmed_layers()
         if self._cycle_layers and self._cycle_index >= 0:
             self._cycle_parked = (list(self._cycle_layers), self._cycle_index)
         self._cycle_layers = []
@@ -731,6 +741,32 @@ class MainWindow(QMainWindow):
         # image behind should not leave the line hanging over the next one.
         self.canvas.clear_ruler()
         self.canvas.zoom_to_layer(layer_id)
+        self._prefetch_cycle_neighbours()
+
+    def _prefetch_cycle_neighbours(self):
+        """Read the images either side of this one before they are asked for.
+
+        Stepping through a group used to stall on every press while the next
+        image came off disk - long enough to be in the way on a slow machine.
+        The neighbours are read in the background instead, so a step is usually
+        just tiles being built from memory. Holding the one behind as well
+        makes Ctrl+Space free, which is the common "wait, go back" case.
+        """
+        if not self._cycle_layers or self._cycle_index < 0:
+            return
+        # Nearest first, and the direction of travel ahead of the other, so the
+        # likelier image is the one already reading when the next key lands.
+        offsets = sorted(
+            (offset for radius in range(1, CYCLE_PREFETCH_RADIUS + 1)
+             for offset in (radius, -radius)),
+            key=lambda offset: (abs(offset),
+                                offset * self._cycle_direction < 0))
+        neighbours = []
+        for offset in offsets:
+            index = self._cycle_index + offset
+            if 0 <= index < len(self._cycle_layers):
+                neighbours.append(self._cycle_layers[index])
+        self.canvas.warm_layers(neighbours)
 
     def _layer_name(self, layer_id: str) -> str:
         """Return a layer's display name for logging (falls back to its id)."""
@@ -854,6 +890,8 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage("No layers to cycle through", 3000)
             return
 
+        self._cycle_direction = -1
+
         # Toggle off current layer
         current_layer_id = self._cycle_layers[self._cycle_index]
         self.layer_panel.uncheck_layers([current_layer_id])
@@ -896,6 +934,8 @@ class MainWindow(QMainWindow):
         if not self._cycle_layers or self._cycle_index < 0:
             self.statusBar.showMessage("No layers to cycle through", 3000)
             return
+
+        self._cycle_direction = 1
 
         # Check if we're already at the last layer (can't go back further)
         if self._cycle_index >= len(self._cycle_layers) - 1:
