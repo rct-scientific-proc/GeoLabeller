@@ -130,8 +130,29 @@ jobs:
           )
           Write-Host "Attaching $($files.Count) file(s):"
           $files | ForEach-Object { Write-Host "  $_" }
-          gh release create $env:GITHUB_REF_NAME `
-            --title "GeoLabeller $($env:GITHUB_REF_NAME)" `
-            --generate-notes `
-            $files
-          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          # The API answered 503 for twenty minutes during an incident on
+          # 2026-08-17 and took two releases with it, after their installers
+          # had already been built and attached. The build is the expensive
+          # part, so wait the outage out here rather than making someone
+          # notice the failure and re-run it by hand.
+          $delays = @(15, 30, 60, 120, 240)
+          for ($attempt = 0; ; $attempt++) {
+            gh release create $env:GITHUB_REF_NAME `
+              --title "GeoLabeller $($env:GITHUB_REF_NAME)" `
+              --generate-notes `
+              $files
+            if ($LASTEXITCODE -eq 0) { break }
+
+            # An attempt can create the release and still fail while uploading,
+            # after which every later create fails with "already exists" - so
+            # try attaching to it before deciding this attempt got nowhere.
+            Write-Host "Create failed; trying to attach to an existing release."
+            gh release upload $env:GITHUB_REF_NAME $files --clobber
+            if ($LASTEXITCODE -eq 0) { break }
+
+            if ($attempt -ge $delays.Count) {
+              throw "gh release create failed after $($attempt + 1) attempts"
+            }
+            Write-Host "Retrying in $($delays[$attempt])s."
+            Start-Sleep -Seconds $delays[$attempt]
+          }
