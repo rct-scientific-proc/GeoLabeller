@@ -75,7 +75,12 @@ function Initialize-WixToolset {
             $wixExe = $onPath.Source
         } else {
             Write-Host "Installing WiX $wixVersion..." -ForegroundColor Yellow
-            & dotnet tool install --global wix --version $wixVersion
+            # Out-Host, not bare invocation: anything a command writes to the
+            # output stream inside a function becomes part of that function's
+            # return value. dotnet's "Tool 'wix' was successfully installed"
+            # chatter would be returned alongside the path, and the caller
+            # would try to run the whole lot as the name of an executable.
+            & dotnet tool install --global wix --version $wixVersion | Out-Host
             Assert-LastExit "Could not install WiX (is the .NET SDK installed?)"
         }
     }
@@ -90,7 +95,7 @@ function Initialize-WixToolset {
     $extensions = (& $wixExe extension list -g 2>&1) -join "`n"
     if ($extensions -notmatch "WixToolset\.UI\.wixext") {
         Write-Host "Adding the WiX UI extension..." -ForegroundColor Yellow
-        & $wixExe extension add -g "WixToolset.UI.wixext/$wixVersion"
+        & $wixExe extension add -g "WixToolset.UI.wixext/$wixVersion" | Out-Host
         Assert-LastExit "Could not add the WiX UI extension"
     }
     return $wixExe
