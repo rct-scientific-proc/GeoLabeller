@@ -1,8 +1,15 @@
 # Build the Windows MSI installer and publish it as a GitHub Release.
 #
-# Push a semver tag to cut a release:
+# To cut a release, declare the version first, then tag it:
+#     echo 1.2.0 > VERSION
+#     python docs_workspace/build_icd.py     # stamps VERSION on the ICD cover
+#     git commit -am "Release 1.2.0"
 #     git tag -a v1.2.0 -m "GeoLabeller 1.2.0"
-#     git push origin v1.2.0
+#     git push origin master v1.2.0
+#
+# VERSION exists because the ICD is built and committed before the tag it
+# belongs to, so it cannot learn its version from the tags. This workflow
+# refuses to build a tag that disagrees with it.
 #
 # The tag name (minus the leading "v") becomes the MSI's ProductVersion, which
 # is what lets Windows Installer upgrade an existing install in place - so the
@@ -55,6 +62,14 @@ jobs:
           }
           if ($version -notmatch '^\d+\.\d+\.\d+$') {
             throw "Version must be X.Y.Z (got '$version'). Tag releases as v1.2.0."
+          }
+          # VERSION is what the ICD stamps on its cover, and is written before
+          # the tag exists. Catching a disagreement here is the only chance to
+          # notice it: nothing downstream reads both.
+          $declared = (Get-Content VERSION -Raw).Trim() -replace '^v', ''
+          if ($declared -ne $version) {
+            throw ("VERSION says $declared but this build is $version. " +
+                   "Update VERSION, rebuild the ICD, commit, then move the tag.")
           }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT `
             -Encoding utf8 -Append
