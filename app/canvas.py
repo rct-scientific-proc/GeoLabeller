@@ -433,13 +433,6 @@ class TiledLayer:
 
             level = max(1, level)
 
-            # Decimated source read shape (served from the nearest overview),
-            # and the source transform scaled to match that read shape.
-            rd_w = max(1, src.width // level)
-            rd_h = max(1, src.height // level)
-            src_read_transform = src.transform * src.transform.scale(
-                src.width / rd_w, src.height / rd_h)
-
             dst_crs = WEB_MERCATOR
             transform, width, height = calculate_default_transform(
                 src.crs, dst_crs, src.width, src.height, *src.bounds
@@ -449,6 +442,25 @@ class TiledLayer:
             # overview level selection) before reducing for this level.
             self._full_width = width
             self._full_height = height
+
+            # Hard floor on memory, applied here rather than only where the
+            # level is chosen: a non-lazy layer loads straight from __init__ at
+            # level 1, so a very large image would otherwise allocate itself
+            # whole before any level selection ran. Cheap to do now - the
+            # transform above is arithmetic on the bounds, not a read.
+            budgeted = self.budget_level(level)
+            if budgeted != level:
+                debug(f"memory cap: {Path(self.file_path).name} level {level} "
+                      f"needs {self.level_pixel_count(level) / 1e6:.0f} MP; "
+                      f"loading at 1/{budgeted} instead")
+                level = budgeted
+
+            # Decimated source read shape (served from the nearest overview),
+            # and the source transform scaled to match that read shape.
+            rd_w = max(1, src.width // level)
+            rd_h = max(1, src.height // level)
+            src_read_transform = src.transform * src.transform.scale(
+                src.width / rd_w, src.height / rd_h)
 
             if level > 1:
                 dst_w = max(1, width // level)
@@ -599,6 +611,14 @@ class TiledLayer:
             self._full_height = src.height
 
             level = max(1, level)
+            # Same memory floor as the georeferenced path: a raw image large
+            # enough to exhaust memory is decimated rather than read whole.
+            budgeted = self.budget_level(level)
+            if budgeted != level:
+                debug(f"memory cap: {Path(self.file_path).name} level {level} "
+                      f"needs {self.level_pixel_count(level) / 1e6:.0f} MP; "
+                      f"loading at 1/{budgeted} instead")
+                level = budgeted
             width = max(1, src.width // level)
             height = max(1, src.height // level)
 
@@ -1413,9 +1433,18 @@ class MapCanvas(QGraphicsView):
         self._throbber = ThrobberWidget(self)
         self._throbber.move(12, 12)
 
-    def add_layer(self, file_path: str, lazy: bool = False,
+    def add_layer(self, file_path: str, lazy: bool = True,
                   visible: bool = True) -> str | None:
         """Add a GeoTIFF layer to the canvas. Returns existing layer_id if already loaded.
+
+        Lazy by default: only bounds and metadata are read here, and the pixels
+        arrive through the background level-of-detail path (coarse preview
+        first, then the level the zoom actually wants). Loading eagerly instead
+        decoded and reprojected the whole image on the UI thread before this
+        call returned, which froze the window for as long as that took - many
+        seconds on a large mosaic - for a layer that may not even be visible.
+        Everything callers read straight afterwards (source dimensions, CRS,
+        transform, bounds) is populated either way.
 
         Args:
             file_path: Path to the GeoTIFF file
@@ -1459,8 +1488,11 @@ class MapCanvas(QGraphicsView):
             return None
 
     def add_pixel_layer(self, file_path: str, group_path: str = "",
-                        lazy: bool = False, visible: bool = True) -> str | None:
+                        lazy: bool = True, visible: bool = True) -> str | None:
         """Add a non-georeferenced image layer to the pixel zone.
+
+        Lazy by default for the same reason as add_layer: the pixels come in
+        through the background loader rather than blocking this call.
 
         Images in the same group are stacked (same position, cycled via visibility).
         Each group occupies a separate column in the pixel zone.
