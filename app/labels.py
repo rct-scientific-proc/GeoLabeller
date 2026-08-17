@@ -602,22 +602,6 @@ class LabelProject:
                 result.append((image, label))
         return result
 
-    def get_labels_for_image(self, image_path: str) -> list[PointLabel]:
-        """Get all labels for a specific image."""
-        if image_path in self.images:
-            return self.images[image_path].labels
-        return []
-
-    def get_labels_by_class(
-            self, class_name: str) -> list[tuple["ImageData", PointLabel]]:
-        """Get all labels with a specific class."""
-        result = []
-        for image in self.images.values():
-            for label in image.labels:
-                if label.class_name == class_name:
-                    result.append((image, label))
-        return result
-
     def get_label_by_id(self,
                         label_id: int) -> tuple["ImageData",
                                                 PointLabel] | tuple[None,
@@ -845,10 +829,3 @@ class LabelProject:
         self._object_id_index.clear()
         self._label_id_index.clear()
 
-    def clear_all(self):
-        """Clear everything."""
-        self.classes.clear()
-        self.images.clear()
-        self._next_id = 1
-        self._object_id_index.clear()
-        self._label_id_index.clear()

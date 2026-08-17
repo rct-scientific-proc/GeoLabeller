@@ -1218,9 +1218,16 @@ class _TileLoadRunnable(QRunnable):
             self._fail()
 
     def _fail(self):
-        """Report that this tile produced nothing, so it stops being pending."""
-        _emit_safely(self._signals.failed, self._layer_id, self._level,
-                     self._tx, self._ty)
+        """Report that this tile produced nothing, so it stops being pending.
+
+        Reaching the signal at all can fail once the canvas has been torn
+        down, which _emit_safely cannot guard against on its own.
+        """
+        try:
+            _emit_safely(self._signals.failed, self._layer_id, self._level,
+                         self._tx, self._ty)
+        except RuntimeError:
+            pass
 
 
 class _LevelLoadSignals(QObject):
@@ -1257,7 +1264,28 @@ class _LevelLoadRunnable(QRunnable):
 
     def run(self):
         """Compute the layer's RGBA data for the level off the UI thread and
-        emit the result (or an error/cancellation) back to the main thread."""
+        emit the result (or an error/cancellation) back to the main thread.
+
+        The whole body is guarded: an exception escaping a QRunnable dies in
+        the worker thread with no traceback, and the load counter would never
+        be balanced - leaving the spinner turning for a load that already gave
+        up.
+        """
+        try:
+            self._run()
+        except Exception as exc:  # noqa: BLE001 - reported, never fatal
+            try:
+                self._safe_emit(self._signals.error, self._layer_id,
+                                self._level, str(exc))
+            except RuntimeError:
+                # The canvas went away mid-load, taking the signal object with
+                # it. There is nobody to notify and nothing has gone wrong.
+                return
+            debug(f"level load FAILED: {self._layer_id} level={self._level}: "
+                  f"{type(exc).__name__}: {exc}")
+
+    def _run(self):
+        """Do the load and emit exactly one terminal signal."""
         # Bail cheaply if superseded/culled while still queued.
         if self._cancelled:
             self._safe_emit(self._signals.cancelled, self._layer_id, self._level)
@@ -1350,7 +1378,6 @@ class MapCanvas(QGraphicsView):
 
     # Signal emitted when the view rotation changes: (degrees). Non-zero means
     # the view no longer points north-up, so lat/lon rulers become meaningless.
-    view_rotation_changed = pyqtSignal(float)
 
     # Signal emitted when user requests to hide layers outside view: (list of
     # layer_ids to hide)
@@ -1457,7 +1484,6 @@ class MapCanvas(QGraphicsView):
 
         # Current absolute view rotation in degrees (0 = north-up). Non-zero in
         # image-up cycle mode, where the view is rotated onto an image's grid.
-        self._view_rotation = 0.0
         self._current_class = ""  # Currently selected class for labeling
 
         # Link mode state
@@ -2451,24 +2477,6 @@ class MapCanvas(QGraphicsView):
             return layer._src_transform, layer._src_crs
         return None, None
 
-    def set_view_rotation(self, degrees: float):
-        """Set the absolute view rotation in degrees (0 = north-up).
-
-        Preserves the current zoom: only the difference from the currently
-        applied rotation is composed into the view transform.
-        """
-        delta = degrees - self._view_rotation
-        if abs(delta) > 1e-9:
-            self.rotate(delta)
-            self._view_rotation = degrees
-            self._schedule_tile_update()
-            self.update_label_markers_scale()
-            self.view_rotation_changed.emit(degrees)
-
-    def view_rotation(self) -> float:
-        """Return the current view rotation in degrees."""
-        return self._view_rotation
-
     def zoom_to_layer(self, layer_id: str):
         """Zoom the view to fit a specific layer's bounds."""
         if layer_id not in self._layers:
@@ -2966,18 +2974,19 @@ class MapCanvas(QGraphicsView):
         scene_pos = self.mapToScene(event.pos())
         easting, northing = self._scene_to_web(scene_pos)
 
+        # One lookup, not two: this runs on every mouse move, and each of the
+        # old calls scanned every layer independently.
+        layer, layer_name, group_path = self._layer_and_name_at(
+            easting, northing)
+
         if self.is_in_pixel_zone(easting):
-            # In the pixel zone: find the layer and compute pixel coords
-            layer_name, group_path = self._get_layer_at_position(easting, northing)
-            layer, _, _ = self._get_layer_and_info_at_position(easting, northing)
-            if layer and not layer.geo:
+            if layer is not None and not layer.geo:
                 px, py = layer.scene_to_pixel(easting, northing)
                 self._queue_coords_emit(px, py, layer_name, group_path, True)
             else:
                 self._queue_coords_emit(0.0, 0.0, layer_name, group_path, True)
         else:
             lon, lat = self._web_mercator_to_wgs84(easting, northing)
-            layer_name, group_path = self._get_layer_at_position(easting, northing)
             self._queue_coords_emit(lon, lat, layer_name, group_path, False)
 
     def _queue_coords_emit(self, x: float, y: float, layer_name: str,
@@ -3118,6 +3127,33 @@ class MapCanvas(QGraphicsView):
             return (f"~{closest_layer.name}", closest_layer.group_path)
 
         return ("", "")
+
+    def _layer_and_name_at(self, easting: float, northing: float):
+        """``(layer, name, group)`` under a position, in a single pass.
+
+        The layer is the topmost visible one actually containing the point, or
+        None. The name falls back to the nearest layer's, prefixed with '~',
+        so the readout still says roughly where the cursor is over blank space.
+
+        Combining the two lookups matters because this runs on every mouse
+        move: asking for the layer and the name separately scanned every layer
+        twice, and three times over empty ground.
+        """
+        layer, name, group = self._get_layer_and_info_at_position(
+            easting, northing)
+        if layer is not None:
+            return layer, name, group
+        # Nothing contains the point - fall back to the nearest layer's name.
+        closest, min_distance = None, float("inf")
+        for candidate in self._layers.values():
+            if not candidate.visible:
+                continue
+            distance = candidate.distance_to_center(easting, northing)
+            if distance < min_distance:
+                min_distance, closest = distance, candidate
+        if closest is not None:
+            return None, f"~{closest.name}", closest.group_path
+        return None, "", ""
 
     def _get_layer_and_info_at_position(
             self, easting: float, northing: float) -> tuple:
@@ -3606,15 +3642,6 @@ class MapCanvas(QGraphicsView):
 
         self.link_mode_changed.emit(False, "")
 
-    def is_link_mode_active(self) -> bool:
-        """Check if link mode is currently active."""
-        return self._link_mode_active
-
-    # ------------------------------------------------------------------
-    # Chain-link mode: click labels one after another to link them all
-    # into one object; N starts a new chain, Esc/K exits.
-    # ------------------------------------------------------------------
-
     def set_chain_link_mode(self, active: bool):
         """Enter or leave chain-link mode.
 
@@ -3651,10 +3678,6 @@ class MapCanvas(QGraphicsView):
             else:
                 self.setCursor(Qt.ArrowCursor)
             self.chain_link_changed.emit(False, "")
-
-    def is_chain_link_mode_active(self) -> bool:
-        """Check if chain-link mode is currently active."""
-        return self._chain_link_active
 
     def chain_link_new_chain(self):
         """Close the current chain; the next label clicked anchors a new one."""
@@ -3874,14 +3897,6 @@ class MapCanvas(QGraphicsView):
             self.setCursor(Qt.ArrowCursor)
 
         self.measure_mode_changed.emit(False, "")
-
-    def is_measure_mode_active(self) -> bool:
-        """Check if measure mode is currently active."""
-        return self._measure_active
-
-    # ------------------------------------------------------------------
-    # Ruler mode: drag to measure ground distance (metres), QGIS-style
-    # ------------------------------------------------------------------
 
     def _ruler_begin(self, view_pos):
         """Start a ruler measurement at the given view position."""

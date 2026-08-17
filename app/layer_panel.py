@@ -858,20 +858,6 @@ class LayerPanel(QWidget):
             return False
         return item.checkState(0) == Qt.Checked
 
-    def get_layer_id_by_path(self, file_path: str) -> str | None:
-        """Find layer ID by file path.
-
-        Args:
-            file_path: The file path to search for
-
-        Returns:
-            The layer ID if found, None otherwise
-        """
-        item = self._path_items.get(file_path)
-        if item is None:
-            return None
-        return item.data(0, Qt.UserRole)
-
     def toggle_layer_visibility(self, layer_id: str):
         """Toggle the visibility of a layer by its ID.
 
@@ -932,10 +918,6 @@ class LabeledLayerPanel(QWidget):
             layer_id: The layer ID assigned by the main layer panel
         """
         self._layer_id_map[file_path] = layer_id
-
-    def get_layer_id(self, file_path: str) -> str | None:
-        """Get the layer ID for a file path."""
-        return self._layer_id_map.get(file_path)
 
     @staticmethod
     def _measurement_suffix(length_m, width_m) -> str:
@@ -1281,33 +1263,6 @@ class LabeledLayerPanel(QWidget):
 
         find_and_set()
         self.tree.blockSignals(False)
-
-    def toggle_layer_checked(self, file_path: str):
-        """Toggle the check state of labels for a file path.
-
-        Args:
-            file_path: The file path of the layer to toggle
-        """
-        def find_and_toggle(parent=None):
-            """Recursively toggle the check state of label items matching ``file_path``."""
-            if parent is None:
-                count = self.tree.topLevelItemCount()
-                for i in range(count):
-                    find_and_toggle(self.tree.topLevelItem(i))
-            else:
-                item_type = parent.data(0, Qt.UserRole + 1)
-                if item_type == "label":
-                    if parent.data(0, Qt.UserRole) == file_path:
-                        self.tree.blockSignals(True)
-                        current_state = parent.checkState(0)
-                        new_state = Qt.Unchecked if current_state == Qt.Checked else Qt.Checked
-                        parent.setCheckState(0, new_state)
-                        self.tree.blockSignals(False)
-                elif item_type == "group":
-                    for i in range(parent.childCount()):
-                        find_and_toggle(parent.child(i))
-
-        find_and_toggle()
 
     def clear(self):
         """Clear all items from the tree and internal state."""

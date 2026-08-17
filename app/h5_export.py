@@ -56,7 +56,6 @@ SCOPE_LABELLED = "labelled"  # visible *and* carrying at least one label
 # hard-negative sliding window never runs.
 SCOPE_ALL_EXAMPLES = "all_examples"          # every loaded layer with labels
 SCOPE_VISIBLE_EXAMPLES = "visible_examples"  # visible layers with labels
-EXAMPLES_ONLY_SCOPES = (SCOPE_ALL_EXAMPLES, SCOPE_VISIBLE_EXAMPLES)
 
 SPLIT_CHOICES = {"Train (0)": 0, "Validate (1)": 1, "Test (2)": 2}
 CHANNEL_CHOICES = {"RGB (3 channels)": 3, "Grayscale (1 channel)": 1}
@@ -220,7 +219,7 @@ class H5DatasetWriter:
     ``"hard_negative"`` last). On append the existing file's H/W/C must match;
     a class list that has since gained or moved classes is migrated in place
     (see ``_reconcile_classes``), and what changed is reported on
-    ``added_classes`` / ``dropped_classes`` / ``classes_remapped``.
+    ``added_classes`` / ``dropped_classes``.
     """
 
     def __init__(self, path, height, width, channels, classes,
@@ -243,7 +242,6 @@ class H5DatasetWriter:
         self._img_buf, self._lbl_buf, self._gt_buf, self._split_buf = [], [], [], []
         # Set when appending to a file whose class list has since changed.
         self.added_classes, self.dropped_classes = [], []
-        self.classes_remapped = False
 
         already = os.path.exists(path) and os.path.getsize(path) > 0
         self._f = h5py.File(path, "a")
@@ -351,7 +349,6 @@ class H5DatasetWriter:
                     # clip guards a corrupt index rather than raising deep in
                     # the middle of a rewrite.
                     labels[start:stop] = lut[np.clip(block, 0, lut.size - 1)]
-                self.classes_remapped = True
         self._write_classes()
 
     @staticmethod
