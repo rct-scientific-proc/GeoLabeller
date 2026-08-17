@@ -37,10 +37,18 @@ Internet Options proxy (WinINET registry), then the WinHTTP proxy — and passes
 
 ### Build MSI Installer
 
+Two packagers are available. `-Wix` is what releases are built with; the
+cx_Freeze `bdist_msi` path is kept because it needs no toolchain beyond Python.
+
 ```powershell
+# Recommended: WiX. Installs the toolset on first use (needs the .NET SDK).
+.\build_windows.ps1 -Msi -Wix -Version 1.2.3
+
+# cx_Freeze's own packager - fewer install-time options, no extra toolchain
 .\build_windows.ps1 -Msi
 
 # Build MSI with a Desktop shortcut (a Start Menu shortcut is always added)
+# Ignored by -Wix, where the person installing ticks the shortcuts they want
 .\build_windows.ps1 -Msi -Shortcut
 
 # Set the version explicitly (otherwise auto-detected from a VERSION file or git tag)
@@ -50,13 +58,38 @@ Internet Options proxy (WinINET registry), then the WinHTTP proxy — and passes
 .\build_windows.ps1 -Msi -Author "Your Name" -Url "https://example.com/geolabeller"
 ```
 
-The MSI is a **per-user** install: it installs into
-`%LocalAppData%\Programs\GeoLabeller` for the current user and requires **no
-administrator elevation**. It adds a (per-user) Start Menu shortcut (Desktop
-optional via `-Shortcut`), and records the publisher, version and icon in Add/
-Remove Programs. Keep incrementing the version between releases so a new MSI
-cleanly upgrades a previous install (the upgrade GUID in `setup.py` must never
-change).
+Keep incrementing the version between releases so a new MSI cleanly upgrades a
+previous install. **The upgrade GUID must never change** — it is what tells
+Windows Installer that a package replaces an existing install rather than being
+a different product. The same GUID appears in `setup.py` and in
+`wix/GeoLabeller.wxs`, so an install made by either packager upgrades to one
+made by the other.
+
+#### What `-Wix` asks the user
+
+Decisions the cx_Freeze package fixes at build time are made during setup
+instead, which is the reason it exists:
+
+- **Install for everyone, or just me.** Defaults to just-me, which installs
+  into the user's profile with no administrator prompt — the same as the
+  cx_Freeze package always did, so nobody who could install the old one is
+  suddenly blocked by UAC. Choosing everyone elevates and installs into
+  Program Files.
+- **Which shortcuts.** Start Menu and Desktop are separate features with
+  tick-boxes, both on by default.
+- **Where to install**, via the usual browse dialog.
+- **An upgrade notice.** If an existing install is found, setup says so and
+  names its version before replacing it, and the only options are to continue
+  or cancel. There is no side-by-side install: two copies would share the
+  upgrade GUID, which Windows Installer reads as one product.
+
+The version is recorded under `HKCU`/`HKLM\Software\<publisher>\GeoLabeller`
+so the *next* upgrade can name the version being replaced. Installs made by
+the cx_Freeze packager never wrote it, so upgrading from 1.3.0 or earlier
+shows the wording that does not name a version.
+
+The licence page shows `LICENSE` from the repository root, converted to RTF at
+build time. Without it WiX shows its own placeholder, which is Lorem ipsum.
 
 > Because it installs per-user, each Windows user who wants GeoLabeller runs the
 > MSI themselves; it is not installed once for the whole machine. To deploy it

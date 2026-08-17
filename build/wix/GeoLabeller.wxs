@@ -1,0 +1,245 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Installer authoring for GeoLabeller.
+
+  cx_Freeze still produces the frozen application (build_exe); this packages
+  that output. Its own bdist_msi is not used, because the choices it bakes in
+  at build time are the ones the person installing wants to make: whether the
+  install is for everyone or just them, and which shortcuts they get.
+
+  Built by build/build_windows.ps1 -Wix, which passes the version, the folder
+  to package and the publisher details in as preprocessor variables:
+
+      wix build -arch x64 -ext WixToolset.UI.wixext ^
+        -d Version=1.3.0 -d PayloadDir=..\build\exe.win-amd64-3.12 ^
+        -d Manufacturer="RCT Scientific Processing" -d AboutUrl=https://... ^
+        -o GeoLabeller-1.3.0-win64.msi GeoLabeller.wxs
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <Package
+      Name="GeoLabeller"
+      Manufacturer="$(var.Manufacturer)"
+      Version="$(var.Version)"
+      Language="1033"
+      Compressed="yes"
+      Scope="perUserOrMachine"
+      UpgradeCode="A1B2C3D4-E5F6-7890-ABCD-EF1234567890">
+
+    <!--
+      This GUID is what lets Windows Installer recognise an existing install as
+      the same product and replace it. It is carried over verbatim from the
+      cx_Freeze packaging, so a 1.x install made by the old installer upgrades
+      cleanly to one made by this. Changing it strands every existing install.
+    -->
+
+    <SummaryInformation Description="GeoLabeller - geospatial image labeling" />
+
+    <!--
+      Upgrade, or stop. There is deliberately no side-by-side: two installs of
+      the same product would share an UpgradeCode, and Windows Installer treats
+      that as one product. Downgrades are refused rather than silently
+      half-applied.
+    -->
+    <!--
+      AllowSameVersionUpgrades lets a rebuild of the same version replace what
+      is installed, which is what testing an installer actually looks like.
+      The cost is validation warning ICE61, because it makes the detected
+      version range include the version being installed; that is the intent,
+      not an oversight.
+    -->
+    <MajorUpgrade
+        AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="A newer version of [ProductName] is already installed. Uninstall it first if you need to go back to this version." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Add/Remove Programs entry. -->
+    <Icon Id="GeoLabellerIcon" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="GeoLabellerIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="$(var.AboutUrl)" />
+    <Property Id="ARPHELPLINK" Value="$(var.AboutUrl)" />
+    <!-- The app is the only thing worth removing; hide the "repair" option. -->
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <Feature Id="MainApplication"
+             Title="GeoLabeller"
+             Description="The application and everything it needs to run."
+             Level="1"
+             AllowAbsent="no"
+             AllowAdvertise="no">
+      <ComponentGroupRef Id="ApplicationFiles" />
+
+      <Feature Id="StartMenuShortcutFeature"
+               Title="Start Menu shortcut"
+               Description="Add GeoLabeller to the Start Menu."
+               Level="1"
+               AllowAdvertise="no">
+        <ComponentRef Id="StartMenuShortcutComponent" />
+      </Feature>
+
+      <Feature Id="DesktopShortcutFeature"
+               Title="Desktop shortcut"
+               Description="Put a GeoLabeller shortcut on the desktop."
+               Level="1"
+               AllowAdvertise="no">
+        <ComponentRef Id="DesktopShortcutComponent" />
+      </Feature>
+    </Feature>
+
+    <!--
+      WixUI_Advanced is the dialog set that offers "just me" or "everyone",
+      which is the whole reason for the perUserOrMachine scope above. It needs
+      the install directory to be called APPLICATIONFOLDER and reads these two
+      properties, so they are not optional decoration.
+    -->
+    <Property Id="ApplicationFolderName" Value="GeoLabeller" />
+    <!-- Default the choice to a per-user install: it needs no elevation, which
+         is how the cx_Freeze installer behaved, so nobody who could install
+         the old one is suddenly blocked by a UAC prompt. -->
+    <Property Id="WixAppFolder" Value="WixPerUserFolder" />
+    <ui:WixUI Id="WixUI_Advanced" />
+
+    <!-- Without this the licence page shows the UI extension's placeholder,
+         which is Lorem ipsum. build_windows.ps1 generates the RTF from the
+         LICENSE file at the repository root so there is only one copy of it. -->
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
+
+    <!--
+      Read back the version stamped by whichever build installed last, so the
+      upgrade notice can name it. Installs made by the old cx_Freeze packaging
+      never wrote this, so it is empty for anyone upgrading from 1.3.0 or
+      earlier - the notice has wording for both cases.
+    -->
+    <!-- RegistrySearch cannot take HKMU the way RegistryValue can, so both
+         hives are searched and whichever answered is used. A per-user install
+         wrote to HKCU, a per-machine one to HKLM. -->
+    <Property Id="INSTALLEDVERSIONUSER" Secure="yes">
+      <RegistrySearch Id="InstalledVersionUserSearch" Root="HKCU"
+                      Key="Software\$(var.Manufacturer)\GeoLabeller"
+                      Name="Version" Type="raw" />
+    </Property>
+    <Property Id="INSTALLEDVERSIONMACHINE" Secure="yes">
+      <RegistrySearch Id="InstalledVersionMachineSearch" Root="HKLM"
+                      Key="Software\$(var.Manufacturer)\GeoLabeller"
+                      Name="Version" Type="raw" />
+    </Property>
+    <SetProperty Id="INSTALLEDVERSION" Action="SetInstalledVersionFromUser"
+                 Value="[INSTALLEDVERSIONUSER]" After="AppSearch"
+                 Condition="INSTALLEDVERSIONUSER" />
+    <SetProperty Id="INSTALLEDVERSION" Action="SetInstalledVersionFromMachine"
+                 Value="[INSTALLEDVERSIONMACHINE]" After="AppSearch"
+                 Condition="INSTALLEDVERSIONMACHINE AND NOT INSTALLEDVERSIONUSER" />
+
+    <!--
+      Say so before replacing an existing install, rather than silently
+      swapping it out. Continuing upgrades in place; Cancel backs out. There
+      is no third option, by design - see the MajorUpgrade note above.
+    -->
+    <UI>
+      <Dialog Id="UpgradeNoticeDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="Title" Type="Text" X="15" Y="15" Width="340" Height="20"
+                 Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Title}An existing installation was found" />
+
+        <Control Id="KnownVersionText" Type="Text" X="15" Y="50" Width="340" Height="90"
+                 NoPrefix="yes" Hidden="yes" ShowCondition="INSTALLEDVERSION"
+                 Text="GeoLabeller [INSTALLEDVERSION] is already installed on this computer.
+
+Continuing will replace it with version [ProductVersion]. The existing version is removed as part of the upgrade; your projects and label files are not touched." />
+
+        <Control Id="UnknownVersionText" Type="Text" X="15" Y="50" Width="340" Height="90"
+                 NoPrefix="yes" Hidden="yes" ShowCondition="NOT INSTALLEDVERSION"
+                 Text="An earlier version of GeoLabeller is already installed on this computer.
+
+Continuing will replace it with version [ProductVersion]. The existing version is removed as part of the upgrade; your projects and label files are not touched." />
+
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+
+        <Control Id="Next" Type="PushButton" X="212" Y="243" Width="80" Height="17"
+                 Default="yes" Text="Upgrade">
+          <Publish Event="NewDialog" Value="AdvancedWelcomeEulaDlg" Condition="1" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17"
+                 Cancel="yes" Text="Cancel">
+          <Publish Event="SpawnDialog" Value="CancelDlg" Condition="1" />
+        </Control>
+      </Dialog>
+    </UI>
+
+    <InstallUISequence>
+      <Show Dialog="UpgradeNoticeDlg" Before="AdvancedWelcomeEulaDlg"
+            Condition="WIX_UPGRADE_DETECTED AND NOT Installed" />
+    </InstallUISequence>
+
+  </Package>
+
+  <Fragment>
+    <!--
+      Everything cx_Freeze emitted, harvested at build time. Listing the files
+      by hand would mean editing this every time a dependency of PyQt5, GDAL or
+      PROJ changes, which is a thing nobody would remember to do.
+    -->
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="APPLICATIONFOLDER" Name="GeoLabeller" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="ApplicationFiles" Directory="APPLICATIONFOLDER">
+      <Files Include="$(var.PayloadDir)\**" />
+
+      <!-- The breadcrumb the upgrade notice reads next time round. HKMU
+           follows the install scope, so a per-user install writes it under
+           HKCU and a per-machine one under HKLM. -->
+      <Component Id="VersionBreadcrumb" Guid="D2E5A146-3B78-4C92-A0F5-7E81B4C6D30A">
+        <RegistryValue Root="HKMU"
+                       Key="Software\$(var.Manufacturer)\GeoLabeller"
+                       Name="Version"
+                       Type="string" Value="$(var.Version)" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <!--
+      Shortcuts live in their own components so each can be a feature the user
+      ticks. HKMU resolves to HKCU or HKLM to match the install scope chosen,
+      so the same package works either way.
+
+      Validation raises ICE57 on both of these, and build_windows.ps1
+      suppresses it: the rule objects to a component holding per-user data
+      (a shortcut under the user's profile) behind a keypath that could be
+      either hive. It cannot see that the shortcut folder and HKMU both follow
+      ALLUSERS together, so in a package that is deliberately either-scope they
+      always agree. Everything else it checks is left switched on.
+    -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcutComponent" Guid="6F3A8B21-7C4D-4E15-9A2B-0D8E5C1F4A73">
+        <Shortcut Id="StartMenuShortcut"
+                  Name="GeoLabeller"
+                  Description="GeoLabeller - geospatial image labeling"
+                  Target="[APPLICATIONFOLDER]GeoLabeller.exe"
+                  WorkingDirectory="APPLICATIONFOLDER" />
+        <RegistryValue Root="HKMU"
+                       Key="Software\$(var.Manufacturer)\GeoLabeller"
+                       Name="StartMenuShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcutComponent" Guid="B49C2E07-51FA-4D63-8C7E-2A6B9F0D3E18">
+        <Shortcut Id="DesktopShortcut"
+                  Name="GeoLabeller"
+                  Description="GeoLabeller - geospatial image labeling"
+                  Target="[APPLICATIONFOLDER]GeoLabeller.exe"
+                  WorkingDirectory="APPLICATIONFOLDER" />
+        <RegistryValue Root="HKMU"
+                       Key="Software\$(var.Manufacturer)\GeoLabeller"
+                       Name="DesktopShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+  </Fragment>
+
+</Wix>

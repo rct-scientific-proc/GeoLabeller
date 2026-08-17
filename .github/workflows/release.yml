@@ -76,7 +76,11 @@ jobs:
           Write-Host "Building GeoLabeller $version"
 
       # -NoProxy skips the corporate-proxy autodetection, which has nothing to
-      # find on a hosted runner and only costs time.
+      # find on a hosted runner and only costs time. -Wix packages with the WiX
+      # toolset rather than cx_Freeze's bdist_msi, so the installer can ask
+      # about scope and shortcuts; the script installs WiX itself on first use,
+      # which the runner's preinstalled .NET SDK is enough for. Shortcuts are no
+      # longer a build-time switch, which is why -Shortcut is gone.
       - name: Build the MSI
         shell: pwsh
         run: |
@@ -85,9 +89,9 @@ jobs:
           Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
           ./build/build_windows.ps1 `
             -Msi `
+            -Wix `
             -Clean `
             -NoProxy `
-            -Shortcut `
             -Version ${{ steps.version.outputs.version }} `
             -Author "RCT Scientific Processing" `
             -Url "https://github.com/${{ github.repository }}"

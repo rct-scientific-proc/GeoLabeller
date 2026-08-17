@@ -4,7 +4,11 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
+# NOT build/ - this repository's build/ holds source: the packaging scripts and
+# the WiX installer authoring. Ignoring it wholesale hid new files there from
+# git status entirely. Only what a build writes underneath it is ignored.
+/build/build/
+/build/.build_venv/
 develop-eggs/
 dist/
 downloads/
