@@ -45,6 +45,24 @@ PIXEL_ZONE_ORIGIN_Y = 0.0
 PIXEL_ZONE_SCALE = 50.0  # Scene units per pixel (makes images ~similar size to geo layers)
 PIXEL_ZONE_GROUP_GAP = 5000.0  # Gap between group columns in scene units
 
+# Ceiling on the pixels one reprojected pyramid level may occupy.
+#
+# A layer is held in memory as a single RGBA array covering the WHOLE image at
+# the displayed level (4 bytes/px), and reprojection needs float32 source and
+# destination bands on top, so peak use is roughly 12 bytes per pixel. Memory
+# therefore scales with the image, not with the screen - which is why a very
+# large mosaic used to take the process with it: at full resolution a
+# 100k x 100k source asks for ~37 GB of RGBA and over 100 GB at peak.
+#
+# Levels finer than this cap are refused, so such an image stays viewable
+# (just no sharper than the cap allows) instead of crashing. 150 MP is ~600 MB
+# of RGBA and ~1.8 GB peak, and leaves ordinary imagery - including a
+# 10000 x 10000 tile at 100 MP - loading at full resolution as before.
+#
+# The real fix is to read only the visible window per tile, which would make
+# memory independent of image size and retire this cap.
+MAX_LEVEL_PIXELS = 150_000_000
+
 # Waterfall mode: a bottom-level group's images are stacked vertically in the
 # pixel zone (raw pixels, no reprojection) so the view can glide through them
 # like a filmstrip. Vertical gap between stacked images, in scene units.
@@ -284,13 +302,13 @@ class TiledLayer:
         """
         full_width = self._full_width or self._width
         if not self._overviews or full_width <= 0 or scene_units_per_pixel <= 0:
-            return 1
+            return self.budget_level(1)
 
         # Scene units covered by one full-resolution data pixel.
         west, _south, east, _north = self.bounds
         native_res = (east - west) / full_width
         if native_res <= 0:
-            return 1
+            return self.budget_level(1)
 
         # Pick the largest decimation factor whose level resolution is still no
         # finer than one screen pixel (overviews are sorted ascending).
@@ -300,7 +318,36 @@ class TiledLayer:
                 best = f
             else:
                 break
-        return best
+        return self.budget_level(best)
+
+    def budget_level(self, level: int) -> int:
+        """Coarsen ``level`` until the whole reprojected array fits in memory.
+
+        The zoom decides how much detail is *wanted*; this decides how much can
+        actually be held (see ``MAX_LEVEL_PIXELS``). Returns ``level`` unchanged
+        whenever it already fits, which is the case for ordinary imagery - the
+        cap only engages on the very large mosaics that would otherwise exhaust
+        memory and take the process down.
+        """
+        level = max(1, level)
+        if self.level_pixel_count(level) <= MAX_LEVEL_PIXELS:
+            return level
+
+        # Prefer a real overview factor: those are cheap to read, since GDAL
+        # serves them straight from the pyramid.
+        for factor in self._overviews:
+            if (factor > level
+                    and self.level_pixel_count(factor) <= MAX_LEVEL_PIXELS):
+                return factor
+
+        # The pyramid doesn't go coarse enough (or there isn't one). Decimating
+        # by an arbitrary factor still works - a windowed read with out_shape
+        # uses the nearest overview and reduces from there - it is just slower.
+        factor = level
+        while (factor < 1 << 20
+               and self.level_pixel_count(factor) > MAX_LEVEL_PIXELS):
+            factor *= 2
+        return factor
 
     def level_pixel_count(self, level: int) -> int:
         """Approximate RGBA pixel count of the array at the given level."""
@@ -1771,13 +1818,27 @@ class MapCanvas(QGraphicsView):
         loaded, is a no-op.
         """
         if not layer.has_overviews():
-            # No pyramids: load full resolution once, in the background.
+            # No pyramids: load full resolution once, in the background - or
+            # the coarsest decimation that fits in memory, for an image too big
+            # to hold whole (without a pyramid there is nothing cheaper to show
+            # in the meantime, so this is the only load it gets).
             if not layer.is_fully_loaded():
-                layer._target_level = 1
-                self._dispatch_level_load(layer_id, layer, 1)
+                level = layer.budget_level(1)
+                if level > 1:
+                    debug(f"memory cap: {layer.name} has no pyramids and is "
+                          f"too large for full resolution; loading at 1/{level}")
+                layer._target_level = level
+                self._dispatch_level_load(layer_id, layer, level)
             return
 
         desired = layer.select_overview_level(units_per_pixel)
+        if desired > 1 and layer.level_pixel_count(1) > MAX_LEVEL_PIXELS:
+            # Detail is capped rather than zoom-limited; say so once per change
+            # so "it stops getting sharper" has a visible reason.
+            if layer._target_level != desired:
+                debug(f"memory cap: {layer.name} limited to 1/{desired} "
+                      f"({layer.level_pixel_count(desired) / 1e6:.0f} MP of "
+                      f"{layer.level_pixel_count(1) / 1e6:.0f} MP full res)")
         layer._target_level = desired
 
         if layer.is_fully_loaded() and layer._loaded_level == desired:
