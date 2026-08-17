@@ -87,6 +87,7 @@ jobs:
             -Msi `
             -Clean `
             -NoProxy `
+            -Shortcut `
             -Version ${{ steps.version.outputs.version }} `
             -Author "RCT Scientific Processing" `
             -Url "https://github.com/${{ github.repository }}"
