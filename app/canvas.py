@@ -9,6 +9,7 @@ import rasterio
 from PyQt5 import sip
 from PyQt5.QtCore import (Qt, pyqtSignal, QRectF, QLineF, QPointF, QTimer,
                           QThread, QObject, QThreadPool, QRunnable)
+
 from PyQt5.QtGui import (
     QImage,
     QPixmap,
