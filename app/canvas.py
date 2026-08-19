@@ -1349,6 +1349,10 @@ class MapCanvas(QGraphicsView):
     # Signal emitted when a label is unlinked: (label_id)
     label_unlinked = pyqtSignal(int)
 
+    # A label's description should be edited: (label_id). The text itself is
+    # not carried - main_window owns the project and prompts for it.
+    label_describe_requested = pyqtSignal(int)
+
     # Signal emitted when user wants to highlight linked labels: (label_id)
     show_linked_requested = pyqtSignal(int)
 
@@ -1422,6 +1426,10 @@ class MapCanvas(QGraphicsView):
     # sit at z = layer index. Comfortably below the label base (layer count +
     # offset), so labels and waypoints still render on top.
     _DETAIL_Z_OFFSET = 0.5
+
+    # Where the overlay group sits among the tiles. Layer z-values are layer
+    # order indices, so this only has to be past any believable image count.
+    _OVERLAY_Z = 1e9
     # Guard against a runaway request: a viewport plus its prefetch margin is a
     # few dozen tiles, so this only ever trims pathological cases.
     _MAX_DETAIL_TILES = 200
@@ -1456,6 +1464,21 @@ class MapCanvas(QGraphicsView):
         self._origin_group = QGraphicsRectItem()
         self._origin_group.setFlag(QGraphicsItem.ItemHasNoContents, True)
         self._scene.addItem(self._origin_group)
+
+        # Everything drawn *on* the imagery - labels, waypoints - lives in
+        # here rather than beside the tiles. A layer's z-value is its index in
+        # the layer order, so it climbs without limit as images are added, and
+        # anything sharing that scale has to be re-stamped above the highest
+        # one every time the order changes. Labels were; waypoints were not,
+        # so a waypoint drawn while five images were open sat at z 1011 and
+        # disappeared under the imagery once the project passed a thousand
+        # layers. Stacking overlays as a group settles it structurally: the
+        # group is one item as far as the tiles are concerned, its z is a
+        # constant no layer count can reach, and z-values inside it only have
+        # to order overlays against each other.
+        self._overlay_group = QGraphicsRectItem(self._origin_group)
+        self._overlay_group.setFlag(QGraphicsItem.ItemHasNoContents, True)
+        self._overlay_group.setZValue(self._OVERLAY_Z)
 
         # Enable pan and zoom
         self.setDragMode(QGraphicsView.ScrollHandDrag)
@@ -1543,7 +1566,6 @@ class MapCanvas(QGraphicsView):
                                       QGraphicsTextItem]] = {}
         # Z-value offset for labels (added to max layer z-value to ensure
         # labels are always on top)
-        self._label_z_offset = 1000
 
         # Layer storage
         self._layers: dict[str, TiledLayer] = {}
@@ -2465,21 +2487,18 @@ class MapCanvas(QGraphicsView):
         for i, layer_id in enumerate(self._layer_order):
             if layer_id in self._layers:
                 self._layers[layer_id].set_z_value(i)
-        # Update label z-values to ensure they remain above all layers
-        self._update_label_z_values()
 
     def _get_label_z_base(self) -> float:
-        """Get the base z-value for labels, ensuring it's always above all layers."""
-        # Labels should be above all layers (layer z-values are 0, 1, 2, ...)
-        max_layer_z = len(self._layer_order)
-        return max_layer_z + self._label_z_offset
+        """Base z-value for overlay items, as an offset within the overlays.
 
-    def _update_label_z_values(self):
-        """Update all label markers to ensure they stay above all layers."""
-        label_z = self._get_label_z_base()
-        for ellipse, text in self._label_items.values():
-            ellipse.setZValue(label_z)
-            text.setZValue(label_z + 1)
+        Overlays used to be stacked against the layers by counting them, which
+        meant re-stamping every marker whenever the count changed. They are in
+        _overlay_group now, so the only thing left to order is overlays among
+        themselves and this is a fixed base. Kept as a method because the
+        ruler and measurement lines are top-level scene items rather than
+        group members, and still need a value above the origin group's zero.
+        """
+        return 1.0
 
     def remove_layer(self, layer_id: str):
         """Remove a layer from the canvas."""
@@ -3347,8 +3366,8 @@ class MapCanvas(QGraphicsView):
 
         # Parent to the floating-origin group so scene coords stay small at
         # deep zoom (positions above are in world coords).
-        ellipse.setParentItem(self._origin_group)
-        text.setParentItem(self._origin_group)
+        ellipse.setParentItem(self._overlay_group)
+        text.setParentItem(self._overlay_group)
         return ellipse, text
 
     def set_waterfall_projections(self, label_infos: list):
@@ -3528,6 +3547,8 @@ class MapCanvas(QGraphicsView):
 
             menu.addSeparator()
 
+            describe_action = menu.addAction("Description...")
+
             # Toggle layer visibility option
             toggle_layer_action = menu.addAction("Toggle Image Visibility")
 
@@ -3546,6 +3567,8 @@ class MapCanvas(QGraphicsView):
                 # Clearing is routed through the same signal; main_window
                 # resets length_m/width_m and calls set_label_measured(False).
                 self.label_measured.emit(label_id, None, None)
+            elif action == describe_action:
+                self.label_describe_requested.emit(label_id)
             elif action == unlink_action:
                 self.label_unlinked.emit(label_id)
             elif action == show_linked_action:
@@ -4130,7 +4153,7 @@ class MapCanvas(QGraphicsView):
         the view transform, so it stays the same size on screen at any zoom and
         upright when the view is rotated.
         """
-        marker = QGraphicsPathItem(self._crosshair_path(), self._origin_group)
+        marker = QGraphicsPathItem(self._crosshair_path(), self._overlay_group)
         pen = QPen(color, 2)
         pen.setCosmetic(True)
         marker.setPen(pen)
@@ -4168,7 +4191,7 @@ class MapCanvas(QGraphicsView):
         # Constant on-screen size and upright, like the label text.
         text.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
         text.setZValue(z)
-        text.setParentItem(self._origin_group)
+        text.setParentItem(self._overlay_group)
         text.setPos(easting, -northing)
         # Nudge clear of the crosshair arms (screen pixels, transform-ignored).
         text.setTransform(QTransform.fromTranslate(10.0, -22.0), True)
@@ -4256,6 +4279,20 @@ class MapCanvas(QGraphicsView):
             text.setPlainText(f"{base} ({length_s}×{width_s} m)")
         else:
             text.setPlainText(base)
+
+    def set_label_description(self, label_id: int, description: str):
+        """Show a label's description as the marker's tooltip.
+
+        A tooltip rather than more text on the map: descriptions are sentences,
+        and drawing them beside every marker would bury the imagery they are
+        describing. Hovering is also how a user asks "which one is this?",
+        which is the question a description answers.
+        """
+        if label_id not in self._label_items:
+            return
+        ellipse, text = self._label_items[label_id]
+        for item in (ellipse, text):
+            item.setToolTip(description or "")
 
     def highlight_labels(self, label_ids: list[int], highlight: bool = True):
         """Highlight or unhighlight a set of label markers."""
