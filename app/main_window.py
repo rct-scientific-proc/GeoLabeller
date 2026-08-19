@@ -345,6 +345,7 @@ class MainWindow(QMainWindow):
         self.canvas.label_removed.connect(self._on_label_removed)
         self.canvas.labels_linked.connect(self._on_labels_linked)
         self.canvas.label_unlinked.connect(self._on_label_unlinked)
+        self.canvas.label_describe_requested.connect(self._describe_label)
         self.canvas.show_linked_requested.connect(self._on_show_linked)
         self.canvas.link_mode_changed.connect(self._on_link_mode_changed)
         self.canvas.label_measured.connect(self._on_label_measured)
@@ -1169,6 +1170,31 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar.showMessage("Failed to link labels", 3000)
 
+    def _describe_label(self, label_id: int):
+        """Prompt for the free-text description of one label.
+
+        Multi-line, because a description is a note rather than a name. The
+        text is stored on this label only: linked labels are the same object
+        seen in different images, and what is worth describing is usually what
+        differs between those views. This is why it is not applied across the
+        object group the way "Wire meas. to linked objects" applies
+        measurements - see _on_label_measured.
+        """
+        _, label = self.project.get_label_by_id(label_id)
+        if label is None:
+            return
+        text, accepted = QInputDialog.getMultiLineText(
+            self, "Label Description",
+            f"Describe this {label.class_name}:", label.description)
+        if not accepted:
+            return
+        label.description = text.strip()
+        self.canvas.set_label_description(label_id, label.description)
+        self.layer_panel.refresh_labeled_panel(self.project)
+        self.statusBar.showMessage(
+            "Description saved" if label.description else "Description cleared",
+            3000)
+
     def _on_label_unlinked(self, label_id: int):
         """Handle a label being unlinked from its object group."""
         # First get the labels that were linked before unlinking
@@ -1420,6 +1446,11 @@ class MainWindow(QMainWindow):
             if label.length_m is not None or label.width_m is not None:
                 self.canvas.set_label_measured(
                     label.id, True, label.length_m, label.width_m)
+
+            # ...and the description tooltip, which is otherwise lost every
+            # time the markers are rebuilt (project load, mode change).
+            if label.description:
+                self.canvas.set_label_description(label.id, label.description)
 
         # Refresh labeled images panel
         self.layer_panel.refresh_labeled_panel(self.project)

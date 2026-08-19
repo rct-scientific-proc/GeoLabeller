@@ -70,6 +70,15 @@ class PointLabel:
     length_m: Optional[float] = None
     width_m: Optional[float] = None
 
+    # Free text describing this particular labelled object.
+    #
+    # Deliberately per-label, not per-object: linking labels makes them the
+    # same object seen in different images, and what is worth writing down is
+    # usually what differs between those views. Nothing copies this across an
+    # object group - see MainWindow._on_label_measured, which does copy the
+    # measurements when the user asks it to.
+    description: str = ""
+
     def to_dict(self, image_width: int = 0, image_height: int = 0) -> dict:
         """Convert to dictionary for serialization.
 
@@ -100,6 +109,10 @@ class PointLabel:
             d["length_m"] = self.length_m
         if self.width_m is not None:
             d["width_m"] = self.width_m
+        # Written only when set, so projects without descriptions are
+        # unchanged and older readers see exactly what they saw before.
+        if self.description:
+            d["description"] = self.description
         return d
 
     @classmethod
@@ -136,7 +149,8 @@ class PointLabel:
             unique_id=data.get("unique_id") or str(uuid.uuid4()),
             object_id=data.get("object_id") or str(uuid.uuid4()),
             length_m=data.get("length_m"),
-            width_m=data.get("width_m")
+            width_m=data.get("width_m"),
+            description=data.get("description", "")
         )
 
 
@@ -746,7 +760,7 @@ class LabelProject:
     def save(self, file_path: str | Path):
         """Save project to JSON file."""
         data = {
-            "version": "3.3",
+            "version": "3.4",
             "classes": self.classes,
             "images": [img.to_dict() for img in self.images.values()],
             "waypoints": [wp.to_dict() for wp in self.waypoints],
