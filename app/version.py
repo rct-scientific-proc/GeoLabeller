@@ -9,17 +9,16 @@ A frozen build has no repository around it, so cx_Freeze copies VERSION next to
 the executable (see include_files in build/setup.py) and this looks beside
 sys.executable instead.
 """
-import sys
 from functools import lru_cache
 from pathlib import Path
+
+from .resources import install_root
 
 APP_NAME = "GeoLabeller"
 
 
 def _version_file() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent / "VERSION"
-    return Path(__file__).resolve().parent.parent / "VERSION"
+    return install_root() / "VERSION"
 
 
 @lru_cache(maxsize=1)

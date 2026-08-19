@@ -91,6 +91,22 @@ shows the wording that does not name a version.
 The licence page shows `LICENSE` from the repository root, converted to RTF at
 build time. Without it WiX shows its own placeholder, which is Lorem ipsum.
 
+#### What lands in the install directory
+
+Beside `GeoLabeller.exe`, cx_Freeze copies:
+
+- `proj_data/` and `gdal_data/` — PROJ and GDAL support files, so coordinate
+  transforms work without a system GDAL install.
+- `VERSION` — read by `app/version.py` for the window title.
+- `GeoLabeller-ICD.pdf` — the built document from `docs/`, opened by
+  **Help ▸ ICD**. `include_files` flattens it into the install root rather
+  than a `docs/` subfolder, which is why `app/resources.py` looks for it
+  beside the executable.
+
+Each is copied only when present, so a build never fails over a missing one -
+the application degrades instead (no version in the title, Help ▸ ICD reports
+where it looked).
+
 > Because it installs per-user, each Windows user who wants GeoLabeller runs the
 > MSI themselves; it is not installed once for the whole machine. To deploy it
 > machine-wide instead (into Program Files, for all users), an administrator can

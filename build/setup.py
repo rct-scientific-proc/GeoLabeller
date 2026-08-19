@@ -52,9 +52,17 @@ if gdal_data_dir.exists():
 # app/version.py reads this to put the version in the window title, and a
 # frozen build has no repository to read it from. Without it the application
 # still runs, but calls itself plain "GeoLabeller".
-_version_file = Path(__file__).resolve().parent.parent / "VERSION"
+_repo_root = Path(__file__).resolve().parent.parent
+_version_file = _repo_root / "VERSION"
 if _version_file.exists():
     include_files.append((str(_version_file), "VERSION"))
+
+# Ships the Interface Control Document so Help > ICD has something to open.
+# app/resources.py looks for it beside the executable, which is where
+# include_files puts it - the docs/ directory itself is not copied.
+_icd_file = _repo_root / "docs" / "GeoLabeller-ICD.pdf"
+if _icd_file.exists():
+    include_files.append((str(_icd_file), "GeoLabeller-ICD.pdf"))
 
 # Dependencies to include
 build_exe_options = {

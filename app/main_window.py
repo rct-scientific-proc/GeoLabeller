@@ -11,8 +11,9 @@ from pathlib import Path
 
 import rasterio
 from pyproj import Transformer
-from PyQt5.QtCore import Qt, Qt as QtCore_Qt, QTimer, QEvent, QThread, QObject, pyqtSignal
-from PyQt5.QtGui import QColor, QKeyEvent
+from PyQt5.QtCore import (Qt, Qt as QtCore_Qt, QTimer, QEvent, QThread,
+                          QObject, QUrl, pyqtSignal)
+from PyQt5.QtGui import QColor, QDesktopServices, QKeyEvent
 from PyQt5.QtWidgets import (
     QMainWindow,
     QSplitter,
@@ -43,6 +44,7 @@ from .h5_export import (H5ExportDialog, H5ExportWorker, HARD_NEGATIVE,
                         centered_window)
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
+from .resources import icd_path
 from .version import app_title
 
 
@@ -532,6 +534,13 @@ class MainWindow(QMainWindow):
         shortcuts_action.setShortcut("F1")
         shortcuts_action.triggered.connect(self._show_shortcuts)
         help_menu.addAction(shortcuts_action)
+
+        # Interface Control Document (ships next to the executable)
+        icd_action = QAction("&ICD", self)
+        icd_action.setStatusTip(
+            "Open the Interface Control Document (PDF)")
+        icd_action.triggered.connect(self._show_icd)
+        help_menu.addAction(icd_action)
 
         # About
         about_action = QAction("&About", self)
@@ -3133,6 +3142,32 @@ class MainWindow(QMainWindow):
     def _show_shortcuts(self):
         """Show the keyboard shortcut reference."""
         ShortcutsDialog(self).exec_()
+
+    def _show_icd(self):
+        """Open the Interface Control Document in the system PDF viewer.
+
+        The document ships beside the executable, so an installed copy has it
+        without needing the repository or a network connection. Handing it to
+        the OS rather than rendering it here means the user gets whatever
+        reader they already use, with their own search and bookmarks.
+        """
+        path = icd_path()
+        if not path.exists():
+            QMessageBox.information(
+                self, "Interface Control Document",
+                "The ICD was not found at:\n\n"
+                f"{path}\n\n"
+                "It ships with the installed application; a copy is also in "
+                "the project's docs folder.")
+            return
+
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            # No handler registered for PDFs, or the shell refused it. Say
+            # where the file is so it can be opened by hand.
+            QMessageBox.warning(
+                self, "Interface Control Document",
+                "Could not open the PDF viewer. The document is at:\n\n"
+                f"{path}")
 
     def _show_about(self):
         """Show about dialog."""
