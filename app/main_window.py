@@ -1724,12 +1724,7 @@ class MainWindow(QMainWindow):
             # Build the serializable snapshot on the UI thread for consistency
             # with the project state. This is pure-Python and does not perform
             # any I/O.
-            snapshot = {
-                "version": "3.2",
-                "classes": list(self.project.classes),
-                "images": [img.to_dict() for img in self.project.images.values()],
-                "_next_id": self.project._next_id,
-            }
+            snapshot = self.project.to_dict()
             recovery_path = RECOVERY_FILE
             crash_marker_path = CRASH_MARKER_FILE
 

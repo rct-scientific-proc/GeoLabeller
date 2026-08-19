@@ -757,18 +757,35 @@ class LabelProject:
         """Number of waypoints in the project."""
         return len(self.waypoints)
 
-    def save(self, file_path: str | Path):
-        """Save project to JSON file."""
-        data = {
+    def to_dict(self) -> dict:
+        """The whole project as plain data, ready for json.dump.
+
+        Both save() and the crash-recovery snapshot serialise through this.
+        They used to build the dictionary separately, and when waypoints were
+        added only save() learned about them - so a crash quietly lost every
+        waypoint in the project while restoring the labels. One serialiser
+        means a new field cannot reach one path and miss the other.
+
+        Pure Python and no I/O, so the caller can build this on the UI thread
+        and hand it to a background writer.
+        """
+        return {
             "version": "3.4",
-            "classes": self.classes,
+            # Copied, not referenced: the recovery snapshot is handed to a
+            # background writer and the user carries on editing meanwhile.
+            # The image and waypoint entries are freshly built dictionaries,
+            # so they are already detached from the project.
+            "classes": list(self.classes),
             "images": [img.to_dict() for img in self.images.values()],
             "waypoints": [wp.to_dict() for wp in self.waypoints],
             "_next_id": self._next_id,
             "_next_waypoint_id": self._next_waypoint_id
         }
+
+    def save(self, file_path: str | Path):
+        """Save project to JSON file."""
         with open(file_path, 'w') as f:
-            json.dump(data, f, indent=2)
+            json.dump(self.to_dict(), f, indent=2)
 
     @classmethod
     def load(cls, file_path: str | Path) -> "LabelProject":
