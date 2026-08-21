@@ -1752,8 +1752,11 @@ class MapCanvas(QGraphicsView):
 
         # Images held in memory while off screen, so stepping onto them is
         # instant (see warm_layers). Insertion order is least-recently-wanted
-        # first, which is the order they are released in.
-        self._warmed: dict[str, None] = {}
+        # first, which is the order they are released in. Values record how
+        # an entry got here: "cycle" (prefetched neighbours, released when
+        # the cycle ends) or "hidden" (kept on being hidden, released only by
+        # the budget or Free Group).
+        self._warmed: dict[str, str] = {}
 
         # Background-load tracking for the loading spinner. `_active_loads`
         # counts in-flight overview loads; the throbber shows while > 0.
@@ -2522,7 +2525,7 @@ class MapCanvas(QGraphicsView):
                 debug(f"prefetch: {layer.name} too large to hold ahead")
                 continue
             self._warmed.pop(layer_id, None)
-            self._warmed[layer_id] = None          # most recently wanted, last
+            self._warmed[layer_id] = "cycle"       # most recently wanted, last
             self._apply_layer_lod(layer_id, layer, units_per_pixel)
         self._trim_warmed(set(layer_ids))
 
@@ -2535,7 +2538,13 @@ class MapCanvas(QGraphicsView):
                 # Gone, or switched on since - either way not ours any more.
                 del self._warmed[layer_id]
                 continue
-            held += layer.level_pixel_count(layer._target_level or 1)
+            # Charge the level actually in memory. Hiding a layer whose
+            # refine was cancelled mid-flight leaves _loaded_level data behind
+            # while _target_level points at the refine - budgeting the target
+            # under-counted a level-1 array by up to the level factor squared.
+            resident = (layer._loaded_level if layer.is_fully_loaded()
+                        else layer._target_level)
+            held += layer.level_pixel_count(resident or 1)
             if held <= WARM_MAX_PIXELS or layer_id in protect:
                 continue
             self._cancel_layer_load(layer)
@@ -2543,13 +2552,20 @@ class MapCanvas(QGraphicsView):
             del self._warmed[layer_id]
 
     def clear_warmed_layers(self):
-        """Release everything held by warm_layers (on leaving a cycle mode)."""
+        """Release what warm_layers holds (on leaving a cycle mode).
+
+        Only cycle-warmed entries: layers that joined the pool by being
+        hidden are not the cycle's to free - reaching for the ruler mid-
+        session must not dump every hidden image's pixels.
+        """
         for layer_id in list(self._warmed):
+            if self._warmed.get(layer_id) != "cycle":
+                continue
             layer = self._layers.get(layer_id)
             if layer is not None and not layer.visible:
                 self._cancel_layer_load(layer)
                 layer.free_data(self._scene)
-        self._warmed.clear()
+            del self._warmed[layer_id]
 
     def free_layer_data(self, layer_id: str):
         """Release a layer's pixel data, cancelling any in-flight load first.
@@ -2565,6 +2581,10 @@ class MapCanvas(QGraphicsView):
         self._cancel_layer_load(layer)
         self._clear_detail_tiles(layer_id, layer)
         layer.free_data(self._scene)
+        # A freed layer holds nothing; leaving it enrolled charged phantom
+        # pixels against the warm budget and evicted images that were
+        # genuinely held.
+        self._warmed.pop(layer_id, None)
 
     def _dispatch_level_load(self, layer_id: str, layer: TiledLayer, level: int):
         """Start a background load of *layer* at *level*.
@@ -2749,7 +2769,7 @@ class MapCanvas(QGraphicsView):
                 # does not. (Free Group remains the explicit release.)
                 if layer.is_fully_loaded():
                     self._warmed.pop(layer_id, None)
-                    self._warmed[layer_id] = None    # most recent last
+                    self._warmed[layer_id] = "hidden"    # most recent last
                     self._trim_warmed(set())
             # For non-geo layers, toggle associated label markers
             if not layer.geo:

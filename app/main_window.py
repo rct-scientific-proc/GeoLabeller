@@ -3104,9 +3104,12 @@ class MainWindow(QMainWindow):
             return
         if layer._loading_level is not None:
             # The canvas is mid-load for this layer (the user zoomed or made
-            # it visible while the preload ran); that load supersedes this
-            # result, and applying both would clobber tracking under it.
-            return
+            # it visible while the preload ran). Cancel it rather than throw
+            # this result away: the in-flight load can die without delivering
+            # (culled, hidden, trimmed), which left the layer with nothing at
+            # all despite the preload dialog reporting it loaded. The
+            # scheduler below re-chases the zoom's own level if it differs.
+            self.canvas._cancel_layer_load(layer)
         layer.apply_level_result(result)
         # Tiles rendered from the previous array are stale the moment the new
         # one lands; rebuild visible layers now rather than leaving mixed
@@ -3114,6 +3117,7 @@ class MainWindow(QMainWindow):
         if layer.visible:
             self.canvas._clear_layer_tiles(layer)
             self.canvas._rebuild_layer_tiles(layer)
+        self.canvas._schedule_tile_update()
 
     def _on_preload_finished(self):
         """Complete the dialog and stop the worker thread (main thread)."""
