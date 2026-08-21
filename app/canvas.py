@@ -164,13 +164,19 @@ class TiledLayer:
     """
 
     def __init__(self, file_path: str, lazy: bool = False,
-                 geo: bool = True):
+                 geo: bool = True, metadata: dict | None = None):
         """Initialize a tiled layer.
 
         Args:
             file_path: Path to the GeoTIFF file
             lazy: If True, only load bounds initially, defer full data loading
             geo: If True (default), reproject to Web Mercator. If False, use raw pixel coordinates.
+            metadata: Prefetched header data (an AsyncFileLoader layer_data
+                dict). When given with lazy=True the constructor does not
+                touch the file at all - the directory import already opened
+                every file off-thread and computed exactly these values, and
+                re-opening each one here ran on the UI thread, stuttering the
+                window for the whole import on network shares.
         """
         self.file_path = file_path
         self.name = Path(file_path).stem  # File name without extension
@@ -240,6 +246,8 @@ class TiledLayer:
         self._lazy = lazy
         self._fully_loaded = False
 
+        if lazy and self._apply_prefetched_metadata(metadata):
+            return
         if geo:
             if lazy:
                 self._load_bounds_only()
@@ -252,6 +260,44 @@ class TiledLayer:
             else:
                 self._load_pixel_data()
                 self._fully_loaded = True
+
+    def _apply_prefetched_metadata(self, metadata: dict | None) -> bool:
+        """Populate lazy-load state from an off-thread header read.
+
+        Returns False when the metadata is missing or incomplete, in which
+        case the caller falls back to opening the file - correctness first,
+        the optimisation only when everything needed is actually there.
+        """
+        if not metadata:
+            return False
+        needed = ("src_width", "src_height", "width", "height", "bounds")
+        if any(metadata.get(key) in (None, 0) for key in needed):
+            return False
+        if self.geo and metadata.get("src_crs") is None:
+            return False   # the geo path requires a CRS; let the opener raise
+
+        self._src_crs = metadata.get("src_crs")
+        self._src_transform = metadata.get("src_transform")
+        self._src_width = int(metadata["src_width"])
+        self._src_height = int(metadata["src_height"])
+        factors = list(metadata.get("overviews") or [])
+        self._overviews = factors
+        self._src_level_dims = [
+            (max(1, self._src_width // f), max(1, self._src_height // f))
+            for f in factors]
+
+        width, height = int(metadata["width"]), int(metadata["height"])
+        self._full_width = width
+        self._full_height = height
+        self._width = width
+        self._height = height
+        self._n_tiles_x = math.ceil(width / TILE_SIZE)
+        self._n_tiles_y = math.ceil(height / TILE_SIZE)
+        if self.geo:
+            self.bounds = tuple(metadata["bounds"])
+        # Non-geo bounds are assigned by the pixel-zone layout, exactly as
+        # after _load_pixel_bounds_only.
+        return True
 
     def _load_bounds_only(self):
         """Load only the bounds and metadata, not the full raster data.
@@ -1050,6 +1096,12 @@ class AsyncFileLoader(QObject):
                     src_transform = src.transform
                     src_width = src.width
                     src_height = src.height
+                    # The UI thread builds the layer from this dict without
+                    # reopening the file, so it needs the pyramid factors too.
+                    try:
+                        overviews = list(src.overviews(1))
+                    except Exception:
+                        overviews = []
 
                     if src.crs is not None:
                         dst_crs = WEB_MERCATOR
@@ -1076,6 +1128,7 @@ class AsyncFileLoader(QObject):
                     'src_transform': src_transform,
                     'src_width': src_width,
                     'src_height': src_height,
+                    'overviews': overviews,
                     'geo': geo,
                 }
                 self.file_loaded.emit(file_path, layer_data)
@@ -1710,7 +1763,8 @@ class MapCanvas(QGraphicsView):
         self._throbber.move(12, 12)
 
     def add_layer(self, file_path: str, lazy: bool = True,
-                  visible: bool = True) -> str | None:
+                  visible: bool = True,
+                  metadata: dict | None = None) -> str | None:
         """Add a GeoTIFF layer to the canvas. Returns existing layer_id if already loaded.
 
         Lazy by default: only bounds and metadata are read here, and the pixels
@@ -1732,7 +1786,7 @@ class MapCanvas(QGraphicsView):
             return self._path_to_layer[file_path]
 
         try:
-            layer = TiledLayer(file_path, lazy=lazy)
+            layer = TiledLayer(file_path, lazy=lazy, metadata=metadata)
             layer.visible = visible
 
             layer_id = f"layer_{self._next_id}"
@@ -1764,7 +1818,8 @@ class MapCanvas(QGraphicsView):
             return None
 
     def add_pixel_layer(self, file_path: str, group_path: str = "",
-                        lazy: bool = True, visible: bool = True) -> str | None:
+                        lazy: bool = True, visible: bool = True,
+                        metadata: dict | None = None) -> str | None:
         """Add a non-georeferenced image layer to the pixel zone.
 
         Lazy by default for the same reason as add_layer: the pixels come in
@@ -1783,7 +1838,8 @@ class MapCanvas(QGraphicsView):
             return self._path_to_layer[file_path]
 
         try:
-            layer = TiledLayer(file_path, lazy=lazy, geo=False)
+            layer = TiledLayer(file_path, lazy=lazy, geo=False,
+                               metadata=metadata)
             layer.visible = visible
             layer.group_path = group_path
 
@@ -2597,7 +2653,10 @@ class MapCanvas(QGraphicsView):
                       f"{layer._width}x{layer._height} "
                       f"(target {layer._target_level})")
                 self._clear_layer_tiles(layer)
-                self._rebuild_layer_tiles(layer)
+                # Same guard as the final branch below: a warmed neighbour
+                # loading ahead of its turn has nothing to draw yet.
+                if layer.visible:
+                    self._rebuild_layer_tiles(layer)
             if (layer.has_overviews()
                     and layer._target_level != layer._loaded_level):
                 self._dispatch_level_load(layer_id, layer, layer._target_level)
@@ -2682,6 +2741,16 @@ class MapCanvas(QGraphicsView):
                 # Hidden layers shouldn't keep loading in the background.
                 self._cancel_layer_load(layer)
                 self._clear_detail_tiles(layer_id, layer)
+                # A hidden layer's pixels used to be kept forever, outside
+                # every budget - hide fifty large images and they all stayed
+                # in memory until the window closed. It joins the warm pool
+                # instead: re-showing it stays instant while the budget
+                # allows, and the least recently hidden are released once it
+                # does not. (Free Group remains the explicit release.)
+                if layer.is_fully_loaded():
+                    self._warmed.pop(layer_id, None)
+                    self._warmed[layer_id] = None    # most recent last
+                    self._trim_warmed(set())
             # For non-geo layers, toggle associated label markers
             if not layer.geo:
                 self._set_label_visibility_for_image(layer.file_path, visible)

@@ -2874,8 +2874,12 @@ class MainWindow(QMainWindow):
                     parent_group = self._get_or_create_group_async(group_path)
 
                     # Add georeferenced layer with lazy loading
+                    # The worker already opened this file and shipped its
+                    # header; passing it along means no rasterio open runs on
+                    # the UI thread for the whole import.
                     layer_id = self.canvas.add_layer(
-                        file_path, lazy=True, visible=False)
+                        file_path, lazy=True, visible=False,
+                        metadata=layer_data)
                     if layer_id:
                         self.layer_panel.add_layer(
                             layer_id, file_path, parent_group, visible=False)
@@ -2886,7 +2890,7 @@ class MainWindow(QMainWindow):
 
                     layer_id = self.canvas.add_pixel_layer(
                         file_path, group_path=group_path, lazy=True,
-                        visible=False)
+                        visible=False, metadata=layer_data)
                     if layer_id:
                         self.layer_panel.add_nongeo_layer(
                             layer_id, file_path, parent_group, visible=False)
