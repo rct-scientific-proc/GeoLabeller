@@ -173,6 +173,9 @@ class TiledLayer:
         # whole-image tiles above. Keyed by (level, tx, ty); only populated for
         # images too large to hold whole (see MapCanvas._uses_detail_tiles).
         self.detail_tiles: dict[tuple[int, int, int], QGraphicsPixmapItem] = {}
+        # The level the canvas last asked detail tiles for; a queued tile
+        # arriving at any other level is stale and dropped.
+        self._detail_level: int | None = None
         # Destination grid per level, so tile geometry needs no file access.
         self._level_grid_cache: dict[int, tuple] = {}
         self.z_value = 0
@@ -1168,10 +1171,15 @@ def _emit_safely(signal, *args):
 
 
 class _TileLoadSignals(QObject):
-    """Signals for one background detail-tile read."""
-    # layer_id, level, tx, ty, rgba array (or None when the tile is empty)
-    finished = pyqtSignal(str, int, int, int, object)
-    failed = pyqtSignal(str, int, int, int)
+    """Signals for one background detail-tile read.
+
+    Both carry the emitting runnable, for the same reason the level-load
+    signals do: the handlers must not act on a stale event just because its
+    (layer_id, level, tx, ty) key matches a newer read's.
+    """
+    # layer_id, level, tx, ty, rgba array (or None when empty), runnable
+    finished = pyqtSignal(str, int, int, int, object, object)
+    failed = pyqtSignal(str, int, int, int, object)
 
 
 class _TileLoadRunnable(QRunnable):
@@ -1215,7 +1223,7 @@ class _TileLoadRunnable(QRunnable):
                 self._fail()
                 return
             _emit_safely(self._signals.finished, self._layer_id, self._level,
-                         self._tx, self._ty, rgba)
+                         self._tx, self._ty, rgba, self)
         except Exception as exc:  # noqa: BLE001 - reported, never fatal
             debug(f"tile read FAILED: {Path(self._file_path).name} "
                   f"level={self._level} ({self._tx},{self._ty}): "
@@ -1230,16 +1238,24 @@ class _TileLoadRunnable(QRunnable):
         """
         try:
             _emit_safely(self._signals.failed, self._layer_id, self._level,
-                         self._tx, self._ty)
+                         self._tx, self._ty, self)
         except RuntimeError:
             pass
 
 
 class _LevelLoadSignals(QObject):
-    """Signals for a background overview-level load."""
-    finished = pyqtSignal(str, int, object)  # layer_id, level, result dict
-    error = pyqtSignal(str, int, str)        # layer_id, level, message
-    cancelled = pyqtSignal(str, int)         # layer_id, level
+    """Signals for a background overview-level load.
+
+    Every signal carries the runnable that emitted it, so the UI-thread
+    handlers can tell a live load from a stale one by identity. Matching on
+    (layer_id, level) is not enough: a cancelled load's queued event can
+    arrive after a NEW load of the same level was dispatched, and would then
+    clear the new load's tracking - orphaning it - or resurrect data the
+    user just freed.
+    """
+    finished = pyqtSignal(str, int, object, object)  # +result, runnable
+    error = pyqtSignal(str, int, str, object)        # +message, runnable
+    cancelled = pyqtSignal(str, int, object)         # +runnable
 
 
 class _LevelLoadRunnable(QRunnable):
@@ -1281,7 +1297,7 @@ class _LevelLoadRunnable(QRunnable):
         except Exception as exc:  # noqa: BLE001 - reported, never fatal
             try:
                 self._safe_emit(self._signals.error, self._layer_id,
-                                self._level, str(exc))
+                                self._level, str(exc), self)
             except RuntimeError:
                 # The canvas went away mid-load, taking the signal object with
                 # it. There is nobody to notify and nothing has gone wrong.
@@ -1293,7 +1309,8 @@ class _LevelLoadRunnable(QRunnable):
         """Do the load and emit exactly one terminal signal."""
         # Bail cheaply if superseded/culled while still queued.
         if self._cancelled:
-            self._safe_emit(self._signals.cancelled, self._layer_id, self._level)
+            self._safe_emit(self._signals.cancelled, self._layer_id,
+                            self._level, self)
             return
         try:
             tmp = TiledLayer(self._file_path, lazy=True, geo=self._geo)
@@ -1315,13 +1332,15 @@ class _LevelLoadRunnable(QRunnable):
             }
         except Exception as e:  # report any load failure back to the UI thread
             self._safe_emit(
-                self._signals.error, self._layer_id, self._level, str(e))
+                self._signals.error, self._layer_id, self._level, str(e), self)
             return
         # Discard the result if the view moved on while we were reprojecting.
         if self._cancelled:
-            self._safe_emit(self._signals.cancelled, self._layer_id, self._level)
+            self._safe_emit(self._signals.cancelled, self._layer_id,
+                            self._level, self)
             return
-        self._safe_emit(self._signals.finished, self._layer_id, self._level, result)
+        self._safe_emit(self._signals.finished, self._layer_id, self._level,
+                        result, self)
 
     @staticmethod
     def _safe_emit(signal, *args):
@@ -2107,6 +2126,7 @@ class MapCanvas(QGraphicsView):
         grid = layer.detail_grid(level)
         if grid is None:
             return
+        layer._detail_level = level
         grid_transform, grid_w, grid_h = grid
 
         view = self._effective_cull_bounds()
@@ -2153,14 +2173,27 @@ class MapCanvas(QGraphicsView):
         self._tile_pool.start(runnable)
 
     def _on_detail_tile_loaded(self, layer_id: str, level: int, tx: int,
-                               ty: int, rgba):
+                               ty: int, rgba, runnable=None):
         """Place a finished detail tile above the coarse backdrop."""
-        self._pending_tiles.pop((layer_id, level, tx, ty), None)
+        key = (layer_id, level, tx, ty)
+        # Only the read this key is actually waiting on may deliver. A
+        # cancelled read can finish anyway (the cancel raced its final flag
+        # check) and its queued event must not install a tile - nor evict the
+        # entry of a newer read for the same key, which would leave that one
+        # to arrive "unexpected" and the tile to be read a third time.
+        if self._pending_tiles.get(key) is not runnable:
+            return
+        del self._pending_tiles[key]
         layer = self._layers.get(layer_id)
         if layer is None or rgba is None:
             return
         # The view may have moved on while this was reading.
         if not self._uses_detail_tiles(layer) or not layer.visible:
+            return
+        # The zoom may have moved to a different level: installing this tile
+        # would break the one-level-on-screen invariant until the next update
+        # pass happened to cull it.
+        if level != layer._detail_level:
             return
         grid = layer.detail_grid(level)
         if grid is None:
@@ -2191,12 +2224,15 @@ class MapCanvas(QGraphicsView):
         layer.detail_tiles[(level, tx, ty)] = item
 
     def _on_detail_tile_failed(self, layer_id: str, level: int, tx: int,
-                               ty: int):
+                               ty: int, runnable=None):
         """Forget a cancelled or failed tile so it can be retried later."""
-        self._pending_tiles.pop((layer_id, level, tx, ty), None)
+        key = (layer_id, level, tx, ty)
+        if self._pending_tiles.get(key) is runnable:
+            del self._pending_tiles[key]
 
     def _clear_detail_tiles(self, layer_id: str, layer: TiledLayer):
         """Remove a layer's detail tiles and cancel any still reading."""
+        layer._detail_level = None
         for item in layer.detail_tiles.values():
             self._scene.removeItem(item)
         layer.detail_tiles.clear()
@@ -2336,6 +2372,21 @@ class MapCanvas(QGraphicsView):
                 layer.free_data(self._scene)
         self._warmed.clear()
 
+    def free_layer_data(self, layer_id: str):
+        """Release a layer's pixel data, cancelling any in-flight load first.
+
+        Freeing without cancelling let a refine that was already reading
+        land seconds later and silently reallocate everything the user had
+        just released - on exactly the large-mosaic sessions the Free Group
+        action exists for.
+        """
+        layer = self._layers.get(layer_id)
+        if layer is None:
+            return
+        self._cancel_layer_load(layer)
+        self._clear_detail_tiles(layer_id, layer)
+        layer.free_data(self._scene)
+
     def _dispatch_level_load(self, layer_id: str, layer: TiledLayer, level: int):
         """Start a background load of *layer* at *level*.
 
@@ -2387,7 +2438,8 @@ class MapCanvas(QGraphicsView):
             layer._pending_runnable = None
             layer._loading_level = None
 
-    def _on_level_loaded(self, layer_id: str, level: int, result: dict):
+    def _on_level_loaded(self, layer_id: str, level: int, result: dict,
+                         runnable=None):
         """Apply a background-loaded overview level on the UI thread."""
         # Balance the in-flight counter first (one per started runnable), even
         # if the layer was removed while loading.
@@ -2398,9 +2450,15 @@ class MapCanvas(QGraphicsView):
         if layer is None:
             return  # Layer was removed while loading.
 
-        if layer._loading_level == level:
-            layer._loading_level = None
-            layer._pending_runnable = None
+        # Only the tracked runnable's result is welcome. A mismatch means the
+        # load was cancelled or superseded while this event sat in the queue -
+        # applying it anyway is how freed data came back from the dead and how
+        # a waterfall relayout got geo pixels pinned onto a stacked layer.
+        if layer._pending_runnable is not runnable:
+            debug(f"stale level result discarded: {layer.name} level={level}")
+            return
+        layer._loading_level = None
+        layer._pending_runnable = None
 
         # A newer zoom may have superseded this level; if so, chase the new one.
         if level != layer._target_level:
@@ -2431,24 +2489,29 @@ class MapCanvas(QGraphicsView):
         if layer.visible:
             self._rebuild_layer_tiles(layer)
 
-    def _on_level_load_error(self, layer_id: str, level: int, message: str):
+    def _on_level_load_error(self, layer_id: str, level: int, message: str,
+                             runnable=None):
         """Handle a failed background level load."""
         self._active_loads = max(0, self._active_loads - 1)
         self._update_throbber()
 
         layer = self._layers.get(layer_id)
-        if layer is not None and layer._loading_level == level:
+        # Identity, not (layer_id, level): a stale event matching on level
+        # would clear a newer runnable's tracking, leaving it uncancellable
+        # and spawning a duplicate load on the next LOD pass.
+        if layer is not None and layer._pending_runnable is runnable:
             layer._loading_level = None
             layer._pending_runnable = None
         debug(f"load FAILED: {layer_id} level={level}: {message}")
 
-    def _on_level_load_cancelled(self, layer_id: str, level: int):
+    def _on_level_load_cancelled(self, layer_id: str, level: int,
+                                 runnable=None):
         """Handle a cancelled background level load (superseded or culled)."""
         self._active_loads = max(0, self._active_loads - 1)
         self._update_throbber()
 
         layer = self._layers.get(layer_id)
-        if layer is not None and layer._loading_level == level:
+        if layer is not None and layer._pending_runnable is runnable:
             layer._loading_level = None
             layer._pending_runnable = None
 

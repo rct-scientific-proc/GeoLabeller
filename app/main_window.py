@@ -3030,9 +3030,11 @@ class MainWindow(QMainWindow):
                                    "No loaded layers to free in this group.")
             return
 
-        # Remove on-screen tiles on the main thread before freeing data
+        # Cancel any in-flight load and remove on-screen tiles before
+        # freeing, or a refine already reading would reallocate the data
+        # moments after the user freed it.
         for lid, layer in layers:
-            layer.free_data(self.canvas._scene)
+            self.canvas.free_layer_data(lid)
 
         QMessageBox.information(
             self, "Free Group",
@@ -3094,8 +3096,20 @@ class MainWindow(QMainWindow):
         happens on the UI thread and can never race the renderer.
         """
         layer = self.canvas.get_layer(layer_id)
-        if layer is not None:
-            layer.apply_level_result(result)
+        if layer is None:
+            return
+        if layer._loading_level is not None:
+            # The canvas is mid-load for this layer (the user zoomed or made
+            # it visible while the preload ran); that load supersedes this
+            # result, and applying both would clobber tracking under it.
+            return
+        layer.apply_level_result(result)
+        # Tiles rendered from the previous array are stale the moment the new
+        # one lands; rebuild visible layers now rather than leaving mixed
+        # generations on screen until the whole group finishes.
+        if layer.visible:
+            self.canvas._clear_layer_tiles(layer)
+            self.canvas._rebuild_layer_tiles(layer)
 
     def _on_preload_finished(self):
         """Complete the dialog and stop the worker thread (main thread)."""
