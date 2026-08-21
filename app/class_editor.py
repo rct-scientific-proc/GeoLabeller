@@ -1,8 +1,17 @@
 """Dialog for managing label classes."""
 from PyQt5.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QMessageBox,
     QPlainTextEdit, QPushButton
 )
+
+# The H5 export appends its own class of this name for the sliding-window
+# negatives. A user class with the same name duplicates the exported class
+# list: labels land under a second same-named class as gt=True while the
+# export's negative bookkeeping points at the first - two "hard_negative"
+# columns a consumer cannot tell apart. Reserved rather than worked around;
+# the way to feed confusers to the model is the image flag (right click an
+# image on the canvas).
+RESERVED_CLASS = "hard_negative"
 
 
 class ClassEditorDialog(QDialog):
@@ -42,11 +51,26 @@ class ClassEditorDialog(QDialog):
         button_layout.addWidget(cancel_btn)
 
         ok_btn = QPushButton("OK")
-        ok_btn.clicked.connect(self.accept)
+        ok_btn.clicked.connect(self._accept_if_valid)
         ok_btn.setDefault(True)
         button_layout.addWidget(ok_btn)
 
         layout.addLayout(button_layout)
+
+    def _accept_if_valid(self):
+        """Close only when no class uses the reserved export name."""
+        if RESERVED_CLASS in self.get_classes():
+            QMessageBox.warning(
+                self, "Reserved class name",
+                f"'{RESERVED_CLASS}' is reserved: the HDF5 export writes its "
+                "sliding-window negatives under that name, and a label class "
+                "with the same name would appear as a second, ambiguous "
+                "'hard_negative' in every exported dataset.\n\n"
+                "To give the model confusers, flag whole images instead: "
+                "right click an image on the canvas and choose "
+                "\"Hard negative source\".")
+            return
+        self.accept()
 
     def get_classes(self) -> list[str]:
         """Get the list of classes from the text editor."""

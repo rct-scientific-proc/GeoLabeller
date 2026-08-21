@@ -1,4 +1,4 @@
-"""Entry point for the GeoLabel application."""
+"""Entry point for the GeoLabeller application."""
 import os
 import sys
 import tempfile
@@ -97,7 +97,7 @@ def main():
         from app.main_window import MainWindow
 
         app = QApplication(sys.argv)
-        app.setApplicationName("GeoLabel")
+        app.setApplicationName("GeoLabeller")
 
         window = MainWindow()
         window.show()

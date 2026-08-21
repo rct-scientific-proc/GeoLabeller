@@ -80,6 +80,16 @@ BACKDROP_MAX_PIXELS = 4_000_000
 WARM_MAX_PIXELS = 64_000_000
 
 
+class LoadCancelled(Exception):
+    """A background load noticed its cancel flag part-way through.
+
+    The read/reproject of a large image runs for seconds; before this, a
+    superseded load could only bail before it started or after it finished,
+    so a burst of zooming kept workers busy producing arrays nobody wanted
+    while the level the user settled on waited for a free thread.
+    """
+
+
 def _as_uint8(band):
     """The band as uint8, copying only when the dtype actually differs."""
     if band.dtype == np.uint8:
@@ -341,7 +351,7 @@ class TiledLayer:
             self._n_tiles_x = math.ceil(width / TILE_SIZE)
             self._n_tiles_y = math.ceil(height / TILE_SIZE)
 
-    def ensure_loaded(self, level: int | None = None):
+    def ensure_loaded(self, level: int | None = None, cancel_check=None):
         """Ensure raster data is loaded, optionally at a specific overview level.
 
         Args:
@@ -349,13 +359,18 @@ class TiledLayer:
                 currently loaded level is kept (or full resolution on first
                 load). Reloads only when the data is missing or the requested
                 level differs from what is loaded.
+            cancel_check: Optional callable polled between the expensive
+                stages of the load; returning True raises LoadCancelled,
+                abandoning the partial work. Background runnables pass their
+                cancel flag so a superseded load frees its worker in a
+                band's time instead of running to completion.
         """
         target = self._loaded_level if level is None else max(1, level)
         if not self._fully_loaded or self._loaded_level != target:
             if self.geo:
-                self._load_and_reproject(target)
+                self._load_and_reproject(target, cancel_check=cancel_check)
             else:
-                self._load_pixel_data(target)
+                self._load_pixel_data(target, cancel_check=cancel_check)
             self._fully_loaded = True
 
     def is_fully_loaded(self) -> bool:
@@ -526,7 +541,13 @@ class TiledLayer:
             debug(f"pyramid {Path(self.file_path).name}: "
                   f"overviews={factors} level_dims={self._src_level_dims}")
 
-    def _load_and_reproject(self, level: int = 1):
+    @staticmethod
+    def _checkpoint(cancel_check):
+        """Abandon the load here if it has been cancelled meanwhile."""
+        if cancel_check is not None and cancel_check():
+            raise LoadCancelled()
+
+    def _load_and_reproject(self, level: int = 1, cancel_check=None):
         """Load GeoTIFF and reproject to Web Mercator at the given overview level.
 
         Args:
@@ -592,10 +613,12 @@ class TiledLayer:
             # Padding areas are identical for all bands after reprojection.
 
             # Band 1: reproject as float32 to detect nodata
+            self._checkpoint(cancel_check)
             src_band1 = src.read(1, out_shape=(rd_h, rd_w)).astype(np.float32)
             if src.nodata is not None:
                 src_band1[src_band1 == src.nodata] = np.nan
 
+            self._checkpoint(cancel_check)
             dst_band1 = np.full((height, width), np.nan, dtype=np.float32)
             reproject(
                 source=src_band1,
@@ -633,6 +656,7 @@ class TiledLayer:
                 bands_uint8 = [band1_uint8]
                 for i in range(2, min(src.count + 1, 4)
                                ):  # bands 2, 3 (and skip 4 if exists)
+                    self._checkpoint(cancel_check)
                     src_band = src.read(i, out_shape=(rd_h, rd_w))
                     # Handle source nodata by setting to 0 (in place - the
                     # read returned a fresh array, and np.where built a whole
@@ -715,7 +739,7 @@ class TiledLayer:
             # Use placeholder bounds at origin; will be overwritten
             self.bounds = (0, 0, width, height)
 
-    def _load_pixel_data(self, level: int = 1):
+    def _load_pixel_data(self, level: int = 1, cancel_check=None):
         """Load a non-georeferenced image directly as pixel data (no reprojection).
 
         Args:
@@ -752,10 +776,14 @@ class TiledLayer:
             if src.count >= 3:
                 # astype on an already-uint8 read is a full-frame copy for
                 # nothing; nearly all supported imagery is uint8.
+                self._checkpoint(cancel_check)
                 r = _as_uint8(src.read(1, out_shape=(height, width)))
+                self._checkpoint(cancel_check)
                 g = _as_uint8(src.read(2, out_shape=(height, width)))
+                self._checkpoint(cancel_check)
                 b = _as_uint8(src.read(3, out_shape=(height, width)))
             else:
+                self._checkpoint(cancel_check)
                 gray = _as_uint8(src.read(1, out_shape=(height, width)))
                 r = g = b = gray
 
@@ -1394,7 +1422,11 @@ class _LevelLoadRunnable(QRunnable):
             return
         try:
             tmp = TiledLayer(self._file_path, lazy=True, geo=self._geo)
-            tmp.ensure_loaded(level=self._level)
+            # The flag is polled between the load's expensive stages, so a
+            # superseded zoom frees this worker within one band's read
+            # instead of holding it for the whole reprojection.
+            tmp.ensure_loaded(level=self._level,
+                              cancel_check=lambda: self._cancelled)
             result = {
                 'rgba': tmp._rgba_data,
                 'width': tmp._width,
@@ -1410,6 +1442,10 @@ class _LevelLoadRunnable(QRunnable):
                 'src_height': tmp._src_height,
                 'level': tmp._loaded_level,
             }
+        except LoadCancelled:
+            self._safe_emit(self._signals.cancelled, self._layer_id,
+                            self._level, self)
+            return
         except Exception as e:  # report any load failure back to the UI thread
             self._safe_emit(
                 self._signals.error, self._layer_id, self._level, str(e), self)

@@ -1567,7 +1567,7 @@ class MainWindow(QMainWindow):
             self,
             "Open Project",
             "",
-            "GeoLabel Project (*.geolabel);;All Files (*)"
+            "GeoLabeller Project (*.geolabel);;All Files (*)"
         )
         if file_path:
             try:
@@ -1674,7 +1674,7 @@ class MainWindow(QMainWindow):
                 reply = QMessageBox.question(
                     self,
                     "Recover Previous Session",
-                    f"GeoLabel appears to have closed unexpectedly.\n\n"
+                    f"GeoLabeller appears to have closed unexpectedly.\n\n"
                     f"A recovery file was found from {age_minutes:.0f} minutes ago.\n\n"
                     f"Would you like to restore your previous session?",
                     QMessageBox.Yes | QMessageBox.No
@@ -1796,7 +1796,7 @@ class MainWindow(QMainWindow):
             self,
             "Save Project",
             "",
-            "GeoLabel Project (*.geolabel)"
+            "GeoLabeller Project (*.geolabel)"
         )
         if file_path:
             if not file_path.endswith('.geolabel'):
@@ -1825,7 +1825,7 @@ class MainWindow(QMainWindow):
             self,
             "Select First Project to Combine",
             "",
-            "GeoLabel Project (*.geolabel);;All Files (*)"
+            "GeoLabeller Project (*.geolabel);;All Files (*)"
         )
         if not file1:
             return
@@ -1835,7 +1835,7 @@ class MainWindow(QMainWindow):
             self,
             "Select Second Project to Combine",
             "",
-            "GeoLabel Project (*.geolabel);;All Files (*)"
+            "GeoLabeller Project (*.geolabel);;All Files (*)"
         )
         if not file2:
             return
@@ -1845,7 +1845,7 @@ class MainWindow(QMainWindow):
             self,
             "Save Combined Project As",
             "",
-            "GeoLabel Project (*.geolabel)"
+            "GeoLabeller Project (*.geolabel)"
         )
         if not output_file:
             return
@@ -2107,6 +2107,18 @@ class MainWindow(QMainWindow):
 
     def _export_h5(self):
         """Export sliding-window snippets to the HDF5 CNN dataset format."""
+        # The editor refuses this name now, but a project written before the
+        # guard (or edited by hand) can still carry it - and exporting would
+        # write two indistinguishable 'hard_negative' classes.
+        if HARD_NEGATIVE in self.project.classes:
+            QMessageBox.warning(
+                self, "HDF5 Export",
+                f"A label class is named '{HARD_NEGATIVE}', which the export "
+                "reserves for its sliding-window negatives - the dataset "
+                "would contain two classes with that name.\n\n"
+                "Rename the class (Edit Classes), or flag whole images as "
+                "hard negative sources instead.")
+            return
         infos = self.canvas.get_layer_infos()
         if not infos:
             QMessageBox.information(
@@ -3279,7 +3291,8 @@ class MainWindow(QMainWindow):
     def _show_about(self):
         """Show about dialog."""
         QMessageBox.about(
-            self, "About GeoLabel", "<h2>GeoLabel</h2>"
+            self, "About GeoLabeller",
+            f"<h2>{app_title()}</h2>"
             "<p>A geospatial image labeling tool for creating ground truth datasets.</p>"
             "<p>Load GeoTIFF images, place point labels, and export annotations "
             "for machine learning workflows.</p>"
