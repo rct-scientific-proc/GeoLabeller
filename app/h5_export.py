@@ -613,7 +613,12 @@ class H5ExportWorker(QObject):
     finished = pyqtSignal(object, str)     # (summary dict or None, error)
 
     def __init__(self, out_path, images, options):
-        """Store the output path, (path, labels) list and export options."""
+        """Store the output path, image list and export options.
+
+        ``images`` is a list of ``(path, labels, examples_only)`` tuples.
+        ``examples_only`` is per image so one run can mix labels-only images
+        with flagged hard-negative sources, which are slid in full.
+        """
         super().__init__()
         self._out_path = out_path
         self._images = images
@@ -651,7 +656,8 @@ class H5ExportWorker(QObject):
                 positive_offset=opts.get("positive_offset"))
             total_images = len(self._images)
             samples = 0
-            for i, (path, labels) in enumerate(self._images):
+            for i, (path, labels, image_examples_only) in enumerate(
+                    self._images):
                 if self._cancelled:
                     break
                 self.progress.emit(i, total_images, samples)
@@ -667,11 +673,14 @@ class H5ExportWorker(QObject):
                         negative_ratio=negative_ratio, rng=rng,
                         positive_offset=opts.get(
                             "positive_offset", DEFAULT_POSITIVE_OFFSET),
-                        examples_only=opts.get("examples_only", False))
+                        examples_only=image_examples_only)
                     samples += added
                     excluded += dropped
-                    for i, count in enumerate(negatives):
-                        negative_counts[i] += count
+                    # split_idx, not i: reusing the outer image index here
+                    # left it stuck at 2 after the first image with negatives,
+                    # so every later progress signal reported a stale index.
+                    for split_idx, count in enumerate(negatives):
+                        negative_counts[split_idx] += count
                 except Exception as e:  # noqa: BLE001 - report, keep going
                     errors.append((path, str(e)))
             added_classes = writer.added_classes
@@ -713,13 +722,17 @@ class H5ExportDialog(QDialog):
     """
 
     def __init__(self, all_count, visible_count, labelled_count=0, parent=None,
-                 defaults=None, all_labelled_count=0):
+                 defaults=None, all_labelled_count=0,
+                 hn_all_count=0, hn_visible_count=0):
         """Build the dialog. ``*_count`` size the scope radio labels."""
         super().__init__(parent)
         self._all_count = all_count
         self._visible_count = visible_count
         self._labelled_count = labelled_count
         self._all_labelled_count = all_labelled_count
+        # Loaded layers flagged as hard-negative sources (all / visible only).
+        self._hn_all_count = hn_all_count
+        self._hn_visible_count = hn_visible_count
         self._defaults = dict(defaults or {})
         self.setWindowTitle("Export HDF5 Dataset")
         self.setMinimumWidth(500)
@@ -777,6 +790,19 @@ class H5ExportDialog(QDialog):
             scope_layout.addWidget(button)
             # Examples-only scopes make the hard-negative options irrelevant.
             button.toggled.connect(self._on_scope_changed)
+
+        # Flagged hard-negative sources join a labels-only scope on request.
+        # Lives here rather than in the hard-negatives box below, because that
+        # box is greyed out exactly when this choice matters.
+        self.include_hn_check = QCheckBox()
+        self.include_hn_check.setToolTip(
+            "Images flagged as hard-negative sources (right click an image on "
+            "the canvas) are slid in full and every window written as a hard "
+            "negative (gt=False), sharing the split settings below. Only "
+            "meaningful for the labels-only scopes; the full scopes already "
+            "slide every image.")
+        self.include_hn_check.toggled.connect(self._on_scope_changed)
+        scope_layout.addWidget(self.include_hn_check)
         layout.addWidget(scope_box)
 
         # Options
@@ -917,6 +943,10 @@ class H5ExportDialog(QDialog):
         self._apply_settings(self._defaults)
         self.out_edit.setText(self._defaults.get("out_path", ""))
         self._on_out_path_changed()
+        # The default radio is checked before the toggled signals connect, so
+        # nothing has run the scope handler yet - the flagged-images checkbox
+        # needs it for its initial text and enabled state.
+        self._on_scope_changed()
 
     def _apply_settings(self, settings):
         """Set the widgets from a settings dict; missing keys are left alone."""
@@ -938,6 +968,9 @@ class H5ExportDialog(QDialog):
         if settings.get("split_negatives") is not None:
             self.split_negatives_check.setChecked(
                 bool(settings["split_negatives"]))
+        if settings.get("include_hard_negatives") is not None:
+            self.include_hn_check.setChecked(
+                bool(settings["include_hard_negatives"]))
         ratio = settings.get("negative_ratio")
         if ratio is not None and len(ratio) == 3:
             for spin, share in zip(
@@ -973,14 +1006,41 @@ class H5ExportDialog(QDialog):
         self._update_ok_enabled()
 
     def _on_scope_changed(self, _checked=False):
-        """Grey out the hard-negative options for the examples-only scopes."""
-        self._neg_box.setEnabled(not self.examples_only())
+        """Track which negative-related controls the scope leaves relevant."""
+        scope = self.scope()
+        labels_only = scope in (SCOPE_LABELLED, SCOPE_ALL_EXAMPLES,
+                                SCOPE_VISIBLE_EXAMPLES)
+        # ALL_EXAMPLES ignores visibility, so it can pull in hidden flagged
+        # images; the other labels-only scopes are visible-only.
+        count = (self._hn_all_count if scope == SCOPE_ALL_EXAMPLES
+                 else self._hn_visible_count)
+        self.include_hn_check.setText(
+            f"Also include flagged hard-negative source images ({count} flagged)")
+        self.include_hn_check.setEnabled(labels_only and count > 0)
+        # The split options apply whenever negatives will be written - always
+        # for the full scopes, and for a labels-only scope once flagged
+        # images are pulled in.
+        self._neg_box.setEnabled(self._writes_negatives())
         self._update_ok_enabled()
 
     def examples_only(self) -> bool:
         """True when the selected scope exports labelled snippets only."""
         return (self.scope_all_examples.isChecked()
                 or self.scope_visible_examples.isChecked())
+
+    def include_hard_negatives(self) -> bool:
+        """True when flagged hard-negative sources join the export."""
+        return (self.include_hn_check.isEnabled()
+                and self.include_hn_check.isChecked())
+
+    def _writes_negatives(self) -> bool:
+        """Will this export write any hard negatives at all?
+
+        Governs whether the split controls and their 100% check matter: the
+        full scopes always slide, and a labels-only scope slides the flagged
+        images once they are included.
+        """
+        return not self.examples_only() or self.include_hard_negatives()
 
     def _on_offset_toggled(self, enabled):
         """Enable the offset distance only while the copies are switched on."""
@@ -994,8 +1054,8 @@ class H5ExportDialog(QDialog):
     def _update_ok_enabled(self):
         """Export needs a path, a ratio totalling 100% and a usable offset."""
         has_path = bool(self.out_edit.text().strip())
-        # With an examples-only scope no negatives exist, so the ratio is moot.
-        ratio_ok = (self.examples_only()
+        # The ratio only matters when negatives will actually be written.
+        ratio_ok = (not self._writes_negatives()
                     or not self.split_negatives_check.isChecked()
                     or self._ratio_total() == 100)
         self._ratio_note.setText(
@@ -1079,11 +1139,12 @@ class H5ExportDialog(QDialog):
             "positive_offset": (self.offset_spin.value()
                                 if self.offset_check.isChecked() else 0),
             "compression": COMPRESSION_CHOICES[self.compress_combo.currentText()],
-            # Examples-only scopes write no hard negatives, so there is
-            # nothing to split either.
+            # Scope-level value; the worker takes a per-image one, so a
+            # labels-only run can still slide its flagged images.
             "examples_only": self.examples_only(),
+            "include_hard_negatives": self.include_hard_negatives(),
             "split_negatives": (self.split_negatives_check.isChecked()
-                                and not self.examples_only()),
+                                and self._writes_negatives()),
             "negative_ratio": tuple(
                 self.negative_ratio_spins[name].value() / 100.0
                 for name in ("Train", "Validate", "Test")),

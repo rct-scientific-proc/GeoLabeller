@@ -323,11 +323,16 @@ class MainWindow(QMainWindow):
             self.canvas.update_layer_order)
         self.layer_panel.layer_group_changed.connect(
             self._on_layer_group_changed)
+        self.layer_panel.hard_negative_unflag_requested.connect(
+            self._on_hard_negative_toggled)
         self.layer_panel.zoom_to_layer_requested.connect(
             self.canvas.zoom_to_layer)
         self.layer_panel.zoom_to_label_requested.connect(
             self._on_zoom_to_label)
         self.layer_panel.layer_removed.connect(self.canvas.remove_layer)
+        # After the canvas drops it, prune any hard-negative mirror entry.
+        self.layer_panel.layer_removed.connect(
+            lambda _lid: self._refresh_hard_negative_panel())
 
         # Connect batch visibility progress signals for group toggle
         self.layer_panel.batch_visibility_started.connect(
@@ -364,6 +369,8 @@ class MainWindow(QMainWindow):
 
         # Waypoints: raised either from the map (right-click) or the panel.
         self.canvas.waypoint_add_requested.connect(self._add_waypoint_at)
+        self.canvas.hard_negative_toggle_requested.connect(
+            self._on_hard_negative_toggled)
         self.canvas.waypoint_goto_requested.connect(self._goto_waypoint)
         self.canvas.waypoint_rename_requested.connect(self._rename_waypoint)
         self.canvas.waypoint_remove_requested.connect(self._remove_waypoint)
@@ -1549,6 +1556,7 @@ class MainWindow(QMainWindow):
         self.canvas.clear_layers()
         self.layer_panel.clear()
         self._refresh_waypoints()  # the new project has none
+        self._refresh_hard_negative_panel()
         self._update_class_combo()
         self.setWindowTitle(app_title())
         self.statusBar.showMessage("New project created", 3000)
@@ -1581,6 +1589,7 @@ class MainWindow(QMainWindow):
                     self._update_class_combo()
                     self._refresh_label_markers()
                     self._refresh_waypoints()
+                    self._refresh_hard_negative_panel()
                     self.setWindowTitle(
                         f"{app_title()} - {self._project_path.name}")
                     self.statusBar.showMessage(
@@ -1695,6 +1704,7 @@ class MainWindow(QMainWindow):
                 self._update_class_combo()
                 self._refresh_label_markers()
                 self._refresh_waypoints()
+                self._refresh_hard_negative_panel()
 
             self.setWindowTitle(f"{app_title()} - Recovered Session (unsaved)")
             self.statusBar.showMessage(
@@ -2090,6 +2100,11 @@ class MainWindow(QMainWindow):
         classes = set(self.project.classes)
         return [l for l in img.labels if l.class_name in classes]
 
+    def _h5_is_hn_source(self, path: str) -> bool:
+        """Is this image flagged as a hard-negative source?"""
+        img = self.project.images.get(path)
+        return bool(img is not None and img.hard_negative_source)
+
     def _export_h5(self):
         """Export sliding-window snippets to the HDF5 CNN dataset format."""
         infos = self.canvas.get_layer_infos()
@@ -2104,9 +2119,15 @@ class MainWindow(QMainWindow):
                              and self._h5_labels_for(i["file_path"]))
         all_labelled_count = sum(1 for i in infos
                                  if self._h5_labels_for(i["file_path"]))
+        hn_all_count = sum(1 for i in infos
+                           if self._h5_is_hn_source(i["file_path"]))
+        hn_visible_count = sum(1 for i in infos if i.get("visible")
+                               and self._h5_is_hn_source(i["file_path"]))
         dialog = H5ExportDialog(all_count, visible_count, labelled_count, self,
                                 defaults=self._h5_last_options,
-                                all_labelled_count=all_labelled_count)
+                                all_labelled_count=all_labelled_count,
+                                hn_all_count=hn_all_count,
+                                hn_visible_count=hn_visible_count)
         if not dialog.exec_():
             return
 
@@ -2118,21 +2139,28 @@ class MainWindow(QMainWindow):
                                   SCOPE_VISIBLE_EXAMPLES)
         needs_labels = scope in (SCOPE_LABELLED, SCOPE_ALL_EXAMPLES,
                                  SCOPE_VISIBLE_EXAMPLES)
+        options = dialog.options()
+        include_hn = options.get("include_hard_negatives", False)
+        # Per-image examples_only: normally the scope decides, but a flagged
+        # image being pulled in must slide, so it gets False even under an
+        # examples-only scope - its labels (if any) still export as examples,
+        # and the engine keeps negatives off the ground they cover.
         images = []
         for info in infos:
             if needs_visible and not info.get("visible"):
                 continue
             path = info["file_path"]
             labels = self._h5_labels_for(path)
-            if needs_labels and not labels:
+            flagged = include_hn and self._h5_is_hn_source(path)
+            if needs_labels and not labels and not flagged:
                 continue
-            images.append((path, labels))
+            images.append((path, labels,
+                           options["examples_only"] and not flagged))
         if not images:
             QMessageBox.information(
                 self, "HDF5 Export", "No images in the selected scope.")
             return
 
-        options = dialog.options()
         self._h5_last_options = dict(options, out_path=out_path)
         options["classes"] = list(self.project.classes) + [HARD_NEGATIVE]
         self._start_h5_worker(out_path, images, options)
@@ -2484,6 +2512,10 @@ class MainWindow(QMainWindow):
                 self.project.add_image(
                     file_path, name, "", width, height,
                     affine=affine, crs=crs)
+
+        # A re-added image whose path is flagged in the project should show
+        # up in the mirror section straight away.
+        self._refresh_hard_negative_panel()
 
         if skipped > 0:
             self.statusBar.showMessage(
@@ -2924,6 +2956,7 @@ class MainWindow(QMainWindow):
             for item in self._async_group_cache.values():
                 self._remove_empty_groups(item)
 
+        self._refresh_hard_negative_panel()
         msg = f"Loaded {self._async_loaded_count} GeoTIFF files"
         if errors > 0:
             msg += f" ({errors} errors)"
@@ -2936,6 +2969,7 @@ class MainWindow(QMainWindow):
         self._update_class_combo()
         self._refresh_label_markers()
         self._refresh_waypoints()
+        self._refresh_hard_negative_panel()
 
         # Update window title (handle recovery case where _project_path is None)
         if self._project_path:
@@ -3128,6 +3162,57 @@ class MainWindow(QMainWindow):
                 self.coord_label.setText(f"Pixel: ({x:.1f}, {y:.1f})")
             else:
                 self.coord_label.setText(f"Lon: {x:.6f}°  Lat: {y:.6f}°")
+
+    def _on_hard_negative_toggled(self, layer_id: str):
+        """Flip an image's hard-negative-source flag.
+
+        Reached from the canvas context menu and from the mirror panel's
+        "Remove hard negative flag" (its entries are always flagged, so a
+        flip there is an unflag). The project owns the flag; the canvas set
+        and the panel are both refreshed from it afterwards.
+        """
+        file_path = self.canvas.get_layer_file_path(layer_id)
+        if not file_path:
+            return
+        img = self.project.images.get(file_path)
+        if img is None:
+            # A never-labelled image has no project entry yet; create one the
+            # same way loading an image does, so the flag has somewhere to
+            # live and survives save/load.
+            name = Path(file_path).stem
+            width, height = self.canvas.get_layer_source_dimensions(layer_id)
+            affine, crs = self.canvas.get_layer_transform(layer_id)
+            img = self.project.add_image(
+                file_path, name, "", width, height, affine=affine, crs=crs)
+        img.hard_negative_source = not img.hard_negative_source
+        self._refresh_hard_negative_panel()
+        self.statusBar.showMessage(
+            f"'{img.name}' "
+            f"{'flagged as' if img.hard_negative_source else 'no longer'} "
+            f"a hard negative source", 4000)
+
+    def _refresh_hard_negative_panel(self):
+        """Rebuild the mirror section and the canvas's menu state.
+
+        Entries are the project's flagged images joined against the loaded
+        layers - a flagged image whose layer is not loaded keeps its flag in
+        the project but has nothing to show or export right now.
+        """
+        entries = []
+        for info in self.canvas.get_layer_infos():
+            path = info["file_path"]
+            img = self.project.images.get(path)
+            flagged = bool(img is not None and img.hard_negative_source)
+            self.canvas.set_hard_negative_flag(path, flagged)
+            if flagged:
+                entries.append({
+                    "layer_id": info["layer_id"],
+                    "file_path": path,
+                    "name": info.get("name") or Path(path).stem,
+                    "group": info.get("group_path", ""),
+                    "visible": bool(info.get("visible")),
+                })
+        self.layer_panel.refresh_hard_negatives(entries)
 
     def _on_layer_group_changed(self, layer_id: str, group_path: str):
         """Handle layer group change - update both canvas and project."""

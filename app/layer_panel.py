@@ -1394,6 +1394,123 @@ class WaypointPanel(QWidget):
             self.remove_requested.emit(waypoint_id)
 
 
+class HardNegativePanel(QWidget):
+    """Mirror list of the images flagged as hard-negative sources.
+
+    The layers stay in their place in the main tree; this section only
+    collects the flagged ones so the whole set can be seen (and reviewed
+    before an export) at a glance. Entries drive the same layer as the main
+    tree: the checkbox is the layer's visibility and double-click zooms to it.
+    """
+
+    zoom_requested = pyqtSignal(str)             # layer_id
+    visibility_changed = pyqtSignal(str, bool)   # layer_id, visible
+    unflag_requested = pyqtSignal(str)           # layer_id
+
+    _ID_ROLE = Qt.UserRole          # layer_id
+    _PATH_ROLE = Qt.UserRole + 1    # file path
+
+    def __init__(self):
+        """Initialize the hard-negatives panel."""
+        super().__init__()
+        self._items: dict[str, QTreeWidgetItem] = {}   # layer_id -> item
+        self._syncing = False
+        self._setup_ui()
+
+    def _setup_ui(self):
+        """Set up the panel UI."""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        header = QLabel("Hard Negatives")
+        header.setStyleSheet("font-weight: bold; padding: 4px;")
+        header.setToolTip(
+            "Images flagged (right click on the canvas) as containing "
+            "confusers but no true positives. The H5 export can include "
+            "them as hard negatives.")
+        layout.addWidget(header)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Name", "Group"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setSelectionMode(QTreeWidget.SingleSelection)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._show_context_menu)
+        self.tree.itemDoubleClicked.connect(self._on_double_clicked)
+        self.tree.itemChanged.connect(self._on_item_changed)
+        layout.addWidget(self.tree)
+
+    def refresh(self, entries: list):
+        """Rebuild the list.
+
+        ``entries`` are dicts with layer_id, file_path, name, group and
+        visible - built by main_window from the project's flags joined
+        against the loaded layers.
+        """
+        self._syncing = True
+        try:
+            self.tree.clear()
+            self._items.clear()
+            for entry in entries:
+                item = QTreeWidgetItem(
+                    [entry["name"], entry.get("group", "")])
+                item.setData(0, self._ID_ROLE, entry["layer_id"])
+                item.setData(0, self._PATH_ROLE, entry["file_path"])
+                item.setToolTip(0, entry["file_path"])
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(
+                    0, Qt.Checked if entry.get("visible") else Qt.Unchecked)
+                self.tree.addTopLevelItem(item)
+                self._items[entry["layer_id"]] = item
+            self.tree.resizeColumnToContents(0)
+        finally:
+            self._syncing = False
+
+    def set_layer_checked(self, layer_id: str, visible: bool):
+        """Sync a checkbox from elsewhere without echoing the change back."""
+        item = self._items.get(layer_id)
+        if item is None:
+            return
+        self._syncing = True
+        try:
+            item.setCheckState(0, Qt.Checked if visible else Qt.Unchecked)
+        finally:
+            self._syncing = False
+
+    def _on_item_changed(self, item, _column):
+        """A checkbox toggle here is a visibility change for the layer."""
+        if self._syncing:
+            return
+        layer_id = item.data(0, self._ID_ROLE)
+        if layer_id is not None:
+            self.visibility_changed.emit(
+                layer_id, item.checkState(0) == Qt.Checked)
+
+    def _on_double_clicked(self, item, _column):
+        """Double-click zooms the canvas to that layer."""
+        layer_id = item.data(0, self._ID_ROLE)
+        if layer_id is not None:
+            self.zoom_requested.emit(layer_id)
+
+    def _show_context_menu(self, position):
+        """Per-entry menu: zoom, or drop the flag."""
+        item = self.tree.itemAt(position)
+        if item is None:
+            return
+        layer_id = item.data(0, self._ID_ROLE)
+        if layer_id is None:
+            return
+        menu = QMenu(self)
+        zoom_action = menu.addAction("Zoom to Layer")
+        menu.addSeparator()
+        unflag_action = menu.addAction("Remove hard negative flag")
+        action = menu.exec_(self.tree.viewport().mapToGlobal(position))
+        if action == zoom_action:
+            self.zoom_requested.emit(layer_id)
+        elif action == unflag_action:
+            self.unflag_requested.emit(layer_id)
+
+
 class CombinedLayerPanel(QWidget):
     """Combined panel with both the main layer panel and labeled images panel."""
 
@@ -1404,6 +1521,9 @@ class CombinedLayerPanel(QWidget):
     zoom_to_layer_requested = pyqtSignal(str)
     zoom_to_label_requested = pyqtSignal(float, float)  # lon, lat
     layer_removed = pyqtSignal(str)
+
+    # Hard-negative mirror section
+    hard_negative_unflag_requested = pyqtSignal(str)  # layer_id
 
     # Group memory management signals
     group_preload_requested = pyqtSignal(list)  # layer_ids
@@ -1447,8 +1567,12 @@ class CombinedLayerPanel(QWidget):
         self.waypoint_panel = WaypointPanel()
         splitter.addWidget(self.waypoint_panel)
 
+        # Hard-negative sources (mirror of the flagged layers)
+        self.hard_negative_panel = HardNegativePanel()
+        splitter.addWidget(self.hard_negative_panel)
+
         # Set initial sizes (main panel takes more space)
-        splitter.setSizes([400, 200, 150])
+        splitter.setSizes([400, 200, 150, 120])
 
         layout.addWidget(splitter)
 
@@ -1494,6 +1618,16 @@ class CombinedLayerPanel(QWidget):
         self.labeled_panel.zoom_to_label_requested.connect(
             self.zoom_to_label_requested)
 
+        # Forward signals from the hard-negatives panel. Zoom rides the same
+        # signal the main tree uses, so MainWindow needs no extra wiring for
+        # it; the unflag request is its own signal.
+        self.hard_negative_panel.zoom_requested.connect(
+            self.zoom_to_layer_requested)
+        self.hard_negative_panel.unflag_requested.connect(
+            self.hard_negative_unflag_requested)
+        self.hard_negative_panel.visibility_changed.connect(
+            self._on_hard_negative_visibility_changed)
+
     def _on_main_visibility_changed(self, layer_id: str, visible: bool):
         """Handle visibility change from main panel."""
         if self._syncing:
@@ -1508,6 +1642,9 @@ class CombinedLayerPanel(QWidget):
         file_path = self._get_file_path_for_layer_id(layer_id)
         if file_path:
             self.labeled_panel.set_layer_checked(file_path, visible)
+        # The HN panel keys by layer_id directly (its images are usually
+        # unlabelled, so the labeled panel's path lookup would miss them).
+        self.hard_negative_panel.set_layer_checked(layer_id, visible)
 
         self._syncing = False
 
@@ -1529,7 +1666,21 @@ class CombinedLayerPanel(QWidget):
         file_path = self._get_file_path_for_layer_id(layer_id)
         if file_path:
             self.labeled_panel.set_layer_checked(file_path, visible)
+        self.hard_negative_panel.set_layer_checked(layer_id, visible)
 
+        self._syncing = False
+
+    def _on_hard_negative_visibility_changed(self, layer_id: str,
+                                             visible: bool):
+        """A checkbox in the hard-negatives section drives the layer."""
+        if self._syncing:
+            return
+        self._syncing = True
+        self.layer_visibility_changed.emit(layer_id, visible)
+        self.main_panel.set_layer_checked(layer_id, visible)
+        file_path = self._get_file_path_for_layer_id(layer_id)
+        if file_path:
+            self.labeled_panel.set_layer_checked(file_path, visible)
         self._syncing = False
 
     def _get_file_path_for_layer_id(self, layer_id: str) -> str | None:
@@ -1616,6 +1767,10 @@ class CombinedLayerPanel(QWidget):
     def refresh_waypoints(self, waypoints, format_coords):
         """Rebuild the waypoint list from the project."""
         self.waypoint_panel.refresh(waypoints, format_coords)
+
+    def refresh_hard_negatives(self, entries: list):
+        """Rebuild the hard-negatives list (delegates to its panel)."""
+        self.hard_negative_panel.refresh(entries)
 
     def waypoints_shown(self) -> bool:
         """Whether the "Show on map" toggle is on."""

@@ -225,6 +225,11 @@ class ImageData:
     # CRS EPSG code for the affine transform (e.g., 3857 for Web Mercator)
     crs_epsg: Optional[int] = None
 
+    # This image holds confusers but no true positives, and the user wants the
+    # model to see them: the H5 export can opt in to sliding the whole image
+    # into gt=False hard negatives even under a labels-only scope.
+    hard_negative_source: bool = False
+
     def get_affine(self) -> Optional[Affine]:
         """Get the Affine transform object, or None if not set."""
         if self.affine_coeffs is None or len(self.affine_coeffs) != 6:
@@ -401,6 +406,11 @@ class ImageData:
         if self.crs_epsg is not None:
             d["crs_epsg"] = self.crs_epsg
 
+        # Written only when set, so projects without the flag are unchanged
+        # and older readers see exactly what they saw before.
+        if self.hard_negative_source:
+            d["hard_negative_source"] = True
+
         # Include corner coordinates in WGS84 for ground truth export
         corners = self.get_corner_coords()
         if corners is not None:
@@ -452,7 +462,8 @@ class ImageData:
             original_height=height,
             reader=reader,
             affine_coeffs=data.get("affine_coeffs"),
-            crs_epsg=data.get("crs_epsg")
+            crs_epsg=data.get("crs_epsg"),
+            hard_negative_source=bool(data.get("hard_negative_source", False))
         )
 
 
@@ -566,6 +577,11 @@ class LabelProject:
         """Update the group for an image."""
         if path in self.images:
             self.images[path].group = group
+
+    def set_hard_negative_source(self, path: str, flagged: bool):
+        """Mark or unmark an image as a hard-negative source."""
+        if path in self.images:
+            self.images[path].hard_negative_source = bool(flagged)
 
     def add_label(
         self,
@@ -770,7 +786,7 @@ class LabelProject:
         and hand it to a background writer.
         """
         return {
-            "version": "3.4",
+            "version": "3.5",
             # Copied, not referenced: the recovery snapshot is handed to a
             # background writer and the user carries on editing meanwhile.
             # The image and waypoint entries are freshly built dictionaries,

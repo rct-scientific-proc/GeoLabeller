@@ -1360,6 +1360,11 @@ class MapCanvas(QGraphicsView):
     # (which owns the project). Add carries a WGS84 (lon, lat); the rest carry
     # a waypoint id.
     waypoint_add_requested = pyqtSignal(float, float)
+
+    # The image under the cursor should flip its hard-negative-source flag:
+    # (layer_id). The canvas only shows the toggle; the project owns the flag,
+    # so main_window flips it and syncs the checked state back down.
+    hard_negative_toggle_requested = pyqtSignal(str)
     waypoint_goto_requested = pyqtSignal(int)
     waypoint_rename_requested = pyqtSignal(int)
     waypoint_remove_requested = pyqtSignal(int)
@@ -1578,6 +1583,11 @@ class MapCanvas(QGraphicsView):
         # Tracks column positions for non-georeferenced image groups
         self._pixel_zone_groups: dict[str, tuple[float, float]] = {}
         self._pixel_zone_next_x = PIXEL_ZONE_ORIGIN_X
+
+        # File paths of images flagged as hard-negative sources. Owned by the
+        # project; main_window mirrors it here so the context menu can show
+        # the toggle's current state without a round trip.
+        self._hard_negative_paths: set[str] = set()
 
         # Waterfall mode state: while active, a group's layers are re-laid-out
         # stacked vertically in the pixel zone. Original bounds are saved so the
@@ -2525,6 +2535,7 @@ class MapCanvas(QGraphicsView):
         self._path_to_layer.clear()
         self._pixel_zone_groups.clear()
         self._pixel_zone_next_x = PIXEL_ZONE_ORIGIN_X
+        self._hard_negative_paths.clear()
 
     def set_layer_group(self, layer_id: str, group_path: str):
         """Set the group path for a layer."""
@@ -3264,6 +3275,27 @@ class MapCanvas(QGraphicsView):
             return None, f"~{closest.name}", closest.group_path
         return None, "", ""
 
+    def set_hard_negative_flag(self, file_path: str, flagged: bool):
+        """Mirror an image's hard-negative-source flag for the context menu."""
+        if flagged:
+            self._hard_negative_paths.add(file_path)
+        else:
+            self._hard_negative_paths.discard(file_path)
+
+    def _layer_id_at(self, easting: float, northing: float) -> str | None:
+        """The topmost visible layer under a position, or None.
+
+        Unlike _get_layer_and_info_at_position this never falls back to the
+        nearest layer: a context-menu toggle must apply to the image actually
+        under the cursor, not to whichever happens to be closest.
+        """
+        for layer_id in reversed(self._layer_order):
+            layer = self._layers.get(layer_id)
+            if (layer is not None and layer.visible
+                    and layer.contains_point(easting, northing)):
+                return layer_id
+        return None
+
     def _get_layer_and_info_at_position(
             self, easting: float, northing: float) -> tuple:
         """Get the layer object and its info at the given position.
@@ -3514,8 +3546,16 @@ class MapCanvas(QGraphicsView):
         return None, None
 
     def _show_label_context_menu(self, view_pos):
-        """Show context menu for label under cursor."""
+        """Show context menu for label under cursor.
+
+        With no label under the cursor this falls through to the general
+        menu, so the waypoint and hard-negative actions are reachable in the
+        labelling modes too - a right click that used to do nothing.
+        """
         label_id, image_path = self._get_label_at_position(view_pos)
+        if label_id is None:
+            self._show_pan_context_menu(view_pos)
+            return
 
         if label_id is not None:
             menu = QMenu(self)
@@ -3624,11 +3664,26 @@ class MapCanvas(QGraphicsView):
         show_in_view_action = menu.addAction("Select layers in view")
         hide_outside_action = menu.addAction("Unselect layers outside view")
 
+        # Right-clicking an image offers its hard-negative-source flag: "this
+        # image holds confusers but no true positives". The H5 export can then
+        # slide flagged images into gt=False negatives on request.
+        hn_action = None
+        hn_layer_id = self._layer_id_at(easting, northing)
+        if hn_layer_id is not None:
+            layer = self._layers[hn_layer_id]
+            menu.addSeparator()
+            hn_action = menu.addAction(
+                f"Hard negative source  ({layer.name})")
+            hn_action.setCheckable(True)
+            hn_action.setChecked(layer.file_path in self._hard_negative_paths)
+
         action = menu.exec_(self.mapToGlobal(view_pos))
 
         if action == add_waypoint_action and not in_pixel_zone:
             lon, lat = self._web_mercator_to_wgs84(easting, northing)
             self.waypoint_add_requested.emit(lon, lat)
+        elif hn_action is not None and action == hn_action:
+            self.hard_negative_toggle_requested.emit(hn_layer_id)
         elif action == show_in_view_action:
             self._show_layers_in_view()
         elif action == hide_outside_action:
