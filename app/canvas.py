@@ -1488,6 +1488,10 @@ class MapCanvas(QGraphicsView):
     # not carried - main_window owns the project and prompts for it.
     label_describe_requested = pyqtSignal(int)
 
+    # The shared group name of a label's linked group should be edited:
+    # (label_id). Same ownership split as the description.
+    label_group_id_requested = pyqtSignal(int)
+
     # Signal emitted when user wants to highlight linked labels: (label_id)
     show_linked_requested = pyqtSignal(int)
 
@@ -3914,6 +3918,7 @@ class MapCanvas(QGraphicsView):
             menu.addSeparator()
 
             describe_action = menu.addAction("Description...")
+            group_id_action = menu.addAction("Group ID...")
 
             # Toggle layer visibility option
             toggle_layer_action = menu.addAction("Toggle Image Visibility")
@@ -3935,6 +3940,8 @@ class MapCanvas(QGraphicsView):
                 self.label_measured.emit(label_id, None, None)
             elif action == describe_action:
                 self.label_describe_requested.emit(label_id)
+            elif action == group_id_action:
+                self.label_group_id_requested.emit(label_id)
             elif action == unlink_action:
                 self.label_unlinked.emit(label_id)
             elif action == show_linked_action:
@@ -4662,7 +4669,7 @@ class MapCanvas(QGraphicsView):
             text.setPlainText(base)
 
     def set_label_description(self, label_id: int, description: str):
-        """Show a label's description as the marker's tooltip.
+        """Record a label's description and refresh the marker's tooltip.
 
         A tooltip rather than more text on the map: descriptions are sentences,
         and drawing them beside every marker would bury the imagery they are
@@ -4671,9 +4678,29 @@ class MapCanvas(QGraphicsView):
         """
         if label_id not in self._label_items:
             return
+        ellipse, _text = self._label_items[label_id]
+        ellipse.setData(5, description or "")
+        self._refresh_label_tooltip(label_id)
+
+    def set_label_group_id(self, label_id: int, group_id: str):
+        """Record a label's shared group name and refresh the tooltip."""
+        if label_id not in self._label_items:
+            return
+        ellipse, _text = self._label_items[label_id]
+        ellipse.setData(6, group_id or "")
+        self._refresh_label_tooltip(label_id)
+
+    def _refresh_label_tooltip(self, label_id: int):
+        """Tooltip = group name line (if any) plus the description."""
         ellipse, text = self._label_items[label_id]
+        parts = []
+        if ellipse.data(6):
+            parts.append(f"Group: {ellipse.data(6)}")
+        if ellipse.data(5):
+            parts.append(ellipse.data(5))
+        tooltip = "\n".join(parts)
         for item in (ellipse, text):
-            item.setToolTip(description or "")
+            item.setToolTip(tooltip)
 
     def highlight_labels(self, label_ids: list[int], highlight: bool = True):
         """Highlight or unhighlight a set of label markers."""

@@ -79,6 +79,13 @@ class PointLabel:
     # measurements when the user asks it to.
     description: str = ""
 
+    # Human-readable name for the linked-object group - the readable
+    # companion to object_id's UUID. The exact opposite contract to
+    # description: this MUST always be identical across every label sharing
+    # an object_id. Only LabelProject.set_group_id may change it (it applies
+    # the change to the whole group), and link/unlink keep it consistent.
+    group_id: str = ""
+
     def to_dict(self, image_width: int = 0, image_height: int = 0) -> dict:
         """Convert to dictionary for serialization.
 
@@ -113,6 +120,8 @@ class PointLabel:
         # unchanged and older readers see exactly what they saw before.
         if self.description:
             d["description"] = self.description
+        if self.group_id:
+            d["group_id"] = self.group_id
         return d
 
     @classmethod
@@ -150,7 +159,8 @@ class PointLabel:
             object_id=data.get("object_id") or str(uuid.uuid4()),
             length_m=data.get("length_m"),
             width_m=data.get("width_m"),
-            description=data.get("description", "")
+            description=data.get("description", ""),
+            group_id=data.get("group_id", "")
         )
 
 
@@ -702,14 +712,49 @@ class LabelProject:
             self._index_object_id(label1)
             self._index_object_id(label2)
 
+        # group_id is shared by contract. The first label's name wins a
+        # conflict (mirroring how its object_id wins above); a group with no
+        # name adopts whatever the other side brings.
+        merged_group_id = label1.group_id or label2.group_id
+        if merged_group_id:
+            self._apply_group_id(object_id, merged_group_id)
+
         return object_id
 
+    def _apply_group_id(self, object_id: str, group_id: str):
+        """Stamp one group_id onto every label sharing *object_id*."""
+        for lid in self._object_id_index.get(object_id, set()):
+            _, label = self.get_label_by_id(lid)
+            if label is not None:
+                label.group_id = group_id
+
+    def set_group_id(self, label_id: int, group_id: str) -> list[int]:
+        """Set the shared group name on a label's whole linked group.
+
+        This is the ONLY way group_id should change: the contract is that
+        every label sharing an object_id always carries the same group_id,
+        so the update is applied to all of them in one move. Returns the ids
+        of every label changed (just the one, for an unlinked label).
+        """
+        _, label = self.get_label_by_id(label_id)
+        if label is None:
+            return []
+        group_id = group_id.strip()
+        self._apply_group_id(label.object_id, group_id)
+        return sorted(self._object_id_index.get(label.object_id, {label_id}))
+
     def unlink_label(self, label_id: int):
-        """Remove a label from its object group by giving it a new unique UUID."""
+        """Remove a label from its object group by giving it a new unique UUID.
+
+        The departing label also loses the group's shared name - group_id
+        describes the linked group it is no longer part of. The labels that
+        stay keep theirs.
+        """
         _, label = self.get_label_by_id(label_id)
         if label:
             self._unindex_object_id(label)
             label.object_id = str(uuid.uuid4())
+            label.group_id = ""
             self._index_object_id(label)
 
     def get_linked_labels(
@@ -802,7 +847,7 @@ class LabelProject:
         and hand it to a background writer.
         """
         return {
-            "version": "3.5",
+            "version": "3.6",
             # Copied, not referenced: the recovery snapshot is handed to a
             # background writer and the user carries on editing meanwhile.
             # The image and waypoint entries are freshly built dictionaries,
@@ -881,6 +926,23 @@ class LabelProject:
 
         # Rebuild the object_id index after loading
         project._rebuild_index()
+        # The shared-group_id contract holds for files this application
+        # wrote, but a hand-edited or merged file can arrive with a group
+        # disagreeing with itself. Repair on load - first non-empty name in
+        # the group wins - so every consumer downstream can rely on the
+        # invariant instead of re-checking it.
+        for object_id, label_ids in project._object_id_index.items():
+            if len(label_ids) < 2:
+                continue
+            names = []
+            for lid in sorted(label_ids):
+                _, label = project.get_label_by_id(lid)
+                if label is not None and label.group_id:
+                    names.append(label.group_id)
+            if names and len(set(names)) >= 1:
+                first = names[0]
+                if any(n != first for n in names) or len(names) != len(label_ids):
+                    project._apply_group_id(object_id, first)
 
         return project
 

@@ -354,6 +354,7 @@ class MainWindow(QMainWindow):
         self.canvas.labels_linked.connect(self._on_labels_linked)
         self.canvas.label_unlinked.connect(self._on_label_unlinked)
         self.canvas.label_describe_requested.connect(self._describe_label)
+        self.canvas.label_group_id_requested.connect(self._edit_group_id)
         self.canvas.show_linked_requested.connect(self._on_show_linked)
         self.canvas.link_mode_changed.connect(self._on_link_mode_changed)
         self.canvas.label_measured.connect(self._on_label_measured)
@@ -1178,6 +1179,9 @@ class MainWindow(QMainWindow):
             linked_labels = self.project.get_linked_labels(label_id1)
             for _, label in linked_labels:
                 self.canvas.set_label_linked(label.id, True)
+                # Linking may have spread a shared group name onto labels
+                # that did not carry one; their tooltips must follow.
+                self.canvas.set_label_group_id(label.id, label.group_id)
 
             # If wiring is on, propagate any existing measurement across the
             # newly-merged group before refreshing the panel.
@@ -1219,6 +1223,34 @@ class MainWindow(QMainWindow):
             "Description saved" if label.description else "Description cleared",
             3000)
 
+    def _edit_group_id(self, label_id: int):
+        """Prompt for the shared group name of a label's linked group.
+
+        Unlike the description, this is one value for the whole group by
+        contract: the project applies it to every linked label at once, and
+        every affected marker's tooltip follows. Setting it on an unlinked
+        label names just that label - the name travels when it is linked.
+        """
+        _, label = self.project.get_label_by_id(label_id)
+        if label is None:
+            return
+        text, accepted = QInputDialog.getText(
+            self, "Group ID",
+            "Shared name for this linked group:", text=label.group_id)
+        if not accepted:
+            return
+        changed = self.project.set_group_id(label_id, text)
+        for lid in changed:
+            # Marker may not exist when its image is not loaded; the
+            # refresh path re-applies it later, like the description.
+            self.canvas.set_label_group_id(lid, label.group_id)
+        self.layer_panel.refresh_labeled_panel(self.project)
+        n = len(changed)
+        note = f" across {n} linked labels" if n > 1 else ""
+        self.statusBar.showMessage(
+            (f"Group ID set{note}" if label.group_id
+             else f"Group ID cleared{note}"), 4000)
+
     def _on_label_unlinked(self, label_id: int):
         """Handle a label being unlinked from its object group."""
         # First get the labels that were linked before unlinking
@@ -1226,8 +1258,10 @@ class MainWindow(QMainWindow):
 
         self.project.unlink_label(label_id)
 
-        # Update the unlinked label
+        # Update the unlinked label; it left the named group, so its group
+        # name is gone too.
         self.canvas.set_label_linked(label_id, False)
+        self.canvas.set_label_group_id(label_id, "")
 
         # Clear highlight from the unlinked label
         self.canvas.highlight_labels([label_id], highlight=False)
@@ -1475,6 +1509,8 @@ class MainWindow(QMainWindow):
             # time the markers are rebuilt (project load, mode change).
             if label.description:
                 self.canvas.set_label_description(label.id, label.description)
+            if label.group_id:
+                self.canvas.set_label_group_id(label.id, label.group_id)
 
         # Refresh labeled images panel
         self.layer_panel.refresh_labeled_panel(self.project)
