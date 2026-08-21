@@ -2755,6 +2755,19 @@ class MainWindow(QMainWindow):
             progress_label: Label shown in progress bar
             skip_project_add: If True, don't add images to project (they're already there)
         """
+        # Only one loader at a time: starting a second while the first runs
+        # (Locate Missing Images during a long project load) clobbered the
+        # thread reference, and the first one's completion then wait()ed on
+        # the SECOND, freezing the UI and tearing progress state down under
+        # a live load.
+        if self._async_loader is not None:
+            self._async_loader.cancel()
+            self._async_loader.wait()
+            self._async_loader.deleteLater()
+            self._async_loader = None
+            self._async_ui_timer.stop()
+            self._async_pending_files.clear()
+
         # Store state for the async operation
         self._async_group_cache: dict[Path, any] = {}
         self._async_loaded_count = 0
@@ -2806,6 +2819,24 @@ class MainWindow(QMainWindow):
                 if index >= 0:
                     self.layer_panel.tree.takeTopLevelItem(index)
 
+    def _find_existing_group(self, name: str, parent):
+        """An already-present group item with this name, or None.
+
+        ``parent`` None means the tree's top level, matching add_group.
+        """
+        tree = self.layer_panel.tree
+        if parent is None:
+            children = [tree.topLevelItem(i)
+                        for i in range(tree.topLevelItemCount())]
+        else:
+            children = [parent.child(i) for i in range(parent.childCount())]
+        for item in children:
+            if (item is not None
+                    and item.data(0, QtCore_Qt.UserRole + 1) == "group"
+                    and item.text(0) == name):
+                return item
+        return None
+
     def _get_or_create_group_async(self, group_path: str):
         """Get or create group hierarchy for async loading."""
         if not group_path:
@@ -2827,9 +2858,17 @@ class MainWindow(QMainWindow):
             current_key = Path(current_path.replace("/", "\\"))
 
             if current_key not in self._async_group_cache:
-                # Create group with visible=False for async imports
-                group = self.layer_panel.add_group(part, parent, visible=False)
-                self._async_group_cache[current_key] = group
+                # A relocation pass re-enters loading on a populated panel;
+                # the cache alone would recreate groups the first pass made,
+                # putting the relocated image in a duplicate tree.
+                existing = self._find_existing_group(part, parent)
+                if existing is not None:
+                    self._async_group_cache[current_key] = existing
+                else:
+                    # Create group with visible=False for async imports
+                    group = self.layer_panel.add_group(
+                        part, parent, visible=False)
+                    self._async_group_cache[current_key] = group
             parent = self._async_group_cache[current_key]
 
         return parent
@@ -3041,16 +3080,29 @@ class MainWindow(QMainWindow):
         dialog = RelocateImagesDialog(missing, self)
         if not dialog.exec_():
             return
-        applied = 0
+        applied, refused = 0, 0
         for res in dialog.found_resolutions():
+            old_path = res.old_path
+            if self.canvas.is_path_loaded(old_path):
+                # Loaded-but-missing: the file vanished after it was loaded.
+                # Drop the stale layer so the reload builds a fresh one keyed
+                # by the new path instead of stranding the old.
+                layer_id = self.canvas._path_to_layer.get(old_path)
+                if layer_id is not None:
+                    self.canvas.remove_layer(layer_id)
             if self.project.relocate_image(
-                    res.old_path, os.path.abspath(res.new_path)):
+                    old_path, os.path.abspath(res.new_path)):
                 applied += 1
+            else:
+                refused += 1
+        if not applied and not refused:
+            return
+        note = f" ({refused} could not be applied)" if refused else ""
+        self.statusBar.showMessage(
+            f"Relocated {applied} image(s){note} - save the project to keep "
+            "the new paths", 8000)
         if not applied:
             return
-        self.statusBar.showMessage(
-            f"Relocated {applied} image(s) - save the project to keep the "
-            "new paths", 8000)
         # Load the newly found images through the normal project pipeline;
         # already-loaded paths are skipped by the loader, and any still-
         # missing images simply come around again.

@@ -30,8 +30,9 @@ The pure functions live Qt-free at the top so the whole policy is testable
 headlessly; the dialog at the bottom is only chrome around them.
 """
 import os
+import re
 from dataclasses import dataclass
-from pathlib import PurePath
+from pathlib import PurePath, PurePosixPath, PureWindowsPath
 
 import rasterio
 
@@ -44,6 +45,19 @@ from PyQt5.QtWidgets import (
 # ---------------------------------------------------------------------------
 # Pure matching logic (no Qt)
 # ---------------------------------------------------------------------------
+
+def _parse(path: str) -> PurePath:
+    """Parse a STORED project path with its authoring OS's rules.
+
+    A bare PurePath uses the running OS's flavor, so a Windows-authored
+    path opened on Linux parsed as one giant component and the whole
+    matching stack went inert. The flavor is decided by the path itself:
+    backslashes or a drive letter mean Windows, otherwise POSIX.
+    """
+    if "\\" in path or re.match(r"^[A-Za-z]:", path):
+        return PureWindowsPath(path)
+    return PurePosixPath(path)
+
 
 FOUND = "found"
 AMBIGUOUS = "ambiguous"
@@ -61,8 +75,8 @@ class Resolution:
 
 def _tail_overlap(a: str, b: str) -> int:
     """How many trailing path components two paths share (case-insensitive)."""
-    pa = [p.lower() for p in PurePath(a).parts]
-    pb = [p.lower() for p in PurePath(b).parts]
+    pa = [p.lower() for p in _parse(a).parts]
+    pb = [p.lower() for p in _parse(b).parts]
     n = 0
     while n < len(pa) and n < len(pb) and pa[-1 - n] == pb[-1 - n]:
         n += 1
@@ -104,7 +118,7 @@ def resolve_against_dir(missing_path: str, base_dir: str) -> str | None:
     ``<base>/survey/north/a.tif`` before ``<base>/a.tif`` is even considered
     ... in fact the longest tail that exists wins.
     """
-    parts = PurePath(missing_path).parts
+    parts = _parse(missing_path).parts
     best = None
     for n in range(1, len(parts)):
         candidate = os.path.join(base_dir, *parts[len(parts) - n:])
@@ -140,8 +154,8 @@ def infer_prefix_rule(old_path: str, new_path: str) -> tuple[str, str] | None:
     shared = _tail_overlap(old_path, new_path)
     if shared == 0:
         return None
-    old_parts = PurePath(old_path).parts
-    new_parts = PurePath(new_path).parts
+    old_parts = _parse(old_path).parts
+    new_parts = _parse(new_path).parts
     old_prefix = str(PurePath(*old_parts[:len(old_parts) - shared])) \
         if len(old_parts) > shared else ""
     new_prefix = str(PurePath(*new_parts[:len(new_parts) - shared])) \
@@ -152,8 +166,8 @@ def infer_prefix_rule(old_path: str, new_path: str) -> tuple[str, str] | None:
 def apply_prefix_rule(missing_path: str, rule: tuple[str, str]) -> str | None:
     """The rule applied to one path, or None when it does not apply."""
     old_prefix, new_prefix = rule
-    norm_path = PurePath(missing_path)
-    norm_old = PurePath(old_prefix)
+    norm_path = _parse(missing_path)
+    norm_old = _parse(old_prefix)
     old_parts = norm_old.parts
     if [p.lower() for p in norm_path.parts[:len(old_parts)]] != \
             [p.lower() for p in old_parts]:
@@ -189,7 +203,7 @@ def match_missing(images: list, index: dict,
     results = []
     for image in images:
         old_path = image.path
-        candidates = index.get(PurePath(old_path).name.lower(), [])
+        candidates = index.get(_parse(old_path).name.lower(), [])
         survivors = [c for c in candidates if verify(c, image)]
         if not survivors:
             results.append(Resolution(
@@ -212,6 +226,29 @@ def match_missing(images: list, index: dict,
             results.append(Resolution(
                 old_path, AMBIGUOUS,
                 note=f"{len(survivors)} equally plausible candidates"))
+
+    # Two missing images may both have matched the SAME file - twin images
+    # whose only surviving candidate is one file cannot both be it. Award it
+    # to the claimant whose old path agrees strictly best, or to nobody:
+    # merging two label sets onto one image is exactly the kind of guess
+    # this module refuses to make.
+    claims: dict[str, list[Resolution]] = {}
+    for res in results:
+        if res.status == FOUND:
+            claims.setdefault(os.path.normcase(res.new_path), []).append(res)
+    for claimants in claims.values():
+        if len(claimants) < 2:
+            continue
+        claimants.sort(key=lambda r: _tail_overlap(r.new_path, r.old_path),
+                       reverse=True)
+        best, runner_up = claimants[0], claimants[1]
+        keep = (_tail_overlap(best.new_path, best.old_path)
+                > _tail_overlap(runner_up.new_path, runner_up.old_path))
+        for res in claimants[0 if not keep else 1:]:
+            res.status = AMBIGUOUS
+            res.new_path = None
+            res.note = (f"{len(claimants)} missing images matched this "
+                        "same file")
     return results
 
 
@@ -255,7 +292,7 @@ class RelocateImagesDialog(QDialog):
         self.tree.setRootIsDecorated(False)
         for image in self._images:
             item = QTreeWidgetItem(
-                [PurePath(image.path).name, image.path, "missing"])
+                [_parse(image.path).name, image.path, "missing"])
             item.setData(0, Qt.UserRole, image.path)
             item.setToolTip(1, image.path)
             self.tree.addTopLevelItem(item)
@@ -295,7 +332,7 @@ class RelocateImagesDialog(QDialog):
 
     def run_directory_search(self, base_dir: str):
         """Index *base_dir* and match every image (separated for testing)."""
-        wanted = {PurePath(i.path).name.lower() for i in self._images}
+        wanted = {_parse(i.path).name.lower() for i in self._images}
         index = build_basename_index(base_dir, wanted)
         self._show_results(match_missing(self._images, index))
 
@@ -305,7 +342,7 @@ class RelocateImagesDialog(QDialog):
             return
         old_path = current.data(0, Qt.UserRole)
         chosen, _ = QFileDialog.getOpenFileName(
-            self, f"New location of {PurePath(old_path).name}",
+            self, f"New location of {_parse(old_path).name}",
             "", "Imagery (*.tif *.tiff);;All Files (*)")
         if chosen:
             self.run_prefix_relocation(old_path, chosen)
