@@ -79,6 +79,13 @@ BACKDROP_MAX_PIXELS = 4_000_000
 # the cycle's neighbours and the images just stepped off. ~256 MB of RGBA.
 WARM_MAX_PIXELS = 64_000_000
 
+
+def _as_uint8(band):
+    """The band as uint8, copying only when the dtype actually differs."""
+    if band.dtype == np.uint8:
+        return band
+    return np.clip(band, 0, 255).astype(np.uint8)
+
 # Waterfall mode: a bottom-level group's images are stacked vertically in the
 # pixel zone (raw pixels, no reprojection) so the view can glide through them
 # like a filmstrip. Vertical gap between stacked images, in scene units.
@@ -555,6 +562,10 @@ class TiledLayer:
                 src_nodata=np.nan,
                 dst_nodata=np.nan
             )
+            # ~4 bytes/px of source float32 with no further use; at the
+            # 150 MP budget that is ~600 MB held across the whole of the
+            # rest of this function unless dropped now.
+            del src_band1
 
             # Create nodata mask from band 1 only (padding is same for all
             # bands)
@@ -577,11 +588,13 @@ class TiledLayer:
                 for i in range(2, min(src.count + 1, 4)
                                ):  # bands 2, 3 (and skip 4 if exists)
                     src_band = src.read(i, out_shape=(rd_h, rd_w))
-                    # Handle source nodata by setting to 0
+                    # Handle source nodata by setting to 0 (in place - the
+                    # read returned a fresh array, and np.where built a whole
+                    # extra frame here)
                     if src.nodata is not None:
-                        src_band = np.where(
-                            src_band == src.nodata, 0, src_band)
-                    src_band = np.clip(src_band, 0, 255).astype(np.uint8)
+                        src_band[src_band == src.nodata] = 0
+                    if src_band.dtype != np.uint8:
+                        src_band = np.clip(src_band, 0, 255).astype(np.uint8)
 
                     dst_band = np.zeros((height, width), dtype=np.uint8)
                     reproject(
@@ -607,8 +620,12 @@ class TiledLayer:
             rgba_full[:, :, 0] = r
             rgba_full[:, :, 1] = g
             rgba_full[:, :, 2] = b
-            # Set alpha to 0 for nodata/padded pixels, 255 for valid pixels
-            rgba_full[:, :, 3] = np.where(nodata_mask, 0, 255).astype(np.uint8)
+            # Set alpha to 0 for nodata/padded pixels, 255 for valid pixels.
+            # Written into the slice directly: np.where(mask, 0, 255) built a
+            # full-frame default-int array first - 8 bytes per pixel, 1.2 GB
+            # at the 150 MP budget - only to throw it away after one astype.
+            rgba_full[:, :, 3] = 255
+            rgba_full[:, :, 3][nodata_mask] = 0
 
             self._rgba_data = rgba_full
 
@@ -687,11 +704,13 @@ class TiledLayer:
             height = max(1, src.height // level)
 
             if src.count >= 3:
-                r = src.read(1, out_shape=(height, width)).astype(np.uint8)
-                g = src.read(2, out_shape=(height, width)).astype(np.uint8)
-                b = src.read(3, out_shape=(height, width)).astype(np.uint8)
+                # astype on an already-uint8 read is a full-frame copy for
+                # nothing; nearly all supported imagery is uint8.
+                r = _as_uint8(src.read(1, out_shape=(height, width)))
+                g = _as_uint8(src.read(2, out_shape=(height, width)))
+                b = _as_uint8(src.read(3, out_shape=(height, width)))
             else:
-                gray = src.read(1, out_shape=(height, width)).astype(np.uint8)
+                gray = _as_uint8(src.read(1, out_shape=(height, width)))
                 r = g = b = gray
 
             rgba = np.zeros((height, width, 4), dtype=np.uint8)
@@ -1192,8 +1211,13 @@ class _TileLoadRunnable(QRunnable):
     """
 
     def __init__(self, layer_id: str, file_path: str, level: int,
-                 tx: int, ty: int, signals: "_TileLoadSignals"):
-        """Store the tile identity and the signal group to report through."""
+                 tx: int, ty: int, signals: "_TileLoadSignals", grid=None):
+        """Store the tile identity and the signal group to report through.
+
+        ``grid`` is the layer's cached level grid; every tile of a level
+        shares it, and recomputing it per tile cost each read a redundant
+        densified CRS transform of the whole image bounds.
+        """
         super().__init__()
         self._layer_id = layer_id
         self._file_path = file_path
@@ -1201,6 +1225,7 @@ class _TileLoadRunnable(QRunnable):
         self._tx = tx
         self._ty = ty
         self._signals = signals
+        self._grid = grid
         self._cancelled = False
 
     def cancel(self):
@@ -1220,7 +1245,7 @@ class _TileLoadRunnable(QRunnable):
                 return
             with rasterio.open(self._file_path) as src:
                 rgba = read_tile(src, WEB_MERCATOR, self._level,
-                                 self._tx, self._ty)
+                                 self._tx, self._ty, grid=self._grid)
             if self._cancelled:
                 self._fail()
                 return
@@ -2263,7 +2288,8 @@ class MapCanvas(QGraphicsView):
                 lambda *_a, s=signals: self._tile_signals.discard(s))
 
         runnable = _TileLoadRunnable(
-            layer_id, layer.file_path, level, tx, ty, signals)
+            layer_id, layer.file_path, level, tx, ty, signals,
+            grid=layer.detail_grid(level))
         self._pending_tiles[(layer_id, level, tx, ty)] = runnable
         self._tile_pool.start(runnable)
 
@@ -2301,7 +2327,9 @@ class MapCanvas(QGraphicsView):
         height, width = rgba.shape[:2]
         image = QImage(rgba.data, width, height, 4 * width,
                        QImage.Format_RGBA8888)
-        item = QGraphicsPixmapItem(QPixmap.fromImage(image.copy()),
+        # fromImage already deep-copies into the pixmap, and `rgba` outlives
+        # this call - the extra image.copy() doubled every tile's memcpy.
+        item = QGraphicsPixmapItem(QPixmap.fromImage(image),
                                    self._origin_group)
         west, south, east, north = tile_bounds(
             grid_transform, x0, y0, x1, y1)
