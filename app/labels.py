@@ -578,6 +578,22 @@ class LabelProject:
         if path in self.images:
             self.images[path].group = group
 
+    def relocate_image(self, old_path: str, new_path: str) -> bool:
+        """Move an image entry to a new path, labels and flags riding along.
+
+        The images dict is keyed by path, so a relocation re-keys the entry;
+        everything about the image - labels, description texts, the
+        hard-negative flag - lives inside the ImageData and moves with it.
+        Refuses (returns False) when the entry is unknown or the new path is
+        already taken by another image, rather than merging two label sets.
+        """
+        if old_path not in self.images or new_path in self.images:
+            return False
+        image = self.images.pop(old_path)
+        image.path = new_path
+        self.images[new_path] = image
+        return True
+
     def set_hard_negative_source(self, path: str, flagged: bool):
         """Mark or unmark an image as a hard-negative source."""
         if path in self.images:

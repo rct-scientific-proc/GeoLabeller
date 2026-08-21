@@ -44,6 +44,7 @@ from .h5_export import (H5ExportDialog, H5ExportWorker, HARD_NEGATIVE,
                         centered_window)
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
+from .relocate import RelocateImagesDialog, silently_resolve
 from .resources import icd_path
 from .version import app_title
 
@@ -422,6 +423,13 @@ class MainWindow(QMainWindow):
         save_as_action.setShortcut("Ctrl+Shift+S")
         save_as_action.triggered.connect(self._save_project_as)
         file_menu.addAction(save_as_action)
+
+        locate_action = QAction("&Locate Missing Images...", self)
+        locate_action.setStatusTip(
+            "Find this project's images on this machine when the recorded "
+            "paths came from another one")
+        locate_action.triggered.connect(self._offer_relocation)
+        file_menu.addAction(locate_action)
 
         file_menu.addSeparator()
 
@@ -1602,6 +1610,17 @@ class MainWindow(QMainWindow):
 
     def _start_project_image_loading(self):
         """Start async loading of project images."""
+
+        # A project shared from another machine often travels WITH its
+        # imagery; resolving missing paths against the project file's own
+        # folder fixes that case before the user sees a single warning.
+        if self._project_path is not None:
+            fixed = silently_resolve(
+                self.project, str(self._project_path.parent))
+            if fixed:
+                self.statusBar.showMessage(
+                    f"Relocated {fixed} image(s) next to the project file - "
+                    "save the project to keep the new paths", 8000)
 
         geotiff_files = []
         missing_files = []
@@ -2999,16 +3018,44 @@ class MainWindow(QMainWindow):
             msg += f" ({errors} load errors)"
         self.statusBar.showMessage(msg, 3000)
 
-        # Show warning for missing images
+        # Missing images: offer to find them rather than only reporting
+        # them - a project shared from another machine usually has ALL of
+        # them somewhere on this one, just under different paths.
         if self._async_missing_files:
-            QMessageBox.warning(
-                self,
-                "Missing Images",
-                f"Could not find {len(self._async_missing_files)} image(s):\n" +
-                "\n".join(self._async_missing_files[:5]) +
-                ("\n..." if len(self._async_missing_files) > 5 else "")
-            )
-            self._async_missing_files = []  # Reset
+            self._async_missing_files = []  # consumed; recomputed on demand
+            self._offer_relocation()
+
+    def _missing_project_images(self) -> list:
+        """The ImageData entries whose recorded paths do not exist."""
+        return [img for img in self.project.images.values()
+                if not os.path.exists(img.path)]
+
+    def _offer_relocation(self):
+        """Show the relocation dialog for whatever is currently missing."""
+        missing = self._missing_project_images()
+        if not missing:
+            QMessageBox.information(
+                self, "Locate Missing Images",
+                "Every image path in this project resolves on this machine.")
+            return
+        dialog = RelocateImagesDialog(missing, self)
+        if not dialog.exec_():
+            return
+        applied = 0
+        for res in dialog.found_resolutions():
+            if self.project.relocate_image(
+                    res.old_path, os.path.abspath(res.new_path)):
+                applied += 1
+        if not applied:
+            return
+        self.statusBar.showMessage(
+            f"Relocated {applied} image(s) - save the project to keep the "
+            "new paths", 8000)
+        # Load the newly found images through the normal project pipeline;
+        # already-loaded paths are skipped by the loader, and any still-
+        # missing images simply come around again.
+        self._show_progress(applied, "Loading relocated images")
+        self._start_project_image_loading()
 
     def _on_batch_visibility_started(self, total: int):
         """Handle start of batch visibility change (e.g., group toggle)."""
