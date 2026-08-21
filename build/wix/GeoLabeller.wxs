@@ -63,6 +63,20 @@
     <!-- The app is the only thing worth removing; hide the "repair" option. -->
     <Property Id="ARPNOREPAIR" Value="1" />
 
+    <!--
+      Force every file to be copied on install, repair and upgrade ('a'),
+      never skipped by version/hash comparison against whatever is on disk.
+      A 1.4.0 -> 1.5.1 upgrade in the field ended with 17 files missing -
+      python3.dll and the stdlib extensions, all byte-identical between the
+      two versions - leaving an app that could not start. The exact trigger
+      never reproduced under controlled upgrades (clean, and with the app
+      running), but with this set the failure class is closed outright: a
+      skipped copy is impossible, and the whole payload is only ~67 MB.
+      Validation flags this as ICE40 ("may cause difficulties") - that
+      is it noticing the deliberate choice, not an error.
+    -->
+    <Property Id="REINSTALLMODE" Value="amus" />
+
     <Feature Id="MainApplication"
              Title="GeoLabeller"
              Description="The application and everything it needs to run."
