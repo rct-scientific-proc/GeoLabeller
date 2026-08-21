@@ -6,6 +6,8 @@ from pathlib import Path
 
 import numpy as np
 import rasterio
+from collections import deque
+
 from PyQt5 import sip
 from PyQt5.QtCore import (Qt, pyqtSignal, QRectF, QLineF, QPointF, QTimer,
                           QThread, QObject, QThreadPool, QRunnable)
@@ -1631,6 +1633,16 @@ class MapCanvas(QGraphicsView):
         self._tile_update_timer.setSingleShot(True)
         self._tile_update_timer.timeout.connect(self._update_visible_tiles)
 
+        # Coarse-tile pixmap construction beyond the per-pass budget is
+        # drained here, a bounded batch per event-loop turn, so a level
+        # landing for a huge image no longer freezes the window while every
+        # visible tile is copied into a pixmap in one synchronous pass.
+        self._tile_build_queue: deque = deque()   # (layer_id, (tx, ty))
+        self._tile_build_queued: set = set()
+        self._tile_build_timer = QTimer()
+        self._tile_build_timer.setSingleShot(True)
+        self._tile_build_timer.timeout.connect(self._drain_tile_build_queue)
+
         # Coordinates emit throttle: coalesce mouseMoveEvent emissions so the
         # status bar isn't updated on every single pixel of mouse motion.
         # _pending_coords holds the latest payload; the timer fires at most
@@ -2033,12 +2045,25 @@ class MapCanvas(QGraphicsView):
         vw, vs, ve, vn = view_bounds
         return not (le < vw or lw > ve or ln < vs or ls > vn)
 
+    # How many coarse tiles one pass may build synchronously. Each is up to a
+    # 1 MB pixmap copy plus a scene insert, so this bounds the UI-thread cost
+    # of any single pass at a few milliseconds; everything beyond it drains
+    # through _tile_build_queue between paints, nearest the view centre first.
+    _TILE_BUILD_BUDGET = 16
+
     def _rebuild_layer_tiles(self, layer: TiledLayer):
         """Add/remove a single layer's tiles to match the current view.
 
         Uses the effective cull bounds, so in waterfall mode tiles within the
         prefetch margin are built ahead of scrolling in and retained after
         scrolling out.
+
+        Building is centre-out and budgeted: the first _TILE_BUILD_BUDGET
+        tiles are made immediately (a typical viewport fits entirely in
+        that), the rest are queued for the event loop. A 150 MP pyramid-less
+        image used to build ~576 pixmaps in one synchronous pass here -
+        roughly half a gigabyte of copying at the exact moment its load
+        finished.
         """
         view_bounds = self._effective_cull_bounds()
         visible_indices = set(layer.get_visible_tile_indices(view_bounds))
@@ -2049,41 +2074,92 @@ class MapCanvas(QGraphicsView):
             self._scene.removeItem(layer.tiles[idx])
             del layer.tiles[idx]
 
-        # Add newly visible tiles
-        for idx in visible_indices - current_indices:
-            tx, ty = idx
-            pixmap = layer.create_tile_pixmap(tx, ty)
-            if pixmap is None:
+        missing = visible_indices - current_indices
+        if not missing:
+            return
+        # The centroid of the wanted set stands in for the view centre: for a
+        # viewport-clipped set they coincide, and for a whole image at fit
+        # zoom the image centre IS the view centre.
+        cx = sum(t[0] for t in missing) / len(missing)
+        cy = sum(t[1] for t in missing) / len(missing)
+        ordered = sorted(
+            missing, key=lambda t: (t[0] - cx) ** 2 + (t[1] - cy) ** 2)
+
+        for idx in ordered[:self._TILE_BUILD_BUDGET]:
+            self._build_layer_tile(layer, idx)
+
+        rest = ordered[self._TILE_BUILD_BUDGET:]
+        if rest:
+            layer_id = self._path_to_layer.get(layer.file_path)
+            if layer_id is None:
+                return
+            for idx in rest:
+                key = (layer_id, idx)
+                if key not in self._tile_build_queued:
+                    self._tile_build_queued.add(key)
+                    self._tile_build_queue.append(key)
+            self._tile_build_timer.start(0)
+
+    def _drain_tile_build_queue(self):
+        """Build one budget's worth of queued tiles, then yield to the loop."""
+        budget = self._TILE_BUILD_BUDGET
+        while self._tile_build_queue and budget > 0:
+            layer_id, idx = self._tile_build_queue.popleft()
+            self._tile_build_queued.discard((layer_id, idx))
+            layer = self._layers.get(layer_id)
+            # The world may have moved on since this was queued.
+            if (layer is None or not layer.visible
+                    or not layer.is_fully_loaded() or idx in layer.tiles):
                 continue
+            self._build_layer_tile(layer, idx)
+            budget -= 1
+        if self._tile_build_queue:
+            self._tile_build_timer.start(0)
 
-            # Parent to the floating-origin group so the tile's *scene*
-            # position stays small at deep zoom (setPos below is in world coords).
-            item = QGraphicsPixmapItem(pixmap, self._origin_group)
+    def _build_layer_tile(self, layer: TiledLayer, idx: tuple):
+        """Construct and place one coarse tile's pixmap item."""
+        tx, ty = idx
+        pixmap = layer.create_tile_pixmap(tx, ty)
+        if pixmap is None:
+            return
 
-            # Standard axis-aligned scaling for GeoTIFF layers
-            px_left, px_top, px_right, px_bottom, tile_west, tile_south, tile_east, tile_north = layer.get_tile_bounds(
-                tx, ty)
+        # Parent to the floating-origin group so the tile's *scene*
+        # position stays small at deep zoom (setPos below is in world coords).
+        item = QGraphicsPixmapItem(pixmap, self._origin_group)
 
-            pixel_width = px_right - px_left
-            pixel_height = px_bottom - px_top
-            scale_x = (tile_east - tile_west) / pixel_width
-            scale_y = (tile_north - tile_south) / pixel_height
+        # Standard axis-aligned scaling for GeoTIFF layers
+        px_left, px_top, px_right, px_bottom, tile_west, tile_south, tile_east, tile_north = layer.get_tile_bounds(
+            tx, ty)
 
-            transform = QTransform()
-            transform.scale(scale_x, scale_y)
-            item.setTransform(transform)
-            item.setPos(tile_west, -tile_north)
+        pixel_width = px_right - px_left
+        pixel_height = px_bottom - px_top
+        scale_x = (tile_east - tile_west) / pixel_width
+        scale_y = (tile_north - tile_south) / pixel_height
 
-            item.setZValue(layer.z_value)
-            item.setVisible(layer.visible)
+        transform = QTransform()
+        transform.scale(scale_x, scale_y)
+        item.setTransform(transform)
+        item.setPos(tile_west, -tile_north)
 
-            layer.tiles[idx] = item
+        item.setZValue(layer.z_value)
+        item.setVisible(layer.visible)
+
+        layer.tiles[idx] = item
 
     def _clear_layer_tiles(self, layer: TiledLayer):
         """Remove all of a layer's tiles from the scene."""
         for item in layer.tiles.values():
             self._scene.removeItem(item)
         layer.tiles.clear()
+        # Queued builds refer to the grid being cleared; a level change would
+        # otherwise build tiles for indices that no longer mean the same ground.
+        if self._tile_build_queued:
+            layer_id = self._path_to_layer.get(layer.file_path)
+            if layer_id is not None:
+                self._tile_build_queue = deque(
+                    k for k in self._tile_build_queue if k[0] != layer_id)
+                self._tile_build_queued = {
+                    k for k in self._tile_build_queued if k[0] != layer_id}
 
     # ------------------------------------------------------------------
     # Detail tiles: full-resolution pixels for the visible area only.
@@ -2130,15 +2206,34 @@ class MapCanvas(QGraphicsView):
         grid_transform, grid_w, grid_h = grid
 
         view = self._effective_cull_bounds()
+        if not self._waterfall_active:
+            # A quarter-viewport margin on every side: tiles a small pan is
+            # about to need start reading early, and tiles it just left stay
+            # instead of being discarded at the exact edge and re-read the
+            # moment the pan reverses. (Waterfall already carries its own,
+            # much larger, vertical margin.)
+            mx = (view[2] - view[0]) * 0.25
+            my = (view[3] - view[1]) * 0.25
+            view = (view[0] - mx, view[1] - my, view[2] + mx, view[3] + my)
         wanted = set()
         for tx, ty in tiles_for_bounds(grid_transform, grid_w, grid_h, view,
                                        DETAIL_TILE_SIZE):
             wanted.add((level, tx, ty))
+        # Centre-out: the ground the user is looking at sharpens first, and
+        # the runaway cap trims the corners rather than everything right of
+        # an arbitrary column. (Dispatch below follows this order too - the
+        # pool runs FIFO, so enqueue order is arrival order.)
+        centre_col, centre_row = ~grid_transform * (
+            (view[0] + view[2]) / 2.0, (view[1] + view[3]) / 2.0)
+        ctx, cty = centre_col / DETAIL_TILE_SIZE, centre_row / DETAIL_TILE_SIZE
+        ordered = sorted(
+            wanted,
+            key=lambda k: (k[1] - ctx) ** 2 + (k[2] - cty) ** 2)
         # A pathological zoom could ask for thousands; the viewport plus its
-        # prefetch margin is a few dozen, so a cap here only ever trims runaway
-        # requests (and keeps the pool from being swamped).
-        if len(wanted) > self._MAX_DETAIL_TILES:
-            wanted = set(sorted(wanted)[:self._MAX_DETAIL_TILES])
+        # margin is a few dozen, so the cap only ever trims runaway requests
+        # (and keeps the pool from being swamped).
+        ordered = ordered[:self._MAX_DETAIL_TILES]
+        wanted = set(ordered)
 
         # Drop what is no longer wanted - including every tile at another
         # level, since the zoom has moved on.
@@ -2149,7 +2244,7 @@ class MapCanvas(QGraphicsView):
             if key[0] == layer_id and key[1:] not in wanted:
                 self._pending_tiles.pop(key).cancel()
 
-        for key in wanted:
+        for key in ordered:
             if key in layer.detail_tiles:
                 continue
             if (layer_id,) + key in self._pending_tiles:
@@ -2528,8 +2623,18 @@ class MapCanvas(QGraphicsView):
 
 
     def _schedule_tile_update(self):
-        """Schedule a tile update (debounced)."""
-        self._tile_update_timer.start(50)  # 50ms debounce
+        """Schedule a tile update, coalescing bursts without starving motion.
+
+        Restarting the timer on every call - the previous behaviour - meant a
+        source of events faster than 50ms kept it from EVER firing: the
+        waterfall glide ticks the scrollbar every 16ms, so a held Space key
+        dispatched no loads at all and the user glided into blank rows while
+        both pools sat idle. Arming only when idle turns the trailing debounce
+        into a throttle: bursts still coalesce, but sustained motion gets an
+        update every 50ms.
+        """
+        if not self._tile_update_timer.isActive():
+            self._tile_update_timer.start(50)
 
     def set_layer_visibility(self, layer_id: str, visible: bool):
         """Show or hide a layer."""
@@ -2539,7 +2644,12 @@ class MapCanvas(QGraphicsView):
             for item in layer.detail_tiles.values():
                 item.setVisible(visible)
             if visible:
-                self._update_visible_tiles()
+                # Deferred: a cycle step toggles visibility BEFORE it
+                # zooms, and updating synchronously here evaluated the
+                # LOD at the previous image's zoom - loading a level the
+                # step was about to discard. One throttled update after
+                # the zoom serves both.
+                self._schedule_tile_update()
             else:
                 # Hidden layers shouldn't keep loading in the background.
                 self._cancel_layer_load(layer)
