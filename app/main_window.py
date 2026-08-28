@@ -44,6 +44,7 @@ from .h5_export import (H5ExportDialog, H5ExportWorker, HARD_NEGATIVE,
                         centered_window)
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
+from .orientation import OrientationEditor
 from .relocate import RelocateImagesDialog, silently_resolve
 from .snippet_panel import SnippetPanel
 from .resources import icd_path
@@ -262,6 +263,8 @@ class MainWindow(QMainWindow):
         self._h5_total = 0
         # Last-used export settings, so a re-export doesn't start from scratch.
         # An existing target file's own settings still take precedence.
+        # The orientation editor window, created on first open.
+        self._orientation_editor = None
         self._h5_last_options: dict = {}
 
 
@@ -475,6 +478,13 @@ class MainWindow(QMainWindow):
         edit_classes_action = QAction("Edit &Classes...", self)
         edit_classes_action.triggered.connect(self._edit_classes)
         labels_menu.addAction(edit_classes_action)
+
+        orientation_action = QAction("&Orientation Editor...", self)
+        orientation_action.setStatusTip(
+            "Draw each label's orientation across a grid of its class's "
+            "snippets")
+        orientation_action.triggered.connect(self._open_orientation_editor)
+        labels_menu.addAction(orientation_action)
 
         labels_menu.addSeparator()
 
@@ -1452,10 +1462,8 @@ class MainWindow(QMainWindow):
         if shown:
             self._refresh_snippet_panel()
 
-    def _refresh_snippet_panel(self):
-        """Feed the sidebar the current labels (no-op while hidden)."""
-        if not self.snippet_panel.isVisible():
-            return
+    def _label_entries(self) -> list:
+        """Every label as a plain dict, for the snippet views."""
         entries = []
         for image in self.project.images.values():
             for label in image.labels:
@@ -1469,8 +1477,43 @@ class MainWindow(QMainWindow):
                     "linked": len(self.project._object_id_index.get(
                         label.object_id, ())) > 1,
                     "group_id": label.group_id,
+                    "orientation_px_rad": label.orientation_px_rad,
+                    "orientation_deg": label.orientation_deg,
                 })
-        self.snippet_panel.set_labels(entries)
+        return entries
+
+    def _refresh_snippet_panel(self):
+        """Feed the sidebar the current labels (no-op while hidden)."""
+        if not self.snippet_panel.isVisible():
+            return
+        self.snippet_panel.set_labels(self._label_entries())
+
+    def _open_orientation_editor(self):
+        """Open (or refresh) the orientation editor window."""
+        if self._orientation_editor is None:
+            self._orientation_editor = OrientationEditor()
+            self._orientation_editor.orientation_changed.connect(
+                self._on_orientation_changed)
+        self._orientation_editor.set_labels(self._label_entries())
+        self._orientation_editor.show()
+        self._orientation_editor.raise_()
+        self._orientation_editor.activateWindow()
+
+    def _on_orientation_changed(self, label_id, px_rad, deg):
+        """Store a drawn (or cleared) orientation on the label."""
+        _, label = self.project.get_label_by_id(label_id)
+        if label is None:
+            return
+        label.orientation_px_rad = px_rad
+        label.orientation_deg = deg
+        if px_rad is None:
+            self.statusBar.showMessage(
+                f"Orientation cleared for label #{label_id}", 3000)
+        else:
+            heading = f", {deg:.1f}° true" if deg is not None                 else ""
+            self.statusBar.showMessage(
+                f"Label #{label_id} oriented: {px_rad:+.3f} rad{heading}",
+                4000)
 
     def _go_to_coordinates(self):
         """Move the view to a latitude/longitude the user types in."""

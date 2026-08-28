@@ -130,6 +130,20 @@ def _window_pixels(src, window, channels, nodata, scaling=None):
 _scaling_cache: dict[str, object] = {}
 
 
+def snippet_frame(pixel_x: float, pixel_y: float, size_px: int,
+                  src_width: int, src_height: int) -> tuple[int, int, int, int]:
+    """The exact crop a snippet uses: (x0, y0, w, h) in source pixels.
+
+    One function, because the orientation editor must map a point drawn ON a
+    snippet back to source pixels, and any drift between how the crop was
+    made and how it is inverted would silently bend every angle.
+    """
+    w = min(size_px, src_width)
+    h = min(size_px, src_height)
+    x0, y0 = centered_window(pixel_x, pixel_y, w, h, src_width, src_height)
+    return x0, y0, w, h
+
+
 def read_label_snippet(image_path: str, pixel_x: float, pixel_y: float,
                        size_px: int) -> np.ndarray | None:
     """The un-warped RGB pixels around one label, export-identical framing.
@@ -144,10 +158,8 @@ def read_label_snippet(image_path: str, pixel_x: float, pixel_y: float,
             if image_path not in _scaling_cache:
                 _scaling_cache[image_path] = _band_scaling(src)
             scaling = _scaling_cache[image_path]
-            w = min(size_px, src.width)
-            h = min(size_px, src.height)
-            x0, y0 = centered_window(pixel_x, pixel_y, w, h,
-                                     src.width, src.height)
+            x0, y0, w, h = snippet_frame(pixel_x, pixel_y, size_px,
+                                         src.width, src.height)
             return _window_pixels(src, Window(x0, y0, w, h), 3,
                                   src.nodata, scaling=scaling)
     except Exception as exc:  # noqa: BLE001 - a bad file costs one thumbnail
