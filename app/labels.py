@@ -79,6 +79,18 @@ class PointLabel:
     # measurements when the user asks it to.
     description: str = ""
 
+    # The object's orientation, drawn by the user in the orientation editor.
+    #
+    # orientation_px_rad: unit-circle principal angle of the drawn
+    # start->end vector in un-warped source-pixel space, radians in
+    # (-pi, pi] (x = +column, y = up the columns; top-right to bottom-left
+    # is about -3*pi/4). orientation_deg: the same vector as a TRUE-north
+    # heading, degrees clockwise in [0, 360); None for non-geo imagery.
+    # Per label even when linked - two views of one object are two
+    # measurements, and their disagreement is signal.
+    orientation_px_rad: Optional[float] = None
+    orientation_deg: Optional[float] = None
+
     # Human-readable name for the linked-object group - the readable
     # companion to object_id's UUID. The exact opposite contract to
     # description: this MUST always be identical across every label sharing
@@ -122,6 +134,10 @@ class PointLabel:
             d["description"] = self.description
         if self.group_id:
             d["group_id"] = self.group_id
+        if self.orientation_px_rad is not None:
+            d["orientation_px_rad"] = self.orientation_px_rad
+        if self.orientation_deg is not None:
+            d["orientation_deg"] = self.orientation_deg
         return d
 
     @classmethod
@@ -160,7 +176,9 @@ class PointLabel:
             length_m=data.get("length_m"),
             width_m=data.get("width_m"),
             description=data.get("description", ""),
-            group_id=data.get("group_id", "")
+            group_id=data.get("group_id", ""),
+            orientation_px_rad=data.get("orientation_px_rad"),
+            orientation_deg=data.get("orientation_deg")
         )
 
 
@@ -847,7 +865,7 @@ class LabelProject:
         and hand it to a background writer.
         """
         return {
-            "version": "3.6",
+            "version": "3.7",
             # Copied, not referenced: the recovery snapshot is handed to a
             # background writer and the user carries on editing meanwhile.
             # The image and waypoint entries are freshly built dictionaries,
