@@ -45,6 +45,7 @@ from .h5_export import (H5ExportDialog, H5ExportWorker, HARD_NEGATIVE,
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
 from .relocate import RelocateImagesDialog, silently_resolve
+from .snippet_panel import SnippetPanel
 from .resources import icd_path
 from .version import app_title
 
@@ -290,8 +291,14 @@ class MainWindow(QMainWindow):
         self.canvas_with_axes = MapCanvasWithAxes(self.canvas)
         splitter.addWidget(self.canvas_with_axes)
 
+        # Snippet sidebar on the far right: every label as its exported
+        # pixels. Hidden until asked for (View > Snippet Panel).
+        self.snippet_panel = SnippetPanel()
+        self.snippet_panel.hide()
+        splitter.addWidget(self.snippet_panel)
+
         # Set initial sizes (layer panel smaller than canvas)
-        splitter.setSizes([250, 774])
+        splitter.setSizes([250, 774, 0])
 
         self.setCentralWidget(splitter)
 
@@ -328,8 +335,8 @@ class MainWindow(QMainWindow):
             self._on_hard_negative_toggled)
         self.layer_panel.zoom_to_layer_requested.connect(
             self.canvas.zoom_to_layer)
-        self.layer_panel.zoom_to_label_requested.connect(
-            self._on_zoom_to_label)
+        self.layer_panel.reveal_label_requested.connect(self._reveal_label)
+        self.snippet_panel.reveal_requested.connect(self._reveal_label)
         self.layer_panel.layer_removed.connect(self.canvas.remove_layer)
         # After the canvas drops it, prune any hard-negative mirror entry.
         self.layer_panel.layer_removed.connect(
@@ -492,6 +499,15 @@ class MainWindow(QMainWindow):
             "Save a named latitude/longitude to return to later")
         add_waypoint_action.triggered.connect(self._add_waypoint_by_coordinates)
         view_menu.addAction(add_waypoint_action)
+
+        snippet_action = QAction("&Snippet Panel", self)
+        snippet_action.setCheckable(True)
+        snippet_action.setShortcut("Ctrl+Shift+S")
+        snippet_action.setStatusTip(
+            "A column of every label's snippet, framed exactly as the "
+            "exports write them")
+        snippet_action.toggled.connect(self._toggle_snippet_panel)
+        view_menu.addAction(snippet_action)
 
         # Remove the crosshair that Go to Coordinates leaves behind
         clear_marker_action = QAction("Clear Coordinate &Marker", self)
@@ -1189,6 +1205,7 @@ class MainWindow(QMainWindow):
 
             # Refresh labeled images panel (grouping may have changed)
             self.layer_panel.refresh_labeled_panel(self.project)
+            self._refresh_snippet_panel()
 
             count = len(linked_labels)
             msg = f"Linked labels (object has {count} labels)"
@@ -1219,6 +1236,7 @@ class MainWindow(QMainWindow):
         label.description = text.strip()
         self.canvas.set_label_description(label_id, label.description)
         self.layer_panel.refresh_labeled_panel(self.project)
+        self._refresh_snippet_panel()
         self.statusBar.showMessage(
             "Description saved" if label.description else "Description cleared",
             3000)
@@ -1245,6 +1263,7 @@ class MainWindow(QMainWindow):
             # refresh path re-applies it later, like the description.
             self.canvas.set_label_group_id(lid, label.group_id)
         self.layer_panel.refresh_labeled_panel(self.project)
+        self._refresh_snippet_panel()
         n = len(changed)
         note = f" across {n} linked labels" if n > 1 else ""
         self.statusBar.showMessage(
@@ -1276,6 +1295,7 @@ class MainWindow(QMainWindow):
 
         # Refresh labeled images panel (grouping may have changed)
         self.layer_panel.refresh_labeled_panel(self.project)
+        self._refresh_snippet_panel()
 
         self.statusBar.showMessage("Label unlinked from object", 3000)
 
@@ -1345,6 +1365,7 @@ class MainWindow(QMainWindow):
             self.canvas.set_label_measured(
                 lbl.id, has_measurement, length_m, width_m)
         self.layer_panel.refresh_labeled_panel(self.project)
+        self._refresh_snippet_panel()
 
         n = len(targets)
         linked_note = f" ({n} linked labels)" if n > 1 else ""
@@ -1371,9 +1392,85 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar.clearMessage()
 
-    def _on_zoom_to_label(self, lon: float, lat: float):
-        """Zoom to a label by its coordinates."""
-        self.canvas.zoom_to_point(lon, lat, size_meters=10.0)
+    def _reveal_label(self, label_id: int):
+        """Show a label properly: image loaded, toggled on, view centred.
+
+        The one pathway behind every "zoom to label" - the labeled-images
+        panel and the snippet sidebar both land here, so revealing cannot
+        behave differently depending on where the click happened. If the
+        label's image is not on the canvas yet it is added (lazily - only
+        its header is read), which is why a reveal can grow the layer tree.
+        """
+        image, label = self.project.get_label_by_id(label_id)
+        if label is None or image is None:
+            return
+        layer_id = self.canvas._path_to_layer.get(image.path)
+        if layer_id is None:
+            if not os.path.exists(image.path):
+                self.statusBar.showMessage(
+                    f"Image not found: {image.path} - use File > Locate "
+                    "Missing Images", 6000)
+                return
+            layer_id = self._add_layer_for_reveal(image)
+            if layer_id is None:
+                return
+        self.layer_panel.check_layers([layer_id])
+        layer = self.canvas.get_layer(layer_id)
+        if layer is not None and layer.geo:
+            self.canvas.zoom_to_point(label.lon, label.lat, size_meters=10.0)
+        else:
+            # Pixel-zone images have no meaningful lon/lat; frame the layer.
+            self.canvas.zoom_to_layer(layer_id)
+
+    def _add_layer_for_reveal(self, image) -> str | None:
+        """Load a project image onto the canvas so its label can be shown."""
+        try:
+            with rasterio.open(image.path) as src:
+                has_crs = src.crs is not None
+        except Exception as e:  # noqa: BLE001 - reported, not fatal
+            self.statusBar.showMessage(
+                f"Could not open {Path(image.path).name}: {e}", 6000)
+            return None
+        if has_crs:
+            layer_id = self.canvas.add_layer(image.path, visible=True)
+            if layer_id:
+                parent = (self._get_or_create_group_async(image.group)
+                          if image.group else None)
+                self.layer_panel.add_layer(layer_id, image.path, parent)
+                if image.group:
+                    self.canvas.set_layer_group(layer_id, image.group)
+        else:
+            layer_id = self.canvas.add_pixel_layer(
+                image.path, group_path=image.group or "")
+            if layer_id:
+                self.layer_panel.add_nongeo_layer(layer_id, image.path)
+        return layer_id
+
+    def _toggle_snippet_panel(self, shown: bool):
+        """Show/hide the snippet sidebar (refreshing it on show)."""
+        self.snippet_panel.setVisible(shown)
+        if shown:
+            self._refresh_snippet_panel()
+
+    def _refresh_snippet_panel(self):
+        """Feed the sidebar the current labels (no-op while hidden)."""
+        if not self.snippet_panel.isVisible():
+            return
+        entries = []
+        for image in self.project.images.values():
+            for label in image.labels:
+                entries.append({
+                    "label_id": label.id,
+                    "image_path": image.path,
+                    "image_name": image.name,
+                    "pixel_x": label.pixel_x,
+                    "pixel_y": label.pixel_y,
+                    "class_name": label.class_name,
+                    "linked": len(self.project._object_id_index.get(
+                        label.object_id, ())) > 1,
+                    "group_id": label.group_id,
+                })
+        self.snippet_panel.set_labels(entries)
 
     def _go_to_coordinates(self):
         """Move the view to a latitude/longitude the user types in."""
@@ -1514,6 +1611,7 @@ class MainWindow(QMainWindow):
 
         # Refresh labeled images panel
         self.layer_panel.refresh_labeled_panel(self.project)
+        self._refresh_snippet_panel()
 
     def _edit_classes(self):
         """Open the class editor dialog."""
@@ -1562,6 +1660,7 @@ class MainWindow(QMainWindow):
             self.canvas.clear_label_markers()
             # Refresh labeled images panel (now empty)
             self.layer_panel.refresh_labeled_panel(self.project)
+            self._refresh_snippet_panel()
             self.statusBar.showMessage("All labels cleared", 3000)
 
     def _new_project(self):

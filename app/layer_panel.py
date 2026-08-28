@@ -879,7 +879,8 @@ class LabeledLayerPanel(QWidget):
     layer_visibility_changed = pyqtSignal(str, bool)  # layer_id, visible
     zoom_to_layer_requested = pyqtSignal(str)  # layer_id
     # lon, lat - zoom to specific coordinates
-    zoom_to_label_requested = pyqtSignal(float, float)
+    # Reveal a label properly: main_window loads/toggles its image and zooms.
+    reveal_label_requested = pyqtSignal(int)
 
     def __init__(self):
         """Initialize the labeled-layer panel and its file-to-layer map."""
@@ -1187,13 +1188,13 @@ class LabeledLayerPanel(QWidget):
         if item_type == "label":
             # Get stored data
             file_path = item.data(0, Qt.UserRole)
-            lon = item.data(0, Qt.UserRole + 3)
-            lat = item.data(0, Qt.UserRole + 4)
+            label_id = item.data(0, Qt.UserRole + 2)
 
-            # Zoom to label (specific coordinates)
+            # Zoom to label - reveals it: the image is toggled on (loading
+            # it first if need be) and the view centres on the label.
             zoom_label_action = menu.addAction("Zoom to Label")
             zoom_label_action.triggered.connect(
-                lambda: self.zoom_to_label_requested.emit(lon, lat))
+                lambda: self.reveal_label_requested.emit(label_id))
 
             # Zoom to layer
             layer_id = self._layer_id_map.get(file_path)
@@ -1204,12 +1205,10 @@ class LabeledLayerPanel(QWidget):
         elif item_type == "group":
             # Zoom to first label in this group
             if item.childCount() > 0:
-                first_child = item.child(0)
-                lon = first_child.data(0, Qt.UserRole + 3)
-                lat = first_child.data(0, Qt.UserRole + 4)
+                first_id = item.child(0).data(0, Qt.UserRole + 2)
                 zoom_label_action = menu.addAction("Zoom to Label")
                 zoom_label_action.triggered.connect(
-                    lambda: self.zoom_to_label_requested.emit(lon, lat))
+                    lambda: self.reveal_label_requested.emit(first_id))
 
             menu.addSeparator()
 
@@ -1519,7 +1518,7 @@ class CombinedLayerPanel(QWidget):
     layers_reordered = pyqtSignal(list)
     layer_group_changed = pyqtSignal(str, str)
     zoom_to_layer_requested = pyqtSignal(str)
-    zoom_to_label_requested = pyqtSignal(float, float)  # lon, lat
+    reveal_label_requested = pyqtSignal(int)  # label_id
     layer_removed = pyqtSignal(str)
 
     # Hard-negative mirror section
@@ -1615,8 +1614,8 @@ class CombinedLayerPanel(QWidget):
             self._on_labeled_visibility_changed)
         self.labeled_panel.zoom_to_layer_requested.connect(
             self.zoom_to_layer_requested)
-        self.labeled_panel.zoom_to_label_requested.connect(
-            self.zoom_to_label_requested)
+        self.labeled_panel.reveal_label_requested.connect(
+            self.reveal_label_requested)
 
         # Forward signals from the hard-negatives panel. Zoom rides the same
         # signal the main tree uses, so MainWindow needs no extra wiring for
