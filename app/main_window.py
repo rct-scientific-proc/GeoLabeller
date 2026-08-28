@@ -302,6 +302,7 @@ class MainWindow(QMainWindow):
 
         # Set initial sizes (layer panel smaller than canvas)
         splitter.setSizes([250, 774, 0])
+        self._splitter = splitter   # so opening the snippet panel can widen it
 
         self.setCentralWidget(splitter)
 
@@ -1460,6 +1461,17 @@ class MainWindow(QMainWindow):
         """Show/hide the snippet sidebar (refreshing it on show)."""
         self.snippet_panel.setVisible(shown)
         if shown:
+            # The panel's splitter slot starts at width 0, so showing it
+            # alone leaves a closed drawer the user would have to find and
+            # drag open. Hand it a usable width out of the canvas's share.
+            sizes = self._splitter.sizes()
+            if len(sizes) == 3 and sizes[2] < 50:
+                want = 300
+                take = min(want - sizes[2], max(0, sizes[1] - 400))
+                if take > 0:
+                    sizes[1] -= take
+                    sizes[2] += take
+                    self._splitter.setSizes(sizes)
             self._refresh_snippet_panel()
 
     def _label_entries(self) -> list:
