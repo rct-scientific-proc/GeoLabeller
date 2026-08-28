@@ -1476,6 +1476,7 @@ class MainWindow(QMainWindow):
                     "class_name": label.class_name,
                     "linked": len(self.project._object_id_index.get(
                         label.object_id, ())) > 1,
+                    "object_id": label.object_id,
                     "group_id": label.group_id,
                     "orientation_px_rad": label.orientation_px_rad,
                     "orientation_deg": label.orientation_deg,

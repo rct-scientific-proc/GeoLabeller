@@ -66,8 +66,19 @@ class SnippetPanel(QWidget):
         controls = QHBoxLayout()
         self.filter_combo = QComboBox()
         self.filter_combo.setToolTip("Which labels to show.")
-        self.filter_combo.currentIndexChanged.connect(self._rebuild)
+        self.filter_combo.currentIndexChanged.connect(self._on_filter_changed)
         controls.addWidget(self.filter_combo, 1)
+
+        # Which linked group to show; only meaningful (and only visible)
+        # under the Linked filter. Groups are named by their group_id where
+        # one is set - the readable name exists for exactly this - and by a
+        # truncated object UUID otherwise. Keyed by object_id underneath, so
+        # two groups that happen to share a name stay distinct.
+        self.group_combo = QComboBox()
+        self.group_combo.setToolTip("Which linked group to show.")
+        self.group_combo.hide()
+        self.group_combo.currentIndexChanged.connect(self._rebuild)
+        controls.addWidget(self.group_combo, 1)
 
         self.size_spin = QSpinBox()
         self.size_spin.setRange(32, 512)
@@ -107,11 +118,45 @@ class SnippetPanel(QWidget):
         """Feed the current project labels.
 
         ``entries`` are dicts: label_id, image_path, image_name, pixel_x,
-        pixel_y, class_name, linked (bool), group_id. Built by main_window
-        from the project, so the panel never touches project internals.
+        pixel_y, class_name, linked (bool), group_id, object_id. Built by
+        main_window from the project, so the panel never touches project
+        internals.
         """
         self._entries = list(entries)
         self._refresh_filter_choices()
+        self._refresh_group_choices()
+        self._rebuild()
+
+    ALL_GROUPS = "All groups"
+
+    def _refresh_group_choices(self):
+        """One entry per linked group, named readably, keyed by object_id."""
+        groups: dict[str, tuple[str, int]] = {}
+        for e in self._entries:
+            if not e.get("linked"):
+                continue
+            oid = e.get("object_id", "")
+            name, count = groups.get(oid, ("", 0))
+            groups[oid] = (e.get("group_id") or name, count + 1)
+        current = self.group_combo.currentData()
+        self.group_combo.blockSignals(True)
+        self.group_combo.clear()
+        self.group_combo.addItem(self.ALL_GROUPS, None)
+        # Named groups first, alphabetically; unnamed after, by id.
+        def sort_key(item):
+            oid, (name, _count) = item
+            return (0, name.lower()) if name else (1, oid)
+        for oid, (name, count) in sorted(groups.items(), key=sort_key):
+            display = name or f"(unnamed) {oid[:8]}"
+            self.group_combo.addItem(f"{display}  ({count})", oid)
+        index = self.group_combo.findData(current)
+        if index >= 0:
+            self.group_combo.setCurrentIndex(index)
+        self.group_combo.blockSignals(False)
+
+    def _on_filter_changed(self):
+        self.group_combo.setVisible(
+            self.filter_combo.currentText() == FILTER_LINKED)
         self._rebuild()
 
     def _refresh_filter_choices(self):
@@ -132,7 +177,12 @@ class SnippetPanel(QWidget):
     def _filtered(self) -> list:
         choice = self.filter_combo.currentText() or FILTER_ALL
         if choice == FILTER_LINKED:
-            return [e for e in self._entries if e.get("linked")]
+            linked = [e for e in self._entries if e.get("linked")]
+            wanted_oid = self.group_combo.currentData()
+            if wanted_oid is None:
+                return linked
+            return [e for e in linked
+                    if e.get("object_id") == wanted_oid]
         if choice.startswith(_CLASS_PREFIX):
             wanted = choice[len(_CLASS_PREFIX):]
             return [e for e in self._entries if e["class_name"] == wanted]
