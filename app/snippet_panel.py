@@ -193,12 +193,22 @@ class SnippetPanel(QWidget):
         self.list.clear()
         self._items.clear()
         size = self.size_spin.value()
+        # Items are created before their icons arrive (snippets load async),
+        # and with uniform item sizes the view caches the FIRST size hint it
+        # computes - a text-only strip - leaving every icon painted into a
+        # ~17px-tall rect until some resize forces a relayout. Pin an
+        # explicit icon+caption hint up front so geometry never depends on
+        # icon timing. Must stay inside the grid cell set by
+        # _apply_display_size.
+        display = min(size, 256)
+        hint = QSize(display + 12, display + 32)
         for entry in self._filtered():
             label_id = entry["label_id"]
             caption = f"{entry['class_name']}  ·  {entry['image_name']}"
             if entry.get("group_id"):
                 caption = f"[{entry['group_id']}]  {caption}"
             item = QListWidgetItem(caption)
+            item.setSizeHint(hint)
             item.setData(self._ID_ROLE, label_id)
             item.setToolTip(
                 f"{entry['class_name']} on {Path(entry['image_path']).name}"
