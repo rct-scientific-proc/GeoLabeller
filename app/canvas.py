@@ -2143,7 +2143,14 @@ class MapCanvas(QGraphicsView):
 
         # View-centre latitude in WGS84 (scene Y is -northing in Web Mercator).
         rect = self.mapToScene(self.viewport().rect()).boundingRect()
-        _easting, center_northing = self._scene_to_web(rect.center())
+        easting, center_northing = self._scene_to_web(rect.center())
+        if self.is_in_pixel_zone(easting):
+            # Raw-pixel territory (the waterfall stack, non-geo images) has no
+            # latitude; the stack's fake northing decoded to one anyway, and
+            # the changing correction made the metre rulers' grid crawl
+            # sideways during a vertical glide. Scene units pass through
+            # uncorrected, so the readout is stable.
+            return units_per_pixel
         _lon, lat = self._web_mercator_to_wgs84(0.0, center_northing)
         return units_per_pixel * math.cos(math.radians(lat))
 
