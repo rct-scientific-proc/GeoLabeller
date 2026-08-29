@@ -1970,8 +1970,11 @@ class MapCanvas(QGraphicsView):
             layer = self._layers.get(layer_id)
             if layer is None:
                 continue
-            # Show georeferenced images as raw pixels while stacked.
-            if layer.geo:
+            # Show georeferenced images as raw pixels while stacked. The flip
+            # happens before the dimension read below so ensure_loaded takes
+            # the cheap raw path rather than a full reprojection.
+            was_geo = layer.geo
+            if was_geo:
                 self._waterfall_was_geo.add(layer_id)
                 layer.geo = False
                 layer._fully_loaded = False
@@ -1982,8 +1985,15 @@ class MapCanvas(QGraphicsView):
                 try:
                     layer.ensure_loaded(1)
                 except Exception:
-                    continue
+                    pass
             if layer._src_width <= 0 or layer._src_height <= 0:
+                # Unreadable: leave it out of the stack, and put the geo flag
+                # back - it never enters _waterfall_saved_bounds, so the
+                # restore loop in clear_waterfall would not undo the flip and
+                # the layer would be stuck displaying raw forever.
+                if was_geo:
+                    layer.geo = True
+                    self._waterfall_was_geo.discard(layer_id)
                 continue
             if layer_id not in self._waterfall_saved_bounds:
                 self._waterfall_saved_bounds[layer_id] = layer.bounds
@@ -1999,6 +2009,31 @@ class MapCanvas(QGraphicsView):
         total_height = -north  # from y=0 down to the bottom of the last image
         self._update_visible_tiles()
         return total_height
+
+    def waterfall_layer_at_view_center(self) -> str | None:
+        """The stacked layer the view is currently centred on, or None.
+
+        Read BEFORE clear_waterfall: the caller uses it to land the restored
+        view on the geography of the image the user was examining, instead of
+        leaving them parked over the emptied pixel-zone stack (a blank canvas
+        that also made View Cycle find nothing "in view").
+        """
+        if not self._waterfall_active or not self._waterfall_layer_order:
+            return None
+        _w, south, _e, north = self._get_view_bounds()
+        centre = (south + north) / 2.0
+        best_id, best_distance = None, float("inf")
+        for layer_id in self._waterfall_layer_order:
+            layer = self._layers.get(layer_id)
+            if layer is None or layer.bounds is None:
+                continue
+            _lw, lsouth, _le, lnorth = layer.bounds
+            if lsouth <= centre <= lnorth:
+                return layer_id
+            distance = min(abs(centre - lsouth), abs(centre - lnorth))
+            if distance < best_distance:
+                best_distance, best_id = distance, layer_id
+        return best_id
 
     def clear_waterfall(self):
         """Restore the normal layout after leaving waterfall mode."""

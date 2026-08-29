@@ -748,10 +748,17 @@ class MainWindow(QMainWindow):
         self.ruler_action.setChecked(mode == CanvasMode.RULER)
         self.waterfall_action.setChecked(mode == CanvasMode.WATERFALL)
 
-        # Leaving waterfall: restore the normal layout and re-place labels.
+        # Leaving waterfall: restore the normal layout and re-place labels,
+        # then take the view to the geography of the image the user was on in
+        # the stack. Without that zoom the view stays parked over the emptied
+        # pixel zone - a blank canvas, and View Cycle then found no layers
+        # "in view" so it refused to start and nothing ever appeared.
         if was_waterfall and mode != CanvasMode.WATERFALL:
+            focus_layer = self.canvas.waterfall_layer_at_view_center()
             self.canvas.clear_waterfall()
             self._refresh_label_markers()
+            if focus_layer is not None:
+                self.canvas.zoom_to_layer(focus_layer)
 
         # Handle mode entry
         if mode == CanvasMode.CYCLE:
