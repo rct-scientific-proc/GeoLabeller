@@ -90,6 +90,12 @@ class PointLabel:
     # measurements, and their disagreement is signal.
     orientation_px_rad: Optional[float] = None
     orientation_deg: Optional[float] = None
+    # True when this orientation was NOT drawn by hand but propagated from a
+    # linked label: the group's shared true-north heading was re-derived into
+    # THIS image's pixel space through its georeferencing. Cleared the moment
+    # the user draws over it. Lets consumers (and the editor's colouring)
+    # tell measured orientations from inherited ones.
+    orientation_derived: bool = False
 
     # Human-readable name for the linked-object group - the readable
     # companion to object_id's UUID. The exact opposite contract to
@@ -138,6 +144,8 @@ class PointLabel:
             d["orientation_px_rad"] = self.orientation_px_rad
         if self.orientation_deg is not None:
             d["orientation_deg"] = self.orientation_deg
+        if self.orientation_derived:
+            d["orientation_derived"] = True
         return d
 
     @classmethod
@@ -178,7 +186,8 @@ class PointLabel:
             description=data.get("description", ""),
             group_id=data.get("group_id", ""),
             orientation_px_rad=data.get("orientation_px_rad"),
-            orientation_deg=data.get("orientation_deg")
+            orientation_deg=data.get("orientation_deg"),
+            orientation_derived=bool(data.get("orientation_derived", False))
         )
 
 
@@ -865,7 +874,7 @@ class LabelProject:
         and hand it to a background writer.
         """
         return {
-            "version": "3.7",
+            "version": "3.8",
             # Copied, not referenced: the recovery snapshot is handed to a
             # background writer and the user carries on editing meanwhile.
             # The image and waypoint entries are freshly built dictionaries,

@@ -22,16 +22,25 @@ import rasterio
 from PyQt5.QtCore import QPointF, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import (
-    QComboBox, QGridLayout, QHBoxLayout, QLabel, QScrollArea, QVBoxLayout,
-    QWidget)
+    QCheckBox, QComboBox, QGridLayout, QHBoxLayout, QLabel, QScrollArea,
+    QVBoxLayout, QWidget)
 
 from .debug_log import debug
-from .orientation_math import principal_angle_rad, true_heading_deg
+from .orientation_math import (
+    pixel_angle_from_heading, principal_angle_rad, true_heading_deg)
 from .snippets import SnippetLoader, snippet_frame
 
 SNIPPET_SIZE = 224      # source pixels per cell, shown 1:1
 GRID_COLUMNS = 3
 MIN_DRAG_PX = 6         # anything shorter is a click, not a direction
+
+# Committed-orientation colours. Amber: drawn by hand on this snippet.
+# Violet: propagated from a linked label's heading (a different calculation -
+# derived through this image's georeferencing, not drawn). A cell with either
+# also gets a border in the same colour, so finished snippets read at a
+# glance. Drawing over a violet arrow turns it amber.
+MANUAL_COLOR = QColor(255, 170, 0)
+DERIVED_COLOR = QColor(175, 110, 255)
 
 
 class OrientationCell(QWidget):
@@ -47,6 +56,7 @@ class OrientationCell(QWidget):
         self._size = size
         self._pixmap: QPixmap | None = None
         self._angle_rad: float | None = None    # committed pixel angle
+        self._derived = False                   # propagated, not drawn
         self._drag_start: QPointF | None = None
         self._drag_now: QPointF | None = None
         self.setFixedSize(size, size)
@@ -60,10 +70,18 @@ class OrientationCell(QWidget):
         self._pixmap = QPixmap.fromImage(image)
         self.update()
 
-    def set_angle(self, angle_rad: float | None):
-        """Show a committed orientation (or clear the arrow)."""
+    def set_angle(self, angle_rad: float | None, derived: bool = False):
+        """Show a committed orientation (or clear the arrow).
+
+        ``derived`` selects the violet propagated-from-a-link colour instead
+        of the amber drawn-by-hand one.
+        """
         self._angle_rad = angle_rad
+        self._derived = derived and angle_rad is not None
         self.update()
+
+    def _committed_color(self) -> QColor:
+        return DERIVED_COLOR if self._derived else MANUAL_COLOR
 
     # -- painting -----------------------------------------------------------
 
@@ -86,7 +104,14 @@ class OrientationCell(QWidget):
             self._draw_arrow(painter,
                              QPointF(cx - dx, cy - dy),
                              QPointF(cx + dx, cy + dy),
-                             QColor(255, 170, 0))
+                             self._committed_color())
+        if self._angle_rad is not None:
+            # Oriented snippets get a border in the arrow's colour, so the
+            # grid shows what is done (and how) without reading captions.
+            pen = QPen(self._committed_color(), 3)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(pen)
+            painter.drawRect(1, 1, self._size - 3, self._size - 3)
         painter.end()
 
     @staticmethod
@@ -134,8 +159,10 @@ class OrientationCell(QWidget):
 class OrientationEditor(QWidget):
     """Grid of one class's snippets, each accepting a drawn orientation."""
 
-    # (label_id, orientation_px_rad or None, orientation_deg or None)
-    orientation_changed = pyqtSignal(int, object, object)
+    # (label_id, orientation_px_rad or None, orientation_deg or None,
+    #  derived) - derived is True for orientations propagated from a linked
+    # label's heading rather than drawn on this snippet.
+    orientation_changed = pyqtSignal(int, object, object, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent, Qt.Window)
@@ -156,6 +183,18 @@ class OrientationEditor(QWidget):
         self.class_combo = QComboBox()
         self.class_combo.currentIndexChanged.connect(self._rebuild)
         controls.addWidget(self.class_combo, 1)
+
+        # Draw once, orient the whole linked group: the heading measured
+        # here is re-derived into each linked label's own image (violet =
+        # propagated; drawing over one makes it amber/manual again).
+        self.propagate_check = QCheckBox("Apply heading to linked labels")
+        self.propagate_check.setChecked(True)
+        self.propagate_check.setToolTip(
+            "When a label has linked labels (same object on other images),\n"
+            "give them the drawn TRUE-NORTH heading too - each one's pixel\n"
+            "angle is derived through its own image's georeferencing.\n"
+            "Propagated orientations show violet until drawn over.")
+        controls.addWidget(self.propagate_check)
         layout.addLayout(controls)
 
         hint = QLabel(
@@ -203,7 +242,8 @@ class OrientationEditor(QWidget):
             cell = OrientationCell(label_id, SNIPPET_SIZE)
             cell.vector_drawn.connect(self._on_vector_drawn)
             cell.clear_requested.connect(self._on_clear)
-            cell.set_angle(entry.get("orientation_px_rad"))
+            cell.set_angle(entry.get("orientation_px_rad"),
+                           derived=bool(entry.get("orientation_derived")))
             caption = QLabel()
             caption.setAlignment(Qt.AlignHCenter)
             box = QVBoxLayout()
@@ -237,6 +277,8 @@ class OrientationEditor(QWidget):
             parts.append(f"{rad:+.3f} rad")
         if deg is not None:
             parts.append(f"{deg:.1f}\N{DEGREE SIGN} true")
+        if rad is not None and entry.get("orientation_derived"):
+            parts.append("auto")
         caption.setText("   ".join(parts))
 
     def _on_snippet_ready(self, label_id, arr):
@@ -287,9 +329,51 @@ class OrientationEditor(QWidget):
         deg = true_heading_deg(col_s, row_s, col_e, row_e, affine, crs)
         entry["orientation_px_rad"] = rad
         entry["orientation_deg"] = deg
-        self._cells[label_id].set_angle(rad)
+        # Drawing by hand always wins: even over a propagated (violet) one.
+        entry["orientation_derived"] = False
+        self._cells[label_id].set_angle(rad, derived=False)
         self._set_caption(entry)
-        self.orientation_changed.emit(label_id, rad, deg)
+        self.orientation_changed.emit(label_id, rad, deg, False)
+        self._propagate_heading(entry, deg)
+
+    def _propagate_heading(self, source_entry: dict, deg):
+        """Give the drawn heading to the source label's linked labels.
+
+        The shared truth between linked labels is the ground heading, not
+        the pixel angle - each linked label sits on a different image with
+        its own rotation. So every linked label gets orientation_deg as-is
+        and an orientation_px_rad derived through ITS image's
+        georeferencing, marked (and coloured) as propagated. Skipped
+        entirely when the toggle is off; linked labels on non-geo imagery
+        are left untouched (no georeferencing to derive through). A label
+        the user already oriented BY HAND is never overwritten.
+        """
+        if (not self.propagate_check.isChecked()
+                or deg is None
+                or not source_entry.get("linked")):
+            return
+        object_id = source_entry.get("object_id")
+        source_id = source_entry["label_id"]
+        for entry in self._entries:
+            if (entry.get("object_id") != object_id
+                    or entry["label_id"] == source_id):
+                continue
+            if (entry.get("orientation_px_rad") is not None
+                    and not entry.get("orientation_derived")):
+                continue    # hand-drawn measurement; keep it
+            affine, crs, _w, _h = self._geo_info(entry["image_path"])
+            rad = pixel_angle_from_heading(
+                deg, entry.get("lon"), entry.get("lat"), affine, crs)
+            if rad is None:
+                continue
+            entry["orientation_px_rad"] = rad
+            entry["orientation_deg"] = deg
+            entry["orientation_derived"] = True
+            cell = self._cells.get(entry["label_id"])
+            if cell is not None:
+                cell.set_angle(rad, derived=True)
+            self._set_caption(entry)
+            self.orientation_changed.emit(entry["label_id"], rad, deg, True)
 
     def _on_clear(self, label_id):
         entry = self._entry(label_id)
@@ -297,6 +381,7 @@ class OrientationEditor(QWidget):
             return
         entry["orientation_px_rad"] = None
         entry["orientation_deg"] = None
+        entry["orientation_derived"] = False
         self._cells[label_id].set_angle(None)
         self._set_caption(entry)
-        self.orientation_changed.emit(label_id, None, None)
+        self.orientation_changed.emit(label_id, None, None, False)

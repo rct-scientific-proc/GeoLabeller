@@ -1501,8 +1501,11 @@ class MainWindow(QMainWindow):
                         label.object_id, ())) > 1,
                     "object_id": label.object_id,
                     "group_id": label.group_id,
+                    "lon": label.lon,
+                    "lat": label.lat,
                     "orientation_px_rad": label.orientation_px_rad,
                     "orientation_deg": label.orientation_deg,
+                    "orientation_derived": label.orientation_derived,
                 })
         return entries
 
@@ -1523,21 +1526,23 @@ class MainWindow(QMainWindow):
         self._orientation_editor.raise_()
         self._orientation_editor.activateWindow()
 
-    def _on_orientation_changed(self, label_id, px_rad, deg):
-        """Store a drawn (or cleared) orientation on the label."""
+    def _on_orientation_changed(self, label_id, px_rad, deg, derived=False):
+        """Store a drawn, propagated or cleared orientation on the label."""
         _, label = self.project.get_label_by_id(label_id)
         if label is None:
             return
         label.orientation_px_rad = px_rad
         label.orientation_deg = deg
+        label.orientation_derived = bool(derived) and px_rad is not None
         if px_rad is None:
             self.statusBar.showMessage(
                 f"Orientation cleared for label #{label_id}", 3000)
         else:
             heading = f", {deg:.1f}° true" if deg is not None                 else ""
+            source = " (from linked label)" if derived else ""
             self.statusBar.showMessage(
-                f"Label #{label_id} oriented: {px_rad:+.3f} rad{heading}",
-                4000)
+                f"Label #{label_id} oriented: {px_rad:+.3f} rad{heading}"
+                f"{source}", 4000)
 
     def _go_to_coordinates(self):
         """Move the view to a latitude/longitude the user types in."""

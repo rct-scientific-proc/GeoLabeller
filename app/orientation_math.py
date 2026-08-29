@@ -47,6 +47,29 @@ def principal_angle_rad(col_start: float, row_start: float,
     return angle
 
 
+def pixel_angle_from_heading(heading_deg: float, lon: float, lat: float,
+                             affine, crs) -> float | None:
+    """The pixel-space principal angle matching a true-north heading.
+
+    The inverse of :func:`true_heading_deg`, used when a heading measured on
+    one linked label is propagated to another label of the same object on a
+    DIFFERENT image: the shared truth is the ground heading, and this turns
+    it back into that image's own unit-circle pixel angle through its
+    georeferencing (rotation, convergence and all). Walks a short geodesic
+    from (lon, lat) along the heading, maps both ends into pixel space, and
+    takes the principal angle. None when the image has no georeferencing.
+    """
+    if heading_deg is None or affine is None or crs is None:
+        return None
+    lon2, lat2, _back = _GEOD.fwd(lon, lat, heading_deg, 10.0)
+    transformer = Transformer.from_crs(WGS84, crs, always_xy=True)
+    x1, y1 = transformer.transform(lon, lat)
+    x2, y2 = transformer.transform(lon2, lat2)
+    col1, row1 = ~affine * (x1, y1)
+    col2, row2 = ~affine * (x2, y2)
+    return principal_angle_rad(col1, row1, col2, row2)
+
+
 def true_heading_deg(col_start: float, row_start: float,
                      col_end: float, row_end: float,
                      affine, crs) -> float | None:
