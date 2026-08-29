@@ -34,6 +34,28 @@ Write-Host "=================================" -ForegroundColor Cyan
 Write-Host ""
 
 # Abort with a message if the last native command failed.
+function Assert-SlimQtPayload([string]$PayloadDir) {
+    # cx_Freeze can nondeterministically bind the PyQt5 module to the
+    # PyQt5-Qt5 wheel and ship its ENTIRE DLL set (~+24MB in the MSI) - see
+    # the workaround in setup.py. The 1.7.1 release shipped fat because of
+    # it. These canaries only exist in a fat payload, so their presence
+    # means the workaround stopped working: fail the build loudly rather
+    # than silently publishing a bloated installer.
+    $canaries = @(
+        "lib\PyQt5\Qt5\qml",
+        "lib\PyQt5\Qt5\bin\opengl32sw.dll",
+        "lib\PyQt5\Qt5\plugins\sqldrivers"
+    )
+    foreach ($canary in $canaries) {
+        if (Test-Path (Join-Path $PayloadDir $canary)) {
+            throw ("Frozen payload contains '$canary' - the unused-Qt bloat " +
+                   "guard tripped. The PyQt5 libs() workaround in setup.py " +
+                   "did not take effect; do not ship this build.")
+        }
+    }
+    Write-Host "  Qt payload is slim (bloat canaries absent)" -ForegroundColor Green
+}
+
 function Assert-LastExit([string]$Message) {
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  ERROR: $Message (exit $LASTEXITCODE)" -ForegroundColor Red
@@ -324,6 +346,7 @@ try {
         $payload = Get-ChildItem -Path (Join-Path $ScriptDir "build") -Directory -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -like "exe.*" } | Select-Object -First 1
         if (-not $payload) { throw "cx_Freeze produced no exe.* directory to package." }
+        Assert-SlimQtPayload $payload.FullName
 
         if ($Sign) {
             $exe = Join-Path $payload.FullName "GeoLabeller.exe"
@@ -372,6 +395,7 @@ try {
 
             $exe = Get-ChildItem -Path (Join-Path $ScriptDir "build") -Recurse -Filter "GeoLabeller.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
             if (-not $exe) { throw "Built GeoLabeller.exe not found for signing." }
+            Assert-SlimQtPayload $exe.Directory.FullName
             Invoke-SignFile $SignTool $exe.FullName
 
             Write-Host "Building MSI installer..." -ForegroundColor Yellow
@@ -381,6 +405,10 @@ try {
             Write-Host "Building MSI installer..." -ForegroundColor Yellow
             & $VenvPython setup.py bdist_msi
             Assert-LastExit "bdist_msi failed"
+
+            $payload = Get-ChildItem -Path (Join-Path $ScriptDir "build") -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "exe.*" } | Select-Object -First 1
+            if ($payload) { Assert-SlimQtPayload $payload.FullName }
         }
     } else {
         Write-Host "Building executable..." -ForegroundColor Yellow

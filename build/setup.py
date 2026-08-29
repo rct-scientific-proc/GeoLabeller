@@ -21,6 +21,39 @@ from cx_Freeze import setup, Executable
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# --- Work around nondeterministic Qt bloat in cx_Freeze (8.7.0) -----------
+#
+# Three installed distributions share the "PyQt5" top-level package: PyQt5,
+# PyQt5-Qt5 (the Qt binaries wheel) and PyQt5-sip. cx_Freeze binds the PyQt5
+# module to ONE of them - chosen last-write-wins over a set() whose iteration
+# order follows the process's randomized string hashing, i.e. a per-build
+# coin flip. When PyQt5-Qt5 wins, Module.libs() ships EVERY DLL in that
+# wheel's RECORD - all of Qt5/bin, Qt5/plugins and Qt5/qml, ~72MB of unused
+# Qt (sql drivers, geoservices, multimedia, the software GL renderer...) on
+# top of what the app needs. That is how the 1.7.1 MSI came out 24MB larger
+# than 1.7.0 from an identical environment.
+#
+# The Qt files PyQt5 actually needs are provided by cx_Freeze's Qt hooks and
+# the binary dependency walk, never by libs(); in a "slim" (lucky) build
+# libs() yields nothing for PyQt5. Pin that behaviour: yield no libs for the
+# PyQt5 root module regardless of which distribution won the coin flip.
+# build_windows.ps1 asserts the result (no qml dir, no opengl32sw.dll), so
+# if a future cx_Freeze changes shape the build fails loudly instead of
+# silently shipping the fat installer again.
+try:
+    import cx_Freeze.module as _cx_module
+
+    _original_libs = _cx_module.Module.libs
+
+    def _libs_without_qt_wheel(self):
+        if self.name == "PyQt5":
+            return iter(())
+        return _original_libs(self)
+
+    _cx_module.Module.libs = _libs_without_qt_wheel
+except (ImportError, AttributeError) as exc:  # pragma: no cover
+    print(f"WARNING: PyQt5 libs() workaround not applied: {exc}")
+
 # Version can be overridden via GEOLABELLER_VERSION environment variable
 VERSION = os.environ.get("GEOLABELLER_VERSION", "1.0.0")
 # Publisher / author shown in Add/Remove Programs (overridable).
