@@ -374,6 +374,10 @@ class MainWindow(QMainWindow):
         self.canvas.hide_layers_outside_view.connect(
             self.layer_panel.uncheck_layers)
         self.canvas.show_layers_in_view.connect(self.layer_panel.check_layers)
+        # "Unselect layer" on a right-clicked image: same uncheck path, so
+        # the panel checkboxes and the canvas stay in sync.
+        self.canvas.layer_unselect_requested.connect(
+            lambda layer_id: self.layer_panel.uncheck_layers([layer_id]))
         self.canvas.toggle_layer_visibility_requested.connect(
             self.layer_panel.toggle_layer_visibility)
         self.canvas.cycle_next_requested.connect(self._cycle_to_next_layer)

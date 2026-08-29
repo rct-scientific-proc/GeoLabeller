@@ -1504,6 +1504,11 @@ class MapCanvas(QGraphicsView):
     # (layer_id). The canvas only shows the toggle; the project owns the flag,
     # so main_window flips it and syncs the checked state back down.
     hard_negative_toggle_requested = pyqtSignal(str)
+
+    # The topmost image under the cursor should be hidden ("Unselect layer"):
+    # (layer_id). Routed through the layer panel's uncheck path so every
+    # checkbox stays in sync, same as "Unselect layers outside view".
+    layer_unselect_requested = pyqtSignal(str)
     waypoint_goto_requested = pyqtSignal(int)
     waypoint_rename_requested = pyqtSignal(int)
     waypoint_remove_requested = pyqtSignal(int)
@@ -3997,14 +4002,18 @@ class MapCanvas(QGraphicsView):
         show_in_view_action = menu.addAction("Select layers in view")
         hide_outside_action = menu.addAction("Unselect layers outside view")
 
-        # Right-clicking an image offers its hard-negative-source flag: "this
-        # image holds confusers but no true positives". The H5 export can then
-        # slide flagged images into gt=False negatives on request.
+        # Actions on the topmost image under the cursor: hide it (so the
+        # ones stacked behind it become visible), or flip its hard-negative
+        # -source flag ("this image holds confusers but no true positives" -
+        # the H5 export can then slide it into gt=False negatives on request).
+        unselect_action = None
         hn_action = None
-        hn_layer_id = self._layer_id_at(easting, northing)
-        if hn_layer_id is not None:
-            layer = self._layers[hn_layer_id]
+        hit_layer_id = self._layer_id_at(easting, northing)
+        if hit_layer_id is not None:
+            layer = self._layers[hit_layer_id]
             menu.addSeparator()
+            unselect_action = menu.addAction(
+                f"Unselect layer  ({layer.name})")
             hn_action = menu.addAction(
                 f"Hard negative source  ({layer.name})")
             hn_action.setCheckable(True)
@@ -4015,8 +4024,10 @@ class MapCanvas(QGraphicsView):
         if action == add_waypoint_action and not in_pixel_zone:
             lon, lat = self._web_mercator_to_wgs84(easting, northing)
             self.waypoint_add_requested.emit(lon, lat)
+        elif unselect_action is not None and action == unselect_action:
+            self.layer_unselect_requested.emit(hit_layer_id)
         elif hn_action is not None and action == hn_action:
-            self.hard_negative_toggle_requested.emit(hn_layer_id)
+            self.hard_negative_toggle_requested.emit(hit_layer_id)
         elif action == show_in_view_action:
             self._show_layers_in_view()
         elif action == hide_outside_action:
