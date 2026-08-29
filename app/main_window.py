@@ -388,6 +388,8 @@ class MainWindow(QMainWindow):
         self.canvas.waypoint_add_requested.connect(self._add_waypoint_at)
         self.canvas.hard_negative_toggle_requested.connect(
             self._on_hard_negative_toggled)
+        self.canvas.waterfall_speed_changed.connect(
+            lambda msg: self.statusBar.showMessage(msg, 4000))
         self.canvas.waypoint_goto_requested.connect(self._goto_waypoint)
         self.canvas.waypoint_rename_requested.connect(self._rename_waypoint)
         self.canvas.waypoint_remove_requested.connect(self._remove_waypoint)
@@ -645,8 +647,9 @@ class MainWindow(QMainWindow):
         self.waterfall_action.setShortcut("W")
         self.waterfall_action.setToolTip(
             "Waterfall mode: stack a bottom-level group's images vertically.\n"
-            "Hold Space to glide up, Ctrl+Space to glide down. Starts at the\n"
-            "bottom of the stack; all labels stay visible.")
+            "Hold Space to glide up, Ctrl+Space to glide down; +/- changes\n"
+            "the glide speed. Starts at the bottom of the stack; all labels\n"
+            "stay visible.")
         self.waterfall_action.triggered.connect(
             lambda: self._set_mode(CanvasMode.WATERFALL))
         toolbar.addAction(self.waterfall_action)
@@ -728,6 +731,14 @@ class MainWindow(QMainWindow):
                 elif etype == QEvent.KeyRelease and not event.isAutoRepeat():
                     self.canvas.stop_waterfall_glide()
                 return True  # Event consumed either way
+        # Glide speed works from the tree too, matching the canvas handler.
+        if (etype == QEvent.KeyPress
+                and self.canvas._mode == CanvasMode.WATERFALL
+                and event.key() in (Qt.Key_Plus, Qt.Key_Equal,
+                                    Qt.Key_Minus, Qt.Key_Underscore)):
+            faster = event.key() in (Qt.Key_Plus, Qt.Key_Equal)
+            self.canvas.adjust_waterfall_speed(2.0 if faster else 0.5)
+            return True
             if etype == QEvent.KeyPress and mode in STEP_CYCLE_MODES:
                 # Ctrl+Space steps backwards, consistent with the canvas handler.
                 if event.modifiers() & Qt.ControlModifier:
@@ -947,7 +958,7 @@ class MainWindow(QMainWindow):
               f"{len(layer_ids)} images stacked")
         self.statusBar.showMessage(
             f"Waterfall: {len(layer_ids)} images - hold Space to glide up, "
-            "Ctrl+Space to glide down", 0)
+            "Ctrl+Space to glide down, +/- to change speed", 0)
 
     def _cycle_to_next_layer(self):
         """Toggle off current layer, turn on and zoom to the next layer in the cycle."""

@@ -1528,6 +1528,9 @@ class MapCanvas(QGraphicsView):
     # Signal emitted when measure mode state changes: (is_active, message)
     measure_mode_changed = pyqtSignal(bool, str)
 
+    # Status text when the waterfall glide speed is stepped with +/-.
+    waterfall_speed_changed = pyqtSignal(str)
+
     # Signal emitted while the ruler is measuring: (is_active, message)
     ruler_changed = pyqtSignal(bool, str)
 
@@ -1756,6 +1759,10 @@ class MapCanvas(QGraphicsView):
         self._waterfall_projection_items: list = []
         # Hold-to-glide navigation timer. Direction: -1 glides up, +1 down.
         self._waterfall_glide_dir = 0
+        # Glide speed multiplier on WATERFALL_GLIDE_PX, stepped x2 with the
+        # +/- keys while the mode is active. Kept for the whole session, so
+        # a user who likes it fast stays fast across waterfall visits.
+        self._waterfall_speed = 1.0
         self._waterfall_glide_timer = QTimer()
         self._waterfall_glide_timer.setInterval(WATERFALL_GLIDE_INTERVAL_MS)
         self._waterfall_glide_timer.timeout.connect(
@@ -2081,14 +2088,28 @@ class MapCanvas(QGraphicsView):
         self._waterfall_glide_dir = 0
         self._waterfall_glide_timer.stop()
 
+    # Glide speed multiplier bounds: 1/4 of the default for careful review,
+    # 8x for skimming a long stack.
+    _WATERFALL_SPEED_MIN = 0.25
+    _WATERFALL_SPEED_MAX = 8.0
+
+    def adjust_waterfall_speed(self, factor: float):
+        """Step the glide speed (x2 or x0.5 from the +/- keys), clamped."""
+        self._waterfall_speed = min(
+            self._WATERFALL_SPEED_MAX,
+            max(self._WATERFALL_SPEED_MIN, self._waterfall_speed * factor))
+        self.waterfall_speed_changed.emit(
+            f"Waterfall glide speed: {self._waterfall_speed:g}x "
+            f"(+ faster, - slower)")
+
     def _on_waterfall_glide_tick(self):
         """Scroll the view a small step in the current glide direction."""
         if self._waterfall_glide_dir == 0 or not self._waterfall_active:
             self._waterfall_glide_timer.stop()
             return
+        step = max(1, round(WATERFALL_GLIDE_PX * self._waterfall_speed))
         bar = self.verticalScrollBar()
-        bar.setValue(bar.value()
-                     + self._waterfall_glide_dir * WATERFALL_GLIDE_PX)
+        bar.setValue(bar.value() + self._waterfall_glide_dir * step)
 
     def _scene_to_web(self, scene_pt: QPointF) -> tuple[float, float]:
         """Convert a scene point to Web Mercator (easting, northing).
@@ -3597,6 +3618,12 @@ class MapCanvas(QGraphicsView):
             if not event.isAutoRepeat():
                 direction = 1 if (event.modifiers() & Qt.ControlModifier) else -1
                 self.start_waterfall_glide(direction)
+        elif (event.key() in (Qt.Key_Plus, Qt.Key_Equal)
+                and self._mode == CanvasMode.WATERFALL):
+            self.adjust_waterfall_speed(2.0)
+        elif (event.key() in (Qt.Key_Minus, Qt.Key_Underscore)
+                and self._mode == CanvasMode.WATERFALL):
+            self.adjust_waterfall_speed(0.5)
         elif event.key() == Qt.Key_Space and self._mode in STEP_CYCLE_MODES:
             if event.modifiers() & Qt.ControlModifier:
                 # Ctrl+Space: go backwards
