@@ -121,6 +121,10 @@ class LayerPanel(QWidget):
         self._layer_items[layer_id] = item
         self._path_items[file_path] = item
 
+        # A new layer can change its group's aggregate (e.g. a hidden layer
+        # added to a fully-shown group makes it partial).
+        self.refresh_group_check_states()
+
     def add_group(self, name: str, parent: QTreeWidgetItem = None,
                   visible: bool = True):
         """Add a group to the tree.
@@ -158,12 +162,13 @@ class LayerPanel(QWidget):
         if item_type == "layer":
             layer_id = item.data(0, Qt.UserRole)
             self.layer_visibility_changed.emit(layer_id, checked)
-
-            # If turning ON, ensure all parent groups are also checked
-            if checked:
-                self._check_parent_groups(item)
+            # Group boxes mirror their layers (on, off, or partial).
+            self.refresh_group_check_states()
 
         elif item_type == "group":
+            # A user click lands on Checked or Unchecked (a partial box goes
+            # to Checked); a refresh writing PartiallyChecked never gets here
+            # because refreshes run with tree signals blocked.
             # Count all descendant layers for progress tracking
             layer_count = self._count_descendant_layers(item)
             use_progress = layer_count >= 10  # Only show progress for 10+ items
@@ -177,61 +182,49 @@ class LayerPanel(QWidget):
             if use_progress:
                 self.batch_visibility_finished.emit()
 
-            # If turning ON, ensure all parent groups are also checked
-            if checked:
-                self._check_parent_groups(item)
+            # Ancestors follow: they may become partial rather than checked.
+            self.refresh_group_check_states()
 
-    def _check_parent_groups(self, item: QTreeWidgetItem):
-        """Ensure all parent groups of an item are checked.
+    def refresh_group_check_states(self):
+        """Make every group checkbox mirror its descendant layers.
 
-        Args:
-            item: The item whose parents should be checked
+        A group shows Checked when all of its layers are on, Unchecked when
+        none are (or it is empty), and PartiallyChecked for a mix. This is
+        the ONE place group boxes are computed; every path that flips layer
+        checks - a user click, waterfall/cycle entry, reveals, syncs from the
+        other panels - ends here, so the boxes cannot drift the way they used
+        to (a waterfall group showing off while all its layers were on).
+        Clicking a partial box turns the whole group on.
         """
         self.tree.blockSignals(True)
-        parent = item.parent()
-        while parent is not None:
-            if parent.checkState(0) != Qt.Checked:
-                parent.setCheckState(0, Qt.Checked)
-            parent = parent.parent()
-        self.tree.blockSignals(False)
+        try:
+            for i in range(self.tree.topLevelItemCount()):
+                self._refresh_group_item(self.tree.topLevelItem(i))
+        finally:
+            self.tree.blockSignals(False)
+
+    def _refresh_group_item(self, item: QTreeWidgetItem) -> tuple:
+        """Bottom-up recompute of one subtree; returns (checked, total)."""
+        if item.data(0, Qt.UserRole + 1) == "layer":
+            return (1 if item.checkState(0) == Qt.Checked else 0), 1
+        checked = total = 0
+        for i in range(item.childCount()):
+            c, t = self._refresh_group_item(item.child(i))
+            checked += c
+            total += t
+        if total == 0 or checked == 0:
+            state = Qt.Unchecked
+        elif checked == total:
+            state = Qt.Checked
+        else:
+            state = Qt.PartiallyChecked
+        if item.checkState(0) != state:
+            item.setCheckState(0, state)
+        return checked, total
 
     def _check_parents_of_visible_items(self):
-        """Ensure all parent groups are checked for any checked (visible) items.
-
-        Called after drag-drop to fix parent states when items are moved.
-        """
-        self.tree.blockSignals(True)
-
-        def check_item(item: QTreeWidgetItem):
-            """Recursively ensure parents of any checked item are also checked."""
-            item_type = item.data(0, Qt.UserRole + 1)
-            is_checked = item.checkState(0) == Qt.Checked
-
-            if item_type == "layer":
-                # If this layer is checked, ensure all parents are checked
-                if is_checked:
-                    parent = item.parent()
-                    while parent is not None:
-                        if parent.checkState(0) != Qt.Checked:
-                            parent.setCheckState(0, Qt.Checked)
-                        parent = parent.parent()
-            elif item_type == "group":
-                # If this group is checked, ensure all parents are checked
-                if is_checked:
-                    parent = item.parent()
-                    while parent is not None:
-                        if parent.checkState(0) != Qt.Checked:
-                            parent.setCheckState(0, Qt.Checked)
-                        parent = parent.parent()
-                # Recurse into children
-                for i in range(item.childCount()):
-                    check_item(item.child(i))
-
-        # Check all top-level items
-        for i in range(self.tree.topLevelItemCount()):
-            check_item(self.tree.topLevelItem(i))
-
-        self.tree.blockSignals(False)
+        """Recompute group boxes after drag-drop moves items between groups."""
+        self.refresh_group_check_states()
 
     def _count_descendant_layers(self, item: QTreeWidgetItem) -> int:
         """Count all layer items that are descendants of this item."""
@@ -446,6 +439,8 @@ class LayerPanel(QWidget):
         set_children_state(item)
         # Also set the group item itself
         item.setCheckState(0, check_state)
+        # Ancestors may now be partial (or no longer partial).
+        self.refresh_group_check_states()
 
     def _expand_all_children(self, item: QTreeWidgetItem):
         """Recursively expand an item and all its children.
@@ -515,6 +510,10 @@ class LayerPanel(QWidget):
         for layer_id in layer_ids_to_remove:
             self._drop_layer_from_caches(layer_id)
 
+        # Removing the only unchecked (or only checked) child changes the
+        # remaining group's aggregate.
+        self.refresh_group_check_states()
+
         # Emit removal signals for each layer
         for layer_id in layer_ids_to_remove:
             self.layer_removed.emit(layer_id)
@@ -560,6 +559,7 @@ class LayerPanel(QWidget):
             if i % 50 == 0:
                 QApplication.processEvents()
         self.tree.blockSignals(False)
+        self.refresh_group_check_states()
 
         # Emit visibility changed signals for each layer that was actually
         # changed
@@ -592,6 +592,7 @@ class LayerPanel(QWidget):
             if i % 50 == 0:
                 QApplication.processEvents()
         self.tree.blockSignals(False)
+        self.refresh_group_check_states()
 
         # Emit visibility changed signals for each layer that was actually
         # changed
@@ -820,6 +821,8 @@ class LayerPanel(QWidget):
         self._layer_items[layer_id] = item
         self._path_items[file_path] = item
 
+        self.refresh_group_check_states()
+
     def set_layer_checked(self, layer_id: str, checked: bool):
         """Set the check state of a specific layer without emitting signals.
 
@@ -833,16 +836,9 @@ class LayerPanel(QWidget):
 
         self.tree.blockSignals(True)
         found_item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
-
-        # If turning ON, also check all parent groups
-        if checked:
-            parent = found_item.parent()
-            while parent is not None:
-                if parent.checkState(0) != Qt.Checked:
-                    parent.setCheckState(0, Qt.Checked)
-                parent = parent.parent()
-
         self.tree.blockSignals(False)
+        # Group boxes follow their layers, whichever way this one flipped.
+        self.refresh_group_check_states()
 
     def is_layer_checked(self, layer_id: str) -> bool:
         """Check if a specific layer is checked (visible).
