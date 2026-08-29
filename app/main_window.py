@@ -1,4 +1,5 @@
 """Main application window."""
+import hashlib
 import json
 import math
 import os
@@ -366,7 +367,6 @@ class MainWindow(QMainWindow):
         self.canvas.label_unlinked.connect(self._on_label_unlinked)
         self.canvas.label_describe_requested.connect(self._describe_label)
         self.canvas.label_group_id_requested.connect(self._edit_group_id)
-        self.canvas.show_linked_requested.connect(self._on_show_linked)
         self.canvas.link_mode_changed.connect(self._on_link_mode_changed)
         self.canvas.label_measured.connect(self._on_label_measured)
         self.canvas.measure_mode_changed.connect(self._on_measure_mode_changed)
@@ -1132,6 +1132,9 @@ class MainWindow(QMainWindow):
         # Remove from labeled images panel incrementally (O(1) instead of full refresh)
         self.layer_panel.remove_label_from_panel(label_id)
 
+        # Its group may have shrunk to one label - that survivor's halo goes.
+        self._update_ring_colors()
+
         # Projections may reference the removed label.
         self._update_waterfall_projections()
 
@@ -1154,7 +1157,8 @@ class MainWindow(QMainWindow):
             if layer is None or layer._src_crs is None:
                 continue  # plain image - a pixel has no meaningful lat/lon
             infos.append((label.id, label.lon, label.lat, label.class_name,
-                          self._get_class_color(label.class_name), image.path))
+                          self._get_class_color(label.class_name), image.path,
+                          self._label_ring_color(label)))
         self.canvas.set_waterfall_projections(infos)
 
     def _sync_measurements_in_group(self, label_id1: int, label_id2: int) -> int:
@@ -1224,6 +1228,11 @@ class MainWindow(QMainWindow):
             # If wiring is on, propagate any existing measurement across the
             # newly-merged group before refreshing the panel.
             synced = self._sync_measurements_in_group(label_id1, label_id2)
+
+            # The whole merged group shares one halo colour now; markers on
+            # every affected label (and any waterfall projections) follow.
+            self._update_ring_colors()
+            self._update_waterfall_projections()
 
             # Refresh labeled images panel (grouping may have changed)
             self.layer_panel.refresh_labeled_panel(self.project)
@@ -1315,30 +1324,15 @@ class MainWindow(QMainWindow):
             # Also clear highlight since it's no longer part of a group
             self.canvas.highlight_labels([remaining[0].id], highlight=False)
 
+        # The leaver loses its halo; a group shrunk to one loses its too.
+        self._update_ring_colors()
+        self._update_waterfall_projections()
+
         # Refresh labeled images panel (grouping may have changed)
         self.layer_panel.refresh_labeled_panel(self.project)
         self._refresh_snippet_panel()
 
         self.statusBar.showMessage("Label unlinked from object", 3000)
-
-    def _on_show_linked(self, label_id: int):
-        """Highlight all labels linked to the given label."""
-        linked_labels = self.project.get_linked_labels(label_id)
-
-        if linked_labels:
-            # First, clear any existing highlights
-            all_label_ids = [label.id for _,
-                             label in self.project.get_all_labels()]
-            self.canvas.highlight_labels(all_label_ids, highlight=False)
-
-            # Highlight linked labels
-            linked_ids = [label.id for _, label in linked_labels]
-            self.canvas.highlight_labels(linked_ids, highlight=True)
-
-            self.statusBar.showMessage(
-                f"Showing {
-                    len(linked_labels)} linked labels (click anywhere to clear)",
-                3000)
 
     def _on_link_mode_changed(self, is_active: bool, message: str):
         """Handle link mode state changes."""
@@ -1654,6 +1648,47 @@ class MainWindow(QMainWindow):
         self.canvas.setFocus()
         self.statusBar.showMessage("Cleared the coordinate marker", 3000)
 
+    # Linked-group halo colours. Distinct linked groups - even within one
+    # class - get different ring colours so they read apart at a glance; the
+    # colour is a stable hash of the object_id, so it never shuffles when
+    # groups are added or the project is reloaded. Hues chosen to stay
+    # distinguishable from the chain-highlight yellow and measured cyan.
+    _RING_PALETTE = [
+        QColor(230, 25, 75),    # crimson
+        QColor(60, 180, 75),    # green
+        QColor(0, 130, 200),    # blue
+        QColor(245, 130, 48),   # orange
+        QColor(145, 30, 180),   # purple
+        QColor(240, 50, 230),   # magenta
+        QColor(170, 110, 40),   # brown
+        QColor(128, 128, 0),    # olive
+        QColor(0, 128, 128),    # teal
+        QColor(230, 190, 60),   # gold
+        QColor(250, 140, 160),  # pink
+        QColor(140, 220, 130),  # mint
+    ]
+
+    def _ring_color_for_object(self, object_id: str) -> QColor:
+        digest = hashlib.md5(object_id.encode("utf-8")).digest()
+        return self._RING_PALETTE[digest[0] % len(self._RING_PALETTE)]
+
+    def _label_ring_color(self, label) -> "QColor | None":
+        """The label's linked-group halo colour, or None when unlinked."""
+        group = self.project._object_id_index.get(label.object_id, ())
+        if len(group) < 2:
+            return None
+        return self._ring_color_for_object(label.object_id)
+
+    def _update_ring_colors(self):
+        """Bring every marker's linked-group halo up to date.
+
+        Called whenever links change (link, chain/box link, unlink, label
+        removal), so the halo is always current - no "show linked" step.
+        """
+        for _image, label in self.project.get_all_labels():
+            self.canvas.set_label_ring(
+                label.id, self._label_ring_color(label))
+
     def _refresh_label_markers(self):
         """Refresh all label markers on the canvas."""
         self.canvas.clear_label_markers()
@@ -1663,7 +1698,8 @@ class MainWindow(QMainWindow):
                 label.id, label.lon, label.lat,
                 image.name, image.group, image.path,
                 label.class_name, color,
-                pixel_x=label.pixel_x, pixel_y=label.pixel_y
+                pixel_x=label.pixel_x, pixel_y=label.pixel_y,
+                ring_color=self._label_ring_color(label)
             )
             # Check if label is linked to others
             linked_labels = self.project.get_linked_labels(label.id)

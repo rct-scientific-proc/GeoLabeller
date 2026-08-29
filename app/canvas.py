@@ -9,8 +9,9 @@ import rasterio
 from collections import deque
 
 from PyQt5 import sip
-from PyQt5.QtCore import (Qt, pyqtSignal, QRectF, QLineF, QPointF, QTimer,
-                          QThread, QObject, QThreadPool, QRunnable)
+from PyQt5.QtCore import (Qt, pyqtSignal, QRect, QRectF, QLineF, QPointF,
+                          QSize, QTimer, QThread, QObject, QThreadPool,
+                          QRunnable)
 
 from PyQt5.QtGui import (
     QImage,
@@ -27,7 +28,7 @@ from PyQt5.QtGui import (
 from PyQt5.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
     QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem, QGraphicsTextItem,
-    QGraphicsPathItem, QGraphicsRectItem, QMenu, QWidget
+    QGraphicsPathItem, QGraphicsRectItem, QMenu, QRubberBand, QWidget
 )
 from pyproj import Transformer
 from rasterio.crs import CRS
@@ -1493,7 +1494,6 @@ class MapCanvas(QGraphicsView):
     label_group_id_requested = pyqtSignal(int)
 
     # Signal emitted when user wants to highlight linked labels: (label_id)
-    show_linked_requested = pyqtSignal(int)
 
     # Waypoint requests raised from the canvas, handled by the main window
     # (which owns the project). Add carries a WGS84 (lon, lat); the rest carry
@@ -1673,6 +1673,10 @@ class MapCanvas(QGraphicsView):
         # the highlight can be undone.
         self._chain_link_active = False
         self._chain_link_anchor: int | None = None
+        # Desktop-style band selection while chain linking: press on empty
+        # canvas, drag a box, and every label inside joins the chain.
+        self._chain_band: QRubberBand | None = None
+        self._chain_band_origin = None      # QPoint while dragging, else None
         self._chain_members: set[int] = set()
         self._chain_highlighted: list = []
 
@@ -3322,12 +3326,21 @@ class MapCanvas(QGraphicsView):
                 self._exit_link_mode()
                 return
 
-            # Chain-link overlay: clicks select labels to link instead of
-            # placing new labels (a miss on empty canvas does nothing).
+            # Chain-link overlay: clicks select labels to link; a press on
+            # empty canvas starts a desktop-style band selection instead -
+            # every label inside the box on release joins the chain.
             if self._chain_link_active:
                 label_id, _ = self._get_label_at_position(event.pos())
                 if label_id is not None:
                     self._chain_link_click(label_id)
+                else:
+                    self._chain_band_origin = event.pos()
+                    if self._chain_band is None:
+                        self._chain_band = QRubberBand(
+                            QRubberBand.Rectangle, self.viewport())
+                    self._chain_band.setGeometry(
+                        QRect(self._chain_band_origin, QSize()))
+                    self._chain_band.show()
                 return
 
             # Ctrl+Left-click in CYCLE/VIEW_CYCLE mode shows label context menu (for
@@ -3384,6 +3397,18 @@ class MapCanvas(QGraphicsView):
 
     def mouseReleaseEvent(self, event):
         """Handle mouse release."""
+        # Chain-link band selection: link everything inside the box.
+        if (self._chain_band_origin is not None
+                and event.button() == Qt.LeftButton):
+            band_rect = QRect(self._chain_band_origin,
+                              event.pos()).normalized()
+            self._chain_band_origin = None
+            if self._chain_band is not None:
+                self._chain_band.hide()
+            # A tiny box is an empty-canvas click, not a selection.
+            if band_rect.width() >= 5 and band_rect.height() >= 5:
+                self._chain_band_select(band_rect)
+            return
         # Measure mode consumes clicks in mousePressEvent; swallow the matching
         # release so it can't reach pan/cycle release handling.
         if self._measure_active:
@@ -3419,6 +3444,11 @@ class MapCanvas(QGraphicsView):
     def mouseMoveEvent(self, event):
         """Track mouse position and emit lat/lon coordinates."""
         self._last_mouse_view_pos = event.pos()
+
+        # Chain-link band selection: stretch the box to the cursor.
+        if self._chain_band_origin is not None and self._chain_band is not None:
+            self._chain_band.setGeometry(
+                QRect(self._chain_band_origin, event.pos()).normalized())
 
         # Measure mode: stretch the rubber-band line to the cursor. Fall through
         # so the coordinate readout still updates.
@@ -3705,7 +3735,8 @@ class MapCanvas(QGraphicsView):
     def add_label_marker(self, label_id: int, lon: float, lat: float,
                          image_name: str, image_group: str, image_path: str,
                          class_name: str, color: QColor = None,
-                         pixel_x: float = None, pixel_y: float = None):
+                         pixel_x: float = None, pixel_y: float = None,
+                         ring_color: QColor = None):
         """Add a visual marker for a label on the canvas.
 
         Args:
@@ -3736,15 +3767,23 @@ class MapCanvas(QGraphicsView):
             x, y = self._wgs84_to_web_mercator(lon, lat)
 
         ellipse, text = self._make_label_marker_items(
-            x, y, class_name, color, image_path)
+            x, y, class_name, color, image_path, ring_color=ring_color)
         self._label_items[label_id] = (ellipse, text)
 
+    # Outer ring diameter as a multiple of the marker: a halo around the
+    # marker rather than an outline on it, so it reads at a glance and never
+    # fights the measured-label (cyan) outline on the marker itself.
+    _RING_FACTOR = 1.9
+
     def _make_label_marker_items(self, x: float, y: float, class_name: str,
-                                 color: QColor, image_path: str):
+                                 color: QColor, image_path: str,
+                                 ring_color: QColor | None = None):
         """Create the (ellipse, text) items of a label marker at world (x, y).
 
         Shared by real label markers and waterfall projections so both render
         identically. Items are parented to the floating-origin group.
+        ``ring_color`` adds the linked-group halo: an outer circle in the
+        group's colour (see set_label_ring).
         """
         # Get current view scale to size markers appropriately
         view_scale = self._view_scale()
@@ -3762,6 +3801,8 @@ class MapCanvas(QGraphicsView):
         ellipse.setBrush(QBrush(color))
         ellipse.setZValue(self._get_label_z_base())
         ellipse.setData(0, image_path)  # Store image_path for later retrieval
+        if ring_color is not None:
+            self._add_ring_item(ellipse, ring_color, marker_size)
 
         # Create text label
         text = QGraphicsTextItem(class_name)
@@ -3782,6 +3823,54 @@ class MapCanvas(QGraphicsView):
         text.setParentItem(self._overlay_group)
         return ellipse, text
 
+    @staticmethod
+    def _ring_of(ellipse) -> "QGraphicsEllipseItem | None":
+        """The linked-group ring child of a marker ellipse, if it has one."""
+        for child in ellipse.childItems():
+            if isinstance(child, QGraphicsEllipseItem):
+                return child
+        return None
+
+    def _add_ring_item(self, ellipse, ring_color: QColor,
+                       marker_size: float):
+        """Attach the linked-group halo as a child of the marker ellipse.
+
+        A child follows the marker's position, visibility and removal for
+        free; it stacks behind the parent so the marker stays crisp on top.
+        """
+        ring_size = marker_size * self._RING_FACTOR
+        ring = QGraphicsEllipseItem(
+            -ring_size / 2, -ring_size / 2, ring_size, ring_size, ellipse)
+        ring.setPen(QPen(ring_color, marker_size / 4))
+        ring.setBrush(QBrush(Qt.NoBrush))
+        ring.setFlag(QGraphicsItem.ItemStacksBehindParent, True)
+        return ring
+
+    def set_label_ring(self, label_id: int, ring_color: QColor | None):
+        """Set, recolour or remove a label's linked-group halo.
+
+        Every label sharing an object gets the same ring colour; distinct
+        linked groups get distinct colours (main_window assigns them), and an
+        unlinked label has no ring. Called whenever links change, so the halo
+        is always current without any "show linked" step.
+        """
+        if label_id not in self._label_items:
+            return
+        ellipse, _text = self._label_items[label_id]
+        ring = self._ring_of(ellipse)
+        if ring_color is None:
+            if ring is not None:
+                ring.setParentItem(None)
+                self._scene.removeItem(ring)
+            return
+        if ring is None:
+            self._add_ring_item(ellipse, ring_color,
+                                ellipse.rect().width())
+        else:
+            pen = ring.pen()
+            pen.setColor(ring_color)
+            ring.setPen(pen)
+
     def set_waterfall_projections(self, label_infos: list):
         """Display labels on every stacked image whose bounds contain them.
 
@@ -3794,12 +3883,13 @@ class MapCanvas(QGraphicsView):
         context menu / link flow applies).
 
         label_infos: list of (label_id, lon, lat, class_name, color,
-        source_image_path) tuples.
+        source_image_path, ring_color) tuples.
         """
         self.clear_waterfall_projections()
         if not self._waterfall_active:
             return
-        for label_id, lon, lat, class_name, color, source_path in label_infos:
+        for (label_id, lon, lat, class_name, color, source_path,
+             ring_color) in label_infos:
             for layer_id in self._waterfall_layer_order:
                 layer = self._layers.get(layer_id)
                 if (layer is None or layer.bounds is None
@@ -3821,7 +3911,7 @@ class MapCanvas(QGraphicsView):
                 ellipse, text = self._make_label_marker_items(
                     x, y, class_name,
                     color if color is not None else QColor(255, 50, 50),
-                    source_path)
+                    source_path, ring_color=ring_color)
                 self._waterfall_projection_items.append(
                     (label_id, ellipse, text))
 
@@ -3877,6 +3967,16 @@ class MapCanvas(QGraphicsView):
             pen = ellipse.pen()
             pen.setWidthF(marker_size / 5)
             ellipse.setPen(pen)
+
+            # The linked-group halo scales with its marker.
+            ring = self._ring_of(ellipse)
+            if ring is not None:
+                ring_size = marker_size * self._RING_FACTOR
+                ring.setRect(-ring_size / 2, -ring_size / 2,
+                             ring_size, ring_size)
+                ring_pen = ring.pen()
+                ring_pen.setWidthF(marker_size / 4)
+                ring.setPen(ring_pen)
 
             # Text ignores the view transform (constant size / upright), so it
             # only needs repositioning as the marker size changes.
@@ -3957,13 +4057,12 @@ class MapCanvas(QGraphicsView):
             if ellipse and ellipse.data(4):
                 clear_measure_action = menu.addAction("Clear Measurements")
 
-            # Unlink and Show linked options (only if label is linked to
-            # others)
+            # Unlink option (only if label is linked to others). The old
+            # "Show Linked" action is gone: linked groups now carry an
+            # always-on coloured halo, so there is nothing to reveal.
             unlink_action = None
-            show_linked_action = None
             if is_linked:
                 unlink_action = menu.addAction("Unlink")
-                show_linked_action = menu.addAction("Show Linked")
 
             menu.addSeparator()
 
@@ -3994,8 +4093,6 @@ class MapCanvas(QGraphicsView):
                 self.label_group_id_requested.emit(label_id)
             elif action == unlink_action:
                 self.label_unlinked.emit(label_id)
-            elif action == show_linked_action:
-                self.show_linked_requested.emit(label_id)
             elif action == toggle_layer_action:
                 # Get the layer_id from the image_path and emit toggle signal
                 if image_path in self._path_to_layer:
@@ -4227,6 +4324,9 @@ class MapCanvas(QGraphicsView):
             self._chain_link_active = False
             self._chain_link_anchor = None
             self._chain_members = set()
+            self._chain_band_origin = None
+            if self._chain_band is not None:
+                self._chain_band.hide()
             self._chain_restore_highlights()
             if self._mode in LABELING_MODES:
                 self.setCursor(_crosshair_cursor())
@@ -4268,6 +4368,36 @@ class MapCanvas(QGraphicsView):
         self.chain_link_changed.emit(
             True, f"Chain link: {len(self._chain_members)} labels in this "
                   "chain - N = new chain, Esc = done")
+
+    def _chain_band_select(self, band_rect: QRect):
+        """Chain-link every label marker inside a dragged selection box.
+
+        Each hit goes through _chain_link_click, so a box behaves exactly
+        like clicking its labels one by one: the first anchors a chain when
+        none is active, the rest link to it immediately, and a second box
+        (or more clicks) extends the same chain. Waterfall projections count
+        as their source labels, just as clicks on them do.
+        """
+        scene_rect = self.mapToScene(band_rect).boundingRect()
+        hits = []
+        for label_id, (ellipse, _text) in self._label_items.items():
+            if (ellipse.isVisible()
+                    and scene_rect.contains(
+                        ellipse.sceneBoundingRect().center())):
+                hits.append(label_id)
+        for label_id, ellipse, _text in self._waterfall_projection_items:
+            if (label_id not in hits and ellipse.isVisible()
+                    and scene_rect.contains(
+                        ellipse.sceneBoundingRect().center())):
+                hits.append(label_id)
+        if not hits:
+            self.chain_link_changed.emit(
+                True, "Chain link: no labels in the box - drag around "
+                      "label markers to link them")
+            return
+        hits.sort()     # deterministic anchor when the box starts a chain
+        for label_id in hits:
+            self._chain_link_click(label_id)
 
     _CHAIN_HIGHLIGHT_COLOR = QColor(255, 255, 0)
 
