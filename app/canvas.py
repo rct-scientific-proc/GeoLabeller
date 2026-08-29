@@ -1673,10 +1673,13 @@ class MapCanvas(QGraphicsView):
         # the highlight can be undone.
         self._chain_link_active = False
         self._chain_link_anchor: int | None = None
-        # Desktop-style band selection while chain linking: press on empty
-        # canvas, drag a box, and every label inside joins the chain.
-        self._chain_band: QRubberBand | None = None
-        self._chain_band_origin = None      # QPoint while dragging, else None
+        # Box-link mode: entered from a label's context menu ("Link by
+        # Box"). The user drags a desktop-style box; on release every label
+        # inside is linked to the ANCHOR label the menu was opened on, then
+        # the mode ends. One shot, one obvious owner.
+        self._box_link_anchor: "int | None" = None
+        self._box_link_band: QRubberBand | None = None
+        self._box_link_origin = None        # QPoint while dragging, else None
         self._chain_members: set[int] = set()
         self._chain_highlighted: list = []
 
@@ -3284,6 +3287,21 @@ class MapCanvas(QGraphicsView):
                 self._exit_measure_mode()
             return
 
+        # Box-link mode intercepts clicks the same way: left press starts
+        # (or restarts) the box, right click cancels the mode.
+        if self._box_link_anchor is not None:
+            if event.button() == Qt.LeftButton:
+                self._box_link_origin = event.pos()
+                if self._box_link_band is None:
+                    self._box_link_band = QRubberBand(
+                        QRubberBand.Rectangle, self.viewport())
+                self._box_link_band.setGeometry(
+                    QRect(self._box_link_origin, QSize()))
+                self._box_link_band.show()
+            elif event.button() == Qt.RightButton:
+                self._exit_box_link_mode("Box link cancelled")
+            return
+
         # Shift+left-drag measures from whatever mode is active, so reaching for
         # the ruler never costs a mode switch - and in cycle modes, never costs
         # the cycle queue.
@@ -3326,21 +3344,12 @@ class MapCanvas(QGraphicsView):
                 self._exit_link_mode()
                 return
 
-            # Chain-link overlay: clicks select labels to link; a press on
-            # empty canvas starts a desktop-style band selection instead -
-            # every label inside the box on release joins the chain.
+            # Chain-link overlay: clicks select labels to link instead of
+            # placing new labels (a miss on empty canvas does nothing).
             if self._chain_link_active:
                 label_id, _ = self._get_label_at_position(event.pos())
                 if label_id is not None:
                     self._chain_link_click(label_id)
-                else:
-                    self._chain_band_origin = event.pos()
-                    if self._chain_band is None:
-                        self._chain_band = QRubberBand(
-                            QRubberBand.Rectangle, self.viewport())
-                    self._chain_band.setGeometry(
-                        QRect(self._chain_band_origin, QSize()))
-                    self._chain_band.show()
                 return
 
             # Ctrl+Left-click in CYCLE/VIEW_CYCLE mode shows label context menu (for
@@ -3397,17 +3406,19 @@ class MapCanvas(QGraphicsView):
 
     def mouseReleaseEvent(self, event):
         """Handle mouse release."""
-        # Chain-link band selection: link everything inside the box.
-        if (self._chain_band_origin is not None
+        # Box-link mode: link everything inside the released box to the
+        # anchor label, then leave the mode.
+        if (self._box_link_origin is not None
                 and event.button() == Qt.LeftButton):
-            band_rect = QRect(self._chain_band_origin,
+            band_rect = QRect(self._box_link_origin,
                               event.pos()).normalized()
-            self._chain_band_origin = None
-            if self._chain_band is not None:
-                self._chain_band.hide()
-            # A tiny box is an empty-canvas click, not a selection.
+            self._box_link_origin = None
+            if self._box_link_band is not None:
+                self._box_link_band.hide()
+            # A tiny box is a stray click; stay in the mode and let the
+            # user drag again.
             if band_rect.width() >= 5 and band_rect.height() >= 5:
-                self._chain_band_select(band_rect)
+                self._apply_box_link(band_rect)
             return
         # Measure mode consumes clicks in mousePressEvent; swallow the matching
         # release so it can't reach pan/cycle release handling.
@@ -3445,10 +3456,11 @@ class MapCanvas(QGraphicsView):
         """Track mouse position and emit lat/lon coordinates."""
         self._last_mouse_view_pos = event.pos()
 
-        # Chain-link band selection: stretch the box to the cursor.
-        if self._chain_band_origin is not None and self._chain_band is not None:
-            self._chain_band.setGeometry(
-                QRect(self._chain_band_origin, event.pos()).normalized())
+        # Box-link selection: stretch the box to the cursor.
+        if (self._box_link_origin is not None
+                and self._box_link_band is not None):
+            self._box_link_band.setGeometry(
+                QRect(self._box_link_origin, event.pos()).normalized())
 
         # Measure mode: stretch the rubber-band line to the cursor. Fall through
         # so the coordinate readout still updates.
@@ -3548,7 +3560,10 @@ class MapCanvas(QGraphicsView):
 
     def keyPressEvent(self, event):
         """Handle key press events."""
-        if event.key() == Qt.Key_Escape and self._measure_active:
+        if (event.key() == Qt.Key_Escape
+                and self._box_link_anchor is not None):
+            self._exit_box_link_mode("Box link cancelled")
+        elif event.key() == Qt.Key_Escape and self._measure_active:
             self._exit_measure_mode()
         elif event.key() == Qt.Key_M and not self._measure_active:
             # Start measuring the label under the cursor.
@@ -4042,6 +4057,7 @@ class MapCanvas(QGraphicsView):
 
             # Link option - always available
             link_action = menu.addAction("Link with...")
+            box_link_action = menu.addAction("Link by Box...")
 
             # Measure length/width - only meaningful for georeferenced images
             measure_action = menu.addAction("Measure Length / Width")
@@ -4081,6 +4097,8 @@ class MapCanvas(QGraphicsView):
                 self.label_removed.emit(label_id, image_path)
             elif action == link_action:
                 self._enter_link_mode(label_id)
+            elif action == box_link_action:
+                self.enter_box_link_mode(label_id)
             elif action == measure_action:
                 self._enter_measure_mode(label_id)
             elif clear_measure_action is not None and action == clear_measure_action:
@@ -4324,9 +4342,6 @@ class MapCanvas(QGraphicsView):
             self._chain_link_active = False
             self._chain_link_anchor = None
             self._chain_members = set()
-            self._chain_band_origin = None
-            if self._chain_band is not None:
-                self._chain_band.hide()
             self._chain_restore_highlights()
             if self._mode in LABELING_MODES:
                 self.setCursor(_crosshair_cursor())
@@ -4369,14 +4384,44 @@ class MapCanvas(QGraphicsView):
             True, f"Chain link: {len(self._chain_members)} labels in this "
                   "chain - N = new chain, Esc = done")
 
-    def _chain_band_select(self, band_rect: QRect):
-        """Chain-link every label marker inside a dragged selection box.
+    def enter_box_link_mode(self, label_id: int):
+        """Arm box linking with ``label_id`` as the anchor.
 
-        Each hit goes through _chain_link_click, so a box behaves exactly
-        like clicking its labels one by one: the first anchors a chain when
-        none is active, the rest link to it immediately, and a second box
-        (or more clicks) extends the same chain. Waterfall projections count
-        as their source labels, just as clicks on them do.
+        Entered from the label's context menu. The next dragged box links
+        every label inside it to this anchor's object (one shot); right
+        click or Esc cancels.
+        """
+        # Take the mouse over from the other linking/measuring overlays.
+        if self._link_mode_active:
+            self._exit_link_mode()
+        if self._measure_active:
+            self._exit_measure_mode()
+        if self._chain_link_active:
+            self.set_chain_link_mode(False)
+        self._box_link_anchor = label_id
+        self.setCursor(_crosshair_cursor())
+        self.link_mode_changed.emit(
+            True, f"Box link: drag a box around labels to link them to "
+                  f"label #{label_id} - right-click or Esc cancels")
+
+    def _exit_box_link_mode(self, message: str = ""):
+        self._box_link_anchor = None
+        self._box_link_origin = None
+        if self._box_link_band is not None:
+            self._box_link_band.hide()
+        if self._mode in LABELING_MODES:
+            self.setCursor(_crosshair_cursor())
+        elif self._mode == CanvasMode.PAN:
+            self.setCursor(Qt.OpenHandCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+        self.link_mode_changed.emit(False, message)
+
+    def _labels_in_band(self, band_rect: QRect) -> list:
+        """Label ids whose markers sit inside a dragged viewport box.
+
+        Waterfall projections count as their source labels, just as clicks
+        on them do.
         """
         scene_rect = self.mapToScene(band_rect).boundingRect()
         hits = []
@@ -4390,14 +4435,23 @@ class MapCanvas(QGraphicsView):
                     and scene_rect.contains(
                         ellipse.sceneBoundingRect().center())):
                 hits.append(label_id)
+        return sorted(hits)
+
+    def _apply_box_link(self, band_rect: QRect):
+        """Link every label in the box to the anchor, then end the mode."""
+        anchor = self._box_link_anchor
+        hits = [lid for lid in self._labels_in_band(band_rect)
+                if lid != anchor]
         if not hits:
-            self.chain_link_changed.emit(
-                True, "Chain link: no labels in the box - drag around "
-                      "label markers to link them")
+            # Nothing caught: keep the mode armed so the user can re-drag.
+            self.link_mode_changed.emit(
+                True, f"Box link: no labels in the box - drag around "
+                      f"label markers to link them to label #{anchor}")
             return
-        hits.sort()     # deterministic anchor when the box starts a chain
         for label_id in hits:
-            self._chain_link_click(label_id)
+            self.labels_linked.emit(anchor, label_id)
+        self._exit_box_link_mode(
+            f"Box link: {len(hits)} labels linked to label #{anchor}")
 
     _CHAIN_HIGHLIGHT_COLOR = QColor(255, 255, 0)
 
