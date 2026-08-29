@@ -1676,10 +1676,13 @@ class MapCanvas(QGraphicsView):
         self._chain_members: set[int] = set()
         self._chain_highlighted: list = []
 
-        # Measure mode state (drawing length/width lines on a label). Only
-        # active for georeferenced labels; see _enter_measure_mode.
+        # Measure mode state (drawing length/width lines on a label). Needs
+        # source georeferencing for metres; see _enter_measure_mode.
         self._measure_active = False
         self._measure_label_id: int | None = None
+        # The measured label's layer: _line_distance_m maps through its
+        # source pixels when the image is displayed raw (waterfall stack).
+        self._measure_layer: "TiledLayer | None" = None
         self._measure_stage = MeasureStage.LENGTH
         self._measure_start = None  # QPointF: first click of the current line
         self._measure_start_view = None  # first click in view coords (for min-drag)
@@ -4311,11 +4314,16 @@ class MapCanvas(QGraphicsView):
     def _enter_measure_mode(self, label_id: int):
         """Begin drawing length/width measurement lines for a label.
 
-        Measurement is only supported on georeferenced layers (metres are
-        undefined in the pixel zone), so entry is refused for non-geo labels.
+        Measurement needs source georeferencing to give metres. That is the
+        layer's own CRS when displayed geographically, and the RETAINED
+        source CRS/geotransform when the image is displayed as raw pixels in
+        the waterfall stack - the drawn line is mapped back through source
+        pixels to the ground there, so measuring keeps working mid-waterfall.
+        Only a plain raster with no georeferencing at all is refused.
         """
         layer = self._measure_target_layer(label_id)
-        if layer is None or not layer.geo:
+        if layer is None or (not layer.geo and (
+                layer._src_crs is None or layer._src_transform is None)):
             self.measure_mode_changed.emit(
                 False, "Measurements need a georeferenced image")
             return
@@ -4325,6 +4333,7 @@ class MapCanvas(QGraphicsView):
             self._exit_link_mode()
 
         self._measure_active = True
+        self._measure_layer = layer
         self._measure_label_id = label_id
         self._measure_stage = MeasureStage.LENGTH
         self._measure_start = None
@@ -4417,13 +4426,27 @@ class MapCanvas(QGraphicsView):
     def _line_distance_m(self, start_scene, end_scene) -> float | None:
         """Geodesic length in metres of a line between two scene points.
 
-        Scene coordinates are Web Mercator metres (scene Y = -northing). Both
-        endpoints are converted to WGS84 and measured with the Haversine
-        formula so the result is a true ground distance rather than the
-        latitude-inflated planar Web Mercator distance.
+        Geographic display: scene coordinates are Web Mercator metres (scene
+        Y = -northing); both endpoints go to WGS84 and are measured with the
+        Haversine formula, so the result is true ground distance rather than
+        the latitude-inflated planar Web Mercator distance.
+
+        Raw display (the waterfall stack): scene offsets are source PIXELS
+        times PIXEL_ZONE_SCALE, so each endpoint is mapped to a source pixel
+        and through the retained source geotransform/CRS to WGS84 first. Both
+        endpoints use the measured label's own layer, so a cursor straying
+        just off the image edge extrapolates along the same grid instead of
+        producing garbage.
         """
         e1, n1 = self._scene_to_web(start_scene)
         e2, n2 = self._scene_to_web(end_scene)
+        layer = self._measure_layer
+        if layer is not None and not layer.geo:
+            ll1 = layer.pixel_to_latlon(*layer.scene_to_pixel(e1, n1))
+            ll2 = layer.pixel_to_latlon(*layer.scene_to_pixel(e2, n2))
+            if ll1 is None or ll2 is None:
+                return None
+            return haversine_distance(ll1[1], ll1[0], ll2[1], ll2[0])
         lon1, lat1 = self._web_mercator_to_wgs84(e1, n1)
         lon2, lat2 = self._web_mercator_to_wgs84(e2, n2)
         return haversine_distance(lat1, lon1, lat2, lon2)
@@ -4438,6 +4461,7 @@ class MapCanvas(QGraphicsView):
         self._measure_start_view = None
         self._measure_active = False
         self._measure_label_id = None
+        self._measure_layer = None
         self._measure_start = None
         self._measure_stage = MeasureStage.LENGTH
         self._measure_length_m = None
