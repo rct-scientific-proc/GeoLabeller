@@ -19,8 +19,8 @@ values, never from the display stretch.
 """
 import numpy as np
 
-from PyQt5.QtCore import QEvent, QPoint, QSize, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
+from PyQt5.QtCore import QEvent, QLineF, QPoint, QSize, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QComboBox, QHBoxLayout, QInputDialog, QLabel, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QSpinBox,
@@ -72,8 +72,13 @@ class MaskPaintCanvas(QWidget):
         self._painting = False
         self._w = self._h = MASK_SNIPPET_SIZE
         self._scale = float(display_scale(MASK_SNIPPET_SIZE))
-        self._pan_last = None       # global pos while middle-drag panning
+        self._pan_last = None       # global pos while drag-panning
+        # Brush preview: the cell under the cursor plus the outline edges of
+        # the exact pixel set a stamp there would paint.
+        self._hover_cell = None
+        self._brush_edges = self._footprint_edges(self._brush_px)
         self._update_fixed_size()
+        self.setMouseTracking(True)
         self.setCursor(Qt.CrossCursor)
 
     # -- data ---------------------------------------------------------------
@@ -110,6 +115,48 @@ class MaskPaintCanvas(QWidget):
 
     def set_brush(self, px: int):
         self._brush_px = max(1, int(px))
+        self._brush_edges = self._footprint_edges(self._brush_px)
+        self.update()
+
+    @staticmethod
+    def _footprint_cells(brush_px: int) -> np.ndarray:
+        """The exact pixel disc _stamp paints, centred in a small array.
+
+        MUST mirror _stamp's formula - the brush preview draws this set's
+        outline, and an outline of anything else would be a lie.
+        """
+        r = max(0.5, brush_px / 2.0)
+        reach = int(r) + 1
+        yy, xx = np.ogrid[-reach:reach + 1, -reach:reach + 1]
+        return (xx * xx + yy * yy) <= r * r
+
+    @classmethod
+    def _footprint_edges(cls, brush_px: int) -> list:
+        """Boundary segments of the brush footprint, in cell units.
+
+        Coordinates are relative to the top-left corner of the CENTRE cell:
+        painted cell (dx, dy) occupies the unit square at (dx, dy). A
+        segment is emitted wherever a painted cell borders an unpainted one,
+        which traces the pixelated outer edge of the brush - the wireframe.
+        """
+        cells = cls._footprint_cells(brush_px)
+        reach = cells.shape[0] // 2
+        edges = []
+        h, w = cells.shape
+        for iy in range(h):
+            for ix in range(w):
+                if not cells[iy, ix]:
+                    continue
+                dx, dy = ix - reach, iy - reach
+                if iy == 0 or not cells[iy - 1, ix]:
+                    edges.append((dx, dy, dx + 1, dy))          # top
+                if iy == h - 1 or not cells[iy + 1, ix]:
+                    edges.append((dx, dy + 1, dx + 1, dy + 1))  # bottom
+                if ix == 0 or not cells[iy, ix - 1]:
+                    edges.append((dx, dy, dx, dy + 1))          # left
+                if ix == w - 1 or not cells[iy, ix + 1]:
+                    edges.append((dx + 1, dy, dx + 1, dy + 1))  # right
+        return edges
 
     def _update_fixed_size(self):
         self.setFixedSize(QSize(max(1, round(self._w * self._scale)),
@@ -186,7 +233,29 @@ class MaskPaintCanvas(QWidget):
         for name in self._order:
             if name in self._layers:
                 painter.drawImage(target, self._overlay_image(name))
+        self._draw_brush_preview(painter)
         painter.end()
+
+    def _draw_brush_preview(self, painter):
+        """Wireframe of the exact pixels the next stamp would paint.
+
+        Drawn twice - a dark line under a light one - so the outline reads
+        on bright and dark imagery alike.
+        """
+        if (self._hover_cell is None or self._pan_last is not None
+                or self._active is None or self._active not in self._layers):
+            return
+        cx, cy = self._hover_cell
+        s = self._scale
+        lines = [QLineF((cx + x1) * s, (cy + y1) * s,
+                        (cx + x2) * s, (cy + y2) * s)
+                 for x1, y1, x2, y2 in self._brush_edges]
+        for color, width in ((QColor(0, 0, 0, 200), 3),
+                             (QColor(255, 255, 255, 230), 1)):
+            pen = QPen(color, width)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.drawLines(lines)
 
     # -- strokes ------------------------------------------------------------
 
@@ -244,6 +313,8 @@ class MaskPaintCanvas(QWidget):
         self._stroke_to(event.pos())
 
     def mouseMoveEvent(self, event):
+        # The brush preview follows the cursor whatever else is going on.
+        self._hover_cell = self._to_mask_point(event.pos())
         if self._pan_last is not None:
             area = self._scroll_area()
             if area is not None:
@@ -256,6 +327,12 @@ class MaskPaintCanvas(QWidget):
             return
         if self._painting:
             self._stroke_to(event.pos())
+        else:
+            self.update()
+
+    def leaveEvent(self, _event):
+        self._hover_cell = None
+        self.update()
 
     def mouseReleaseEvent(self, event):
         if (self._pan_last is not None
