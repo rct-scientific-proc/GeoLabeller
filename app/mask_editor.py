@@ -19,7 +19,7 @@ values, never from the display stretch.
 """
 import numpy as np
 
-from PyQt5.QtCore import QPoint, QSize, Qt, pyqtSignal
+from PyQt5.QtCore import QEvent, QPoint, QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
 from PyQt5.QtWidgets import (
     QComboBox, QHBoxLayout, QInputDialog, QLabel, QListWidget,
@@ -223,8 +223,11 @@ class MaskPaintCanvas(QWidget):
         self.update()
 
     def mousePressEvent(self, event):
-        # Middle button pans the zoomed view (left/right stay paint/erase).
-        if event.button() == Qt.MiddleButton:
+        # Shift+left-drag pans the zoomed view (middle-drag still works for
+        # those with the habit); plain left/right stay paint/erase.
+        if (event.button() == Qt.MiddleButton
+                or (event.button() == Qt.LeftButton
+                    and event.modifiers() & Qt.ShiftModifier)):
             self._pan_last = event.globalPos()
             self.setCursor(Qt.ClosedHandCursor)
             return
@@ -255,7 +258,8 @@ class MaskPaintCanvas(QWidget):
             self._stroke_to(event.pos())
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MiddleButton and self._pan_last is not None:
+        if (self._pan_last is not None
+                and event.button() in (Qt.MiddleButton, Qt.LeftButton)):
             self._pan_last = None
             self.setCursor(Qt.CrossCursor)
             return
@@ -273,6 +277,7 @@ class MaskEditor(QWidget):
     masks_changed = pyqtSignal(int, list)
 
     _ID_ROLE = Qt.UserRole
+    ALL_CLASSES = "All classes"
 
     def __init__(self, parent=None):
         super().__init__(parent, Qt.Window)
@@ -324,7 +329,8 @@ class MaskEditor(QWidget):
         layout.addLayout(controls)
 
         hint = QLabel("Left-drag paints the active mask, right-drag erases; "
-                      "wheel zooms (to the cursor), middle-drag pans. "
+                      "wheel zooms (to the cursor), Shift+drag pans. "
+                      "Space / Ctrl+Space step through the snippets. "
                       "Masks may overlap; each is its own layer.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -336,6 +342,7 @@ class MaskEditor(QWidget):
         self.snippet_list.setIconSize(QSize(96, 96))
         self.snippet_list.setFixedWidth(210)
         self.snippet_list.currentItemChanged.connect(self._on_snippet_picked)
+        self.snippet_list.installEventFilter(self)
         body.addWidget(self.snippet_list)
 
         # The paint surface, scrollable so any zoom level fits on screen.
@@ -355,6 +362,7 @@ class MaskEditor(QWidget):
         self.mask_list = QListWidget()
         self.mask_list.setFixedWidth(220)
         self.mask_list.currentItemChanged.connect(self._on_mask_picked)
+        self.mask_list.installEventFilter(self)
         side.addWidget(self.mask_list)
         buttons = QHBoxLayout()
         self.add_button = QPushButton("Add Mask...")
@@ -384,14 +392,22 @@ class MaskEditor(QWidget):
     # -- data in ------------------------------------------------------------
 
     def set_labels(self, entries: list):
-        """Same entry dicts as the other snippet views (masks included)."""
-        self._entries = list(entries)
+        """Same entry dicts as the other snippet views (masks included).
+
+        The strip is kept in a stable, readable order (class, then image
+        name, then label id) rather than project-dict order, so a snippet
+        is always where it was last time.
+        """
+        self._entries = sorted(
+            entries, key=lambda e: (e["class_name"], e["image_name"],
+                                    e["label_id"]))
         classes = sorted({e["class_name"] for e in self._entries})
         current = self.class_combo.currentText()
+        wanted = [self.ALL_CLASSES] + classes
         self.class_combo.blockSignals(True)
         self.class_combo.clear()
-        self.class_combo.addItems(classes)
-        if current in classes:
+        self.class_combo.addItems(wanted)
+        if current in wanted:
             self.class_combo.setCurrentText(current)
         self.class_combo.blockSignals(False)
         self._rebuild_list()
@@ -402,10 +418,13 @@ class MaskEditor(QWidget):
         self.snippet_list.clear()
         self.snippet_list.blockSignals(False)
         wanted = self.class_combo.currentText()
+        show_all = wanted == self.ALL_CLASSES
         for entry in self._entries:
-            if entry["class_name"] != wanted:
+            if not show_all and entry["class_name"] != wanted:
                 continue
             caption = entry["image_name"]
+            if show_all:
+                caption = f"{entry['class_name']}  \N{MIDDLE DOT}  {caption}"
             n_masks = len(entry.get("masks") or [])
             if n_masks:
                 caption += f"  [{n_masks} mask{'s' if n_masks > 1 else ''}]"
@@ -418,6 +437,34 @@ class MaskEditor(QWidget):
             self.snippet_list.setCurrentRow(0)
         else:
             self._show_entry(None)
+
+    # -- snippet cycling ----------------------------------------------------
+
+    def _cycle_snippet(self, delta: int):
+        """Step to the next/previous snippet in the strip, wrapping."""
+        count = self.snippet_list.count()
+        if count == 0:
+            return
+        row = self.snippet_list.currentRow()
+        self.snippet_list.setCurrentRow((row + delta) % count)
+
+    def keyPressEvent(self, event):
+        # Space / Ctrl+Space step through the strip - the same convention
+        # as the canvas's cycle modes, so the habit transfers.
+        if event.key() == Qt.Key_Space:
+            self._cycle_snippet(
+                -1 if event.modifiers() & Qt.ControlModifier else 1)
+            return
+        super().keyPressEvent(event)
+
+    def eventFilter(self, obj, event):
+        """Steal Space from the list widgets so cycling works everywhere."""
+        if (event.type() == QEvent.KeyPress
+                and event.key() == Qt.Key_Space):
+            self._cycle_snippet(
+                -1 if event.modifiers() & Qt.ControlModifier else 1)
+            return True
+        return super().eventFilter(obj, event)
 
     def _on_snippet_ready(self, label_id, arr):
         for i in range(self.snippet_list.count()):
@@ -581,6 +628,9 @@ class MaskEditor(QWidget):
         if item is None or self._current is None:
             return
         caption = self._current["image_name"]
+        if self.class_combo.currentText() == self.ALL_CLASSES:
+            caption = (f"{self._current['class_name']}  \N{MIDDLE DOT}  "
+                       f"{caption}")
         n = len(self._order)
         if n:
             caption += f"  [{n} mask{'s' if n > 1 else ''}]"
