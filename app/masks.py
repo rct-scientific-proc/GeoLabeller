@@ -14,13 +14,17 @@ one) by pure translation.
 
 The compression, precisely: "rle" is a run-length encoding of the binary
 window read row-major (row 0 left to right, then row 1, ...). Runs
-alternate between 0s and 1s and the list ALWAYS starts with a run of 0s -
-a mask whose first pixel is set therefore begins [0, n, ...]. The runs must
-sum to width*height exactly; decoders reject anything else rather than
-render a shifted mask. A painted blob of a few thousand pixels typically
-encodes to a few hundred integers, which is what lets masks live inside the
-project JSON and ride the single-serializer autosave like every other
-field.
+alternate between 0s and 1s and ALWAYS start with a run of 0s - a mask
+whose first pixel is set therefore begins "0,n,...". The runs must sum to
+width*height exactly; decoders reject anything else rather than render a
+shifted mask.
+
+The runs are serialized as ONE comma-separated string, not a JSON array:
+the project file is pretty-printed, and an array of integers costs a full
+indented line (~20 bytes) per run - a few thousand runs ballooned into
+tens of kilobytes of whitespace. As a string, the same mask is one line at
+a few bytes per run. Readers accept the pre-release array form too, so
+projects written before the change still load.
 
 Masks are independent binary layers: several can overlap on one snippet,
 which a single labelled-component array could never represent.
@@ -67,12 +71,20 @@ def mask_entry(name: str, x0: int, y0: int, mask: np.ndarray) -> dict:
     h, w = mask.shape
     return {"name": name, "x0": int(x0), "y0": int(y0),
             "width": int(w), "height": int(h),
-            "rle": encode_rle(mask)}
+            "rle": ",".join(str(r) for r in encode_rle(mask))}
+
+
+def entry_runs(entry: dict) -> list:
+    """The run list of a serialized mask (string form or legacy array)."""
+    runs = entry["rle"]
+    if isinstance(runs, str):
+        return [int(token) for token in runs.split(",") if token]
+    return [int(r) for r in runs]
 
 
 def entry_array(entry: dict) -> np.ndarray:
     """The (height, width) bool array of a serialized mask."""
-    return decode_rle(entry["rle"], entry["width"], entry["height"])
+    return decode_rle(entry_runs(entry), entry["width"], entry["height"])
 
 
 def entry_in_window(entry: dict, x0: int, y0: int,
