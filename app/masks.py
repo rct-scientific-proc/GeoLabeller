@@ -99,6 +99,29 @@ def entry_in_window(entry: dict, x0: int, y0: int,
     return out
 
 
+def merged_entry(name: str, x0: int, y0: int, layer: np.ndarray,
+                 previous: "dict | None" = None) -> dict:
+    """Serialize an edited window WITHOUT losing pixels outside it.
+
+    The editor paints inside one window, but a previously stored mask may
+    extend beyond it (painted earlier at a larger snippet size). Committing
+    only the visible window would silently crop that content - so the new
+    entry covers the UNION of the previous window and the edited one: the
+    edited window replaces its region wholesale (erasures included), and
+    everything outside it survives untouched.
+    """
+    if previous is None:
+        return mask_entry(name, x0, y0, layer)
+    h, w = layer.shape
+    ux0 = min(x0, previous["x0"])
+    uy0 = min(y0, previous["y0"])
+    ux1 = max(x0 + w, previous["x0"] + previous["width"])
+    uy1 = max(y0 + h, previous["y0"] + previous["height"])
+    union = entry_in_window(previous, ux0, uy0, ux1 - ux0, uy1 - uy0)
+    union[y0 - uy0:y0 - uy0 + h, x0 - ux0:x0 - ux0 + w] = layer
+    return mask_entry(name, ux0, uy0, union)
+
+
 def mask_statistics(pixels: np.ndarray, mask: np.ndarray) -> "dict | None":
     """Per-band mean/std of the masked object versus the background.
 

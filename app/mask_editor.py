@@ -26,13 +26,20 @@ from PyQt5.QtWidgets import (
     QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QVBoxLayout,
     QWidget)
 
-from .masks import entry_in_window, mask_entry, mask_statistics
+from .masks import entry_in_window, mask_statistics, merged_entry
 from .snippets import (SnippetLoader, read_label_snippet,
                        read_label_window_raw)
 
-MASK_SNIPPET_SIZE = 224     # source pixels painted on, shown at 2x
-DISPLAY_SCALE = 2
+MASK_SNIPPET_SIZE = 224     # default source pixels painted on
+MAX_DISPLAY_PX = 448        # paint surface cap; scale adapts to the size
 DEFAULT_BRUSH_PX = 12       # brush diameter in SOURCE pixels
+
+
+def display_scale(size_px: int) -> int:
+    """Integer upscale for the paint surface: small snippets get room to
+    paint, large ones stay on screen (32px -> 4x, 224px -> 2x, 512px -> 1x).
+    """
+    return max(1, min(4, MAX_DISPLAY_PX // max(1, size_px)))
 
 # Overlay colours cycle per mask on a snippet. Alpha is applied at paint
 # time (active mask brighter than the rest).
@@ -44,7 +51,7 @@ MASK_COLORS = [
 
 
 class MaskPaintCanvas(QWidget):
-    """The snippet at 2x with paintable mask overlays."""
+    """The snippet, upscaled for painting, with paintable mask overlays."""
 
     stroke_finished = pyqtSignal()
 
@@ -60,6 +67,7 @@ class MaskPaintCanvas(QWidget):
         self._stroke_value = True
         self._painting = False
         self._w = self._h = MASK_SNIPPET_SIZE
+        self._scale = display_scale(MASK_SNIPPET_SIZE)
         self._update_fixed_size()
         self.setCursor(Qt.CrossCursor)
 
@@ -68,6 +76,7 @@ class MaskPaintCanvas(QWidget):
     def set_snippet(self, arr: "np.ndarray | None", width: int, height: int):
         """Show a snippet's display pixels; masks are set separately."""
         self._w, self._h = width, height
+        self._scale = display_scale(max(width, height))
         if arr is None:
             self._pixmap = None
         else:
@@ -93,8 +102,8 @@ class MaskPaintCanvas(QWidget):
         self._brush_px = max(1, int(px))
 
     def _update_fixed_size(self):
-        self.setFixedSize(QSize(self._w * DISPLAY_SCALE,
-                                self._h * DISPLAY_SCALE))
+        self.setFixedSize(QSize(self._w * self._scale,
+                                self._h * self._scale))
 
     # -- painting -----------------------------------------------------------
 
@@ -126,7 +135,7 @@ class MaskPaintCanvas(QWidget):
     # -- strokes ------------------------------------------------------------
 
     def _to_mask_point(self, pos) -> "tuple[int, int]":
-        return (int(pos.x() / DISPLAY_SCALE), int(pos.y() / DISPLAY_SCALE))
+        return (int(pos.x() / self._scale), int(pos.y() / self._scale))
 
     def _stamp(self, cx: int, cy: int):
         layer = self._layers.get(self._active)
@@ -198,6 +207,10 @@ class MaskEditor(QWidget):
         self._entries: list = []
         self._current: "dict | None" = None      # selected entry
         self._frame = (0, 0, MASK_SNIPPET_SIZE, MASK_SNIPPET_SIZE)
+        # The as-stored entries, by name: committing a stroke merges the
+        # edited window into these, so mask content lying OUTSIDE the
+        # current window (painted earlier at a larger size) survives.
+        self._stored_by_name: dict = {}
         self._layers: "dict[str, np.ndarray]" = {}
         self._order: list = []
         self._raw = None                          # (bands, h, w) source data
@@ -210,6 +223,19 @@ class MaskEditor(QWidget):
         self.class_combo = QComboBox()
         self.class_combo.currentIndexChanged.connect(self._rebuild_list)
         controls.addWidget(self.class_combo, 1)
+        controls.addWidget(QLabel("Snippet:"))
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(32, 512)
+        self.size_spin.setSingleStep(32)
+        self.size_spin.setValue(MASK_SNIPPET_SIZE)
+        self.size_spin.setSuffix(" px")
+        self.size_spin.setToolTip(
+            "Snippet size in SOURCE pixels around the label. Masks are\n"
+            "anchored to the imagery, so changing size only changes the\n"
+            "window you paint in - existing masks stay where they are,\n"
+            "including any part outside the current view.")
+        self.size_spin.valueChanged.connect(self._on_size_changed)
+        controls.addWidget(self.size_spin)
         controls.addWidget(QLabel("Brush:"))
         self.brush_spin = QSpinBox()
         self.brush_spin.setRange(1, 64)
@@ -330,19 +356,20 @@ class MaskEditor(QWidget):
         self._layers = {}
         self._order = []
         self._raw = None
+        self._stored_by_name = {}
+        size = self.size_spin.value()
         if entry is None:
-            self.canvas.set_snippet(None, MASK_SNIPPET_SIZE,
-                                    MASK_SNIPPET_SIZE)
+            self.canvas.set_snippet(None, size, size)
             self.canvas.set_layers({}, [], None)
             self._refresh_mask_list()
             self._refresh_stats()
             return
         raw = read_label_window_raw(entry["image_path"], entry["pixel_x"],
-                                    entry["pixel_y"], MASK_SNIPPET_SIZE)
+                                    entry["pixel_y"], size)
         if raw is not None:
             self._raw, self._frame = raw
         else:
-            self._frame = (0, 0, MASK_SNIPPET_SIZE, MASK_SNIPPET_SIZE)
+            self._frame = (0, 0, size, size)
         x0, y0, w, h = self._frame
         # Stored masks re-anchor into the current crop (paint-time snippet
         # size may differ from today's).
@@ -350,13 +377,19 @@ class MaskEditor(QWidget):
             self._layers[stored["name"]] = entry_in_window(
                 stored, x0, y0, w, h)
             self._order.append(stored["name"])
+            self._stored_by_name[stored["name"]] = stored
         display = read_label_snippet(entry["image_path"], entry["pixel_x"],
-                                     entry["pixel_y"], MASK_SNIPPET_SIZE)
+                                     entry["pixel_y"], size)
         self.canvas.set_snippet(display, w, h)
         active = self._order[0] if self._order else None
         self.canvas.set_layers(self._layers, self._order, active)
         self._refresh_mask_list(select=active)
         self._refresh_stats()
+
+    def _on_size_changed(self):
+        # Strokes commit as they happen, so the entry dicts already hold the
+        # latest masks; re-showing re-anchors them into the new window.
+        self._show_entry(self._current)
 
     # -- mask management ----------------------------------------------------
 
@@ -410,6 +443,7 @@ class MaskEditor(QWidget):
         if name is None or self._current is None:
             return
         self._layers.pop(name, None)
+        self._stored_by_name.pop(name, None)
         if name in self._order:
             self._order.remove(name)
         nxt = self._order[0] if self._order else None
@@ -428,8 +462,10 @@ class MaskEditor(QWidget):
         if self._current is None:
             return
         x0, y0, _w, _h = self._frame
-        entries = [mask_entry(name, x0, y0, self._layers[name])
+        entries = [merged_entry(name, x0, y0, self._layers[name],
+                                self._stored_by_name.get(name))
                    for name in self._order]
+        self._stored_by_name = {e["name"]: e for e in entries}
         self._current["masks"] = entries
         self._update_snippet_caption()
         self.masks_changed.emit(self._current["label_id"], entries)
