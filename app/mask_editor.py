@@ -26,7 +26,8 @@ from PyQt5.QtWidgets import (
     QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QVBoxLayout,
     QWidget)
 
-from .masks import entry_in_window, mask_statistics, merged_entry
+from .masks import (entry_in_window, fill_enclosed, mask_statistics,
+                    merged_entry)
 from .snippets import (SnippetLoader, read_label_snippet,
                        read_label_window_raw)
 
@@ -96,6 +97,11 @@ class MaskPaintCanvas(QWidget):
     def set_active(self, name: "str | None"):
         self._active = name
         self._overlay_cache.clear()
+        self.update()
+
+    def invalidate_layer(self, name: str):
+        """Redraw one layer whose array was changed outside a stroke."""
+        self._overlay_cache.pop(name, None)
         self.update()
 
     def set_brush(self, px: int):
@@ -282,6 +288,13 @@ class MaskEditor(QWidget):
         self.delete_button.clicked.connect(self._on_delete_mask)
         buttons.addWidget(self.delete_button)
         side.addLayout(buttons)
+        self.fill_button = QPushButton("Fill Enclosed")
+        self.fill_button.setToolTip(
+            "Draw a closed outline with a thin brush, then fill its\n"
+            "inside in one click. Refused when the outline has a gap\n"
+            "(nothing is actually enclosed).")
+        self.fill_button.clicked.connect(self._on_fill_enclosed)
+        side.addWidget(self.fill_button)
         side.addWidget(QLabel("Object vs background (raw values):"))
         self.stats_label = QLabel("-")
         self.stats_label.setWordWrap(True)
@@ -453,6 +466,23 @@ class MaskEditor(QWidget):
         self._refresh_stats()
 
     # -- persistence + stats ------------------------------------------------
+
+    def _on_fill_enclosed(self):
+        """Fill the active mask's enclosed interior (a drawn hull)."""
+        name = self._active_name()
+        if name is None or name not in self._layers:
+            return
+        filled, added = fill_enclosed(self._layers[name])
+        if added == 0:
+            QMessageBox.information(
+                self, "Nothing enclosed",
+                f"'{name}' does not fully enclose any area - the outline "
+                "probably has a gap. Close the hull and try again.")
+            return
+        self._layers[name][:] = filled
+        self.canvas.invalidate_layer(name)
+        self._emit_masks()
+        self._refresh_stats()
 
     def _on_stroke_finished(self):
         self._emit_masks()

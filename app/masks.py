@@ -111,6 +111,44 @@ def entry_in_window(entry: dict, x0: int, y0: int,
     return out
 
 
+def fill_enclosed(mask: np.ndarray) -> "tuple[np.ndarray, int]":
+    """Fill every region the mask fully encloses; returns (filled, added).
+
+    The complement is flooded inward from the window border; whatever open
+    ground the flood cannot reach is enclosed by the mask and gets filled.
+    An outline with a gap encloses nothing - its inside leaks to the border
+    through the gap - so ``added`` comes back 0 and the mask is returned
+    unchanged, which is exactly the "refuse to fill an unclosed hull"
+    behaviour the editor wants.
+
+    The flood is 4-connected, which makes the OUTLINE effectively
+    8-connected: a hand-drawn one-pixel stroke whose pixels only touch
+    diagonally still counts as closed.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    open_ground = ~mask
+    outside = np.zeros_like(mask)
+    outside[0, :] = open_ground[0, :]
+    outside[-1, :] = open_ground[-1, :]
+    outside[:, 0] |= open_ground[:, 0]
+    outside[:, -1] |= open_ground[:, -1]
+    while True:
+        grown = outside.copy()
+        grown[1:, :] |= outside[:-1, :]
+        grown[:-1, :] |= outside[1:, :]
+        grown[:, 1:] |= outside[:, :-1]
+        grown[:, :-1] |= outside[:, 1:]
+        grown &= open_ground
+        if np.array_equal(grown, outside):
+            break
+        outside = grown
+    holes = open_ground & ~outside
+    added = int(holes.sum())
+    if added == 0:
+        return mask, 0
+    return mask | holes, added
+
+
 def merged_entry(name: str, x0: int, y0: int, layer: np.ndarray,
                  previous: "dict | None" = None) -> dict:
     """Serialize an edited window WITHOUT losing pixels outside it.

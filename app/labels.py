@@ -198,7 +198,14 @@ class PointLabel:
             orientation_px_rad=data.get("orientation_px_rad"),
             orientation_deg=data.get("orientation_deg"),
             orientation_derived=bool(data.get("orientation_derived", False)),
-            masks=list(data.get("masks", []))
+            masks=[
+                # Normalize the pre-release integer-array rle to the compact
+                # string form on load, so any load-and-save migrates the
+                # file (an array cost one pretty-printed line per run).
+                (dict(m, rle=",".join(str(int(r)) for r in m["rle"]))
+                 if isinstance(m.get("rle"), list) else dict(m))
+                for m in data.get("masks", [])
+            ]
         )
 
 
