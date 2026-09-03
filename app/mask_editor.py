@@ -23,8 +23,8 @@ from PyQt5.QtCore import QPoint, QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
 from PyQt5.QtWidgets import (
     QComboBox, QHBoxLayout, QInputDialog, QLabel, QListWidget,
-    QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QVBoxLayout,
-    QWidget)
+    QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QSpinBox,
+    QVBoxLayout, QWidget)
 
 from .masks import (entry_in_window, fill_enclosed, mask_statistics,
                     merged_entry)
@@ -32,13 +32,16 @@ from .snippets import (SnippetLoader, read_label_snippet,
                        read_label_window_raw)
 
 MASK_SNIPPET_SIZE = 224     # default source pixels painted on
-MAX_DISPLAY_PX = 448        # paint surface cap; scale adapts to the size
+MAX_DISPLAY_PX = 448        # starting-view cap; the user zooms from there
 DEFAULT_BRUSH_PX = 12       # brush diameter in SOURCE pixels
+MIN_ZOOM = 0.25             # far enough out to survey a huge snippet
+MAX_ZOOM = 32.0             # far enough in for single-pixel brushwork
 
 
 def display_scale(size_px: int) -> int:
-    """Integer upscale for the paint surface: small snippets get room to
-    paint, large ones stay on screen (32px -> 4x, 224px -> 2x, 512px -> 1x).
+    """Starting upscale for the paint surface: small snippets get room to
+    paint, large ones start on screen (32px -> 4x, 224px -> 2x, 512px+ ->
+    1x). Only the initial view - the wheel zooms freely from there.
     """
     return max(1, min(4, MAX_DISPLAY_PX // max(1, size_px)))
 
@@ -68,7 +71,8 @@ class MaskPaintCanvas(QWidget):
         self._stroke_value = True
         self._painting = False
         self._w = self._h = MASK_SNIPPET_SIZE
-        self._scale = display_scale(MASK_SNIPPET_SIZE)
+        self._scale = float(display_scale(MASK_SNIPPET_SIZE))
+        self._pan_last = None       # global pos while middle-drag panning
         self._update_fixed_size()
         self.setCursor(Qt.CrossCursor)
 
@@ -77,7 +81,7 @@ class MaskPaintCanvas(QWidget):
     def set_snippet(self, arr: "np.ndarray | None", width: int, height: int):
         """Show a snippet's display pixels; masks are set separately."""
         self._w, self._h = width, height
-        self._scale = display_scale(max(width, height))
+        self._scale = float(display_scale(max(width, height)))
         if arr is None:
             self._pixmap = None
         else:
@@ -108,8 +112,54 @@ class MaskPaintCanvas(QWidget):
         self._brush_px = max(1, int(px))
 
     def _update_fixed_size(self):
-        self.setFixedSize(QSize(self._w * self._scale,
-                                self._h * self._scale))
+        self.setFixedSize(QSize(max(1, round(self._w * self._scale)),
+                                max(1, round(self._h * self._scale))))
+
+    # -- zoom and pan -------------------------------------------------------
+
+    @property
+    def zoom(self) -> float:
+        return self._scale
+
+    def _scroll_area(self) -> "QScrollArea | None":
+        widget = self.parentWidget()
+        while widget is not None and not isinstance(widget, QScrollArea):
+            widget = widget.parentWidget()
+        return widget
+
+    def set_zoom(self, scale: float, anchor=None):
+        """Zoom the paint surface, keeping ``anchor`` (widget pos) fixed.
+
+        The canvas lives in a scroll area; zooming resizes the widget, and
+        the scrollbars are nudged so the mask pixel under the cursor stays
+        under the cursor - the standard image-editor feel.
+        """
+        scale = max(MIN_ZOOM, min(MAX_ZOOM, float(scale)))
+        if scale == self._scale:
+            return
+        old = self._scale
+        area = self._scroll_area()
+        viewport_pos = None
+        if anchor is not None and area is not None:
+            # Capture where the anchor sits in the viewport BEFORE the
+            # resize moves everything around.
+            viewport_pos = self.mapTo(area.viewport(), anchor)
+        # The mask-space point to hold steady.
+        ax = (anchor.x() / old) if anchor is not None else self._w / 2.0
+        ay = (anchor.y() / old) if anchor is not None else self._h / 2.0
+        self._scale = scale
+        self._update_fixed_size()
+        if area is not None and viewport_pos is not None:
+            area.horizontalScrollBar().setValue(
+                round(ax * scale - viewport_pos.x()))
+            area.verticalScrollBar().setValue(
+                round(ay * scale - viewport_pos.y()))
+        self.update()
+
+    def wheelEvent(self, event):
+        factor = 1.25 if event.angleDelta().y() > 0 else 1 / 1.25
+        self.set_zoom(self._scale * factor, anchor=event.pos())
+        event.accept()
 
     # -- painting -----------------------------------------------------------
 
@@ -173,6 +223,11 @@ class MaskPaintCanvas(QWidget):
         self.update()
 
     def mousePressEvent(self, event):
+        # Middle button pans the zoomed view (left/right stay paint/erase).
+        if event.button() == Qt.MiddleButton:
+            self._pan_last = event.globalPos()
+            self.setCursor(Qt.ClosedHandCursor)
+            return
         if self._active is None or self._active not in self._layers:
             return
         if event.button() == Qt.LeftButton:
@@ -186,10 +241,24 @@ class MaskPaintCanvas(QWidget):
         self._stroke_to(event.pos())
 
     def mouseMoveEvent(self, event):
+        if self._pan_last is not None:
+            area = self._scroll_area()
+            if area is not None:
+                delta = event.globalPos() - self._pan_last
+                hbar = area.horizontalScrollBar()
+                vbar = area.verticalScrollBar()
+                hbar.setValue(hbar.value() - delta.x())
+                vbar.setValue(vbar.value() - delta.y())
+            self._pan_last = event.globalPos()
+            return
         if self._painting:
             self._stroke_to(event.pos())
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MiddleButton and self._pan_last is not None:
+            self._pan_last = None
+            self.setCursor(Qt.CrossCursor)
+            return
         if self._painting and event.button() in (Qt.LeftButton,
                                                  Qt.RightButton):
             self._painting = False
@@ -231,10 +300,13 @@ class MaskEditor(QWidget):
         controls.addWidget(self.class_combo, 1)
         controls.addWidget(QLabel("Snippet:"))
         self.size_spin = QSpinBox()
-        self.size_spin.setRange(32, 512)
+        self.size_spin.setRange(16, 2048)
         self.size_spin.setSingleStep(32)
         self.size_spin.setValue(MASK_SNIPPET_SIZE)
         self.size_spin.setSuffix(" px")
+        # Any typed value is accepted; committing on Enter/focus-out (not
+        # per keystroke) stops "3" and "30" reloading on the way to "300".
+        self.size_spin.setKeyboardTracking(False)
         self.size_spin.setToolTip(
             "Snippet size in SOURCE pixels around the label. Masks are\n"
             "anchored to the imagery, so changing size only changes the\n"
@@ -251,7 +323,8 @@ class MaskEditor(QWidget):
         controls.addWidget(self.brush_spin)
         layout.addLayout(controls)
 
-        hint = QLabel("Left-drag paints the active mask, right-drag erases. "
+        hint = QLabel("Left-drag paints the active mask, right-drag erases; "
+                      "wheel zooms (to the cursor), middle-drag pans. "
                       "Masks may overlap; each is its own layer.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -265,13 +338,16 @@ class MaskEditor(QWidget):
         self.snippet_list.currentItemChanged.connect(self._on_snippet_picked)
         body.addWidget(self.snippet_list)
 
-        # The paint surface.
+        # The paint surface, scrollable so any zoom level fits on screen.
         self.canvas = MaskPaintCanvas()
         self.canvas.stroke_finished.connect(self._on_stroke_finished)
         self.brush_spin.valueChanged.connect(self.canvas.set_brush)
-        canvas_holder = QVBoxLayout()
-        canvas_holder.addWidget(self.canvas, alignment=Qt.AlignTop)
-        body.addLayout(canvas_holder, 1)
+        self.canvas_scroll = QScrollArea()
+        self.canvas_scroll.setWidget(self.canvas)
+        self.canvas_scroll.setWidgetResizable(False)
+        self.canvas_scroll.setAlignment(Qt.AlignCenter)
+        self.canvas_scroll.setMinimumSize(360, 360)
+        body.addWidget(self.canvas_scroll, 1)
 
         # Mask management + statistics.
         side = QVBoxLayout()
