@@ -144,6 +144,27 @@ def snippet_frame(pixel_x: float, pixel_y: float, size_px: int,
     return x0, y0, w, h
 
 
+def read_label_window_raw(image_path: str, pixel_x: float, pixel_y: float,
+                          size_px: int) -> "tuple | None":
+    """RAW source values of a label's snippet window, plus its frame.
+
+    Returns ((bands, h, w) array in the source dtype, (x0, y0, w, h)) or
+    None on failure. No stretch and no RGB collapse: the mask editor's
+    object-versus-background statistics must describe the actual data, and
+    a display-stretched byte distribution would describe the stretch.
+    """
+    try:
+        with rasterio.open(image_path) as src:
+            x0, y0, w, h = snippet_frame(pixel_x, pixel_y, size_px,
+                                         src.width, src.height)
+            data = src.read(window=Window(x0, y0, w, h))
+            return data, (x0, y0, w, h)
+    except Exception as exc:  # noqa: BLE001 - stats just go missing
+        debug(f"raw window read failed: {Path(image_path).name}: "
+              f"{type(exc).__name__}: {exc}")
+        return None
+
+
 def read_label_snippet(image_path: str, pixel_x: float, pixel_y: float,
                        size_px: int) -> np.ndarray | None:
     """The un-warped RGB pixels around one label, export-identical framing.

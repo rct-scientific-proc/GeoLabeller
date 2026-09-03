@@ -97,6 +97,14 @@ class PointLabel:
     # tell measured orientations from inherited ones.
     orientation_derived: bool = False
 
+    # Named binary masks painted on this label's snippet in the mask editor.
+    # Each entry is a dict {name, x0, y0, width, height, rle}: the window is
+    # the snippet crop IN SOURCE PIXELS at paint time, the rle a row-major
+    # run-length encoding of the binary layer (see app/masks.py for the
+    # exact encoding). Masks are independent layers - several may overlap on
+    # one snippet - and per label, like every other per-view annotation.
+    masks: list = field(default_factory=list)
+
     # Human-readable name for the linked-object group - the readable
     # companion to object_id's UUID. The exact opposite contract to
     # description: this MUST always be identical across every label sharing
@@ -146,6 +154,8 @@ class PointLabel:
             d["orientation_deg"] = self.orientation_deg
         if self.orientation_derived:
             d["orientation_derived"] = True
+        if self.masks:
+            d["masks"] = self.masks
         return d
 
     @classmethod
@@ -187,7 +197,8 @@ class PointLabel:
             group_id=data.get("group_id", ""),
             orientation_px_rad=data.get("orientation_px_rad"),
             orientation_deg=data.get("orientation_deg"),
-            orientation_derived=bool(data.get("orientation_derived", False))
+            orientation_derived=bool(data.get("orientation_derived", False)),
+            masks=list(data.get("masks", []))
         )
 
 
@@ -874,7 +885,7 @@ class LabelProject:
         and hand it to a background writer.
         """
         return {
-            "version": "3.8",
+            "version": "3.9",
             # Copied, not referenced: the recovery snapshot is handed to a
             # background writer and the user carries on editing meanwhile.
             # The image and waypoint entries are freshly built dictionaries,

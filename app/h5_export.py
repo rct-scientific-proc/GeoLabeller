@@ -35,6 +35,7 @@ from PyQt5.QtCore import QObject, pyqtSignal
 
 # The framing and stretch live with the snippet service now, so the
 # sidebar/orientation views and the exports can never frame differently.
+from .masks import entry_in_window
 from .snippets import centered_window, _band_scaling, _window_pixels  # noqa: F401
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox, QLabel,
@@ -156,6 +157,14 @@ class H5DatasetWriter:
         self._compression = compression
         self._n = 0
         self._img_buf, self._lbl_buf, self._gt_buf, self._split_buf = [], [], [], []
+        # Painted snippet masks ride along in their own aligned table:
+        # mask_pixels[j] is a binary (H, W) layer belonging to sample row
+        # mask_sample[j], named mask_names[j]. A separate table (rather than
+        # a per-sample dataset) keeps overlapping masks and any per-sample
+        # count lossless. Datasets are created on demand so legacy files
+        # append cleanly and mask-free exports stay byte-identical.
+        self._mask_px_buf, self._mask_row_buf, self._mask_name_buf = [], [], []
+        self._mask_n = 0
         # Set when appending to a file whose class list has since changed.
         self.added_classes, self.dropped_classes = [], []
 
@@ -164,6 +173,8 @@ class H5DatasetWriter:
         if already and "images" in self._f:
             self._validate_existing()
             self._n = self._f["images"].shape[0]
+            if "mask_pixels" in self._f:
+                self._mask_n = self._f["mask_pixels"].shape[0]
         else:
             self._create()
         # Most recently used, so an append made with different settings becomes
@@ -282,14 +293,65 @@ class H5DatasetWriter:
                 break
         return found
 
-    def add(self, image_hwc, label_index, gt, split_value):
-        """Buffer one sample; flushes to disk when a chunk has accumulated."""
+    def add(self, image_hwc, label_index, gt, split_value) -> int:
+        """Buffer one sample; flushes when a batch has accumulated.
+
+        Returns the sample's global row index, so masks (and any future
+        per-sample sidecar) can reference it before the flush happens.
+        """
         self._img_buf.append(image_hwc)
         self._lbl_buf.append(label_index)
         self._gt_buf.append(gt)
         self._split_buf.append(split_value)
+        row = self._n + len(self._img_buf) - 1
         if len(self._img_buf) >= _FLUSH_BATCH:
             self._flush()
+        return row
+
+    def add_mask(self, sample_row: int, name: str, mask):
+        """Buffer one named binary mask belonging to sample ``sample_row``."""
+        self._mask_px_buf.append(
+            np.asarray(mask, dtype="uint8"))
+        self._mask_row_buf.append(int(sample_row))
+        self._mask_name_buf.append(str(name))
+        if len(self._mask_px_buf) >= _FLUSH_BATCH:
+            self._flush_masks()
+
+    def _ensure_mask_datasets(self):
+        """Create the mask table lazily (legacy files gain it on first use)."""
+        f = self._f
+        if "mask_pixels" in f:
+            return
+        f.create_dataset(
+            "mask_pixels",
+            shape=(0, self.height, self.width),
+            maxshape=(None, self.height, self.width),
+            dtype="uint8",
+            chunks=(self._chunk, self.height, self.width),
+            compression=self._compression)
+        f.create_dataset("mask_sample", shape=(0,), maxshape=(None,),
+                         dtype="int64", chunks=(_META_CHUNK,))
+        f.create_dataset(
+            "mask_names", shape=(0,), maxshape=(None,),
+            dtype=h5py.string_dtype("utf-8"), chunks=(_META_CHUNK,))
+
+    def _flush_masks(self):
+        if not self._mask_px_buf:
+            return
+        self._ensure_mask_datasets()
+        f = self._f
+        end = self._mask_n + len(self._mask_px_buf)
+        f["mask_pixels"].resize(end, axis=0)
+        f["mask_pixels"][self._mask_n:end] = np.stack(self._mask_px_buf)
+        f["mask_sample"].resize(end, axis=0)
+        f["mask_sample"][self._mask_n:end] = np.asarray(
+            self._mask_row_buf, dtype="int64")
+        f["mask_names"].resize(end, axis=0)
+        f["mask_names"][self._mask_n:end] = self._mask_name_buf
+        self._mask_n = end
+        self._mask_px_buf.clear()
+        self._mask_row_buf.clear()
+        self._mask_name_buf.clear()
 
     def _flush(self):
         """Write buffered samples to the resizable datasets."""
@@ -313,6 +375,7 @@ class H5DatasetWriter:
         """Flush, close the file and return the total sample count."""
         try:
             self._flush()
+            self._flush_masks()
         finally:
             total = self._n
             self._f.close()
@@ -463,6 +526,13 @@ def export_image(writer, path, labels, height, width, overlap, channels,
         if ci is not None:
             pts.append((float(lab.pixel_x), float(lab.pixel_y), ci))
 
+    # Every painted mask on this image, in source-pixel anchoring. Each
+    # example crop gets every mask that intersects it (re-anchored by pure
+    # translation), so the mask table stays true to the ground even where
+    # crops overlap or a neighbouring object's mask leaks into the window.
+    mask_entries = [entry for lab in labels
+                    for entry in getattr(lab, "masks", []) or []]
+
     with rasterio.open(path) as src:
         nodata = src.nodata
         # One contrast stretch per raster (None for uint8), so every snippet
@@ -480,7 +550,11 @@ def export_image(writer, path, labels, height, width, overlap, channels,
                 scaling=scaling)
             if arr is None:
                 continue  # entirely nodata
-            writer.add(arr, class_index, True, split_value)
+            row = writer.add(arr, class_index, True, split_value)
+            for entry in mask_entries:
+                layer = entry_in_window(entry, x0, y0, width, height)
+                if layer.any():
+                    writer.add_mask(row, entry["name"], layer)
             added += 1
 
         if examples_only:

@@ -45,6 +45,7 @@ from .h5_export import (H5ExportDialog, H5ExportWorker, HARD_NEGATIVE,
                         centered_window)
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
+from .mask_editor import MaskEditor
 from .orientation import OrientationEditor
 from .relocate import RelocateImagesDialog, silently_resolve
 from .snippet_panel import SnippetPanel
@@ -266,6 +267,7 @@ class MainWindow(QMainWindow):
         # An existing target file's own settings still take precedence.
         # The orientation editor window, created on first open.
         self._orientation_editor = None
+        self._mask_editor = None
         self._h5_last_options: dict = {}
 
 
@@ -492,6 +494,13 @@ class MainWindow(QMainWindow):
             "snippets")
         orientation_action.triggered.connect(self._open_orientation_editor)
         labels_menu.addAction(orientation_action)
+
+        mask_action = QAction("&Mask Editor...", self)
+        mask_action.setStatusTip(
+            "Paint named binary masks on label snippets to compare object "
+            "pixels against the background")
+        mask_action.triggered.connect(self._open_mask_editor)
+        labels_menu.addAction(mask_action)
 
         labels_menu.addSeparator()
 
@@ -1511,6 +1520,9 @@ class MainWindow(QMainWindow):
                     "orientation_px_rad": label.orientation_px_rad,
                     "orientation_deg": label.orientation_deg,
                     "orientation_derived": label.orientation_derived,
+                    # Copies: the mask editor mutates its entries freely and
+                    # commits through masks_changed, never by aliasing.
+                    "masks": [dict(m) for m in label.masks],
                 })
         return entries
 
@@ -1530,6 +1542,31 @@ class MainWindow(QMainWindow):
         self._orientation_editor.show()
         self._orientation_editor.raise_()
         self._orientation_editor.activateWindow()
+
+    def _open_mask_editor(self):
+        """Open (or refresh) the snippet mask editor window."""
+        if self._mask_editor is None:
+            self._mask_editor = MaskEditor()
+            self._mask_editor.masks_changed.connect(self._on_masks_changed)
+        self._mask_editor.set_labels(self._label_entries())
+        self._mask_editor.show()
+        self._mask_editor.raise_()
+        self._mask_editor.activateWindow()
+
+    def _on_masks_changed(self, label_id, masks):
+        """Store a label's full replacement mask list.
+
+        Every stroke commits, so the project (and its autosave snapshot) is
+        never behind what the editor shows.
+        """
+        _, label = self.project.get_label_by_id(label_id)
+        if label is None:
+            return
+        label.masks = list(masks)
+        n = len(label.masks)
+        self.statusBar.showMessage(
+            f"Label #{label_id}: {n} mask{'s' if n != 1 else ''} stored",
+            3000)
 
     def _on_orientation_changed(self, label_id, px_rad, deg, derived=False):
         """Store a drawn, propagated or cleared orientation on the label."""
