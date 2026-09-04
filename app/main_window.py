@@ -1,11 +1,13 @@
 """Main application window."""
 import hashlib
+from collections import deque
 import json
 import math
 import os
 import platform
 import tempfile
 import threading
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -204,7 +206,9 @@ class MainWindow(QMainWindow):
         self._async_total_files = 0
         self._async_loader = None
         # Queue for pending file loads
-        self._async_pending_files: list[tuple[str, dict]] = []
+        # A deque: the consumer pops from the front, and list.pop(0) at 17k
+        # queued files is its own quadratic shuffle.
+        self._async_pending_files: deque = deque()
         # "directory" or "project" - controls post-load behavior
         self._async_mode: str = "directory"
         # Track files that couldn't be found
@@ -215,7 +219,7 @@ class MainWindow(QMainWindow):
         # Timer for safe UI updates during async loading (avoids reentrancy
         # issues)
         self._async_ui_timer = QTimer()
-        self._async_ui_timer.setInterval(100)  # Update UI every 100ms
+        self._async_ui_timer.setInterval(50)
         self._async_ui_timer.timeout.connect(self._process_pending_async_files)
 
         # Cycle mode state
@@ -3214,17 +3218,21 @@ class MainWindow(QMainWindow):
         if not self._async_pending_files:
             return
 
-        # Process a smaller batch to keep UI responsive
-        # Each file involves rasterio file opening + tree update
-        batch_size = min(5, len(self._async_pending_files))
-        batch = self._async_pending_files[:batch_size]
-        self._async_pending_files = self._async_pending_files[batch_size:]
+        # Time-budgeted slice: process files until a UI-friendly deadline,
+        # measured around the REAL work. The old fixed batch of 5 per 100ms
+        # tick capped intake at 50 files/second - a 17k-image project spent
+        # minutes waiting on that ceiling alone.
+        deadline = time.perf_counter() + 0.030
+        processed_any = False
 
         # Use batch mode to suppress tree updates during batch processing
         self.layer_panel.begin_batch_update()
 
         try:
-            for file_path, layer_data in batch:
+            while self._async_pending_files and (
+                    not processed_any or time.perf_counter() < deadline):
+                file_path, layer_data = self._async_pending_files.popleft()
+                processed_any = True
                 if self.canvas.is_path_loaded(file_path):
                     continue
 

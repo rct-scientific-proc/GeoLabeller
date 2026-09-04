@@ -1860,7 +1860,9 @@ class MapCanvas(QGraphicsView):
             self._layers[layer_id] = layer
             self._layer_order.append(layer_id)
             self._path_to_layer[file_path] = layer_id
-            self._update_z_order()
+            # Appending goes on top: only the NEW layer needs a z-value.
+            # Restamping every layer here made bulk imports quadratic.
+            layer.set_z_value(len(self._layer_order) - 1)
 
             # Only update tiles if visible (skip for hidden layers)
             if visible:
@@ -1918,7 +1920,8 @@ class MapCanvas(QGraphicsView):
             self._layers[layer_id] = layer
             self._layer_order.append(layer_id)
             self._path_to_layer[file_path] = layer_id
-            self._update_z_order()
+            # Same incremental stamp as add_layer: appending goes on top.
+            layer.set_z_value(len(self._layer_order) - 1)
 
             if visible:
                 self._update_visible_tiles()
