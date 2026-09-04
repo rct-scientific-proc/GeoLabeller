@@ -30,6 +30,7 @@ from PyQt5.QtWidgets import (
     QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem, QGraphicsTextItem,
     QGraphicsPathItem, QGraphicsRectItem, QMenu, QRubberBand, QWidget
 )
+from affine import Affine
 from pyproj import Transformer
 from rasterio.crs import CRS
 from rasterio.warp import calculate_default_transform, reproject, Resampling
@@ -1172,6 +1173,84 @@ class AsyncFileLoader(QObject):
                 self.progress_update.emit(i + 1, total)
 
         self.batch_complete.emit(loaded_count, error_count)
+
+
+# Cached per-CRS transformers for stored_layer_metadata: one project's
+# images overwhelmingly share a CRS, and Transformer construction is the
+# expensive part of the bounds computation.
+_stored_meta_transformers: dict = {}
+
+
+def stored_layer_metadata(file_path: str, group_path: str,
+                          src_width: int, src_height: int,
+                          affine_coeffs, crs_epsg) -> "dict | None":
+    """Build an AsyncFileLoader-shaped layer_data dict WITHOUT touching disk.
+
+    The project file records each image's dimensions, affine transform and
+    CRS (ImageData.affine_coeffs / crs_epsg), which is everything a lazy
+    TiledLayer needs - so a project whose entries carry them can construct
+    all its layers with zero file opens, and a 17k-image load stops paying
+    17k rasterio header reads up front.
+
+    The Web Mercator bounds and full-resolution grid are computed by
+    transforming a sampling of the source boundary through a cached
+    transformer: sub-metre of rasterio's calculate_default_transform at a
+    tiny fraction of its cost, and provisional either way - the first real
+    load recomputes the exact values (apply_level_result overwrites them).
+
+    Returns None when the stored metadata is incomplete; the caller falls
+    back to the file-opening path.
+    """
+    if (not affine_coeffs or len(affine_coeffs) != 6 or not crs_epsg
+            or not src_width or not src_height):
+        return None
+    try:
+        src_transform = Affine(*affine_coeffs)
+        src_crs = CRS.from_epsg(int(crs_epsg))
+        transformer = _stored_meta_transformers.get(int(crs_epsg))
+        if transformer is None:
+            transformer = Transformer.from_crs(
+                src_crs, WEB_MERCATOR, always_xy=True)
+            _stored_meta_transformers[int(crs_epsg)] = transformer
+
+        left, bottom, right, top = rasterio.transform.array_bounds(
+            src_height, src_width, src_transform)
+        xs = np.linspace(left, right, 6)
+        ys = np.linspace(bottom, top, 6)
+        edge_x = np.concatenate(
+            [xs, xs, np.full(6, left), np.full(6, right)])
+        edge_y = np.concatenate(
+            [np.full(6, bottom), np.full(6, top), ys, ys])
+        gx, gy = transformer.transform(edge_x, edge_y)
+        if not (np.all(np.isfinite(gx)) and np.all(np.isfinite(gy))):
+            return None
+        west, east = float(np.min(gx)), float(np.max(gx))
+        south, north = float(np.min(gy)), float(np.max(gy))
+        if east <= west or north <= south:
+            return None
+        # Split the source pixel count by the projected aspect ratio.
+        aspect = (east - west) / (north - south)
+        width = max(1, round((src_width * src_height * aspect) ** 0.5))
+        height = max(1, round(width / aspect))
+        return {
+            'file_path': file_path,
+            'group_path': group_path,
+            'bounds': (west, south, east, north),
+            'width': width,
+            'height': height,
+            'src_crs': src_crs,
+            'src_transform': src_transform,
+            'src_width': int(src_width),
+            'src_height': int(src_height),
+            # Pyramid factors are not recorded in the project; the first
+            # real load reads and applies them (apply_level_result).
+            'overviews': [],
+            'geo': True,
+        }
+    except Exception as exc:  # noqa: BLE001 - fall back to opening the file
+        debug(f"stored metadata rejected for "
+              f"{Path(file_path).name}: {type(exc).__name__}: {exc}")
+        return None
 
 
 class AsyncFileLoaderThread(QThread):

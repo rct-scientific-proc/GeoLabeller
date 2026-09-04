@@ -1919,10 +1919,20 @@ class MainWindow(QMainWindow):
 
         geotiff_files = []
         missing_files = []
+        fast_images = []
 
         for image in self.project.images.values():
             if not os.path.exists(image.path):
                 missing_files.append(image.path)
+            elif (image.affine_coeffs and image.crs_epsg
+                    and image.original_width and image.original_height):
+                # The project records everything a lazy layer needs, so
+                # this image loads with ZERO file I/O. Entries without the
+                # stored transform (older projects, non-geo imagery) go
+                # through the header-reading worker below - and get their
+                # metadata backfilled there, so the NEXT save makes them
+                # fast too.
+                fast_images.append(image)
             else:
                 geotiff_files.append((image.path, image.group or ""))
 
@@ -1930,13 +1940,61 @@ class MainWindow(QMainWindow):
         self._async_missing_files = missing_files
         self._project_geotiff_files = geotiff_files
 
-        total_files = len(geotiff_files)
+        if fast_images:
+            self._load_project_images_from_metadata(fast_images)
 
-        if total_files == 0:
+        if not geotiff_files:
+            self._hide_progress()
             self._finish_async_loading_project()
             return
 
         self._start_project_geotiff_loading()
+
+    def _load_project_images_from_metadata(self, images: list):
+        """Construct layers straight from the project's stored metadata.
+
+        No worker thread, no rasterio opens, no pacing: a tight batched
+        loop that yields to the event loop every few hundred layers. This
+        is what turns a minutes-long 17k-image load into seconds - the
+        filesystem is not consulted until an image is actually displayed
+        (and a file gone missing surfaces there, where Locate Missing
+        Images already handles it).
+        """
+        from .canvas import stored_layer_metadata
+
+        if not hasattr(self, "_async_group_cache"):
+            self._async_group_cache = {}
+        count = 0
+        self.layer_panel.begin_batch_update()
+        try:
+            for image in images:
+                meta = stored_layer_metadata(
+                    image.path, image.group or "",
+                    image.original_width, image.original_height,
+                    image.affine_coeffs, image.crs_epsg)
+                if meta is None:
+                    # Corrupt stored metadata: hand it to the worker path.
+                    self._project_geotiff_files.append(
+                        (image.path, image.group or ""))
+                    continue
+                group_path = image.group or ""
+                parent_group = self._get_or_create_group_async(group_path)
+                layer_id = self.canvas.add_layer(
+                    image.path, lazy=True, visible=False, metadata=meta)
+                if layer_id:
+                    self.layer_panel.add_layer(
+                        layer_id, image.path, parent_group, visible=False)
+                    self.canvas.set_layer_group(layer_id, group_path)
+                count += 1
+                if count % 500 == 0:
+                    # Let the window breathe and the progress bar move.
+                    self.layer_panel.end_batch_update()
+                    self._update_progress(count)
+                    QApplication.processEvents()
+                    self.layer_panel.begin_batch_update()
+        finally:
+            self.layer_panel.end_batch_update()
+        self._update_progress(count)
 
     def _start_project_geotiff_loading(self):
         """Start async loading of GeoTIFF files during project load."""
@@ -3275,6 +3333,24 @@ class MainWindow(QMainWindow):
                         self.project.add_image(
                             file_path, name, group_path, width, height,
                             affine=affine, crs=crs)
+                    else:
+                        # Project mode reached the worker because this
+                        # entry's stored metadata was incomplete (an older
+                        # project). Backfill it from the header the worker
+                        # just read, so the next save makes this image load
+                        # with zero file I/O.
+                        image = self.project.images.get(file_path)
+                        if image is not None:
+                            if not image.original_width:
+                                w, h = self.canvas.get_layer_source_dimensions(
+                                    layer_id)
+                                image.original_width = int(w or 0)
+                                image.original_height = int(h or 0)
+                            if image.affine_coeffs is None:
+                                affine, crs = self.canvas.get_layer_transform(
+                                    layer_id)
+                                if affine is not None and crs is not None:
+                                    image.set_affine(affine, crs)
 
                     self._async_loaded_count += 1
         finally:
