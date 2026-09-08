@@ -127,20 +127,59 @@ def resolve_against_dir(missing_path: str, base_dir: str) -> str | None:
     return best
 
 
-def silently_resolve(project, project_dir: str, verify=verify_candidate) -> int:
+def silently_resolve(project, project_dir: str, verify=verify_candidate,
+                     progress=None, sample_every: int = 100) -> int:
     """Fix missing image paths relative to the project file's folder.
 
     The zero-UI case: the imagery travelled with the project. Returns how
     many images were relocated; anything unresolved is left for the dialog.
+
+    An imagery tree copied wholesale beside the project resolves through
+    ONE prefix substitution, so after the first verified match its inferred
+    rule is tried first: one isfile per image instead of a tail search.
+    Header-verifying every rule match used to open tens of thousands of
+    files (minutes of frozen UI on a big project) while discriminating
+    nothing - twin surveys share dimensions and CRS; the protection is the
+    path structure - so rule matches are verified on the first few and then
+    one in *sample_every*. A sampled failure drops the rule and that image
+    (and any the rule no longer covers) goes back through the fully
+    verified tail search, which re-infers a rule from what it finds - a
+    tree copied folder-by-folder settles onto each folder's rule after one
+    verified open. ``progress`` (done, total) is called periodically so the
+    caller can keep its UI alive.
     """
+    missing = [p for p in list(project.images) if not os.path.exists(p)]
+    total = len(missing)
     relocated = 0
-    for old_path in list(project.images):
-        if os.path.exists(old_path):
-            continue
-        candidate = resolve_against_dir(old_path, project_dir)
-        if candidate and verify(candidate, project.images[old_path]):
-            if project.relocate_image(old_path, os.path.abspath(candidate)):
-                relocated += 1
+    rule = None
+    since_sample = 0
+    for i, old_path in enumerate(missing):
+        if progress is not None and i % 50 == 0:
+            progress(i, total)
+        image = project.images[old_path]
+        via_rule = False
+        candidate = apply_prefix_rule(old_path, rule) if rule else None
+        if candidate is not None:
+            via_rule = True
+            since_sample += 1
+            if relocated < 4 or since_sample >= sample_every:
+                since_sample = 0
+                if not verify(candidate, image):
+                    rule = None          # the rule betrayed us: full checks
+                    candidate = None
+                    via_rule = False     # a fallback match re-infers below
+        if candidate is None:
+            found = resolve_against_dir(old_path, project_dir)
+            if not (found and verify(found, image)):
+                continue
+            candidate = found
+        candidate = os.path.abspath(candidate)
+        if project.relocate_image(old_path, candidate):
+            relocated += 1
+            if not via_rule:
+                rule = infer_prefix_rule(old_path, candidate)
+    if progress is not None and total:
+        progress(total, total)
     return relocated
 
 

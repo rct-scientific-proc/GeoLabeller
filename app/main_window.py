@@ -1917,12 +1917,27 @@ class MainWindow(QMainWindow):
         # imagery; resolving missing paths against the project file's own
         # folder fixes that case before the user sees a single warning.
         if self._project_path is not None:
+            def relocation_progress(done, total):
+                # Repurpose the load progress bar for the relocation scan
+                # and pump events - a 20k-image scan must not freeze the
+                # window (it did, for minutes, before the prefix-rule fast
+                # path and this pump existed).
+                if done == 0:
+                    self._show_progress(total, "Locating project imagery")
+                else:
+                    self._update_progress(done)
+                QApplication.processEvents()
+
             fixed = silently_resolve(
-                self.project, str(self._project_path.parent))
+                self.project, str(self._project_path.parent),
+                progress=relocation_progress)
             if fixed:
                 self.statusBar.showMessage(
                     f"Relocated {fixed} image(s) next to the project file - "
                     "save the project to keep the new paths", 8000)
+                # Back to the label the load itself uses.
+                self._show_progress(len(self.project.images),
+                                    "Loading project")
 
         geotiff_files = []
         missing_files = []
