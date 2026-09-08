@@ -49,6 +49,14 @@ class LayerPanel(QWidget):
         # reparents existing items in place, so cached references stay valid.
         self._layer_items: dict[str, QTreeWidgetItem] = {}
         self._path_items: dict[str, QTreeWidgetItem] = {}
+        # Group-toggle re-entrancy state. A big group toggle pumps the event
+        # loop to stay responsive, so the user's NEXT click can arrive while
+        # the loop is still walking the tree; these make that click supersede
+        # the walk instead of running nested inside it (see _on_item_changed).
+        self._group_toggle_active = False
+        self._group_toggle_item = None
+        self._group_toggle_superseded = False
+        self._pending_group_toggles: list = []   # (item, checked) to replay
         self._setup_ui()
 
     def _setup_ui(self):
@@ -161,6 +169,18 @@ class LayerPanel(QWidget):
             self.tree.addTopLevelItem(item)
         return item
 
+    @staticmethod
+    def _covers(a: QTreeWidgetItem, b: QTreeWidgetItem) -> bool:
+        """True when a and b share a subtree (same item, or one contains
+        the other) - i.e. toggling one overlaps toggling the other."""
+        for first, second in ((a, b), (b, a)):
+            node = second
+            while node is not None:
+                if node is first:
+                    return True
+                node = node.parent()
+        return False
+
     def _on_item_changed(self, item: QTreeWidgetItem, column: int):
         """Handle item check state changes."""
         item_type = item.data(0, Qt.UserRole + 1)
@@ -169,28 +189,68 @@ class LayerPanel(QWidget):
         if item_type == "layer":
             layer_id = item.data(0, Qt.UserRole)
             self.layer_visibility_changed.emit(layer_id, checked)
-            # Group boxes mirror their layers (on, off, or partial).
-            self.refresh_group_check_states()
+            # Group boxes mirror their layers (on, off, or partial). During
+            # a group toggle the toggle's own final refresh covers it.
+            if not self._group_toggle_active:
+                self.refresh_group_check_states()
 
         elif item_type == "group":
             # A user click lands on Checked or Unchecked (a partial box goes
             # to Checked); a refresh writing PartiallyChecked never gets here
             # because refreshes run with tree signals blocked.
-            # Count all descendant layers for progress tracking
-            layer_count = self._count_descendant_layers(item)
-            use_progress = layer_count >= 10  # Only show progress for 10+ items
+            if self._group_toggle_active:
+                # This click arrived through a processEvents pause of a
+                # toggle still walking the tree. NEVER run it nested: the
+                # suspended loop would resume afterwards and re-apply its
+                # stale state on top of this one (the "keeps turning
+                # sub-groups on after I turned the group off" bug). Queue
+                # it - with the state as clicked, since a refresh may
+                # rewrite the box before the replay - and when it covers
+                # the running toggle's subtree, stop that toggle: the user
+                # changed their mind about those very layers.
+                running = self._group_toggle_item
+                if running is not None and self._covers(item, running):
+                    self._group_toggle_superseded = True
+                self._pending_group_toggles = [
+                    (it, st) for it, st in self._pending_group_toggles
+                    if it is not item]        # latest click on an item wins
+                self._pending_group_toggles.append((item, checked))
+                return
+            self._group_toggle_active = True
+            try:
+                self._run_group_toggle(item, checked)
+                while self._pending_group_toggles:
+                    queued, queued_state = self._pending_group_toggles.pop(0)
+                    try:
+                        alive = queued.treeWidget() is self.tree
+                    except RuntimeError:      # item deleted meanwhile
+                        alive = False
+                    if alive:
+                        self._run_group_toggle(queued, queued_state)
+            finally:
+                self._group_toggle_active = False
+                self._group_toggle_item = None
+                self._pending_group_toggles.clear()
 
-            if use_progress:
-                self.batch_visibility_started.emit(layer_count)
+    def _run_group_toggle(self, item: QTreeWidgetItem, checked: bool):
+        """Apply one user group toggle to its whole subtree."""
+        self._group_toggle_item = item
+        self._group_toggle_superseded = False
+        layer_count = self._count_descendant_layers(item)
+        use_progress = layer_count >= 10  # Only show progress for 10+ items
 
-            # Toggle all children with progress tracking
+        if use_progress:
+            self.batch_visibility_started.emit(layer_count)
+        try:
             self._toggle_group_children(item, checked, use_progress)
-
+        finally:
             if use_progress:
                 self.batch_visibility_finished.emit()
 
-            # Ancestors follow: they may become partial rather than checked.
-            self.refresh_group_check_states()
+        # Ancestors follow: they may become partial rather than checked -
+        # and after a superseded (aborted) toggle this puts every group box
+        # back in line with whatever its layers actually are.
+        self.refresh_group_check_states()
 
     def refresh_group_check_states(self):
         """Make every group checkbox mirror its descendant layers.
@@ -247,18 +307,39 @@ class LayerPanel(QWidget):
 
     def _toggle_group_children(
             self, item: QTreeWidgetItem, checked: bool, emit_progress: bool):
-        """Toggle all children of a group item, optionally emitting progress."""
+        """Toggle all children of a group item, optionally emitting progress.
+
+        Check states are set with tree signals BLOCKED and the visibility
+        signals emitted here directly, for layers that actually change -
+        letting setCheckState cascade back into _on_item_changed used to
+        run a complete nested toggle per sub-group, then walk the same
+        subtree again. The processEvents pauses run with signals live, so
+        a user click during the walk still reaches _on_item_changed, which
+        queues it and - via _group_toggle_superseded - stops this walk
+        when the click covers the same layers.
+        """
         check_state = Qt.Checked if checked else Qt.Unchecked
         progress_count = [0]  # Use list for mutable closure
 
         def process_item(parent: QTreeWidgetItem):
             """Recursively apply the check state to descendants, emitting progress per layer."""
             for i in range(parent.childCount()):
+                if self._group_toggle_superseded:
+                    return    # a newer toggle owns these layers now
                 child = parent.child(i)
-                child.setCheckState(0, check_state)
                 child_type = child.data(0, Qt.UserRole + 1)
+                child_changed = child.checkState(0) != check_state
+                if child_changed:
+                    self.tree.blockSignals(True)
+                    child.setCheckState(0, check_state)
+                    self.tree.blockSignals(False)
 
                 if child_type == "layer":
+                    if child_changed:
+                        layer_id = child.data(0, Qt.UserRole)
+                        if layer_id:
+                            self.layer_visibility_changed.emit(
+                                layer_id, checked)
                     progress_count[0] += 1
                     if emit_progress:
                         self.batch_visibility_progress.emit(progress_count[0])
