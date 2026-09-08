@@ -98,11 +98,15 @@ class PointLabel:
     orientation_derived: bool = False
 
     # Named binary masks painted on this label's snippet in the mask editor.
-    # Each entry is a dict {name, x0, y0, width, height, rle}: the window is
-    # the snippet crop IN SOURCE PIXELS at paint time, the rle a row-major
-    # run-length encoding of the binary layer (see app/masks.py for the
-    # exact encoding). Masks are independent layers - several may overlap on
-    # one snippet - and per label, like every other per-view annotation.
+    # Each entry is a dict {name, x0, y0, width, height, rle}. As of format
+    # 4.0 the window is the FULL source image (x0=y0=0, width/height = the
+    # image's), so the rle is co-registered with the imagery; the rle is a
+    # row-major run-length encoding of the binary layer (see app/masks.py
+    # for the exact encoding). Format 3.9 wrote the paint-time snippet crop
+    # instead - readers honor whatever window an entry records, and
+    # from_dict migrates windowed entries when it knows the image size.
+    # Masks are independent layers - several may overlap on one snippet -
+    # and per label, like every other per-view annotation.
     masks: list = field(default_factory=list)
 
     # Human-readable name for the linked-object group - the readable
@@ -198,15 +202,36 @@ class PointLabel:
             orientation_px_rad=data.get("orientation_px_rad"),
             orientation_deg=data.get("orientation_deg"),
             orientation_derived=bool(data.get("orientation_derived", False)),
-            masks=[
-                # Normalize the pre-release integer-array rle to the compact
-                # string form on load, so any load-and-save migrates the
-                # file (an array cost one pretty-printed line per run).
-                (dict(m, rle=",".join(str(int(r)) for r in m["rle"]))
-                 if isinstance(m.get("rle"), list) else dict(m))
-                for m in data.get("masks", [])
-            ]
+            masks=cls._normalized_masks(data.get("masks", []),
+                                        image_width, image_height)
         )
+
+    @staticmethod
+    def _normalized_masks(entries, image_width: int, image_height: int) -> list:
+        """Stored mask entries upgraded to the current on-disk form.
+
+        Two migrations happen here, so any load-and-save modernizes the
+        file: the pre-release integer-array rle becomes the compact string
+        (an array cost one pretty-printed line per run), and 3.9's
+        snippet-window anchoring becomes 4.0's full-image anchoring - the
+        runs are recomputed arithmetically, never through an image-sized
+        array. Without the image dimensions (or on a corrupt rle) the entry
+        is kept as stored; readers honor whatever window it records.
+        """
+        from app.masks import entry_to_full_image
+        masks = []
+        for m in entries:
+            if isinstance(m.get("rle"), list):
+                m = dict(m, rle=",".join(str(int(r)) for r in m["rle"]))
+            else:
+                m = dict(m)
+            if image_width > 0 and image_height > 0:
+                try:
+                    m = entry_to_full_image(m, image_width, image_height)
+                except (KeyError, ValueError, TypeError):
+                    pass    # keep the entry as stored; fail loudly on use
+            masks.append(m)
+        return masks
 
 
 @dataclass
@@ -892,7 +917,9 @@ class LabelProject:
         and hand it to a background writer.
         """
         return {
-            "version": "3.9",
+            # "4.0", not "3.10": the ICD pins readers to STRING comparison,
+            # and "3.10" < "3.9" lexicographically.
+            "version": "4.0",
             # Copied, not referenced: the recovery snapshot is handed to a
             # background writer and the user carries on editing meanwhile.
             # The image and waypoint entries are freshly built dictionaries,

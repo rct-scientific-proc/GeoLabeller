@@ -1527,6 +1527,13 @@ class MainWindow(QMainWindow):
                     # Copies: the mask editor mutates its entries freely and
                     # commits through masks_changed, never by aliasing.
                     "masks": [dict(m) for m in label.masks],
+                    # Full image dimensions when the project knows them -
+                    # what the mask editor anchors full-image RLEs against
+                    # without re-reading the file header.
+                    "image_size": (
+                        (image.original_width, image.original_height)
+                        if image.original_width and image.original_height
+                        else None),
                 })
         return entries
 

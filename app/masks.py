@@ -3,14 +3,16 @@
 A mask is painted on a label's snippet and stored ON the label as a named
 binary layer:
 
-    {"name": "hull", "x0": 128, "y0": 64, "width": 224, "height": 224,
-     "rle": [312, 5, 214, ...]}
+    {"name": "hull", "x0": 0, "y0": 0, "width": 30000, "height": 24000,
+     "rle": "361200128,14,29986,..."}
 
-The window (x0, y0, width, height) is the snippet crop IN SOURCE PIXELS at
-paint time, from the shared snippet_frame - so the mask stays anchored to
-the imagery rather than to whatever snippet size happens to be selected
-later, and can be re-projected into any other window (the H5 export's, for
-one) by pure translation.
+As of project format 4.0 the window IS the full source image: x0/y0 are 0
+and width/height equal the image dimensions, so the rle decodes directly
+against the image with no anchoring step - the mask is co-registered with
+its imagery. (Format 3.9 wrote the paint-time snippet crop instead;
+readers honor whatever window an entry records, and 3.9 entries are
+migrated to full-image on load.) The run COUNT barely changes between the
+two anchorings - only the runs bordering empty ground grow large.
 
 The compression, precisely: "rle" is a run-length encoding of the binary
 window read row-major (row 0 left to right, then row 1, ...). Runs
@@ -25,6 +27,12 @@ indented line (~20 bytes) per run - a few thousand runs ballooned into
 tens of kilobytes of whitespace. As a string, the same mask is one line at
 a few bytes per run. Readers accept the pre-release array form too, so
 projects written before the change still load.
+
+A full-image window over survey imagery can cover BILLIONS of pixels, so
+nothing in this module ever materializes an entry-sized array: encoding,
+windowed decoding, merging and migration all work on the runs themselves
+(streams of per-row spans), costing O(number of runs) time and
+O(requested window) memory.
 
 Masks are independent binary layers: several can overlap on one snippet,
 which a single labelled-component array could never represent.
@@ -67,11 +75,122 @@ def decode_rle(runs: list, width: int, height: int) -> np.ndarray:
 
 
 def mask_entry(name: str, x0: int, y0: int, mask: np.ndarray) -> dict:
-    """Build the serialized form of one named mask."""
+    """Build the serialized form of one named mask (windowed anchoring).
+
+    Format 3.9 wrote entries like this; 4.0 writers use
+    :func:`full_image_entry` instead. Kept because readers must accept the
+    windowed form, and tests exercise it.
+    """
     h, w = mask.shape
     return {"name": name, "x0": int(x0), "y0": int(y0),
             "width": int(w), "height": int(h),
             "rle": ",".join(str(r) for r in encode_rle(mask))}
+
+
+# ---------------------------------------------------------------------------
+# Run/span arithmetic: everything below works on ordered per-row spans of
+# 1-pixels, (row, col_start, col_end) with col_end exclusive, in absolute
+# SOURCE-image coordinates - never on entry-sized arrays.
+# ---------------------------------------------------------------------------
+
+def _entry_row_spans(entry: dict):
+    """Yield the 1-runs of a serialized mask as absolute per-row spans."""
+    ew, eh = int(entry["width"]), int(entry["height"])
+    ex0, ey0 = int(entry["x0"]), int(entry["y0"])
+    runs = entry_runs(entry)
+    if sum(runs) != ew * eh:
+        raise ValueError(
+            f"mask RLE covers {sum(runs)} pixels, window has {ew * eh}")
+    pos = 0
+    value = False
+    for run in runs:
+        if value and run:
+            start, end = pos, pos + run
+            r0, r1 = start // ew, (end - 1) // ew
+            for r in range(r0, r1 + 1):
+                c0 = start - r * ew if r == r0 else 0
+                c1 = end - r * ew if r == r1 else ew
+                yield (ey0 + r, ex0 + c0, ex0 + c1)
+        pos += run
+        value = not value
+
+
+def _mask_row_spans(mask: np.ndarray, x0: int, y0: int):
+    """Yield a window array's 1-runs as absolute per-row spans."""
+    mask = np.asarray(mask, dtype=bool)
+    for r in range(mask.shape[0]):
+        row = mask[r]
+        if not row.any():
+            continue
+        idx = np.flatnonzero(row[1:] != row[:-1]) + 1
+        bounds = np.concatenate(([0], idx, [row.size]))
+        value = bool(row[0])
+        for i in range(len(bounds) - 1):
+            if value:
+                yield (y0 + r, x0 + int(bounds[i]), x0 + int(bounds[i + 1]))
+            value = not value
+
+
+def _spans_to_entry(name: str, spans, image_width: int,
+                    image_height: int) -> dict:
+    """Serialize ordered absolute spans as a FULL-IMAGE entry.
+
+    Spans must be in raster order; parts outside the image are clipped.
+    Touching spans merge, so the runs come out canonical.
+    """
+    runs = []
+    pos = 0
+    for row, c0, c1 in spans:
+        if row < 0 or row >= image_height:
+            continue
+        c0, c1 = max(0, c0), min(image_width, c1)
+        if c1 <= c0:
+            continue
+        start = row * image_width + c0
+        length = c1 - c0
+        gap = start - pos
+        if gap < 0:
+            raise ValueError("mask spans out of order")
+        if gap == 0 and runs:
+            runs[-1] += length      # abuts the previous 1-run: extend it
+        else:
+            runs.append(gap)
+            runs.append(length)
+        pos = start + length
+    tail = image_width * image_height - pos
+    if tail:
+        runs.append(tail)
+    if not runs:
+        runs = [image_width * image_height]
+    return {"name": name, "x0": 0, "y0": 0,
+            "width": int(image_width), "height": int(image_height),
+            "rle": ",".join(str(r) for r in runs)}
+
+
+def full_image_entry(name: str, x0: int, y0: int, mask: np.ndarray,
+                     image_width: int, image_height: int) -> dict:
+    """Serialize a painted window as a full-image mask entry.
+
+    The runs are composed arithmetically from the window's row spans - the
+    image-sized canvas is never built (it can be billions of pixels).
+    """
+    return _spans_to_entry(name, _mask_row_spans(mask, x0, y0),
+                           image_width, image_height)
+
+
+def entry_to_full_image(entry: dict, image_width: int,
+                        image_height: int) -> dict:
+    """Re-anchor a (possibly windowed) entry to the full image.
+
+    Already-full entries pass through unchanged; this is the 3.9 -> 4.0
+    load-time migration.
+    """
+    if (int(entry["x0"]) == 0 and int(entry["y0"]) == 0
+            and int(entry["width"]) == int(image_width)
+            and int(entry["height"]) == int(image_height)):
+        return dict(entry)
+    return _spans_to_entry(entry["name"], _entry_row_spans(entry),
+                           image_width, image_height)
 
 
 def entry_runs(entry: dict) -> list:
@@ -96,18 +215,21 @@ def entry_in_window(entry: dict, x0: int, y0: int,
     inside the window land at their true source position, everything else is
     False. This is what keeps a mask painted at one snippet size correct
     under any other - and what aligns it with the H5 export's window.
+
+    Streams the entry's runs rather than decoding its window (which, for a
+    full-image entry over survey imagery, would be a multi-gigabyte array):
+    memory is the REQUESTED window only.
     """
     out = np.zeros((height, width), dtype=bool)
-    stored = entry_array(entry)
-    sx, sy = entry["x0"], entry["y0"]
-    left = max(sx, x0)
-    top = max(sy, y0)
-    right = min(sx + entry["width"], x0 + width)
-    bottom = min(sy + entry["height"], y0 + height)
-    if right <= left or bottom <= top:
-        return out
-    out[top - y0:bottom - y0, left - x0:right - x0] = \
-        stored[top - sy:bottom - sy, left - sx:right - sx]
+    wy1, wx1 = y0 + height, x0 + width
+    for row, c0, c1 in _entry_row_spans(entry):
+        if row >= wy1:
+            break               # spans arrive in raster order
+        if row < y0:
+            continue
+        cc0, cc1 = max(c0, x0), min(c1, wx1)
+        if cc1 > cc0:
+            out[row - y0, cc0 - x0:cc1 - x0] = True
     return out
 
 
@@ -150,16 +272,41 @@ def fill_enclosed(mask: np.ndarray) -> "tuple[np.ndarray, int]":
 
 
 def merged_entry(name: str, x0: int, y0: int, layer: np.ndarray,
-                 previous: "dict | None" = None) -> dict:
+                 previous: "dict | None" = None,
+                 image_size: "tuple[int, int] | None" = None) -> dict:
     """Serialize an edited window WITHOUT losing pixels outside it.
 
     The editor paints inside one window, but a previously stored mask may
     extend beyond it (painted earlier at a larger snippet size). Committing
-    only the visible window would silently crop that content - so the new
-    entry covers the UNION of the previous window and the edited one: the
-    edited window replaces its region wholesale (erasures included), and
+    only the visible window would silently crop that content - so the
+    edited window replaces its region wholesale (erasures included) while
     everything outside it survives untouched.
+
+    With ``image_size`` (width, height) the result is a full-image entry,
+    spliced run-by-run: the previous entry's spans are clipped AGAINST the
+    edited rectangle, the window's own spans dropped in, and the whole lot
+    re-serialized - no array larger than the edited window is ever built.
+    Without it (legacy callers, old tests) the result covers the union of
+    the two windows, as format 3.9 did.
     """
+    if image_size is not None:
+        iw, ih = image_size
+        h, w = layer.shape
+        rx0, ry0, rx1, ry1 = x0, y0, x0 + w, y0 + h
+        pieces = []
+        if previous is not None:
+            for row, c0, c1 in _entry_row_spans(previous):
+                if ry0 <= row < ry1:
+                    # Keep only the parts outside the edited rectangle.
+                    if c0 < rx0:
+                        pieces.append((row, c0, min(c1, rx0)))
+                    if c1 > rx1:
+                        pieces.append((row, max(c0, rx1), c1))
+                else:
+                    pieces.append((row, c0, c1))
+        pieces.extend(_mask_row_spans(layer, x0, y0))
+        pieces.sort()
+        return _spans_to_entry(name, pieces, iw, ih)
     if previous is None:
         return mask_entry(name, x0, y0, layer)
     h, w = layer.shape

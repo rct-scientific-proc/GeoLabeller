@@ -8,10 +8,14 @@ drag erases, the brush size is adjustable, and several masks can coexist
 on one snippet (they may overlap - each is an independent binary layer
 with its own overlay colour).
 
-Masks are stored on the label in SOURCE-pixel anchoring (the crop origin
-comes from the shared snippet_frame), run-length encoded - see app/masks.py
-for the exact format. Every stroke re-encodes and emits immediately, so
-the project (and its autosave) is never behind the screen.
+Masks are stored on the label as FULL-IMAGE run-length encodings (format
+4.0): the painted window is spliced into the stored runs arithmetically,
+so the entry is co-registered with its imagery and no image-sized array
+is ever built - see app/masks.py for the exact format. Every stroke
+re-encodes and emits immediately, so the project (and its autosave) is
+never behind the screen. If an image's dimensions cannot be read, the
+editor falls back to the 3.9 windowed anchoring, which readers still
+honor.
 
 The stats line is the point of the exercise: per-band mean +/- std of the
 active mask's pixels versus the background, computed from RAW source
@@ -371,6 +375,9 @@ class MaskEditor(QWidget):
         self._layers: "dict[str, np.ndarray]" = {}
         self._order: list = []
         self._raw = None                          # (bands, h, w) source data
+        # Image (width, height) by path - one header read each, so every
+        # stroke can serialize against the full image without touching disk.
+        self._image_dims: "dict[str, tuple | None]" = {}
         self._setup_ui()
 
     def _setup_ui(self):
@@ -688,12 +695,32 @@ class MaskEditor(QWidget):
         self._emit_masks()
         self._refresh_stats()
 
+    def _dims_for(self, entry: dict) -> "tuple | None":
+        """The image's (width, height): from the project when it knows them,
+        else header-read once and cached. None only when the file itself is
+        unreadable - the caller then falls back to windowed anchoring.
+        """
+        size = entry.get("image_size")
+        if size:
+            return size
+        path = entry["image_path"]
+        if path not in self._image_dims:
+            try:
+                import rasterio
+                with rasterio.open(path) as src:
+                    self._image_dims[path] = (src.width, src.height)
+            except Exception:
+                self._image_dims[path] = None
+        return self._image_dims[path]
+
     def _emit_masks(self):
         if self._current is None:
             return
         x0, y0, _w, _h = self._frame
+        image_size = self._dims_for(self._current)
         entries = [merged_entry(name, x0, y0, self._layers[name],
-                                self._stored_by_name.get(name))
+                                self._stored_by_name.get(name),
+                                image_size=image_size)
                    for name in self._order]
         self._stored_by_name = {e["name"]: e for e in entries}
         self._current["masks"] = entries
