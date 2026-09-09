@@ -1,11 +1,39 @@
 # GeoLabeller
 
-A PyQt5-based desktop application for viewing georeferenced and non-georeferenced raster images and creating point annotations for machine learning datasets. Supports GeoTIFF images.
+A PyQt5 desktop application for viewing georeferenced (and non-georeferenced)
+raster imagery and building point-annotation datasets for machine learning:
+place labels, link them across images, measure and orient objects, paint
+per-object masks, and export training data as HDF5 or GeoTIFF crops.
 
+## Installation
+
+**Windows**: download the MSI installer from the
+[latest GitHub release](../../releases/latest). It upgrades an existing
+install in place.
+
+**From source** (any platform):
+
+```bash
+# Create the pinned conda environment
+conda env create -f environment.yml
+conda activate geolabel
+
+# Or install the dependencies yourself
+pip install PyQt5 rasterio numpy pyproj h5py affine
+
+python main.py
+```
+
+Runs on FIPS-enabled systems (no md5/sha1 anywhere; the test suite enforces
+this).
 
 ## Supported File Formats
 
-GeoTIFF (`.tif`, `.tiff`), both georeferenced and non-georeferenced, read via rasterio.
+GeoTIFF (`.tif`, `.tiff`), read via rasterio — georeferenced or not
+(non-georeferenced images display in a separate pixel zone), any band count,
+uint8 / uint16 / float32 pixels. Non-byte imagery is shown through a
+per-image 2–98 percentile contrast stretch; exports can keep the native
+values (see below).
 
 ## Preparing GeoTIFFs for Fast Rendering
 
@@ -58,196 +86,80 @@ with rasterio.open("image.tif", "r+") as ds:
 > zoomed-out view has to decode the entire raster, whereas with overviews the app
 > reads only a small decimated level.
 
+Avoid sidecar files (`.tfw`, external `.ovr`, `.aux.xml`) next to the imagery
+when you can: a sidecar-free directory imports noticeably faster, because
+GeoLabeller can then skip GDAL's per-file directory scan.
 
 ## Features
 
-### Image Viewing
-- Load individual GeoTIFF images or entire directories of them
-- **Non-georeferenced image support** — images without a CRS are displayed in a separate pixel zone
-- **Async loading** with progress bar for large datasets — UI stays responsive
-- **Lazy bounds-only loading** — reads only file headers for fast bulk imports; pixel data loaded on demand
-- **Add Directory** creates a root group named after the selected folder
-- Organize images into groups with drag-and-drop support
-- Toggle layer visibility on/off (layers default to hidden on load)
-- **Parent group auto-check**: Turning on a layer automatically enables its parent groups
-- Zoom to specific layers
-- Pan and zoom navigation with mouse wheel
-- Real-time coordinate display (WGS84) with nearest image info in status bar
-- **Scale bar** in the top-right corner showing distance at current zoom level
-- **Duplicate detection** prevents loading the same image file twice
-- **Optimized tile rendering** with O(1) visible tile calculation for smooth performance
-- **Auto-save & crash recovery** — project state saved every 60 seconds; automatic recovery prompt on restart after an abnormal shutdown
+### Viewing and organizing
+- Load single GeoTIFFs or whole directories (recursive; folders become
+  groups). Bulk imports read only headers — pixels load on demand.
+- Layer panel: hierarchical groups with drag-and-drop, tristate group
+  checkboxes that mirror their layers, preload/free per group, per-group
+  **location tags** (right-click → Set Location…).
+- Projects with 10k+ images reopen in seconds: layer geometry is rebuilt
+  from metadata stored in the project, with zero file reads.
+- A project copied to another machine alongside its imagery relocates every
+  image automatically on open; **File → Locate Missing Images** handles
+  anything that moved elsewhere.
+- Waypoints (named geographic bookmarks), go-to-coordinates, scale bar,
+  live WGS84 coordinate readout, auto-save with crash recovery.
 
-### Layer Panel
-- Hierarchical tree view of all loaded images and groups
-- **Expand All / Collapse All** via right-click context menu on groups
-- **Select All / Unselect All** children via right-click context menu
-- Drag-and-drop to reorganize layers and groups
-- Tree collapses by default on project load for cleaner UI
-- Visibility changes sync automatically with Labeled Images panel
+### Labeling
+- Point labels in custom classes (`1`–`9` quick-switch), placed with a click
+  in Label mode or any cycle mode.
+- **Linking**: labels of the same real-world object across images share an
+  `object_id` — link via right-click, chain-linking (`K`), or box-linking
+  (right-click a label → Link by Box…). Linked groups always wear
+  per-group colored halo rings, plus a shared editable group name.
+- **Measurements**: length/width per object (`M` on a label, or Shift+drag
+  to measure any ground distance), stored in metres.
+- **Orientation editor** (Labels menu): draw per-label headings on
+  snippets; headings can auto-propagate to linked labels through each
+  image's own georeferencing.
+- **Mask editor** (Labels menu): paint named binary masks over a label's
+  snippet (zoom to single-pixel precision, flood-fill closed outlines) and
+  compare the object's raw pixel distribution against the background.
+  Masks are stored in the project as compact full-image RLE.
+- Hard-negative sources: flag whole images that contain confusers but no
+  true positives (right-click the image on the canvas).
 
-### Labeled Images Panel
-- Separate panel below the layer panel showing all labeled images
-- Labels grouped by **object ID** (linked labels appear together)
-- Individual labels displayed with their unique label IDs
-- Click to zoom directly to any label location
-- **Synchronized visibility** toggle with main layer panel (bidirectional)
-- Right-click context menu for quick navigation
+### Modes
+Pan (`P`), Label (`L`), Cycle through a group (`C`), View Cycle (`V`),
+Waterfall (`W`) — a group's images stacked vertically, glide with Space,
+with labeling and measuring still live — and Ruler (`R`).
 
-### Point Labeling
-- Create custom label classes with distinct colors
-- Switch between Pan and Label modes
-- Place point annotations with a single click
-- Remove labels via right-click context menu
-- Labels store both pixel coordinates and geographic coordinates (WGS84)
+### Exports (Export menu)
+- **HDF5 Dataset** — sliding-window CNN training data: labeled example
+  crops (with an offset ring) plus hard-negative windows, train/val/test
+  splits, painted masks and location tags carried per sample. Pixels as
+  stretched uint8 or native-scale float32 grayscale. Appendable.
+- **Ground Truth** (all or labeled-only) — JSON ground truth.
+- **Sub-images** — one GeoTIFF crop per label, source dtype and
+  georeferencing preserved.
+- **Optimized GeoTIFFs** — re-tile/overview imagery in place for speed.
 
-### Object Linking
-- Link labels across multiple images to track the same real-world object
-- Each label has a unique UUID; linked labels share the same UUID
-- Right-click menu options: "Link with...", "Unlink", "Show Linked"
-- Visual highlighting of linked labels
+## Documentation
 
-### Cycle Mode
-- Sequential workflow for labeling layers within a selected group
-- Select a group, press **C** to enter Cycle mode
-- Automatically zooms to the last checked layer in the group
-- **Left-click** places labels (same as Label mode)
-- **Right-click + drag** to pan around
-- **Mouse wheel** to zoom in/out
-- **Space** to advance: unchecks current layer and zooms to next
-- **Ctrl+Left-click** on a label for context menu (link, remove, etc.)
-- Group name displayed in status bar during cycle
+- **Help → Keyboard Shortcuts (`F1`)** — the complete, always-current key
+  reference (the tables live in `app/shortcuts.py`; this README does not
+  duplicate them).
+- **Help → ICD** — the Interface Control Document
+  ([docs/GeoLabeller-ICD.pdf](docs/GeoLabeller-ICD.pdf)): the authoritative
+  specification of the `.geolabel` project format (currently format 4.1),
+  the mask RLE encoding, every export product, and the coordinate
+  conventions. If you are writing a reader or consumer, start there.
 
-### Project Management
-- Save/load projects as JSON files (`.geolabel` extension)
-- Projects preserve: images, groups, label classes, and all annotations
-- Export format includes pixel coordinates, lat/lon, and object IDs
+## Project Files
 
-## Installation
-
-```bash
-# Create conda environment from environment.yml
-conda env create -f environment.yml
-conda activate geolabel
-
-# Or install dependencies manually
-pip install PyQt5 rasterio numpy pillow
-```
-
-## Usage
-
-```bash
-python main.py
-```
-
-### Keyboard Shortcuts
-
-#### File Operations
-| Shortcut | Action |
-|----------|--------|
-| `Ctrl+N` | New Project |
-| `Ctrl+Shift+P` | Open Project |
-| `Ctrl+S` | Save Project |
-| `Ctrl+Shift+S` | Save Project As |
-| `Ctrl+O` | Add Image (GeoTIFF) |
-| `Ctrl+Shift+O` | Add Directory |
-| `Ctrl+Q` | Exit |
-
-#### Navigation
-| Shortcut | Action |
-|----------|--------|
-| Mouse Wheel | Zoom in/out |
-| Click + Drag | Pan (in Pan mode) |
-| Right-click | Context menu |
-
-#### Mode Switching
-| Shortcut | Action |
-|----------|--------|
-| `P` | Pan mode |
-| `L` | Label mode |
-| `C` | Cycle mode (group-based) |
-| `V` | View Cycle mode (layers in current view) |
-
-#### Labeling
-| Shortcut | Action |
-|----------|--------|
-| Left-click | Place label (in Label/Cycle mode) |
-| Right-click label | Label options (remove, link) |
-| `Ctrl`+Left-click | Label options in Cycle mode |
-| `1`–`9` | Quick-switch to class 1–9 |
-| `Escape` | Cancel link mode |
-
-#### Cycle / View Cycle Mode
-| Shortcut | Action |
-|----------|--------|
-| `Space` | Advance to next layer (unchecks current) |
-| `Ctrl+Space` | Go back to previous layer |
-| Right-click + drag | Pan around |
-| Mouse wheel | Zoom in/out |
-
-#### Help
-| Shortcut | Action |
-|----------|--------|
-| `F1` | Show keyboard shortcuts & tips |
-
-### Layer Panel Features
-- **Checkbox** — Toggle layer/group visibility
-- **Right-click group** — Select All, Unselect All, Expand All, Collapse All
-- **Right-click layer** — Zoom to layer, Remove
-- **Drag & Drop** — Reorder layers between groups
-
-### Labeling Workflow
-1. Load images via File → Add Image or Add Directory
-2. Create label classes via Labels → Edit Classes
-3. Select a class from the toolbar dropdown (or press `1`–`9`)
-4. Press `L` to enter Label mode
-5. Click on images to place point annotations
-6. Right-click labels to remove, link, or view linked labels
-7. Save project to preserve all work
-
-## Project File Format
-
-Projects are saved as JSON with the following structure:
-
-```json
-{
-  "version": "2.1",
-  "classes": ["car", "building", "tree"],
-  "images": [
-    {
-      "path": "/path/to/image.tif",
-      "name": "image",
-      "group": "folder/subfolder",
-      "original_width": 1024,
-      "original_height": 768,
-      "labels": [
-        {
-          "id": 1,
-          "unique_id": "uuid-v4-unique-to-label",
-          "class_name": "car",
-          "pixel_x": 0.25,
-          "pixel_y": 0.167,
-          "lon": -73.985,
-          "lat": 40.748,
-          "object_id": "uuid-v4-for-linking"
-        }
-      ]
-    }
-  ]
-}
-```
-
-### Label Fields (v2.1)
-- `id`: Sequential integer ID (internal use)
-- `unique_id`: UUID v4 string, always unique per label
-- `pixel_x`, `pixel_y`: **Percentage** coordinates (0.0-1.0), divide by original image dimensions
-- `lon`, `lat`: WGS84 geographic coordinates
-- `object_id`: UUID v4 for linking labels across images (shared by linked labels)
+Projects are single JSON files (`.geolabel`) holding classes, image
+references (with georeferencing metadata), labels, links, measurements,
+orientations, masks, waypoints and location tags — everything except the
+pixels. The full schema and its version history are specified in the ICD;
+old project files always load unchanged.
 
 ## Requirements
 
-- Python 3.10+
-- PyQt5
-- rasterio
-- numpy
-- affine
+- Python 3.10+ (the pinned environment uses 3.14)
+- PyQt5, rasterio, numpy, pyproj, h5py, affine
