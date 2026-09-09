@@ -310,6 +310,12 @@ class ImageData:
     # into gt=False hard negatives even under a labels-only scope.
     hard_negative_source: bool = False
 
+    # Free-text location tag, e.g. "New York Area". Stored per image so it
+    # survives regrouping, but normally applied to a whole group at once
+    # (right-click a group > Set Location...). Rides into the H5 export as
+    # the per-sample locations dataset. Empty means untagged.
+    location: str = ""
+
     def get_affine(self) -> Optional[Affine]:
         """Get the Affine transform object, or None if not set."""
         if self.affine_coeffs is None or len(self.affine_coeffs) != 6:
@@ -490,6 +496,8 @@ class ImageData:
         # and older readers see exactly what they saw before.
         if self.hard_negative_source:
             d["hard_negative_source"] = True
+        if self.location:
+            d["location"] = self.location
 
         # Include corner coordinates in WGS84 for ground truth export
         corners = self.get_corner_coords()
@@ -543,7 +551,8 @@ class ImageData:
             reader=reader,
             affine_coeffs=data.get("affine_coeffs"),
             crs_epsg=data.get("crs_epsg"),
-            hard_negative_source=bool(data.get("hard_negative_source", False))
+            hard_negative_source=bool(data.get("hard_negative_source", False)),
+            location=str(data.get("location", ""))
         )
 
 
@@ -917,9 +926,9 @@ class LabelProject:
         and hand it to a background writer.
         """
         return {
-            # "4.0", not "3.10": the ICD pins readers to STRING comparison,
-            # and "3.10" < "3.9" lexicographically.
-            "version": "4.0",
+            # Single-digit minors only ("4.0" came after "3.9", never
+            # "3.10"): the ICD pins readers to STRING comparison.
+            "version": "4.1",
             # Copied, not referenced: the recovery snapshot is handed to a
             # background writer and the user carries on editing meanwhile.
             # The image and waypoint entries are freshly built dictionaries,

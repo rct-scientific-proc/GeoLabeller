@@ -365,6 +365,8 @@ class MainWindow(QMainWindow):
             self._on_group_preload_requested)
         self.layer_panel.group_free_requested.connect(
             self._on_group_free_requested)
+        self.layer_panel.group_location_edit_requested.connect(
+            self._on_group_location_edit)
 
         self.canvas.coordinates_changed.connect(self._update_coordinates)
         self.canvas.label_placed.connect(self._on_label_placed)
@@ -2560,8 +2562,10 @@ class MainWindow(QMainWindow):
             flagged = include_hn and self._h5_is_hn_source(path)
             if needs_labels and not labels and not flagged:
                 continue
+            img = self.project.images.get(path)
             images.append((path, labels,
-                           options["examples_only"] and not flagged))
+                           options["examples_only"] and not flagged,
+                           img.location if img is not None else ""))
         if not images:
             QMessageBox.information(
                 self, "HDF5 Export", "No images in the selected scope.")
@@ -3509,6 +3513,48 @@ class MainWindow(QMainWindow):
     def _on_batch_visibility_started(self, total: int):
         """Handle start of batch visibility change (e.g., group toggle)."""
         self._show_progress(total, "Toggling")
+
+    # ── Group location tag ───────────────────────────────────────────
+
+    def _images_in_group(self, group_path: str) -> list:
+        """The project's images in ``group_path``, sub-groups included."""
+        prefix = group_path + "/"
+        return [img for img in self.project.images.values()
+                if img.group == group_path or img.group.startswith(prefix)]
+
+    def _on_group_location_edit(self, group_path: str):
+        """Right-click a group > Set Location...: tag every image in it.
+
+        The tag is stored per image (so it survives regrouping) but edited
+        per group, which is how users think of it - "these geotiffs are the
+        New York Area". Prefilled with the group's current tag when the
+        images agree on one; an empty entry clears the tag.
+        """
+        images = self._images_in_group(group_path)
+        if not images:
+            QMessageBox.information(
+                self, "Set Location",
+                f'No project images in "{group_path}" - the location tag '
+                "lives on the project's images, so label or save the "
+                "project with this group first.")
+            return
+        current = {img.location for img in images}
+        prefill = next(iter(current)) if len(current) == 1 else ""
+        location, accepted = QInputDialog.getText(
+            self, "Set Location",
+            f'Location for the {len(images)} image(s) in "{group_path}"\n'
+            "(applied to every image, sub-groups included; empty clears):",
+            text=prefill)
+        if not accepted:
+            return
+        location = location.strip()
+        for img in images:
+            img.location = location
+        self.statusBar.showMessage(
+            (f'Tagged {len(images)} image(s) in "{group_path}" as '
+             f'"{location}"' if location else
+             f'Cleared the location of {len(images)} image(s) in '
+             f'"{group_path}"'), 5000)
 
     # ── Group memory management ──────────────────────────────────────
 

@@ -34,6 +34,10 @@ class LayerPanel(QWidget):
     group_preload_requested = pyqtSignal(list)  # layer_ids to fully load
     group_free_requested = pyqtSignal(list)  # layer_ids to free from memory
 
+    # Right-click a group > Set Location...: MainWindow runs the dialog and
+    # applies the tag to every project image in the group.
+    group_location_edit_requested = pyqtSignal(str)  # group_path
+
     # Batch progress signals for group toggle operations
     batch_visibility_started = pyqtSignal(int)  # total items to process
     batch_visibility_progress = pyqtSignal(int)  # current progress
@@ -363,6 +367,11 @@ class LayerPanel(QWidget):
         # moved
         self._check_parents_of_visible_items()
 
+    def _full_group_path(self, item: QTreeWidgetItem) -> str:
+        """A GROUP item's own '/'-joined path (ancestors + itself)."""
+        ancestors = self._get_group_path(item)
+        return f"{ancestors}/{item.text(0)}" if ancestors else item.text(0)
+
     def _get_group_path(self, item: QTreeWidgetItem) -> str:
         """Get the group path for an item by traversing up the tree."""
         parts = []
@@ -484,6 +493,16 @@ class LayerPanel(QWidget):
                 collapse_all_action = menu.addAction("Collapse All")
                 collapse_all_action.triggered.connect(
                     lambda: self._collapse_all_children(item))
+
+                menu.addSeparator()
+                location_action = menu.addAction("Set Location...")
+                location_action.setToolTip(
+                    "Tag every image in this group with a location string "
+                    "(e.g. \"New York Area\"); stored in the project and "
+                    "carried into the HDF5 export.")
+                location_action.triggered.connect(
+                    lambda: self.group_location_edit_requested.emit(
+                        self._full_group_path(item)))
 
                 menu.addSeparator()
                 preload_action = menu.addAction("Preload Group")
@@ -1613,6 +1632,9 @@ class CombinedLayerPanel(QWidget):
     group_preload_requested = pyqtSignal(list)  # layer_ids
     group_free_requested = pyqtSignal(list)  # layer_ids
 
+    # Group location tag (right-click a group > Set Location...)
+    group_location_edit_requested = pyqtSignal(str)  # group_path
+
     # Batch progress signals
     batch_visibility_started = pyqtSignal(int)  # total items
     batch_visibility_progress = pyqtSignal(int)  # current progress
@@ -1693,6 +1715,8 @@ class CombinedLayerPanel(QWidget):
             self.group_preload_requested)
         self.main_panel.group_free_requested.connect(
             self.group_free_requested)
+        self.main_panel.group_location_edit_requested.connect(
+            self.group_location_edit_requested)
 
         # Forward signals from labeled panel
         self.labeled_panel.layer_visibility_changed.connect(

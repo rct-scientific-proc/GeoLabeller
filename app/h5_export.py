@@ -165,6 +165,12 @@ class H5DatasetWriter:
         # append cleanly and mask-free exports stay byte-identical.
         self._mask_px_buf, self._mask_row_buf, self._mask_name_buf = [], [], []
         self._mask_n = 0
+        # Per-sample location tags (the project's group location). Like the
+        # mask table, the dataset is created on demand - only once a
+        # non-empty tag is seen - so untagged exports stay byte-identical
+        # and legacy files append cleanly; rows written before the first tag
+        # read back as "".
+        self._loc_buf = []
         # Set when appending to a file whose class list has since changed.
         self.added_classes, self.dropped_classes = [], []
 
@@ -177,6 +183,7 @@ class H5DatasetWriter:
                 self._mask_n = self._f["mask_pixels"].shape[0]
         else:
             self._create()
+        self._has_locations = "locations" in self._f
         # Most recently used, so an append made with different settings becomes
         # the default next time round.
         if overlap is not None:
@@ -293,16 +300,20 @@ class H5DatasetWriter:
                 break
         return found
 
-    def add(self, image_hwc, label_index, gt, split_value) -> int:
+    def add(self, image_hwc, label_index, gt, split_value,
+            location: str = "") -> int:
         """Buffer one sample; flushes when a batch has accumulated.
 
         Returns the sample's global row index, so masks (and any future
         per-sample sidecar) can reference it before the flush happens.
+        ``location`` is the sample's free-text location tag ("" when
+        untagged); it lands in the aligned ``locations`` dataset.
         """
         self._img_buf.append(image_hwc)
         self._lbl_buf.append(label_index)
         self._gt_buf.append(gt)
         self._split_buf.append(split_value)
+        self._loc_buf.append(str(location or ""))
         row = self._n + len(self._img_buf) - 1
         if len(self._img_buf) >= _FLUSH_BATCH:
             self._flush()
@@ -367,9 +378,20 @@ class H5DatasetWriter:
                               ("split", self._split_buf, "uint8")):
             f[name].resize(end, axis=0)
             f[name][self._n:end] = np.asarray(buf, dtype=dt)
+        if not self._has_locations and any(self._loc_buf):
+            # First tagged sample: create the column sized to the rows
+            # already written, which read back as "" - staying aligned.
+            f.create_dataset(
+                "locations", shape=(self._n,), maxshape=(None,),
+                dtype=h5py.string_dtype("utf-8"), chunks=(_META_CHUNK,))
+            self._has_locations = True
+        if self._has_locations:
+            f["locations"].resize(end, axis=0)
+            f["locations"][self._n:end] = self._loc_buf
         self._n = end
         self._img_buf.clear(); self._lbl_buf.clear()
         self._gt_buf.clear(); self._split_buf.clear()
+        self._loc_buf.clear()
 
     def close(self) -> int:
         """Flush, close the file and return the total sample count."""
@@ -490,7 +512,7 @@ def export_image(writer, path, labels, height, width, overlap, channels,
                  split_value, class_to_index, hard_negative_index,
                  cancel_check=None, negative_ratio=None, rng=None,
                  positive_offset=DEFAULT_POSITIVE_OFFSET,
-                 examples_only=False):
+                 examples_only=False, location=""):
     """Extract one raster's examples and hard negatives into ``writer``.
 
     Returns ``(added, negative_counts, excluded)`` - the number of snippets
@@ -513,6 +535,10 @@ def export_image(writer, path, labels, height, width, overlap, channels,
 
     With ``examples_only`` set, only the label-bearing example crops are
     written - the hard-negative sliding window never runs.
+
+    ``location`` is the image's free-text location tag; every snippet cut
+    from this raster (examples and negatives alike) records it in the
+    ``locations`` dataset.
     """
     added = 0
     negative_counts = [0, 0, 0]
@@ -550,7 +576,8 @@ def export_image(writer, path, labels, height, width, overlap, channels,
                 scaling=scaling)
             if arr is None:
                 continue  # entirely nodata
-            row = writer.add(arr, class_index, True, split_value)
+            row = writer.add(arr, class_index, True, split_value,
+                             location=location)
             for entry in mask_entries:
                 layer = entry_in_window(entry, x0, y0, width, height)
                 if layer.any():
@@ -590,7 +617,8 @@ def export_image(writer, path, labels, height, width, overlap, channels,
                 if pool is not None and taken < pool.size:
                     negative_split = int(pool[taken])
                     taken += 1
-                writer.add(arr, hard_negative_index, False, negative_split)
+                writer.add(arr, hard_negative_index, False, negative_split,
+                           location=location)
                 negative_counts[negative_split] += 1
                 added += 1
     return added, negative_counts, int(excluded.sum())
@@ -605,9 +633,11 @@ class H5ExportWorker(QObject):
     def __init__(self, out_path, images, options):
         """Store the output path, image list and export options.
 
-        ``images`` is a list of ``(path, labels, examples_only)`` tuples.
-        ``examples_only`` is per image so one run can mix labels-only images
-        with flagged hard-negative sources, which are slid in full.
+        ``images`` is a list of ``(path, labels, examples_only, location)``
+        tuples. ``examples_only`` is per image so one run can mix
+        labels-only images with flagged hard-negative sources, which are
+        slid in full; ``location`` is the image's location tag ("" when
+        untagged).
         """
         super().__init__()
         self._out_path = out_path
@@ -646,7 +676,7 @@ class H5ExportWorker(QObject):
                 positive_offset=opts.get("positive_offset"))
             total_images = len(self._images)
             samples = 0
-            for i, (path, labels, image_examples_only) in enumerate(
+            for i, (path, labels, image_examples_only, location) in enumerate(
                     self._images):
                 if self._cancelled:
                     break
@@ -663,7 +693,8 @@ class H5ExportWorker(QObject):
                         negative_ratio=negative_ratio, rng=rng,
                         positive_offset=opts.get(
                             "positive_offset", DEFAULT_POSITIVE_OFFSET),
-                        examples_only=image_examples_only)
+                        examples_only=image_examples_only,
+                        location=location)
                     samples += added
                     excluded += dropped
                     # split_idx, not i: reusing the outer image index here
