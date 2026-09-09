@@ -1759,7 +1759,11 @@ class MainWindow(QMainWindow):
     ]
 
     def _ring_color_for_object(self, object_id: str) -> QColor:
-        digest = hashlib.md5(object_id.encode("utf-8")).digest()
+        # sha256, NOT md5: on a FIPS-enabled OS hashlib.md5() raises
+        # ValueError, and this line then crashed the app the moment a
+        # linked label needed its halo. Any FIPS-approved hash does - the
+        # digest only picks a palette slot - it just must never be md5/sha1.
+        digest = hashlib.sha256(object_id.encode("utf-8")).digest()
         return self._RING_PALETTE[digest[0] % len(self._RING_PALETTE)]
 
     def _label_ring_color(self, label) -> "QColor | None":
