@@ -65,6 +65,14 @@ SCOPE_VISIBLE_EXAMPLES = "visible_examples"  # visible layers with labels
 SPLIT_CHOICES = {"Train (0)": 0, "Validate (1)": 1, "Test (2)": 2}
 CHANNEL_CHOICES = {"RGB (3 channels)": 3, "Grayscale (1 channel)": 1}
 COMPRESSION_CHOICES = {"None": None, "gzip": "gzip", "lzf": "lzf"}
+# Pixel storage for the images dataset. uint8 applies the per-raster display
+# stretch (the historical behaviour); float32 keeps float sources in their
+# NATIVE units (no stretch - physical values stay comparable across images)
+# and normalizes integer sources by their dtype's full range (uint8 / 255),
+# always as one grayscale channel so the file only grows ~4/3 over 3-channel
+# uint8.
+PIXEL_FORMAT_CHOICES = {"uint8 (stretched 0-255)": "uint8",
+                        "float32 grayscale (native / 0-1)": "float32"}
 
 # One sample per chunk (default) makes shuffled random-access reads cheap during
 # training: a single-index read fetches exactly one sample instead of a whole
@@ -104,6 +112,9 @@ def read_settings(path) -> dict | None:
                 "channels": int(channels),
                 "chunk": int(images.chunks[0]) if images.chunks else _DEFAULT_CHUNK,
                 "compression": images.compression,
+                # Read from the dataset itself, so files written before the
+                # float32 option existed correctly report uint8.
+                "pixel_dtype": str(images.dtype),
             }
             if "overlap" in f.attrs:
                 settings["overlap"] = float(f.attrs["overlap"])
@@ -117,6 +128,34 @@ def read_settings(path) -> dict | None:
             return settings
     except Exception:  # noqa: BLE001 - a bad/locked file just has no settings
         return None
+
+
+def _float_window_pixels(src, window, nodata):
+    """Read a window as an (H, W, 1) float32 grayscale array, or ``None``.
+
+    The float32 pixel format keeps values MEANINGFUL rather than displayable:
+    float sources (sonar dB, elevation) pass through in their native units,
+    exactly as stored - so the same physical value reads the same in every
+    image - while integer sources are divided by their dtype's full range
+    (uint8 by 255, uint16 by 65535) to land in [0, 1]. No contrast stretch is
+    ever applied. Multi-band integer imagery collapses to the same luminance
+    the uint8 grayscale export uses; multi-band float imagery takes band 1
+    (mixing physical units through luminance weights would mean nothing).
+    Entirely-nodata windows return None, like the uint8 reader.
+    """
+    data = src.read(window=window)
+    if nodata is not None and bool(np.all(data == nodata)):
+        return None
+    integer = np.issubdtype(data.dtype, np.integer)
+    if data.shape[0] >= 3 and integer:
+        gray = (0.299 * data[0].astype(np.float32)
+                + 0.587 * data[1].astype(np.float32)
+                + 0.114 * data[2].astype(np.float32))
+    else:
+        gray = data[0].astype(np.float32)
+    if integer:
+        gray /= float(np.iinfo(data.dtype).max)
+    return np.ascontiguousarray(gray[..., np.newaxis])
 
 
 def _snippet_positions(total: int, window: int, step: int) -> list[int]:
@@ -142,7 +181,7 @@ class H5DatasetWriter:
     def __init__(self, path, height, width, channels, classes,
                  chunk=_DEFAULT_CHUNK, compression=None, overlap=None,
                  split_negatives=None, negative_ratio=None,
-                 positive_offset=None):
+                 positive_offset=None, pixel_dtype="uint8"):
         """Open ``path`` for create-or-append and prepare the datasets.
 
         ``chunk`` and ``compression`` apply only when the file is *created*;
@@ -153,6 +192,7 @@ class H5DatasetWriter:
         """
         self.height, self.width, self.channels = height, width, channels
         self.classes = list(classes)
+        self.pixel_dtype = str(pixel_dtype)
         self._chunk = max(1, int(chunk))
         self._compression = compression
         self._n = 0
@@ -203,7 +243,7 @@ class H5DatasetWriter:
             "images",
             shape=(0, self.height, self.width, self.channels),
             maxshape=(None, self.height, self.width, self.channels),
-            dtype="uint8",
+            dtype=self.pixel_dtype,
             chunks=(self._chunk, self.height, self.width, self.channels),
             compression=self._compression)
         for name, dtype in (("labels", "uint16"), ("gt", "bool"),
@@ -234,6 +274,12 @@ class H5DatasetWriter:
                 f"{f.attrs.get('height')}x{f.attrs.get('width')}x"
                 f"{f.attrs.get('channels')}, not "
                 f"{self.height}x{self.width}x{self.channels}.")
+        existing_dtype = str(f["images"].dtype)
+        if existing_dtype != self.pixel_dtype:
+            raise ValueError(
+                f"Cannot append: the existing file stores {existing_dtype} "
+                f"pixels, not {self.pixel_dtype} - mixing the two would "
+                "give the samples two different value scales.")
         existing = list(f["classes"].asstr()[:]) if "classes" in f else []
         if existing != self.classes:
             self._reconcile_classes(existing)
@@ -512,7 +558,7 @@ def export_image(writer, path, labels, height, width, overlap, channels,
                  split_value, class_to_index, hard_negative_index,
                  cancel_check=None, negative_ratio=None, rng=None,
                  positive_offset=DEFAULT_POSITIVE_OFFSET,
-                 examples_only=False, location=""):
+                 examples_only=False, location="", pixel_dtype="uint8"):
     """Extract one raster's examples and hard negatives into ``writer``.
 
     Returns ``(added, negative_counts, excluded)`` - the number of snippets
@@ -539,6 +585,11 @@ def export_image(writer, path, labels, height, width, overlap, channels,
     ``location`` is the image's free-text location tag; every snippet cut
     from this raster (examples and negatives alike) records it in the
     ``locations`` dataset.
+
+    ``pixel_dtype`` selects how snippet pixels are stored: "uint8" applies
+    the per-raster display stretch (the historical behaviour, honouring
+    ``channels``); "float32" writes one grayscale channel of native-scale
+    values with NO stretch (see :func:`_float_window_pixels`).
     """
     added = 0
     negative_counts = [0, 0, 0]
@@ -561,9 +612,17 @@ def export_image(writer, path, labels, height, width, overlap, channels,
 
     with rasterio.open(path) as src:
         nodata = src.nodata
-        # One contrast stretch per raster (None for uint8), so every snippet
-        # of this image is scaled identically - see _band_scaling.
-        scaling = _band_scaling(src)
+        as_float = pixel_dtype == "float32"
+        # One contrast stretch per raster (None for uint8 sources), so every
+        # snippet of this image is scaled identically - see _band_scaling.
+        # The float32 format never stretches, so it skips the sampling read.
+        scaling = None if as_float else _band_scaling(src)
+
+        def window_pixels(win):
+            if as_float:
+                return _float_window_pixels(src, win, nodata)
+            return _window_pixels(src, win, channels, nodata, scaling=scaling)
+
         positives = _positive_windows(
             pts, src.width, src.height, width, height,
             max(0, int(positive_offset)))
@@ -571,9 +630,7 @@ def export_image(writer, path, labels, height, width, overlap, channels,
         for (x0, y0), class_index in positives.items():
             if cancel_check and cancel_check():
                 return added, negative_counts, 0
-            arr = _window_pixels(
-                src, Window(x0, y0, width, height), channels, nodata,
-                scaling=scaling)
+            arr = window_pixels(Window(x0, y0, width, height))
             if arr is None:
                 continue  # entirely nodata
             row = writer.add(arr, class_index, True, split_value,
@@ -608,9 +665,7 @@ def export_image(writer, path, labels, height, width, overlap, channels,
                     return added, negative_counts, int(excluded.sum())
                 if excluded[iy, ix]:
                     continue  # shares ground with an example
-                arr = _window_pixels(
-                    src, Window(x0, y0, width, height), channels, nodata,
-                    scaling=scaling)
+                arr = window_pixels(Window(x0, y0, width, height))
                 if arr is None:
                     continue  # entirely nodata
                 negative_split = split_value
@@ -673,7 +728,8 @@ class H5ExportWorker(QObject):
                 overlap=opts.get("overlap"),
                 split_negatives=opts.get("split_negatives"),
                 negative_ratio=opts.get("negative_ratio"),
-                positive_offset=opts.get("positive_offset"))
+                positive_offset=opts.get("positive_offset"),
+                pixel_dtype=opts.get("pixel_dtype", "uint8"))
             total_images = len(self._images)
             samples = 0
             for i, (path, labels, image_examples_only, location) in enumerate(
@@ -694,7 +750,8 @@ class H5ExportWorker(QObject):
                         positive_offset=opts.get(
                             "positive_offset", DEFAULT_POSITIVE_OFFSET),
                         examples_only=image_examples_only,
-                        location=location)
+                        location=location,
+                        pixel_dtype=opts.get("pixel_dtype", "uint8"))
                     samples += added
                     excluded += dropped
                     # split_idx, not i: reusing the outer image index here
@@ -853,6 +910,20 @@ class H5ExportDialog(QDialog):
         self.channel_combo.addItems(list(CHANNEL_CHOICES.keys()))
         form.addRow("Channels:", self.channel_combo)
 
+        self.pixel_format_combo = QComboBox()
+        self.pixel_format_combo.addItems(list(PIXEL_FORMAT_CHOICES.keys()))
+        self.pixel_format_combo.setToolTip(
+            "uint8 stores display-stretched bytes (each raster's 2-98 "
+            "percentile window). float32 stores one grayscale channel of "
+            "NATIVE-scale values: float imagery (sonar dB, elevation) "
+            "passes through unchanged, so the same physical value reads "
+            "the same in every image, and integer imagery is divided by "
+            "its full range (uint8 by 255) to land in 0-1. (New files "
+            "only.)")
+        self.pixel_format_combo.currentTextChanged.connect(
+            self._on_pixel_format_changed)
+        form.addRow("Pixel format:", self.pixel_format_combo)
+
         self.offset_check = QCheckBox("Add 8 offset copies of each example")
         self.offset_check.setChecked(True)
         self.offset_check.setToolTip(
@@ -1002,7 +1073,9 @@ class H5ExportDialog(QDialog):
         for key, choices, combo in (
                 ("channels", CHANNEL_CHOICES, self.channel_combo),
                 ("split_value", SPLIT_CHOICES, self.split_combo),
-                ("compression", COMPRESSION_CHOICES, self.compress_combo)):
+                ("compression", COMPRESSION_CHOICES, self.compress_combo),
+                ("pixel_dtype", PIXEL_FORMAT_CHOICES,
+                 self.pixel_format_combo)):
             if key in settings:
                 label = _choice_label(choices, settings[key])
                 if label is not None:
@@ -1017,8 +1090,21 @@ class H5ExportDialog(QDialog):
         was built with.
         """
         return (self.height_spin, self.width_spin, self.channel_combo,
-                self.chunk_spin, self.compress_combo, self.offset_spin,
-                self.offset_check)
+                self.pixel_format_combo, self.chunk_spin, self.compress_combo,
+                self.offset_spin, self.offset_check)
+
+    def _on_pixel_format_changed(self, *_):
+        """float32 storage is always single-channel grayscale."""
+        is_float = PIXEL_FORMAT_CHOICES.get(
+            self.pixel_format_combo.currentText()) == "float32"
+        if is_float:
+            label = _choice_label(CHANNEL_CHOICES, 1)
+            if label is not None:
+                self.channel_combo.setCurrentText(label)
+            self.channel_combo.setEnabled(False)
+        elif self.pixel_format_combo.isEnabled():
+            # Not file-locked (that path disables both combos together).
+            self.channel_combo.setEnabled(True)
 
     def _on_split_negatives(self, enabled):
         """Enable the ratio inputs only while the split is switched on."""
@@ -1116,6 +1202,9 @@ class H5ExportDialog(QDialog):
 
         for widget in self._fixed_widgets():
             widget.setEnabled(True)
+        # Re-enabling everything may have freed the channels combo although
+        # float32 (grayscale-only) is still selected.
+        self._on_pixel_format_changed()
         if text and os.path.exists(text):
             self._append_note.setText("Existing file - snippets will be appended.")
         else:
@@ -1154,6 +1243,8 @@ class H5ExportDialog(QDialog):
             "width": self.width_spin.value(),
             "overlap": self.overlap_spin.value() / 100.0,
             "channels": CHANNEL_CHOICES[self.channel_combo.currentText()],
+            "pixel_dtype": PIXEL_FORMAT_CHOICES[
+                self.pixel_format_combo.currentText()],
             "split_value": SPLIT_CHOICES[self.split_combo.currentText()],
             "chunk": self.chunk_spin.value(),
             # 0 disables the eight offset copies (centred snippet only).
