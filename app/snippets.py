@@ -130,6 +130,33 @@ def _window_pixels(src, window, channels, nodata, scaling=None):
 _scaling_cache: dict[str, object] = {}
 
 
+def cached_band_scaling(src):
+    """The per-file display stretch for an open dataset (None for uint8).
+
+    One cache for every display surface - snippets, the canvas's coarse
+    and detail tiles, the pixel zone - so a float32 or 16-bit raster shows
+    the SAME contrast everywhere it is drawn. Keyed by the dataset's path.
+    """
+    key = src.name
+    if key not in _scaling_cache:
+        _scaling_cache[key] = _band_scaling(src)
+    return _scaling_cache[key]
+
+
+def apply_band_stretch(band: np.ndarray, scaling, band_index: int):
+    """One band mapped through the display stretch (float32, unclipped).
+
+    Pass-through when ``scaling`` is None (uint8 imagery) or the band has
+    no recorded stretch. NaNs survive, so nodata marking done before the
+    stretch stays valid; the caller still clips to 0..255 and casts.
+    """
+    if scaling is None or band_index >= scaling[0].size:
+        return band
+    lo = float(scaling[0][band_index])
+    hi = float(scaling[1][band_index])
+    return (band.astype(np.float32) - lo) * (255.0 / max(hi - lo, 1e-6))
+
+
 def snippet_frame(pixel_x: float, pixel_y: float, size_px: int,
                   src_width: int, src_height: int) -> tuple[int, int, int, int]:
     """The exact crop a snippet uses: (x0, y0, w, h) in source pixels.
@@ -176,9 +203,7 @@ def read_label_snippet(image_path: str, pixel_x: float, pixel_y: float,
     """
     try:
         with rasterio.open(image_path) as src:
-            if image_path not in _scaling_cache:
-                _scaling_cache[image_path] = _band_scaling(src)
-            scaling = _scaling_cache[image_path]
+            scaling = cached_band_scaling(src)
             x0, y0, w, h = snippet_frame(pixel_x, pixel_y, size_px,
                                          src.width, src.height)
             return _window_pixels(src, Window(x0, y0, w, h), 3,

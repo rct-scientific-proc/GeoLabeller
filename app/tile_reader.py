@@ -31,6 +31,8 @@ from rasterio.warp import (Resampling, calculate_default_transform, reproject,
                            transform_bounds)
 from rasterio.windows import Window
 
+from .snippets import apply_band_stretch, cached_band_scaling
+
 # Tile edge in destination pixels. Matches the canvas's own TILE_SIZE.
 TILE_SIZE = 512
 
@@ -229,12 +231,18 @@ def read_tile(src, dst_crs, level: int, tx: int, ty: int,
         "tolerance": WARP_TOLERANCE,
     }
 
+    # The same per-file display stretch the coarse tiles and snippets use,
+    # so detail refinement never shifts the imagery's contrast (and float
+    # or 16-bit data doesn't clip to black).
+    scaling = cached_band_scaling(src)
+
     # Band 1 in float32: NaN marks both source nodata and the areas the
     # reprojection never writes, which become the alpha channel.
     band1 = src.read(1, window=window,
                      out_shape=(read_h, read_w)).astype(np.float32)
     if src.nodata is not None:
         band1[band1 == src.nodata] = np.nan
+    band1 = apply_band_stretch(band1, scaling, 0)
     dst_band1 = np.full((out_h, out_w), np.nan, dtype=np.float32)
     reproject(source=band1, destination=dst_band1,
               src_nodata=np.nan, dst_nodata=np.nan, **common)
@@ -251,9 +259,12 @@ def read_tile(src, dst_crs, level: int, tx: int, ty: int,
     if src.count >= 3:
         for index, channel in ((2, 1), (3, 2)):
             band = src.read(index, window=window, out_shape=(read_h, read_w))
-            if src.nodata is not None:
-                band = np.where(band == src.nodata, 0, band)
+            nodata_at = (band == src.nodata) \
+                if src.nodata is not None else None
+            band = apply_band_stretch(band, scaling, index - 1)
             band = np.clip(band, 0, 255).astype(np.uint8)
+            if nodata_at is not None:
+                band[nodata_at] = 0
             dst_band = np.zeros((out_h, out_w), dtype=np.uint8)
             reproject(source=band, destination=dst_band,
                       src_nodata=0, dst_nodata=0, **common)

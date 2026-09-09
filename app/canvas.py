@@ -37,6 +37,7 @@ from rasterio.warp import calculate_default_transform, reproject, Resampling
 
 from .labels import haversine_distance
 from .debug_log import debug
+from .snippets import apply_band_stretch, cached_band_scaling
 from .tile_reader import (TILE_SIZE as DETAIL_TILE_SIZE, level_grid_for,
                           read_tile, tile_bounds, tile_span, tiles_for_bounds)
 
@@ -92,8 +93,14 @@ class LoadCancelled(Exception):
     """
 
 
-def _as_uint8(band):
-    """The band as uint8, copying only when the dtype actually differs."""
+def _as_uint8(band, scaling=None, band_index=0):
+    """The band as display uint8, copying only when work is actually needed.
+
+    ``scaling`` is the per-file stretch from cached_band_scaling: without
+    it, float or 16-bit imagery clips to 0..255 - sonar-style negative dB
+    values rendered as solid black. uint8 imagery passes through untouched.
+    """
+    band = apply_band_stretch(band, scaling, band_index)
     if band.dtype == np.uint8:
         return band
     return np.clip(band, 0, 255).astype(np.uint8)
@@ -614,11 +621,18 @@ class TiledLayer:
             # then reproject remaining bands directly as uint8 (faster, less memory).
             # Padding areas are identical for all bands after reprojection.
 
+            # Per-file display stretch: None for uint8; for float or 16-bit
+            # imagery the same 2-98 percentile mapping the snippets use, so
+            # the canvas and every snippet view agree. Without it the clip
+            # below rendered e.g. negative-dB float32 sonar as solid black.
+            band_scaling = cached_band_scaling(src)
+
             # Band 1: reproject as float32 to detect nodata
             self._checkpoint(cancel_check)
             src_band1 = src.read(1, out_shape=(rd_h, rd_w)).astype(np.float32)
             if src.nodata is not None:
                 src_band1[src_band1 == src.nodata] = np.nan
+            src_band1 = apply_band_stretch(src_band1, band_scaling, 0)
 
             self._checkpoint(cancel_check)
             dst_band1 = np.full((height, width), np.nan, dtype=np.float32)
@@ -660,13 +674,17 @@ class TiledLayer:
                                ):  # bands 2, 3 (and skip 4 if exists)
                     self._checkpoint(cancel_check)
                     src_band = src.read(i, out_shape=(rd_h, rd_w))
-                    # Handle source nodata by setting to 0 (in place - the
-                    # read returned a fresh array, and np.where built a whole
-                    # extra frame here)
-                    if src.nodata is not None:
-                        src_band[src_band == src.nodata] = 0
+                    # Nodata positions noted BEFORE the stretch (which maps
+                    # the sentinel value like any other), zeroed after the
+                    # byte conversion - 0 is the uint8 reproject's nodata.
+                    nodata_at = (src_band == src.nodata) \
+                        if src.nodata is not None else None
+                    src_band = apply_band_stretch(
+                        src_band, band_scaling, i - 1)
                     if src_band.dtype != np.uint8:
                         src_band = np.clip(src_band, 0, 255).astype(np.uint8)
+                    if nodata_at is not None:
+                        src_band[nodata_at] = 0
 
                     dst_band = np.zeros((height, width), dtype=np.uint8)
                     reproject(
@@ -775,18 +793,23 @@ class TiledLayer:
             width = max(1, src.width // level)
             height = max(1, src.height // level)
 
+            band_scaling = cached_band_scaling(src)
             if src.count >= 3:
                 # astype on an already-uint8 read is a full-frame copy for
                 # nothing; nearly all supported imagery is uint8.
                 self._checkpoint(cancel_check)
-                r = _as_uint8(src.read(1, out_shape=(height, width)))
+                r = _as_uint8(src.read(1, out_shape=(height, width)),
+                              band_scaling, 0)
                 self._checkpoint(cancel_check)
-                g = _as_uint8(src.read(2, out_shape=(height, width)))
+                g = _as_uint8(src.read(2, out_shape=(height, width)),
+                              band_scaling, 1)
                 self._checkpoint(cancel_check)
-                b = _as_uint8(src.read(3, out_shape=(height, width)))
+                b = _as_uint8(src.read(3, out_shape=(height, width)),
+                              band_scaling, 2)
             else:
                 self._checkpoint(cancel_check)
-                gray = _as_uint8(src.read(1, out_shape=(height, width)))
+                gray = _as_uint8(src.read(1, out_shape=(height, width)),
+                                 band_scaling, 0)
                 r = g = b = gray
 
             rgba = np.zeros((height, width, 4), dtype=np.uint8)
