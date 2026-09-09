@@ -140,6 +140,35 @@ CRASH_MARKER_FILE = RECOVERY_DIR / ".running"
 # Auto-save interval in milliseconds (60 seconds)
 AUTOSAVE_INTERVAL_MS = 60000
 
+# Sidecar suffixes GDAL discovers by listing an image's directory: world
+# files, external overviews/statistics, projection and mask files. When a
+# directory scan sees NONE of these, the header-reading loader can tell
+# GDAL to skip that per-open listing, which costs almost half of an open.
+_SIDECAR_SUFFIXES = (
+    ".ovr", ".aux.xml", ".aux", ".rrd", ".msk", ".tab", ".prj",
+    ".tfw", ".tifw", ".tiffw", ".wld", ".jgw", ".pgw", ".j2w")
+
+
+def scan_directory_images(root_path: Path) -> "tuple[list, bool]":
+    """One walk of a directory: (sorted image files, sidecars present?).
+
+    A single os.walk replaces one rglob per extension pattern, and the same
+    pass answers whether any GDAL sidecar file exists anywhere in the tree -
+    which decides whether header opens may skip GDAL's per-open directory
+    listing (see AsyncFileLoader.set_files). Unknown files (a .geolabel, a
+    readme) are neither images nor sidecars and change nothing.
+    """
+    image_files = []
+    has_sidecars = False
+    for dirpath, _dirnames, filenames in os.walk(root_path):
+        for name in filenames:
+            lower = name.lower()
+            if lower.endswith((".tif", ".tiff")):
+                image_files.append(Path(dirpath) / name)
+            elif lower.endswith(_SIDECAR_SUFFIXES):
+                has_sidecars = True
+    return sorted(set(image_files)), has_sidecars
+
 # How many images either side of the current one a cycle mode reads ahead.
 # What is then kept in memory is capped by the canvas (WARM_MAX_PIXELS), so
 # raising this widens the read-ahead without uncapping what it costs.
@@ -2952,11 +2981,7 @@ class MainWindow(QMainWindow):
 
         # Find all supported files recursively
         root_path = Path(dir_path)
-        image_files = []
-        for pattern in ("*.tif", "*.tiff"):
-            image_files.extend(root_path.rglob(pattern))
-        # Deduplicate (in case of overlapping patterns) and sort
-        image_files = sorted(set(image_files))
+        image_files, has_sidecars = scan_directory_images(root_path)
 
         if not image_files:
             self.statusBar.showMessage(
@@ -2967,7 +2992,8 @@ class MainWindow(QMainWindow):
         use_async = len(image_files) > 50
 
         if use_async:
-            self._add_directory_async(root_path, image_files)
+            self._add_directory_async(root_path, image_files,
+                                      assume_no_sidecars=not has_sidecars)
         else:
             self._add_directory_sync(root_path, image_files)
 
@@ -3092,7 +3118,8 @@ class MainWindow(QMainWindow):
                 f"Loaded {loaded_count} of {
                     len(image_files)} image files", 5000)
 
-    def _add_directory_async(self, root_path: Path, image_files: list):
+    def _add_directory_async(self, root_path: Path, image_files: list,
+                             assume_no_sidecars: bool = False):
         """Asynchronous directory loading for large imports.
 
         Layers are added with lazy loading (only bounds read initially) and
@@ -3117,7 +3144,8 @@ class MainWindow(QMainWindow):
             files_with_groups,
             mode="directory",
             progress_label="Loading dir",
-            skip_project_add=False  # Add images to project
+            skip_project_add=False,  # Add images to project
+            assume_no_sidecars=assume_no_sidecars,
         )
 
     def _start_unified_async_loading(self,
@@ -3125,7 +3153,8 @@ class MainWindow(QMainWindow):
                                                                    str]],
                                      mode: str = "directory",
                                      progress_label: str = "Loading",
-                                     skip_project_add: bool = False):
+                                     skip_project_add: bool = False,
+                                     assume_no_sidecars: bool = False):
         """Unified async loading for both Open Project and Add Directory.
 
         Args:
@@ -3156,7 +3185,8 @@ class MainWindow(QMainWindow):
 
         # Create and start the async loader
         self._async_loader = AsyncFileLoaderThread(self)
-        self._async_loader.set_files(files_with_groups)
+        self._async_loader.set_files(files_with_groups,
+                                     assume_no_sidecars=assume_no_sidecars)
 
         # Connect signals
         self._async_loader.file_loaded.connect(self._on_async_file_loaded)

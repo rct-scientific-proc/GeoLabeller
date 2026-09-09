@@ -1096,15 +1096,23 @@ class AsyncFileLoader(QObject):
         # (file_path, group_path)
         self._files_to_load: list[tuple[str, str]] = []
         self._cancelled = False
+        self._assume_no_sidecars = False
 
-    def set_files(self, files: list[tuple[str, str]]):
+    def set_files(self, files: list[tuple[str, str]],
+                  assume_no_sidecars: bool = False):
         """Set the list of files to load.
 
         Args:
             files: List of (file_path, group_path) tuples
+            assume_no_sidecars: The caller scanned the directory and saw no
+                sidecar files (.tfw/.ovr/.aux.xml/...), so GDAL's per-open
+                directory listing can be skipped - it exists only to find
+                them, and costs almost half of a header open. Never set it
+                for files whose folders were not scanned.
         """
         self._files_to_load = files
         self._cancelled = False
+        self._assume_no_sidecars = assume_no_sidecars
 
     def cancel(self):
         """Cancel the loading operation."""
@@ -1116,6 +1124,17 @@ class AsyncFileLoader(QObject):
         error_count = 0
         total = len(self._files_to_load)
 
+        env_options = {}
+        if self._assume_no_sidecars:
+            env_options["GDAL_DISABLE_READDIR_ON_OPEN"] = "EMPTY_DIR"
+        with rasterio.Env(**env_options):
+            loaded_count, error_count = self._process_files(total)
+
+        self.batch_complete.emit(loaded_count, error_count)
+
+    def _process_files(self, total: int) -> tuple:
+        loaded_count = 0
+        error_count = 0
         for i, (file_path, group_path) in enumerate(self._files_to_load):
             if self._cancelled:
                 break
@@ -1134,12 +1153,28 @@ class AsyncFileLoader(QObject):
                         overviews = []
 
                     if src.crs is not None:
-                        dst_crs = WEB_MERCATOR
-                        transform, width, height = calculate_default_transform(
-                            src.crs, dst_crs, src.width, src.height, *src.bounds
-                        )
-                        bounds = rasterio.transform.array_bounds(
-                            height, width, transform)
+                        # The cheap boundary-sampled estimate first (the
+                        # same provisional bounds a fast project load uses;
+                        # the first display recomputes exact values). The
+                        # full calculate_default_transform costs ~2ms per
+                        # image - half of what made a 13k directory load
+                        # take a minute.
+                        est = None
+                        try:
+                            est = _web_mercator_estimate(
+                                src.crs, src.transform,
+                                src.width, src.height)
+                        except Exception:
+                            est = None
+                        if est is not None:
+                            bounds, width, height = est
+                        else:
+                            transform, width, height = \
+                                calculate_default_transform(
+                                    src.crs, WEB_MERCATOR,
+                                    src.width, src.height, *src.bounds)
+                            bounds = rasterio.transform.array_bounds(
+                                height, width, transform)
                         geo = True
                     else:
                         width = src.width
@@ -1172,13 +1207,54 @@ class AsyncFileLoader(QObject):
             if (i + 1) % 10 == 0 or i == total - 1:
                 self.progress_update.emit(i + 1, total)
 
-        self.batch_complete.emit(loaded_count, error_count)
+        return loaded_count, error_count
 
 
-# Cached per-CRS transformers for stored_layer_metadata: one project's
-# images overwhelmingly share a CRS, and Transformer construction is the
-# expensive part of the bounds computation.
+# Cached per-CRS transformers for the metadata bounds estimate: one
+# project's (or directory's) images overwhelmingly share a CRS, and
+# Transformer construction is the expensive part of the computation.
 _stored_meta_transformers: dict = {}
+
+
+def _web_mercator_estimate(src_crs, src_transform,
+                           src_width: int, src_height: int):
+    """Estimated Web Mercator (bounds, width, height) for a source grid.
+
+    A sampling of the source boundary transformed through a cached
+    transformer: sub-metre of rasterio's calculate_default_transform at a
+    tiny fraction of its cost (~0.03ms vs ~2.2ms per image), and
+    provisional either way - the first real load recomputes the exact
+    values (apply_level_result overwrites them). Returns None when the
+    CRS cannot be transformed finitely; the caller falls back to the
+    full computation.
+    """
+    key = src_crs.to_epsg() or src_crs.to_wkt()
+    transformer = _stored_meta_transformers.get(key)
+    if transformer is None:
+        transformer = Transformer.from_crs(
+            src_crs, WEB_MERCATOR, always_xy=True)
+        _stored_meta_transformers[key] = transformer
+
+    left, bottom, right, top = rasterio.transform.array_bounds(
+        src_height, src_width, src_transform)
+    xs = np.linspace(left, right, 6)
+    ys = np.linspace(bottom, top, 6)
+    edge_x = np.concatenate(
+        [xs, xs, np.full(6, left), np.full(6, right)])
+    edge_y = np.concatenate(
+        [np.full(6, bottom), np.full(6, top), ys, ys])
+    gx, gy = transformer.transform(edge_x, edge_y)
+    if not (np.all(np.isfinite(gx)) and np.all(np.isfinite(gy))):
+        return None
+    west, east = float(np.min(gx)), float(np.max(gx))
+    south, north = float(np.min(gy)), float(np.max(gy))
+    if east <= west or north <= south:
+        return None
+    # Split the source pixel count by the projected aspect ratio.
+    aspect = (east - west) / (north - south)
+    width = max(1, round((src_width * src_height * aspect) ** 0.5))
+    height = max(1, round(width / aspect))
+    return (west, south, east, north), width, height
 
 
 def stored_layer_metadata(file_path: str, group_path: str,
@@ -1207,35 +1283,15 @@ def stored_layer_metadata(file_path: str, group_path: str,
     try:
         src_transform = Affine(*affine_coeffs)
         src_crs = CRS.from_epsg(int(crs_epsg))
-        transformer = _stored_meta_transformers.get(int(crs_epsg))
-        if transformer is None:
-            transformer = Transformer.from_crs(
-                src_crs, WEB_MERCATOR, always_xy=True)
-            _stored_meta_transformers[int(crs_epsg)] = transformer
-
-        left, bottom, right, top = rasterio.transform.array_bounds(
-            src_height, src_width, src_transform)
-        xs = np.linspace(left, right, 6)
-        ys = np.linspace(bottom, top, 6)
-        edge_x = np.concatenate(
-            [xs, xs, np.full(6, left), np.full(6, right)])
-        edge_y = np.concatenate(
-            [np.full(6, bottom), np.full(6, top), ys, ys])
-        gx, gy = transformer.transform(edge_x, edge_y)
-        if not (np.all(np.isfinite(gx)) and np.all(np.isfinite(gy))):
+        est = _web_mercator_estimate(
+            src_crs, src_transform, src_width, src_height)
+        if est is None:
             return None
-        west, east = float(np.min(gx)), float(np.max(gx))
-        south, north = float(np.min(gy)), float(np.max(gy))
-        if east <= west or north <= south:
-            return None
-        # Split the source pixel count by the projected aspect ratio.
-        aspect = (east - west) / (north - south)
-        width = max(1, round((src_width * src_height * aspect) ** 0.5))
-        height = max(1, round(width / aspect))
+        bounds, width, height = est
         return {
             'file_path': file_path,
             'group_path': group_path,
-            'bounds': (west, south, east, north),
+            'bounds': bounds,
             'width': width,
             'height': height,
             'src_crs': src_crs,
@@ -1273,9 +1329,10 @@ class AsyncFileLoaderThread(QThread):
         self._loader.batch_complete.connect(self.batch_complete.emit)
         self._loader.progress_update.connect(self.progress_update.emit)
 
-    def set_files(self, files: list[tuple[str, str]]):
-        """Set files to load."""
-        self._loader.set_files(files)
+    def set_files(self, files: list[tuple[str, str]],
+                  assume_no_sidecars: bool = False):
+        """Set files to load (see AsyncFileLoader.set_files)."""
+        self._loader.set_files(files, assume_no_sidecars)
 
     def cancel(self):
         """Cancel loading."""
