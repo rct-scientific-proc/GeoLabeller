@@ -42,8 +42,8 @@ from .labels import LabelProject, combine_projects, haversine_distance
 from .layer_panel import CombinedLayerPanel
 from .optimize_export import (OptimizeExportDialog, OptimizeWorker,
                               plan_output_paths)
-from .h5_export import (H5ExportDialog, H5ExportWorker, HARD_NEGATIVE,
-                        SCOPE_LABELLED, SCOPE_VISIBLE,
+from .h5_export import (ExportImage, H5ExportDialog, H5ExportWorker,
+                        HARD_NEGATIVE, SCOPE_LABELLED, SCOPE_VISIBLE,
                         SCOPE_ALL_EXAMPLES, SCOPE_VISIBLE_EXAMPLES,
                         centered_window)
 from .debug_log import debug, debug_log, DebugConsole
@@ -2875,9 +2875,15 @@ class MainWindow(QMainWindow):
             if needs_labels and not labels and not flagged:
                 continue
             img = self.project.images.get(path)
-            images.append((path, labels,
-                           options["examples_only"] and not flagged,
-                           img.location if img is not None else ""))
+            # Every label on the image is protected from the negative grid,
+            # whatever its class and whether or not it is being exported -
+            # the rule is about the ground, not about the selection.
+            images.append(ExportImage(
+                path=path,
+                labels=labels,
+                examples_only=options["examples_only"] and not flagged,
+                location=img.location if img is not None else "",
+                protect=list(img.labels) if img is not None else []))
         if not images:
             QMessageBox.information(
                 self, "HDF5 Export", "No images in the selected scope.")

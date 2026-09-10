@@ -26,6 +26,7 @@ Contents:
 - ``H5ExportDialog`` - the setup dialog.
 """
 import os
+from dataclasses import dataclass, field
 
 import numpy as np
 import rasterio
@@ -47,6 +48,30 @@ from PyQt5.QtWidgets import (
 from .debug_log import debug
 
 HARD_NEGATIVE = "hard_negative"
+
+
+@dataclass
+class ExportImage:
+    """One raster's contribution to an export.
+
+    ``labels`` become gt=True example crops. ``protect`` are labels whose
+    ground must not be written as a hard negative even though they are not
+    being exported - every other object on the image, whatever its class.
+    Keeping the two apart is the whole point: protection used to be a side
+    effect of exporting, so exporting a subset of an image's labels (one
+    linked object, or none at all) silently offered the rest as background.
+    """
+
+    path: str
+    labels: list = field(default_factory=list)
+    # False slides the hard-negative window over this raster as well.
+    examples_only: bool = False
+    # The image's free-text location tag, recorded on every snippet cut here.
+    location: str = ""
+    # Additional labels to keep clear of the negative grid. The exported
+    # labels are always protected; this is what is protected *as well*, so
+    # the default can never protect less than before.
+    protect: list = field(default_factory=list)
 
 # How far, in pixels, the eight surrounding example crops sit from the one
 # centred on the label - see _positive_windows. A quarter of the default 64px
@@ -575,7 +600,8 @@ def export_image(writer, path, labels, height, width, overlap, channels,
                  split_value, class_to_index, hard_negative_index,
                  cancel_check=None, negative_ratio=None, rng=None,
                  positive_offset=DEFAULT_POSITIVE_OFFSET,
-                 examples_only=False, location="", pixel_dtype="uint8"):
+                 examples_only=False, location="", pixel_dtype="uint8",
+                 protect_labels=()):
     """Extract one raster's examples and hard negatives into ``writer``.
 
     Returns ``(added, negative_counts, excluded)`` - the number of snippets
@@ -591,6 +617,15 @@ def export_image(writer, path, labels, height, width, overlap, channels,
     that overlaps an example crop - so no ground is ever taught as both an
     object and not-an-object. Windows never cross the image edge (a final
     window is shifted to fit), so every snippet is exactly HxW.
+
+    ``protect_labels`` are labels that are NOT being exported here but whose
+    ground must still be kept out of the negative grid: every other object
+    on this raster, whatever its class. Without them the rule "nothing
+    labelled becomes a hard negative" only held because every run happened
+    to export every label it knew about - exporting one linked object, or
+    exporting negatives alone, would have offered the rest as background.
+    They are protected with the same crop footprint the exported labels get,
+    so the guarded area does not depend on which labels were chosen.
 
     With ``negative_ratio`` set, this image's hard negatives are shared out
     over train/validate/test in those proportions instead of all taking
@@ -640,9 +675,9 @@ def export_image(writer, path, labels, height, width, overlap, channels,
                 return _float_window_pixels(src, win, nodata)
             return _window_pixels(src, win, channels, nodata, scaling=scaling)
 
+        offset = max(0, int(positive_offset))
         positives = _positive_windows(
-            pts, src.width, src.height, width, height,
-            max(0, int(positive_offset)))
+            pts, src.width, src.height, width, height, offset)
 
         for (x0, y0), class_index in positives.items():
             if cancel_check and cancel_check():
@@ -664,7 +699,17 @@ def export_image(writer, path, labels, height, width, overlap, channels,
 
         xs = _snippet_positions(src.width, width, step_x)
         ys = _snippet_positions(src.height, height, step_y)
-        excluded = _excluded_grid(positives.keys(), xs, ys, width, height)
+        # Guarded ground: the crops actually being written, plus the crops
+        # every other labelled object on this raster WOULD occupy. The class
+        # index is irrelevant here - a label of a class this export does not
+        # carry (or does not want) still marks ground that is not background.
+        guarded = set(positives)
+        if protect_labels:
+            guarded |= set(_positive_windows(
+                [(float(l.pixel_x), float(l.pixel_y), 0)
+                 for l in protect_labels],
+                src.width, src.height, width, height, offset))
+        excluded = _excluded_grid(guarded, xs, ys, width, height)
 
         pool, taken = None, 0
         if negative_ratio is not None:
@@ -705,11 +750,11 @@ class H5ExportWorker(QObject):
     def __init__(self, out_path, images, options):
         """Store the output path, image list and export options.
 
-        ``images`` is a list of ``(path, labels, examples_only, location)``
-        tuples. ``examples_only`` is per image so one run can mix
-        labels-only images with flagged hard-negative sources, which are
-        slid in full; ``location`` is the image's location tag ("" when
-        untagged).
+        ``images`` is a list of :class:`ExportImage`. The per-image
+        ``examples_only`` lets one run mix labels-only images with flagged
+        hard-negative sources, which are slid in full; ``protect`` carries
+        the labels that must stay out of the negative grid without being
+        exported.
         """
         super().__init__()
         self._out_path = out_path
@@ -749,26 +794,27 @@ class H5ExportWorker(QObject):
                 pixel_dtype=opts.get("pixel_dtype", "uint8"))
             total_images = len(self._images)
             samples = 0
-            for i, (path, labels, image_examples_only, location) in enumerate(
-                    self._images):
+            for i, request in enumerate(self._images):
                 if self._cancelled:
                     break
                 self.progress.emit(i, total_images, samples)
-                if not os.path.exists(path):
-                    errors.append((path, "file not found"))
+                if not os.path.exists(request.path):
+                    errors.append((request.path, "file not found"))
                     continue
                 try:
                     added, negatives, dropped = export_image(
-                        writer, path, labels, opts["height"], opts["width"],
+                        writer, request.path, request.labels,
+                        opts["height"], opts["width"],
                         opts["overlap"], opts["channels"], opts["split_value"],
                         class_to_index, hard_negative_index,
                         cancel_check=lambda: self._cancelled,
                         negative_ratio=negative_ratio, rng=rng,
                         positive_offset=opts.get(
                             "positive_offset", DEFAULT_POSITIVE_OFFSET),
-                        examples_only=image_examples_only,
-                        location=location,
-                        pixel_dtype=opts.get("pixel_dtype", "uint8"))
+                        examples_only=request.examples_only,
+                        location=request.location,
+                        pixel_dtype=opts.get("pixel_dtype", "uint8"),
+                        protect_labels=request.protect)
                     samples += added
                     excluded += dropped
                     # split_idx, not i: reusing the outer image index here
@@ -777,7 +823,7 @@ class H5ExportWorker(QObject):
                     for split_idx, count in enumerate(negatives):
                         negative_counts[split_idx] += count
                 except Exception as e:  # noqa: BLE001 - report, keep going
-                    errors.append((path, str(e)))
+                    errors.append((request.path, str(e)))
             added_classes = writer.added_classes
             dropped_classes = writer.dropped_classes
             total = writer.close()
