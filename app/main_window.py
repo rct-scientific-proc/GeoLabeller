@@ -247,6 +247,18 @@ class MainWindow(QMainWindow):
 
         # Timer for safe UI updates during async loading (avoids reentrancy
         # issues)
+        # Project-wide refreshes coalesce onto one zero-delay timer, so a
+        # gesture that changes many labels at once (box link catches a
+        # dozen, chain link, unlinking a group) pays for ONE rebuild of the
+        # labelled tree and the snippet strip instead of one per label -
+        # measured at 14.2 s for a 15-label box link on a 1,500-label
+        # project, almost all of it repeated rebuilds.
+        self._pending_refreshes: set[str] = set()
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.setInterval(0)
+        self._refresh_timer.timeout.connect(self._run_pending_refreshes)
+
         self._async_ui_timer = QTimer()
         self._async_ui_timer.setInterval(50)
         self._async_ui_timer.timeout.connect(self._process_pending_async_files)
@@ -1402,8 +1414,7 @@ class MainWindow(QMainWindow):
             self._update_waterfall_projections()
 
             # Refresh labeled images panel (grouping may have changed)
-            self.layer_panel.refresh_labeled_panel(self.project)
-            self._refresh_snippet_panel()
+            self._schedule_refresh("labeled", "snippets")
 
             count = len(linked_labels)
             msg = f"Linked labels (object has {count} labels)"
@@ -1433,8 +1444,7 @@ class MainWindow(QMainWindow):
             return
         label.description = text.strip()
         self.canvas.set_label_description(label_id, label.description)
-        self.layer_panel.refresh_labeled_panel(self.project)
-        self._refresh_snippet_panel()
+        self._label_row_changed(label_id)
         self.statusBar.showMessage(
             "Description saved" if label.description else "Description cleared",
             3000)
@@ -1460,8 +1470,7 @@ class MainWindow(QMainWindow):
             # Marker may not exist when its image is not loaded; the
             # refresh path re-applies it later, like the description.
             self.canvas.set_label_group_id(lid, label.group_id)
-        self.layer_panel.refresh_labeled_panel(self.project)
-        self._refresh_snippet_panel()
+            self._label_row_changed(lid)
         n = len(changed)
         note = f" across {n} linked labels" if n > 1 else ""
         self.statusBar.showMessage(
@@ -1495,9 +1504,9 @@ class MainWindow(QMainWindow):
         self._update_ring_colors()
         self._update_waterfall_projections()
 
-        # Refresh labeled images panel (grouping may have changed)
-        self.layer_panel.refresh_labeled_panel(self.project)
-        self._refresh_snippet_panel()
+        # Grouping changed, so the tree really is rebuilt - but once
+        # per gesture, not once per label an unlink or box link touches.
+        self._schedule_refresh("labeled", "snippets")
 
         self.statusBar.showMessage("Label unlinked from object", 3000)
 
@@ -1547,8 +1556,8 @@ class MainWindow(QMainWindow):
             # is a no-op then, and the load path re-adorns it later.
             self.canvas.set_label_measured(
                 lbl.id, has_measurement, length_m, width_m)
-        self.layer_panel.refresh_labeled_panel(self.project)
-        self._refresh_snippet_panel()
+        for lbl in targets:
+            self._label_row_changed(lbl.id)
 
         n = len(targets)
         linked_note = f" ({n} linked labels)" if n > 1 else ""
@@ -1685,6 +1694,37 @@ class MainWindow(QMainWindow):
         if not self.snippet_panel.isVisible():
             return
         self.snippet_panel.set_labels(self._label_entries())
+
+    def _schedule_refresh(self, *kinds: str):
+        """Ask for project-wide refreshes once the current burst settles.
+
+        ``kinds`` are "labeled" and "snippets". Repeat requests within one
+        gesture collapse into a single rebuild on the next event-loop turn.
+        """
+        self._pending_refreshes.update(kinds)
+        if not self._refresh_timer.isActive():
+            self._refresh_timer.start()
+
+    def _run_pending_refreshes(self):
+        """Do the coalesced refreshes that _schedule_refresh asked for."""
+        kinds, self._pending_refreshes = self._pending_refreshes, set()
+        if "labeled" in kinds:
+            self.layer_panel.refresh_labeled_panel(self.project)
+        if "snippets" in kinds:
+            self._refresh_snippet_panel()
+
+    def _label_row_changed(self, label_id: int):
+        """One label's text changed - update its row without a rebuild.
+
+        Falls back to a full refresh when the row cannot be found (its
+        image is not in the panel yet, or the structure moved underneath).
+        """
+        image, label = self.project.get_label_by_id(label_id)
+        if (label is not None and image is not None
+                and self.layer_panel.update_label_in_panel(label, image)):
+            self._refresh_snippet_panel()
+            return
+        self._schedule_refresh("labeled", "snippets")
 
     def _reseat_open_editors(self):
         """Re-seat the orientation and mask editors on the CURRENT project.

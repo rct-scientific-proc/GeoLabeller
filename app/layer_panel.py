@@ -1262,6 +1262,39 @@ class LabeledLayerPanel(QWidget):
 
         self.tree.blockSignals(False)
 
+    def update_label(self, label, image) -> bool:
+        """Refresh one label's row text in place; True when a row was found.
+
+        Describing, measuring or renaming a group changes what a row SAYS
+        without changing where it sits - the tree is grouped by object_id -
+        so rebuilding every row for it cost about 12 s on a 20k-label
+        project. Structural changes (link, unlink, add, remove) still go
+        through refresh().
+        """
+        rows = self._items_by_path.get(image.path)
+        if not rows:
+            return False
+        found = False
+        self.tree.blockSignals(True)
+        try:
+            for item in rows:
+                try:
+                    if item.data(0, Qt.UserRole + 2) != label.id:
+                        continue
+                except RuntimeError:
+                    continue        # the C++ row is gone; refresh() will tidy
+                item.setText(
+                    0, f"#{label.id}: {image.name} [{label.class_name}]"
+                       + self._measurement_suffix(label.length_m,
+                                                  label.width_m))
+                item.setToolTip(
+                    0, f"Label #{label.id} on {image.path}\n"
+                       f"Lon: {label.lon:.6f}, Lat: {label.lat:.6f}")
+                found = True
+        finally:
+            self.tree.blockSignals(False)
+        return found
+
     def remove_label(self, label_id: int):
         """Remove a single label from the tree incrementally.
 
@@ -1957,6 +1990,10 @@ class CombinedLayerPanel(QWidget):
         """Clear all items from both trees."""
         self.main_panel.clear()
         self.labeled_panel.clear()
+
+    def update_label_in_panel(self, label, image) -> bool:
+        """Update one label's row text; False when a full refresh is needed."""
+        return self.labeled_panel.update_label(label, image)
 
     def refresh_labeled_panel(self, project):
         """Refresh the labeled images panel with current project data."""

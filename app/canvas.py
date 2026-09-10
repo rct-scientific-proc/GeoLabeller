@@ -3949,8 +3949,19 @@ class MapCanvas(QGraphicsView):
         if color is None:
             color = QColor(255, 50, 50)  # Default red
 
-        # Determine scene position based on whether layer is georeferenced
-        layer = self._get_layer_by_name_and_group(image_name, image_group)
+        # Determine scene position based on whether layer is georeferenced.
+        # By path first: the label already knows which file it belongs to,
+        # and _path_to_layer answers in O(1). Resolving it by scanning every
+        # loaded layer for a matching name and group made a marker rebuild
+        # O(labels x layers) - about 7.5 s of pure scanning at 20k/20k, paid
+        # on every project open and every mode change. The scan remains as
+        # the fallback for a label whose image is not loaded under that path.
+        layer = None
+        layer_id = self._path_to_layer.get(image_path)
+        if layer_id is not None:
+            layer = self._layers.get(layer_id)
+        if layer is None:
+            layer = self._get_layer_by_name_and_group(image_name, image_group)
         if layer and not layer.geo and pixel_x is not None and pixel_y is not None:
             # Non-geo layer: compute scene position from pixel coords
             # pixel_y=0 is top of image (north), increasing downward
