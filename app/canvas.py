@@ -1636,6 +1636,11 @@ class MapCanvas(QGraphicsView):
     label_placed = pyqtSignal(float, float, float, float, str, str, str)
 
     # Signal emitted when a label is removed: (label_id, image_path)
+    # A click that resolved to a layer but fell outside its pixels (the
+    # transparent margin a rotated raster leaves inside its bounding box).
+    # Carries the message for the status bar.
+    label_rejected = pyqtSignal(str)
+
     label_removed = pyqtSignal(int, str)
 
     # Signal emitted when two labels are linked: (label_id1, label_id2)
@@ -3564,14 +3569,30 @@ class MapCanvas(QGraphicsView):
                     pixel_x, pixel_y = layer.scene_to_pixel(easting, northing)
                     latlon = layer.pixel_to_latlon(pixel_x, pixel_y)
                     lon, lat = latlon if latlon is not None else (0.0, 0.0)
-                self.label_placed.emit(
-                    pixel_x,
-                    pixel_y,
-                    lon,
-                    lat,
-                    layer_name,
-                    group_path,
-                    layer.file_path)
+                # A reprojected raster's bounding box contains transparent
+                # margin - a rotated UTM image leaves wedges at the corners
+                # - and layers are resolved by box, so a click there maps
+                # outside the source pixels. Placing it anyway created a
+                # label on the wrong image with negative or past-the-edge
+                # coordinates: a marker floating over empty ground, and a
+                # label the HDF5 export silently skips as "pixel coords
+                # outside image bounds".
+                src_w, src_h = layer._src_width, layer._src_height
+                inside = (not src_w or not src_h
+                          or (0 <= pixel_x < src_w and 0 <= pixel_y < src_h))
+                if not inside:
+                    self.label_rejected.emit(
+                        f"No image data there - the click landed in "
+                        f"{layer_name}'s transparent margin")
+                else:
+                    self.label_placed.emit(
+                        pixel_x,
+                        pixel_y,
+                        lon,
+                        lat,
+                        layer_name,
+                        group_path,
+                        layer.file_path)
         elif self._mode in LABELING_MODES and event.button() == Qt.RightButton:
             # Right button in any labeling mode (Label + Cycle): a right-click
             # without dragging opens the label context menu; a right-drag pans.

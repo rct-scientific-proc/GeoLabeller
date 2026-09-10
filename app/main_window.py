@@ -414,6 +414,8 @@ class MainWindow(QMainWindow):
         self.canvas.label_describe_requested.connect(self._describe_label)
         self.canvas.label_group_id_requested.connect(self._edit_group_id)
         self.canvas.link_mode_changed.connect(self._on_link_mode_changed)
+        self.canvas.label_rejected.connect(
+            lambda message: self.statusBar.showMessage(message, 4000))
         self.canvas.label_measured.connect(self._on_label_measured)
         self.canvas.measure_mode_changed.connect(self._on_measure_mode_changed)
         self.canvas.ruler_changed.connect(self._on_ruler_changed)
