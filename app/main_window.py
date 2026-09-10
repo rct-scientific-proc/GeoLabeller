@@ -40,7 +40,8 @@ from .goto_location import (GoToLocationDialog, WaypointDialog,
                             format_lat_lon)
 from .labels import LabelProject, combine_projects, haversine_distance
 from .layer_panel import CombinedLayerPanel
-from .optimize_export import OptimizeExportDialog, OptimizeWorker, plan_output_path
+from .optimize_export import (OptimizeExportDialog, OptimizeWorker,
+                              plan_output_paths)
 from .h5_export import (H5ExportDialog, H5ExportWorker, HARD_NEGATIVE,
                         SCOPE_LABELLED, SCOPE_VISIBLE,
                         SCOPE_ALL_EXAMPLES, SCOPE_VISIBLE_EXAMPLES,
@@ -872,16 +873,29 @@ class MainWindow(QMainWindow):
             return True
         return super().eventFilter(obj, event)
 
-    def _set_mode(self, mode: CanvasMode):
-        """Set the canvas interaction mode."""
-        was_waterfall = self.canvas._waterfall_active
-        self.canvas.set_mode(mode)
+    def _sync_mode_actions(self, mode: CanvasMode):
+        """Keep the toolbar's checked states in step with the canvas."""
         self.pan_action.setChecked(mode == CanvasMode.PAN)
         self.label_action.setChecked(mode == CanvasMode.LABEL)
         self.cycle_action.setChecked(mode == CanvasMode.CYCLE)
         self.view_cycle_action.setChecked(mode == CanvasMode.VIEW_CYCLE)
         self.ruler_action.setChecked(mode == CanvasMode.RULER)
         self.waterfall_action.setChecked(mode == CanvasMode.WATERFALL)
+
+    def _set_mode(self, mode: CanvasMode):
+        """Set the canvas interaction mode."""
+        if mode == self.canvas._mode:
+            # The mode actions are checkable and their shortcuts fire
+            # triggered() whatever the checked state, so tapping C in Cycle
+            # mode came straight back through here to _start_cycle_mode -
+            # which reassigns the layer list and resets the index. A user
+            # at image 150 of 300 jumped to 300 and lost the position the
+            # park/resume machinery exists to protect.
+            self._sync_mode_actions(mode)
+            return
+        was_waterfall = self.canvas._waterfall_active
+        self.canvas.set_mode(mode)
+        self._sync_mode_actions(mode)
 
         # Leaving waterfall: restore the normal layout and re-place labels,
         # then take the view to the geography of the image the user was on in
@@ -2648,21 +2662,21 @@ class MainWindow(QMainWindow):
             file_path += '.json'
 
         try:
-            # Collect only images that have at least one label
-            images = [img.to_dict()
-                      for img in self.project.images.values() if img.labels]
+            # The same serializer Save Project uses, with the unlabelled
+            # images filtered out. Hand-building the dict left a literal
+            # "version": "3.2" over image entries carrying every field
+            # added since - masks, orientations, group ids, descriptions,
+            # location - and the ICD tells readers to gate features on that
+            # string, so an ICD-compliant consumer dropped them all.
+            data = self.project.to_dict()
+            images = [img for img in data["images"] if img.get("labels")]
 
             if not images:
                 QMessageBox.information(
                     self, "Export", "No labeled images to export.")
                 return
 
-            data = {
-                "version": "3.2",
-                "classes": self.project.classes,
-                "images": images,
-                "_next_id": self.project._next_id
-            }
+            data["images"] = images
 
             with open(file_path, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -2691,13 +2705,15 @@ class MainWindow(QMainWindow):
             return
         opts = dialog.get_options()
 
-        # Build the (source, destination) task list, mirroring the group tree.
-        tasks = []
-        for info in infos:
-            dst = plan_output_path(
-                opts["output_dir"], info.get("group_path", ""),
-                info["file_path"])
-            tasks.append((info["file_path"], str(dst)))
+        # Build the (source, destination) task list, mirroring the group
+        # tree. Planned together so two layers whose names collide get
+        # distinct outputs instead of one clobbering the other.
+        planned = plan_output_paths(
+            opts["output_dir"],
+            [(info.get("group_path", ""), info["file_path"])
+             for info in infos])
+        tasks = [(info["file_path"], str(dst))
+                 for info, dst in zip(infos, planned)]
 
         self._start_optimize_worker(tasks, opts)
 

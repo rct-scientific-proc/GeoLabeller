@@ -68,6 +68,34 @@ def plan_output_path(output_dir, group_path: str, file_path: str) -> Path:
     return out / (_sanitize(Path(file_path).stem) + ".tif")
 
 
+def plan_output_paths(output_dir, entries) -> list:
+    """Destination paths for (group_path, file_path) pairs, all distinct.
+
+    plan_output_path drops the source extension and keeps only the stem, so
+    two layers in one group named ``tile_03.tif`` and ``tile_03.png`` - or
+    the same stem imported from two folders into one group - mapped to the
+    same output. The second then either "skipped" (reported as if the file
+    had already been exported) or, with overwrite on, silently replaced the
+    first. Colliding names get a numeric suffix instead.
+
+    Comparison is case-insensitive: on Windows ``Tile.tif`` and ``tile.tif``
+    are one file.
+    """
+    seen = set()
+    planned = []
+    for group_path, file_path in entries:
+        dst = plan_output_path(output_dir, group_path, file_path)
+        if str(dst).casefold() in seen:
+            stem, suffix = dst.stem, dst.suffix
+            n = 2
+            while str(dst.with_name(f"{stem}_{n}{suffix}")).casefold() in seen:
+                n += 1
+            dst = dst.with_name(f"{stem}_{n}{suffix}")
+        seen.add(str(dst).casefold())
+        planned.append(dst)
+    return planned
+
+
 def _has_colormap(src) -> bool:
     """Return True if any band carries a colour table (paletted raster)."""
     for band in range(1, src.count + 1):
@@ -367,10 +395,15 @@ class OptimizeExportDialog(QDialog):
             group_nodes[group_path] = item
             return item
 
-        for info in self._layer_infos:
+        # The same planner the export uses, so the preview shows the
+        # disambiguated name rather than the colliding one.
+        planned = plan_output_paths(
+            "", [(info.get("group_path", "") or "", info["file_path"])
+                 for info in self._layer_infos])
+        for info, dst in zip(self._layer_infos, planned):
             parent = ensure_group(info.get("group_path", "") or "")
-            leaf = QTreeWidgetItem(
-                [_sanitize(Path(info["file_path"]).stem) + ".tif"])
+            leaf = QTreeWidgetItem([dst.name])
+            leaf.setToolTip(0, info["file_path"])
             leaf.setIcon(0, file_icon)
             if parent is None:
                 self.tree.addTopLevelItem(leaf)

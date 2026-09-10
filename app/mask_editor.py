@@ -30,6 +30,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QSpinBox,
     QVBoxLayout, QWidget)
 
+from .debug_log import debug
 from .masks import (entry_in_window, fill_enclosed, mask_statistics,
                     merged_entry)
 from .snippets import (SnippetLoader, read_label_snippet,
@@ -218,7 +219,11 @@ class MaskPaintCanvas(QWidget):
         self.update()
 
     def wheelEvent(self, event):
-        factor = 1.25 if event.angleDelta().y() > 0 else 1 / 1.25
+        dy = event.angleDelta().y()
+        if dy == 0:
+            event.ignore()      # a sideways gesture is not a zoom-out
+            return
+        factor = 1.25 if dy > 0 else 1 / 1.25
         self.set_zoom(self._scale * factor, anchor=event.pos())
         event.accept()
 
@@ -591,6 +596,7 @@ class MaskEditor(QWidget):
         self._raw_nodata = None
         self._stored_by_name = {}
         self._unreadable = False
+        self._undecodable = set()
         size = self.size_spin.value()
         if entry is None:
             self.canvas.set_snippet(None, size, size)
@@ -622,10 +628,24 @@ class MaskEditor(QWidget):
         # Stored masks re-anchor into the current crop (paint-time snippet
         # size may differ from today's).
         for stored in entry.get("masks") or []:
-            self._layers[stored["name"]] = entry_in_window(
-                stored, x0, y0, w, h)
-            self._order.append(stored["name"])
-            self._stored_by_name[stored["name"]] = stored
+            name = stored["name"]
+            try:
+                self._layers[name] = entry_in_window(stored, x0, y0, w, h)
+            except (ValueError, KeyError, TypeError) as exc:
+                # A mask whose run-length encoding will not decode: the
+                # project deliberately keeps it rather than dropping it on
+                # load, so the editor must too. Raising here left the
+                # editor half-populated - showing the PREVIOUS snippet -
+                # and the next stroke committed a mask list missing this
+                # entry and everything after it, deleting them for good.
+                debug(f"mask {name!r} will not decode: "
+                      f"{type(exc).__name__}: {exc}")
+                self._undecodable.add(name)
+                self._stored_by_name[name] = stored
+                self._order.append(name)
+                continue
+            self._order.append(name)
+            self._stored_by_name[name] = stored
         display = read_label_snippet(entry["image_path"], entry["pixel_x"],
                                      entry["pixel_y"], size)
         self.canvas.set_snippet(display, w, h)
@@ -660,7 +680,17 @@ class MaskEditor(QWidget):
         self.mask_list.blockSignals(True)
         self.mask_list.clear()
         for i, name in enumerate(self._order):
+            # The row text stays the mask name - every lookup here is by
+            # item.text() - so an unreadable mask is marked by style.
             item = QListWidgetItem(name)
+            if name in getattr(self, "_undecodable", ()):
+                font = item.font()
+                font.setItalic(True)
+                item.setFont(font)
+                item.setForeground(QColor(150, 150, 150))
+                item.setToolTip("This mask's encoding could not be read. It "
+                                "is kept exactly as stored and cannot be "
+                                "edited.")
             color = MASK_COLORS[i % len(MASK_COLORS)]
             pix = QPixmap(12, 12)
             pix.fill(color)
@@ -703,6 +733,7 @@ class MaskEditor(QWidget):
             return
         self._layers.pop(name, None)
         self._stored_by_name.pop(name, None)
+        self._undecodable.discard(name)
         if name in self._order:
             self._order.remove(name)
         nxt = self._order[0] if self._order else None
@@ -757,9 +788,11 @@ class MaskEditor(QWidget):
             return
         x0, y0, _w, _h = self._frame
         image_size = self._dims_for(self._current)
-        entries = [merged_entry(name, x0, y0, self._layers[name],
-                                self._stored_by_name.get(name),
-                                image_size=image_size)
+        undecodable = getattr(self, "_undecodable", ())
+        entries = [self._stored_by_name[name] if name in undecodable
+                   else merged_entry(name, x0, y0, self._layers[name],
+                                     self._stored_by_name.get(name),
+                                     image_size=image_size)
                    for name in self._order]
         self._stored_by_name = {e["name"]: e for e in entries}
         self._current["masks"] = entries

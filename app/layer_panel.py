@@ -140,7 +140,13 @@ class LayerPanel(QWidget):
         item.setText(0, os.path.basename(file_path))
         item.setData(0, Qt.UserRole, layer_id)
         item.setData(0, Qt.UserRole + 1, "layer")
-        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        # Checkable, but NOT a drop target: every walk in this panel treats
+        # a layer as a leaf, so a layer dropped onto another layer vanished
+        # from the z-order, from group toggles and from removal - and was
+        # deleted along with its host, leaving the canvas and project
+        # holding a layer whose tree item no longer existed.
+        item.setFlags((item.flags() | Qt.ItemIsUserCheckable)
+                      & ~Qt.ItemIsDropEnabled)
         item.setCheckState(0, Qt.Checked if visible else Qt.Unchecked)
         item.setToolTip(0, file_path)
 
@@ -639,6 +645,13 @@ class LayerPanel(QWidget):
     def _remove_item(self, item: QTreeWidgetItem):
         """Remove an item (and, via MainWindow, its images) for good."""
         item_type = item.data(0, Qt.UserRole + 1)
+        # Removing the Non-Georeferenced root while still caching it meant
+        # every later non-geo import appended to a detached subtree: the
+        # canvas and project got the images, the panel showed nothing.
+        if self._nongeo_root is not None and (
+                item is self._nongeo_root
+                or self._is_ancestor_of(item, self._nongeo_root)):
+            self._nongeo_root = None
 
         # (layer_id, file_path) for every layer this removal covers.
         entries = []
@@ -681,6 +694,17 @@ class LayerPanel(QWidget):
             self.layer_removed.emit(layer_id)
         if entries:
             self.layers_removed.emit(entries)
+
+    @staticmethod
+    def _is_ancestor_of(item: QTreeWidgetItem,
+                        other: QTreeWidgetItem) -> bool:
+        """Is *item* somewhere above *other* in the tree?"""
+        parent = other.parent()
+        while parent is not None:
+            if parent is item:
+                return True
+            parent = parent.parent()
+        return False
 
     def _collect_layer_entries(self, item: QTreeWidgetItem, entries: list):
         """Recursively collect (layer_id, file_path) from item's subtree."""
@@ -980,7 +1004,8 @@ class LayerPanel(QWidget):
         item.setText(0, os.path.basename(file_path))
         item.setData(0, Qt.UserRole, layer_id)
         item.setData(0, Qt.UserRole + 1, "layer")
-        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setFlags((item.flags() | Qt.ItemIsUserCheckable)
+                      & ~Qt.ItemIsDropEnabled)     # a leaf, see add_layer
         item.setCheckState(0, Qt.Checked if visible else Qt.Unchecked)
         item.setToolTip(0, file_path)
 

@@ -3238,6 +3238,11 @@ class MapCanvas(QGraphicsView):
             QRectF(west, -north, east - west, north - south))
         self.fitInView(rect, Qt.KeepAspectRatio)
         self._refresh_scene_rect()
+        # Markers are sized in scene units against the view scale, so a
+        # zoom that skips this leaves them sub-pixel (after stepping out
+        # from a metre-scale wheel zoom) or covering the image (after a
+        # whole-project view). Cycle mode reaches here on every step.
+        self.update_label_markers_scale()
         self._schedule_tile_update()
 
     def zoom_to_point(self, lon: float, lat: float, size_meters: float = 10.0):
@@ -3286,7 +3291,15 @@ class MapCanvas(QGraphicsView):
         scene coordinates, so it is unaffected by view rotation.
         """
         factor = 1.15
-        if event.angleDelta().y() > 0:
+        dy = event.angleDelta().y()
+        if dy == 0:
+            # A horizontal wheel, a tilt-wheel, or a two-finger sideways
+            # swipe: every one of those used to fall into the else branch
+            # below and zoom OUT, so a stray gesture threw the view out by
+            # an order of magnitude.
+            event.ignore()
+            return
+        if dy > 0:
             view_rect = self.mapToScene(self.viewport().rect()).boundingRect()
             if (view_rect.width() / factor < self._MIN_VIEW_SIZE
                     or view_rect.height() / factor < self._MIN_VIEW_SIZE):
@@ -4275,6 +4288,12 @@ class MapCanvas(QGraphicsView):
 
         # Check each label marker
         for label_id, (ellipse, text) in self._label_items.items():
+            if not ellipse.isVisible():
+                # A hidden pixel-zone image stacks at the same scene
+                # position as the visible one above it, so hit-testing its
+                # markers meant Remove Label deleting a label the user
+                # could not see.
+                continue
             # Bounding rect in scene coordinates (sceneBoundingRect accounts for
             # the floating-origin parent transform).
             scene_rect = ellipse.sceneBoundingRect()
@@ -4295,6 +4314,8 @@ class MapCanvas(QGraphicsView):
         # Waterfall projections hit-test as their source label, so the normal
         # context menu / link flow works on them transparently.
         for label_id, ellipse, _text in self._waterfall_projection_items:
+            if not ellipse.isVisible():
+                continue
             scene_rect = ellipse.sceneBoundingRect()
             hit_margin = scene_rect.width() * 0.5
             scene_rect.adjust(-hit_margin, -hit_margin, hit_margin, hit_margin)
