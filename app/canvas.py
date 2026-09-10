@@ -1692,6 +1692,11 @@ class MapCanvas(QGraphicsView):
     # Carries the message for the status bar.
     label_rejected = pyqtSignal(str)
 
+    # Right-click a label > Export Object Snippets: the CNN workflow is
+    # "give me every view of this one object", so the object a label belongs
+    # to is the selection unit, not the label and not the class.
+    export_object_requested = pyqtSignal(int)      # label_id
+
     label_removed = pyqtSignal(int, str)
 
     # Signal emitted when two labels are linked: (label_id1, label_id2)
@@ -4519,6 +4524,12 @@ class MapCanvas(QGraphicsView):
 
             menu.addSeparator()
 
+            export_object_action = menu.addAction(
+                "Export Object Snippets...")
+            export_object_action.setToolTip(
+                "Export the true-positive snippets for this object - every "
+                "image it was labelled in, or just the ones toggled on.")
+
             describe_action = menu.addAction("Description...")
             group_id_action = menu.addAction("Group ID...")
 
@@ -4542,6 +4553,8 @@ class MapCanvas(QGraphicsView):
                 # Clearing is routed through the same signal; main_window
                 # resets length_m/width_m and calls set_label_measured(False).
                 self.label_measured.emit(label_id, None, None)
+            elif action == export_object_action:
+                self.export_object_requested.emit(label_id)
             elif action == describe_action:
                 self.label_describe_requested.emit(label_id)
             elif action == group_id_action:

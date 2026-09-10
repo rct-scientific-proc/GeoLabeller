@@ -41,7 +41,7 @@ from .snippets import (centered_window, nodata_mask, _band_scaling,  # noqa: F40
                        _window_pixels)
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox, QLabel,
-    QLineEdit, QSpinBox, QComboBox, QRadioButton, QButtonGroup, QPushButton,
+    QLineEdit, QSpinBox, QComboBox, QRadioButton, QPushButton,
     QDialogButtonBox, QFileDialog, QCheckBox,
 )
 
@@ -79,14 +79,26 @@ class ExportImage:
 # clear of the crop edge.
 DEFAULT_POSITIVE_OFFSET = 16
 
-# Which layers an export covers.
-SCOPE_ALL = "all"
-SCOPE_VISIBLE = "visible"
-SCOPE_LABELLED = "labelled"  # visible *and* carrying at least one label
-# Examples-only scopes: only snippets containing a label are exported - the
-# hard-negative sliding window never runs.
-SCOPE_ALL_EXAMPLES = "all_examples"          # every loaded layer with labels
-SCOPE_VISIBLE_EXAMPLES = "visible_examples"  # visible layers with labels
+# An export answers two independent questions - which images contribute
+# gt=True examples, and which get the hard-negative window slid over them.
+# They used to share one list of five radio buttons, which left most
+# combinations unreachable: "examples from everything, negatives only from
+# the layers I have toggled on" could not be said at all, and neither could
+# "negatives and nothing else".
+#
+# Where the example crops come from:
+EXAMPLES_NONE = "none"                    # negatives only
+EXAMPLES_OBJECT = "object"                # the selected object(s), every view
+EXAMPLES_OBJECT_VISIBLE = "object_visible"   # ...only on toggled-on layers
+EXAMPLES_VISIBLE = "visible"              # toggled-on layers that have labels
+EXAMPLES_ALL = "all"                      # every loaded layer that has labels
+
+# Which images the hard-negative window is slid over:
+NEGATIVES_NONE = "none"                   # true positives only
+NEGATIVES_SAME = "same"                   # only images contributing examples
+NEGATIVES_VISIBLE = "visible"             # every toggled-on layer
+NEGATIVES_FLAGGED = "flagged"             # flagged hard-negative sources only
+NEGATIVES_ALL = "all"                     # every loaded layer
 
 SPLIT_CHOICES = {"Train (0)": 0, "Validate (1)": 1, "Test (2)": 2}
 CHANNEL_CHOICES = {"RGB (3 channels)": 3, "Grayscale (1 channel)": 1}
@@ -892,18 +904,24 @@ class H5ExportDialog(QDialog):
     fixed at creation time are shown but locked.
     """
 
-    def __init__(self, all_count, visible_count, labelled_count=0, parent=None,
-                 defaults=None, all_labelled_count=0,
-                 hn_all_count=0, hn_visible_count=0):
-        """Build the dialog. ``*_count`` size the scope radio labels."""
+    def __init__(self, counts=None, parent=None, defaults=None,
+                 selection=None):
+        """Build the dialog.
+
+        ``counts`` sizes the scope options - keys ``all``, ``visible``,
+        ``labelled_all``, ``labelled_visible``, ``flagged_all`` and
+        ``flagged_visible``, each an image count, all defaulting to 0.
+
+        ``selection`` is what turns this into the per-object dialog: keys
+        ``ids`` (the chosen object ids), ``instances`` and
+        ``instances_visible`` (how many images they appear in) and
+        ``classes`` ({class name: count} across those instances, so a linked
+        object whose views disagree about a class shows the disagreement
+        before it is exported). ``None`` for the whole-project export.
+        """
         super().__init__(parent)
-        self._all_count = all_count
-        self._visible_count = visible_count
-        self._labelled_count = labelled_count
-        self._all_labelled_count = all_labelled_count
-        # Loaded layers flagged as hard-negative sources (all / visible only).
-        self._hn_all_count = hn_all_count
-        self._hn_visible_count = hn_visible_count
+        self._counts = dict(counts or {})
+        self._selection = dict(selection) if selection else None
         self._defaults = dict(defaults or {})
         self.setWindowTitle("Export HDF5 Dataset")
         self.setMinimumWidth(500)
@@ -921,60 +939,83 @@ class H5ExportDialog(QDialog):
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        # Scope
-        scope_box = QGroupBox("Images to export")
-        scope_layout = QVBoxLayout(scope_box)
-        self.scope_all = QRadioButton(f"All loaded layers ({self._all_count})")
-        self.scope_visible = QRadioButton(
-            f"Only visible (ON) layers ({self._visible_count})")
-        self.scope_labelled = QRadioButton(
-            f"Only visible (ON) layers with labels ({self._labelled_count})")
-        self.scope_labelled.setToolTip(
-            "Skips visible layers that have no labels, so the export contains "
-            "no images made up entirely of hard negatives.")
-        self.scope_all_examples = QRadioButton(
-            "Labelled snippets ONLY - all loaded layers "
-            f"({self._all_labelled_count})")
-        self.scope_all_examples.setToolTip(
-            "Export only the snippets that contain a label centre, from every "
-            "loaded layer that has labels (visible or not). No hard negatives "
-            "are written at all.")
-        self.scope_visible_examples = QRadioButton(
-            "Labelled snippets ONLY - visible (ON) layers "
-            f"({self._labelled_count})")
-        self.scope_visible_examples.setToolTip(
-            "Export only the snippets that contain a label centre, from the "
-            "layers toggled on in the viewer. No hard negatives are written "
-            "at all.")
-        self.scope_all.setChecked(True)
-        if self._visible_count == 0:
-            self.scope_visible.setEnabled(False)
-        if self._labelled_count == 0:
-            self.scope_labelled.setEnabled(False)
-            self.scope_visible_examples.setEnabled(False)
-        if self._all_labelled_count == 0:
-            self.scope_all_examples.setEnabled(False)
-        self._scope_group = QButtonGroup(self)
-        for button in (self.scope_all, self.scope_visible, self.scope_labelled,
-                       self.scope_all_examples, self.scope_visible_examples):
-            self._scope_group.addButton(button)
-            scope_layout.addWidget(button)
-            # Examples-only scopes make the hard-negative options irrelevant.
-            button.toggled.connect(self._on_scope_changed)
+        # Where the examples come from. When the dialog was opened on an
+        # object, that object leads the list and is preselected.
+        n = self._counts
+        ex_box = QGroupBox("Examples (gt=true) from")
+        ex_layout = QVBoxLayout(ex_box)
+        self._example_buttons = []
+        if self._selection:
+            summary = self._selection_summary()
+            layout.addWidget(self._selection_banner(summary))
+            self._add_example_option(
+                ex_layout, EXAMPLES_OBJECT,
+                f"The selected object - every image it appears in "
+                f"({self._selection.get('instances', 0)})",
+                "Export the true-positive snippets for this object alone, "
+                "from every image it was labelled in.")
+            self._add_example_option(
+                ex_layout, EXAMPLES_OBJECT_VISIBLE,
+                f"The selected object - only layers toggled on "
+                f"({self._selection.get('instances_visible', 0)})",
+                "The same, restricted to the images currently toggled on in "
+                "the viewer.",
+                enabled=self._selection.get("instances_visible", 0) > 0)
+        self._add_example_option(
+            ex_layout, EXAMPLES_VISIBLE,
+            f"Layers toggled on, with labels ({n.get('labelled_visible', 0)})",
+            "Every label on the images toggled on in the viewer.",
+            enabled=n.get("labelled_visible", 0) > 0)
+        self._add_example_option(
+            ex_layout, EXAMPLES_ALL,
+            f"All loaded layers, with labels ({n.get('labelled_all', 0)})",
+            "Every label in the project's loaded imagery, visible or not.",
+            enabled=n.get("labelled_all", 0) > 0)
+        self._add_example_option(
+            ex_layout, EXAMPLES_NONE, "Nothing - hard negatives only",
+            "Write no examples at all: just the sliding-window negatives "
+            "chosen below, which is how a set is topped up with negatives "
+            "from a new area.")
+        layout.addWidget(ex_box)
 
-        # Flagged hard-negative sources join a labels-only scope on request.
-        # Lives here rather than in the hard-negatives box below, because that
-        # box is greyed out exactly when this choice matters.
-        self.include_hn_check = QCheckBox()
-        self.include_hn_check.setToolTip(
-            "Images flagged as hard-negative sources (right click an image on "
-            "the canvas) are slid in full and every window written as a hard "
-            "negative (gt=False), sharing the split settings below. Only "
-            "meaningful for the labels-only scopes; the full scopes already "
-            "slide every image.")
-        self.include_hn_check.toggled.connect(self._on_scope_changed)
-        scope_layout.addWidget(self.include_hn_check)
-        layout.addWidget(scope_box)
+        # ...and, independently, which images get slid for hard negatives.
+        neg_box = QGroupBox("Hard negatives (gt=false) from")
+        neg_layout = QVBoxLayout(neg_box)
+        self._negative_buttons = []
+        self._add_negative_option(
+            neg_layout, NEGATIVES_NONE, "Nothing - true positives only",
+            "No sliding window runs; the file gets example crops alone.")
+        self._add_negative_option(
+            neg_layout, NEGATIVES_SAME,
+            "Only the images that contribute examples",
+            "Slide the same images the examples came from, and no others - "
+            "so the export contains no image made up entirely of negatives.")
+        self._add_negative_option(
+            neg_layout, NEGATIVES_VISIBLE,
+            f"Layers toggled on ({n.get('visible', 0)})",
+            "Slide every image toggled on in the viewer, labelled or not.",
+            enabled=n.get("visible", 0) > 0)
+        self._add_negative_option(
+            neg_layout, NEGATIVES_FLAGGED,
+            f"Flagged hard-negative sources only "
+            f"({n.get('flagged_all', 0)})",
+            "Only the images flagged as hard-negative sources (right click "
+            "an image on the canvas): confusers with no true positives.",
+            enabled=n.get("flagged_all", 0) > 0)
+        self._add_negative_option(
+            neg_layout, NEGATIVES_ALL,
+            f"All loaded layers ({n.get('all', 0)})",
+            "Slide every loaded image.",
+            enabled=n.get("all", 0) > 0)
+        layout.addWidget(neg_box)
+
+        # Nothing labelled is ever offered as background, whatever these two
+        # say - every label on an image guards its ground (see export_image).
+        guard = QLabel(
+            "Labelled ground is never written as a hard negative, whichever "
+            "images are slid.")
+        guard.setWordWrap(True)
+        layout.addWidget(guard)
 
         # Options
         opts = QGroupBox("Snippet options")
@@ -1067,7 +1108,7 @@ class H5ExportDialog(QDialog):
 
         # Hard-negative split
         neg_box = QGroupBox("Hard negatives")
-        self._neg_box = neg_box  # greyed out for examples-only scopes
+        self._neg_box = neg_box  # greyed out when no negatives are written
         neg_layout = QVBoxLayout(neg_box)
         self.split_negatives_check = QCheckBox(
             "Split hard negatives across train / validate / test")
@@ -1122,15 +1163,25 @@ class H5ExportDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
 
+        # An opening pair for the two axes. Opened on an object, the useful
+        # default is that object's true positives and nothing else; opened
+        # from the menu it is what the single "All loaded layers" scope used
+        # to mean - every labelled image exported and every image slid.
+        if self._selection:
+            self._select_value(self._example_buttons, EXAMPLES_OBJECT)
+            self._select_value(self._negative_buttons, NEGATIVES_NONE)
+        else:
+            self._select_value(self._example_buttons, EXAMPLES_ALL)
+            self._select_value(self._negative_buttons, NEGATIVES_ALL)
+
         # Last: setting the path fires _on_out_path_changed, which needs every
         # widget above to exist, and lets the file's own settings win over the
         # caller's defaults.
         self._apply_settings(self._defaults)
         self.out_edit.setText(self._defaults.get("out_path", ""))
         self._on_out_path_changed()
-        # The default radio is checked before the toggled signals connect, so
-        # nothing has run the scope handler yet - the flagged-images checkbox
-        # needs it for its initial text and enabled state.
+        # The axes may have been set before their toggled signals were
+        # connected, so run the handler once for the initial enabled states.
         self._on_scope_changed()
 
     def _apply_settings(self, settings):
@@ -1153,9 +1204,15 @@ class H5ExportDialog(QDialog):
         if settings.get("split_negatives") is not None:
             self.split_negatives_check.setChecked(
                 bool(settings["split_negatives"]))
-        if settings.get("include_hard_negatives") is not None:
-            self.include_hn_check.setChecked(
-                bool(settings["include_hard_negatives"]))
+        # The remembered axes, when they still apply. An object scope is
+        # never restored: it belongs to the selection this dialog was opened
+        # on, not to the last export.
+        wanted = settings.get("examples_scope")
+        if wanted in (EXAMPLES_VISIBLE, EXAMPLES_ALL, EXAMPLES_NONE):
+            self._select_value(self._example_buttons, wanted)
+        if settings.get("negatives_scope"):
+            self._select_value(self._negative_buttons,
+                               settings["negatives_scope"])
         ratio = settings.get("negative_ratio")
         if ratio is not None and len(ratio) == 3:
             for spin, share in zip(
@@ -1173,6 +1230,78 @@ class H5ExportDialog(QDialog):
                 label = _choice_label(choices, settings[key])
                 if label is not None:
                     combo.setCurrentText(label)
+
+    def _add_example_option(self, box, value, text, tip, enabled=True):
+        """One radio on the examples axis."""
+        self._add_option(box, self._example_buttons, value, text, tip,
+                         enabled)
+
+    def _add_negative_option(self, box, value, text, tip, enabled=True):
+        """One radio on the hard-negatives axis."""
+        self._add_option(box, self._negative_buttons, value, text, tip,
+                         enabled)
+
+    def _add_option(self, box, bucket, value, text, tip, enabled):
+        button = QRadioButton(text)
+        button.setToolTip(tip)
+        button.setEnabled(enabled)
+        button.toggled.connect(self._on_scope_changed)
+        box.addWidget(button)
+        bucket.append((value, button))
+
+    def _selection_summary(self) -> str:
+        """One line naming the object(s) and how their views are classed."""
+        ids = self._selection.get("ids") or []
+        classes = self._selection.get("classes") or {}
+        spread = ", ".join(f"{name} x{count}"
+                           for name, count in sorted(classes.items()))
+        who = (f"Object {ids[0][:8]}..." if len(ids) == 1
+               else f"{len(ids)} objects")
+        return (f"{who}   seen in {self._selection.get('instances', 0)} "
+                f"image(s)   {spread}")
+
+    def _selection_banner(self, summary: str) -> QLabel:
+        """The object header, and a warning when its views disagree."""
+        text = summary
+        if len(self._selection.get("classes") or {}) > 1:
+            # Not an error: the instances are exported under their own class
+            # names, as any other export would. But two names on one linked
+            # object is usually a disagreement worth settling first.
+            text += ("\nThese views do not agree on a class. Each snippet is "
+                     "written under its own label's class.")
+        label = QLabel(text)
+        label.setWordWrap(True)
+        return label
+
+    def _checked_value(self, bucket, fallback):
+        for value, button in bucket:
+            if button.isChecked():
+                return value
+        return fallback
+
+    def _select_value(self, bucket, wanted):
+        """Check the option for ``wanted``, or the first enabled one."""
+        for value, button in bucket:
+            if value == wanted and button.isEnabled():
+                button.setChecked(True)
+                return True
+        for _value, button in bucket:
+            if button.isEnabled():
+                button.setChecked(True)
+                return False
+        return False
+
+    def examples_scope(self) -> str:
+        """Which images contribute gt=True crops - an EXAMPLES_* value."""
+        return self._checked_value(self._example_buttons, EXAMPLES_NONE)
+
+    def negatives_scope(self) -> str:
+        """Which images get slid for negatives - a NEGATIVES_* value."""
+        return self._checked_value(self._negative_buttons, NEGATIVES_NONE)
+
+    def selected_object_ids(self) -> list:
+        """The object ids this dialog was opened on ([] when it was not)."""
+        return list((self._selection or {}).get("ids") or [])
 
     def _fixed_widgets(self):
         """The widgets an existing file dictates.
@@ -1206,41 +1335,21 @@ class H5ExportDialog(QDialog):
         self._update_ok_enabled()
 
     def _on_scope_changed(self, _checked=False):
-        """Track which negative-related controls the scope leaves relevant."""
-        scope = self.scope()
-        labels_only = scope in (SCOPE_LABELLED, SCOPE_ALL_EXAMPLES,
-                                SCOPE_VISIBLE_EXAMPLES)
-        # ALL_EXAMPLES ignores visibility, so it can pull in hidden flagged
-        # images; the other labels-only scopes are visible-only.
-        count = (self._hn_all_count if scope == SCOPE_ALL_EXAMPLES
-                 else self._hn_visible_count)
-        self.include_hn_check.setText(
-            f"Also include flagged hard-negative source images ({count} flagged)")
-        self.include_hn_check.setEnabled(labels_only and count > 0)
-        # The split options apply whenever negatives will be written - always
-        # for the full scopes, and for a labels-only scope once flagged
-        # images are pulled in.
+        """Keep the split controls and the OK button in step with the axes."""
         self._neg_box.setEnabled(self._writes_negatives())
         self._update_ok_enabled()
-
-    def examples_only(self) -> bool:
-        """True when the selected scope exports labelled snippets only."""
-        return (self.scope_all_examples.isChecked()
-                or self.scope_visible_examples.isChecked())
-
-    def include_hard_negatives(self) -> bool:
-        """True when flagged hard-negative sources join the export."""
-        return (self.include_hn_check.isEnabled()
-                and self.include_hn_check.isChecked())
 
     def _writes_negatives(self) -> bool:
         """Will this export write any hard negatives at all?
 
-        Governs whether the split controls and their 100% check matter: the
-        full scopes always slide, and a labels-only scope slides the flagged
-        images once they are included.
+        Governs whether the split controls and their 100% check matter.
         """
-        return not self.examples_only() or self.include_hard_negatives()
+        return self.negatives_scope() != NEGATIVES_NONE
+
+    def _writes_anything(self) -> bool:
+        """The one nonsense pair: no examples AND no negatives."""
+        return (self.examples_scope() != EXAMPLES_NONE
+                or self._writes_negatives())
 
     def _on_offset_toggled(self, enabled):
         """Enable the offset distance only while the copies are switched on."""
@@ -1273,8 +1382,10 @@ class H5ExportDialog(QDialog):
             "" if offset_ok
             else f"Offset must be under half the snippet ({limit} px), or the "
                  "object falls outside its own examples.")
+        # An export with neither examples nor negatives would write an
+        # empty file; it is the one pair of axis choices that means nothing.
         self.buttons.button(QDialogButtonBox.Ok).setEnabled(
-            has_path and ratio_ok and offset_ok)
+            has_path and ratio_ok and offset_ok and self._writes_anything())
 
     def _on_out_path_changed(self):
         """Adopt an existing target file's settings and enable/disable Export."""
@@ -1313,18 +1424,6 @@ class H5ExportDialog(QDialog):
                 path += ".h5"
             self.out_edit.setText(path)
 
-    def scope(self) -> str:
-        """Return which layers to export: one of the ``SCOPE_*`` constants."""
-        if self.scope_all_examples.isChecked():
-            return SCOPE_ALL_EXAMPLES
-        if self.scope_visible_examples.isChecked():
-            return SCOPE_VISIBLE_EXAMPLES
-        if self.scope_labelled.isChecked():
-            return SCOPE_LABELLED
-        if self.scope_visible.isChecked():
-            return SCOPE_VISIBLE
-        return SCOPE_ALL
-
     def output_path(self) -> str:
         """Return the chosen output .h5 path."""
         return self.out_edit.text().strip()
@@ -1344,10 +1443,11 @@ class H5ExportDialog(QDialog):
             "positive_offset": (self.offset_spin.value()
                                 if self.offset_check.isChecked() else 0),
             "compression": COMPRESSION_CHOICES[self.compress_combo.currentText()],
-            # Scope-level value; the worker takes a per-image one, so a
-            # labels-only run can still slide its flagged images.
-            "examples_only": self.examples_only(),
-            "include_hard_negatives": self.include_hard_negatives(),
+            # The two axes; MainWindow turns them into the per-image
+            # example/slide decisions the worker takes.
+            "examples_scope": self.examples_scope(),
+            "negatives_scope": self.negatives_scope(),
+            "object_ids": self.selected_object_ids(),
             "split_negatives": (self.split_negatives_check.isChecked()
                                 and self._writes_negatives()),
             "negative_ratio": tuple(

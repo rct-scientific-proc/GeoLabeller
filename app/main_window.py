@@ -42,10 +42,11 @@ from .labels import LabelProject, combine_projects, haversine_distance
 from .layer_panel import CombinedLayerPanel
 from .optimize_export import (OptimizeExportDialog, OptimizeWorker,
                               plan_output_paths)
-from .h5_export import (ExportImage, H5ExportDialog, H5ExportWorker,
-                        HARD_NEGATIVE, SCOPE_LABELLED, SCOPE_VISIBLE,
-                        SCOPE_ALL_EXAMPLES, SCOPE_VISIBLE_EXAMPLES,
-                        centered_window)
+from .h5_export import (EXAMPLES_ALL, EXAMPLES_OBJECT,
+                        EXAMPLES_OBJECT_VISIBLE, EXAMPLES_VISIBLE,
+                        ExportImage, H5ExportDialog, H5ExportWorker,
+                        HARD_NEGATIVE, NEGATIVES_ALL, NEGATIVES_FLAGGED,
+                        NEGATIVES_SAME, NEGATIVES_VISIBLE, centered_window)
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
 from .mask_editor import MaskEditor
@@ -443,6 +444,10 @@ class MainWindow(QMainWindow):
         self.layer_panel.group_location_edit_requested.connect(
             self._on_group_location_edit)
 
+        self.canvas.export_object_requested.connect(
+            self._export_object_of_label)
+        self.layer_panel.export_object_requested.connect(
+            lambda object_id: self._export_object_snippets([object_id]))
         self.canvas.layer_load_failed.connect(self._on_layer_load_failed)
         self.canvas.coordinates_changed.connect(self._update_coordinates)
         self.canvas.label_placed.connect(self._on_label_placed)
@@ -2813,8 +2818,126 @@ class MainWindow(QMainWindow):
         img = self.project.images.get(path)
         return bool(img is not None and img.hard_negative_source)
 
-    def _export_h5(self):
-        """Export sliding-window snippets to the HDF5 CNN dataset format."""
+    def _h5_counts(self, infos) -> dict:
+        """How many loaded images each scope option covers."""
+        visible = [i for i in infos if i.get("visible")]
+        return {
+            "all": len(infos),
+            "visible": len(visible),
+            "labelled_all": sum(1 for i in infos
+                                if self._h5_labels_for(i["file_path"])),
+            "labelled_visible": sum(1 for i in visible
+                                    if self._h5_labels_for(i["file_path"])),
+            "flagged_all": sum(1 for i in infos
+                               if self._h5_is_hn_source(i["file_path"])),
+            "flagged_visible": sum(1 for i in visible
+                                   if self._h5_is_hn_source(i["file_path"])),
+        }
+
+    def _h5_selection(self, infos, object_ids) -> "dict | None":
+        """Describe the objects an export was opened on, for the dialog.
+
+        Counts the images each object was labelled in, and how their labels
+        are classed - a linked object whose views disagree about the class
+        is worth seeing before the export rather than after.
+        """
+        if not object_ids:
+            return None
+        wanted = set(object_ids)
+        visible_paths = {i["file_path"] for i in infos if i.get("visible")}
+        loaded_paths = {i["file_path"] for i in infos}
+        instances = 0
+        instances_visible = 0
+        classes: dict = {}
+        for path, image in self.project.images.items():
+            if path not in loaded_paths:
+                continue
+            here = [l for l in image.labels
+                    if getattr(l, "object_id", None) in wanted]
+            if not here:
+                continue
+            instances += 1
+            if path in visible_paths:
+                instances_visible += 1
+            for label in here:
+                classes[label.class_name] = classes.get(label.class_name,
+                                                        0) + 1
+        return {"ids": list(object_ids), "instances": instances,
+                "instances_visible": instances_visible, "classes": classes}
+
+    def _h5_images_for(self, infos, examples_scope, negatives_scope,
+                       object_ids) -> list:
+        """Turn the two scope axes into one request per image.
+
+        The axes are independent by design: which images contribute example
+        crops has nothing to do with which get the hard-negative window slid
+        over them. Every image that takes part carries its FULL label list as
+        `protect`, so no labelled ground is ever offered as background - see
+        export_image.
+        """
+        wanted = set(object_ids or ())
+        images = []
+        for info in infos:
+            path = info["file_path"]
+            visible = bool(info.get("visible"))
+            labels = self._h5_labels_for(path)
+
+            if examples_scope == EXAMPLES_ALL:
+                examples = labels
+            elif examples_scope == EXAMPLES_VISIBLE:
+                examples = labels if visible else []
+            elif examples_scope == EXAMPLES_OBJECT:
+                examples = [l for l in labels
+                            if getattr(l, "object_id", None) in wanted]
+            elif examples_scope == EXAMPLES_OBJECT_VISIBLE:
+                examples = [l for l in labels
+                            if visible
+                            and getattr(l, "object_id", None) in wanted]
+            else:                                   # EXAMPLES_NONE
+                examples = []
+
+            if negatives_scope == NEGATIVES_ALL:
+                slide = True
+            elif negatives_scope == NEGATIVES_VISIBLE:
+                slide = visible
+            elif negatives_scope == NEGATIVES_FLAGGED:
+                slide = self._h5_is_hn_source(path)
+            elif negatives_scope == NEGATIVES_SAME:
+                slide = bool(examples)
+            else:                                   # NEGATIVES_NONE
+                slide = False
+
+            if not examples and not slide:
+                continue
+            img = self.project.images.get(path)
+            images.append(ExportImage(
+                path=path,
+                labels=examples,
+                examples_only=not slide,
+                location=img.location if img is not None else "",
+                protect=list(img.labels) if img is not None else []))
+        return images
+
+    def _export_object_snippets(self, object_ids):
+        """Export the snippets of one linked object (or several)."""
+        ids = [oid for oid in object_ids if oid]
+        if not ids:
+            return
+        self._export_h5(object_ids=ids)
+
+    def _export_object_of_label(self, label_id: int):
+        """Export the object a label belongs to, chosen by right-click."""
+        _image, label = self.project.get_label_by_id(label_id)
+        if label is None:
+            return
+        self._export_object_snippets([label.object_id])
+
+    def _export_h5(self, object_ids=None):
+        """Export sliding-window snippets to the HDF5 CNN dataset format.
+
+        ``object_ids`` opens the dialog scoped to those linked objects - the
+        per-object export reached by right-clicking a label or an object row.
+        """
         # The editor refuses this name now, but a project written before the
         # guard (or edited by hand) can still carry it - and exporting would
         # write two indistinguishable 'hard_negative' classes.
@@ -2833,57 +2956,18 @@ class MainWindow(QMainWindow):
                 self, "HDF5 Export", "No layers are loaded to export.")
             return
 
-        all_count = len(infos)
-        visible_count = sum(1 for i in infos if i.get("visible"))
-        labelled_count = sum(1 for i in infos if i.get("visible")
-                             and self._h5_labels_for(i["file_path"]))
-        all_labelled_count = sum(1 for i in infos
-                                 if self._h5_labels_for(i["file_path"]))
-        hn_all_count = sum(1 for i in infos
-                           if self._h5_is_hn_source(i["file_path"]))
-        hn_visible_count = sum(1 for i in infos if i.get("visible")
-                               and self._h5_is_hn_source(i["file_path"]))
-        dialog = H5ExportDialog(all_count, visible_count, labelled_count, self,
+        dialog = H5ExportDialog(self._h5_counts(infos), self,
                                 defaults=self._h5_last_options,
-                                all_labelled_count=all_labelled_count,
-                                hn_all_count=hn_all_count,
-                                hn_visible_count=hn_visible_count)
+                                selection=self._h5_selection(infos,
+                                                             object_ids))
         if not dialog.exec_():
             return
 
         out_path = dialog.output_path()
-        scope = dialog.scope()
-        # Which images the scope covers. The examples-only scopes only need
-        # labelled images (unlabelled ones would contribute nothing anyway).
-        needs_visible = scope in (SCOPE_VISIBLE, SCOPE_LABELLED,
-                                  SCOPE_VISIBLE_EXAMPLES)
-        needs_labels = scope in (SCOPE_LABELLED, SCOPE_ALL_EXAMPLES,
-                                 SCOPE_VISIBLE_EXAMPLES)
         options = dialog.options()
-        include_hn = options.get("include_hard_negatives", False)
-        # Per-image examples_only: normally the scope decides, but a flagged
-        # image being pulled in must slide, so it gets False even under an
-        # examples-only scope - its labels (if any) still export as examples,
-        # and the engine keeps negatives off the ground they cover.
-        images = []
-        for info in infos:
-            if needs_visible and not info.get("visible"):
-                continue
-            path = info["file_path"]
-            labels = self._h5_labels_for(path)
-            flagged = include_hn and self._h5_is_hn_source(path)
-            if needs_labels and not labels and not flagged:
-                continue
-            img = self.project.images.get(path)
-            # Every label on the image is protected from the negative grid,
-            # whatever its class and whether or not it is being exported -
-            # the rule is about the ground, not about the selection.
-            images.append(ExportImage(
-                path=path,
-                labels=labels,
-                examples_only=options["examples_only"] and not flagged,
-                location=img.location if img is not None else "",
-                protect=list(img.labels) if img is not None else []))
+        images = self._h5_images_for(
+            infos, options["examples_scope"], options["negatives_scope"],
+            options.get("object_ids") or [])
         if not images:
             QMessageBox.information(
                 self, "HDF5 Export", "No images in the selected scope.")

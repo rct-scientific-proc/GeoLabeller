@@ -1220,6 +1220,10 @@ class LabeledLayerPanel(QWidget):
     # lon, lat - zoom to specific coordinates
     # Reveal a label properly: main_window loads/toggles its image and zooms.
     reveal_label_requested = pyqtSignal(int)
+    # Right-click an "Object: ..." row > Export Object Snippets. The CNN
+    # workflow is "every view of this one object", so the object is the
+    # selection unit - not the label, and not the class.
+    export_object_requested = pyqtSignal(str)  # object_id
 
     def __init__(self):
         """Initialize the labeled-layer panel and its file-to-layer map."""
@@ -1600,6 +1604,18 @@ class LabeledLayerPanel(QWidget):
 
             menu.addSeparator()
 
+            # The whole object as a training set of its own: every view of
+            # it, or only the ones toggled on (chosen in the dialog).
+            object_id = item.data(0, Qt.UserRole)
+            if object_id:
+                export_action = menu.addAction("Export Object Snippets...")
+                export_action.setToolTip(
+                    "Export the true-positive snippets for this object from "
+                    "every image it appears in.")
+                export_action.triggered.connect(
+                    lambda: self.export_object_requested.emit(object_id))
+                menu.addSeparator()
+
             # Select/unselect all in group
             select_all_action = menu.addAction("Select all")
             select_all_action.triggered.connect(
@@ -1914,6 +1930,7 @@ class CombinedLayerPanel(QWidget):
     layer_group_changed = pyqtSignal(str, str)
     zoom_to_layer_requested = pyqtSignal(str)
     reveal_label_requested = pyqtSignal(int)  # label_id
+    export_object_requested = pyqtSignal(str)  # object_id
     layer_removed = pyqtSignal(str)
     layers_removed = pyqtSignal(list)  # [(layer_id, file_path), ...]
 
@@ -2018,6 +2035,8 @@ class CombinedLayerPanel(QWidget):
             self.zoom_to_layer_requested)
         self.labeled_panel.reveal_label_requested.connect(
             self.reveal_label_requested)
+        self.labeled_panel.export_object_requested.connect(
+            self.export_object_requested)
 
         # Forward signals from the hard-negatives panel. Zoom rides the same
         # signal the main tree uses, so MainWindow needs no extra wiring for
