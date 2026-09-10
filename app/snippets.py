@@ -86,6 +86,37 @@ def _band_scaling(src):
     return lows, highs
 
 
+def nodata_mask(data, nodata):
+    """Which pixels carry no data - by sentinel AND by NaN.
+
+    Two things mean "nothing here" and only one of them is comparable.
+    ``data == nodata`` is False for every NaN, because NaN equals nothing,
+    itself included - so a sentinel test alone lets NaN through as if it
+    were a measurement. It then poisons a mean (one NaN makes the mean
+    NaN), casts to an undefined byte, or hides an entirely empty window
+    from the "skip this" check.
+
+    Returns a boolean array shaped like ``data``, or None when nothing in
+    it can be nodata (integer imagery with no declared sentinel), so
+    callers can skip the work entirely.
+    """
+    data = np.asarray(data)
+    mask = None
+    if np.issubdtype(data.dtype, np.floating):
+        mask = np.isnan(data)
+    if nodata is not None:
+        try:
+            sentinel = float(nodata)
+        except (TypeError, ValueError):
+            sentinel = None
+        # A declared NaN sentinel is already covered by the isnan pass, and
+        # comparing against it would match nothing.
+        if sentinel is not None and not np.isnan(sentinel):
+            hit = data == nodata
+            mask = hit if mask is None else (mask | hit)
+    return mask
+
+
 def _window_pixels(src, window, channels, nodata, scaling=None):
     """Read a window as an (H, W, C) uint8 array, or None if entirely nodata.
 
@@ -93,7 +124,8 @@ def _window_pixels(src, window, channels, nodata, scaling=None):
     non-uint8 sources (uint8 data passes through byte-exact).
     """
     data = src.read(window=window)  # (bands, h, w)
-    if nodata is not None and bool(np.all(data == nodata)):
+    empty = nodata_mask(data, nodata)
+    if empty is not None and bool(empty.all()):
         return None
     if scaling is not None:
         lo, hi = scaling
@@ -102,6 +134,10 @@ def _window_pixels(src, window, channels, nodata, scaling=None):
         scaled -= lo[:, None, None]
         scaled *= (255.0 / np.maximum(hi - lo, 1e-6))[:, None, None]
         data = np.clip(scaled, 0.0, 255.0)
+    if np.issubdtype(data.dtype, np.floating) and not np.isfinite(data).all():
+        # NaN cast to an integer is undefined (0 on x86, plus a numpy
+        # RuntimeWarning); paint nodata black rather than arbitrary.
+        data = np.nan_to_num(data, nan=0.0, posinf=255.0, neginf=0.0)
     bands = data.shape[0]
     if channels == 1:
         if bands >= 3:
@@ -175,17 +211,19 @@ def read_label_window_raw(image_path: str, pixel_x: float, pixel_y: float,
                           size_px: int) -> "tuple | None":
     """RAW source values of a label's snippet window, plus its frame.
 
-    Returns ((bands, h, w) array in the source dtype, (x0, y0, w, h)) or
-    None on failure. No stretch and no RGB collapse: the mask editor's
-    object-versus-background statistics must describe the actual data, and
-    a display-stretched byte distribution would describe the stretch.
+    Returns ((bands, h, w) array in the source dtype, (x0, y0, w, h),
+    nodata) or None on failure. No stretch and no RGB collapse: the mask
+    editor's object-versus-background statistics must describe the actual
+    data, and a display-stretched byte distribution would describe the
+    stretch. The declared nodata rides along because raw values alone
+    cannot say which of them mean "nothing here" - see nodata_mask.
     """
     try:
         with rasterio.open(image_path) as src:
             x0, y0, w, h = snippet_frame(pixel_x, pixel_y, size_px,
                                          src.width, src.height)
             data = src.read(window=Window(x0, y0, w, h))
-            return data, (x0, y0, w, h)
+            return data, (x0, y0, w, h), src.nodata
     except Exception as exc:  # noqa: BLE001 - stats just go missing
         debug(f"raw window read failed: {Path(image_path).name}: "
               f"{type(exc).__name__}: {exc}")

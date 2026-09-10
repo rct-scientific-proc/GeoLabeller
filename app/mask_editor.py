@@ -375,6 +375,7 @@ class MaskEditor(QWidget):
         self._layers: "dict[str, np.ndarray]" = {}
         self._order: list = []
         self._raw = None                          # (bands, h, w) source data
+        self._raw_nodata = None                   # its declared nodata
         # Image (width, height) by path - one header read each, so every
         # stroke can serialize against the full image without touching disk.
         self._image_dims: "dict[str, tuple | None]" = {}
@@ -576,6 +577,7 @@ class MaskEditor(QWidget):
         self._layers = {}
         self._order = []
         self._raw = None
+        self._raw_nodata = None
         self._stored_by_name = {}
         size = self.size_spin.value()
         if entry is None:
@@ -587,7 +589,7 @@ class MaskEditor(QWidget):
         raw = read_label_window_raw(entry["image_path"], entry["pixel_x"],
                                     entry["pixel_y"], size)
         if raw is not None:
-            self._raw, self._frame = raw
+            self._raw, self._frame, self._raw_nodata = raw
         else:
             self._frame = (0, 0, size, size)
         x0, y0, w, h = self._frame
@@ -746,7 +748,8 @@ class MaskEditor(QWidget):
                 or name not in self._layers):
             self.stats_label.setText("-")
             return
-        stats = mask_statistics(self._raw, self._layers[name])
+        stats = mask_statistics(self._raw, self._layers[name],
+                                nodata=self._raw_nodata)
         if stats is None:
             self.stats_label.setText(
                 "Paint some pixels to compare the object's raw values "

@@ -319,26 +319,46 @@ def merged_entry(name: str, x0: int, y0: int, layer: np.ndarray,
     return mask_entry(name, ux0, uy0, union)
 
 
-def mask_statistics(pixels: np.ndarray, mask: np.ndarray) -> "dict | None":
+def mask_statistics(pixels: np.ndarray, mask: np.ndarray,
+                    nodata=None) -> "dict | None":
     """Per-band mean/std of the masked object versus the background.
 
     ``pixels`` is a (bands, height, width) array of RAW source values (not
     the display stretch - distributions of stretched bytes would be
     meaningless), ``mask`` the (height, width) binary layer. None when the
-    mask selects nothing or everything (no comparison to make).
+    mask selects nothing or everything (no comparison to make), or when
+    either side is entirely nodata.
+
+    Nodata is excluded from both distributions: a single NaN makes a mean
+    NaN, so one row of swath exterior used to turn the whole readout into
+    "nan", and a sentinel like -9999 drags the average somewhere
+    meaningless. NaN is always excluded; ``nodata`` additionally excludes a
+    declared sentinel value.
     """
+    from .snippets import nodata_mask
+
     mask = np.asarray(mask, dtype=bool)
     n_object = int(mask.sum())
     if n_object == 0 or n_object == mask.size:
         return None
     data = np.asarray(pixels, dtype=np.float64)
+    invalid = nodata_mask(data, nodata)
+    if invalid is not None and invalid.any():
+        data = np.where(invalid, np.nan, data)
+
     inside = data[:, mask]
     outside = data[:, ~mask]
-    return {
-        "pixels_object": n_object,
-        "pixels_background": int(mask.size - n_object),
-        "object_mean": inside.mean(axis=1).tolist(),
-        "object_std": inside.std(axis=1).tolist(),
-        "background_mean": outside.mean(axis=1).tolist(),
-        "background_std": outside.std(axis=1).tolist(),
-    }
+    # A band with nothing valid left on one side has no comparison to
+    # report, and nanmean of an empty slice is a warning plus a NaN.
+    if (np.isfinite(inside).sum(axis=1).min() == 0
+            or np.isfinite(outside).sum(axis=1).min() == 0):
+        return None
+    with np.errstate(all="ignore"):
+        return {
+            "pixels_object": n_object,
+            "pixels_background": int(mask.size - n_object),
+            "object_mean": np.nanmean(inside, axis=1).tolist(),
+            "object_std": np.nanstd(inside, axis=1).tolist(),
+            "background_mean": np.nanmean(outside, axis=1).tolist(),
+            "background_std": np.nanstd(outside, axis=1).tolist(),
+        }

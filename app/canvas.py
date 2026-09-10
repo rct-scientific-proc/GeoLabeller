@@ -37,7 +37,7 @@ from rasterio.warp import calculate_default_transform, reproject, Resampling
 
 from .labels import haversine_distance
 from .debug_log import debug
-from .snippets import apply_band_stretch, cached_band_scaling
+from .snippets import apply_band_stretch, cached_band_scaling, nodata_mask
 from .tile_reader import (TILE_SIZE as DETAIL_TILE_SIZE, level_grid_for,
                           read_tile, tile_bounds, tile_span, tiles_for_bounds)
 
@@ -103,6 +103,11 @@ def _as_uint8(band, scaling=None, band_index=0):
     band = apply_band_stretch(band, scaling, band_index)
     if band.dtype == np.uint8:
         return band
+    if np.issubdtype(band.dtype, np.floating):
+        # NaN cast to an integer is undefined in C (0 on x86, and numpy
+        # warns); decide it here instead of inheriting whatever the
+        # platform does.
+        band = np.nan_to_num(band, nan=0.0, posinf=255.0, neginf=0.0)
     return np.clip(band, 0, 255).astype(np.uint8)
 
 # Waterfall mode: a bottom-level group's images are stacked vertically in the
@@ -794,12 +799,19 @@ class TiledLayer:
             height = max(1, src.height // level)
 
             band_scaling = cached_band_scaling(src)
+            self._checkpoint(cancel_check)
+            band1 = src.read(1, out_shape=(height, width))
+            # Nodata read from the RAW band, before the stretch maps it to
+            # some ordinary-looking value. The geo path and the detail
+            # tiles have always turned nodata into transparency; this one
+            # painted it opaque - and for NaN it painted an undefined byte,
+            # so a swath exterior that is invisible on the map showed up as
+            # a black block in waterfall.
+            empty = nodata_mask(band1, src.nodata)
+            r = _as_uint8(band1, band_scaling, 0)
             if src.count >= 3:
                 # astype on an already-uint8 read is a full-frame copy for
                 # nothing; nearly all supported imagery is uint8.
-                self._checkpoint(cancel_check)
-                r = _as_uint8(src.read(1, out_shape=(height, width)),
-                              band_scaling, 0)
                 self._checkpoint(cancel_check)
                 g = _as_uint8(src.read(2, out_shape=(height, width)),
                               band_scaling, 1)
@@ -807,16 +819,15 @@ class TiledLayer:
                 b = _as_uint8(src.read(3, out_shape=(height, width)),
                               band_scaling, 2)
             else:
-                self._checkpoint(cancel_check)
-                gray = _as_uint8(src.read(1, out_shape=(height, width)),
-                                 band_scaling, 0)
-                r = g = b = gray
+                g = b = r
 
             rgba = np.zeros((height, width, 4), dtype=np.uint8)
             rgba[:, :, 0] = r
             rgba[:, :, 1] = g
             rgba[:, :, 2] = b
             rgba[:, :, 3] = 255
+            if empty is not None and empty.any():
+                rgba[:, :, 3][empty] = 0
 
             self._rgba_data = rgba
             self._width = width

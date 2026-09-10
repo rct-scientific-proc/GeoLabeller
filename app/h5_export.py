@@ -36,7 +36,8 @@ from PyQt5.QtCore import QObject, pyqtSignal
 # The framing and stretch live with the snippet service now, so the
 # sidebar/orientation views and the exports can never frame differently.
 from .masks import entry_in_window
-from .snippets import centered_window, _band_scaling, _window_pixels  # noqa: F401
+from .snippets import (centered_window, nodata_mask, _band_scaling,  # noqa: F401
+                       _window_pixels)
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox, QLabel,
     QLineEdit, QSpinBox, QComboBox, QRadioButton, QButtonGroup, QPushButton,
@@ -144,7 +145,8 @@ def _float_window_pixels(src, window, nodata):
     Entirely-nodata windows return None, like the uint8 reader.
     """
     data = src.read(window=window)
-    if nodata is not None and bool(np.all(data == nodata)):
+    empty = nodata_mask(data, nodata)
+    if empty is not None and bool(empty.all()):
         return None
     integer = np.issubdtype(data.dtype, np.integer)
     if data.shape[0] >= 3 and integer:
