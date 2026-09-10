@@ -116,6 +116,9 @@ _FLUSH_BYTES = 64 * 1024 * 1024
 # The 1-D label/gt/split datasets are tiny per element, so a larger chunk keeps
 # metadata overhead low with negligible read amplification.
 _META_CHUNK = 4096
+# Aligned per-sample string columns, written only when a run has values for
+# them. See _H5DatasetWriter._flush_string_column.
+_STRING_COLUMNS = ("locations", "object_ids")
 # Label rows read at a time when re-indexing an existing file's classes; 1M
 # uint16 is a couple of MB, so even a huge dataset migrates in bounded memory.
 _SCAN_BLOCK = 1 << 20
@@ -241,12 +244,15 @@ class H5DatasetWriter:
         # append cleanly and mask-free exports stay byte-identical.
         self._mask_px_buf, self._mask_row_buf, self._mask_name_buf = [], [], []
         self._mask_n = 0
-        # Per-sample location tags (the project's group location). Like the
-        # mask table, the dataset is created on demand - only once a
-        # non-empty tag is seen - so untagged exports stay byte-identical
-        # and legacy files append cleanly; rows written before the first tag
-        # read back as "".
-        self._loc_buf = []
+        # Aligned per-sample string columns, each created on demand - only
+        # once a non-empty value is seen - so an export that never uses one
+        # stays byte-identical and legacy files append cleanly; rows written
+        # before the first value read back as "".
+        #
+        #   locations   the project's per-image location tag
+        #   object_ids  which linked object a sample is a view of ("" for a
+        #               hard negative, which is a view of nothing)
+        self._str_bufs = {name: [] for name in _STRING_COLUMNS}
         # Set when appending to a file whose class list has since changed.
         self.added_classes, self.dropped_classes = [], []
 
@@ -259,7 +265,7 @@ class H5DatasetWriter:
                 self._mask_n = self._f["mask_pixels"].shape[0]
         else:
             self._create()
-        self._has_locations = "locations" in self._f
+        self._has_str = {name: name in self._f for name in _STRING_COLUMNS}
         # Most recently used, so an append made with different settings becomes
         # the default next time round.
         if overlap is not None:
@@ -383,19 +389,25 @@ class H5DatasetWriter:
         return found
 
     def add(self, image_hwc, label_index, gt, split_value,
-            location: str = "") -> int:
+            location: str = "", object_id: str = "") -> int:
         """Buffer one sample; flushes when a batch has accumulated.
 
         Returns the sample's global row index, so masks (and any future
         per-sample sidecar) can reference it before the flush happens.
+
         ``location`` is the sample's free-text location tag ("" when
-        untagged); it lands in the aligned ``locations`` dataset.
+        untagged). ``object_id`` names the linked object this sample is a
+        view of - the same id every other view of it carries, so a consumer
+        can group the views of one object, hold all of them out of a split
+        together, and tell whether a file already contains an object before
+        appending it again. Empty for a hard negative.
         """
         self._img_buf.append(image_hwc)
         self._lbl_buf.append(label_index)
         self._gt_buf.append(gt)
         self._split_buf.append(split_value)
-        self._loc_buf.append(str(location or ""))
+        self._str_bufs["locations"].append(str(location or ""))
+        self._str_bufs["object_ids"].append(str(object_id or ""))
         self._img_bytes += getattr(image_hwc, "nbytes", 0)
         row = self._n + len(self._img_buf) - 1
         if (len(self._img_buf) >= _FLUSH_BATCH
@@ -465,21 +477,34 @@ class H5DatasetWriter:
                               ("split", self._split_buf, "uint8")):
             f[name].resize(end, axis=0)
             f[name][self._n:end] = np.asarray(buf, dtype=dt)
-        if not self._has_locations and any(self._loc_buf):
-            # First tagged sample: create the column sized to the rows
-            # already written, which read back as "" - staying aligned.
-            f.create_dataset(
-                "locations", shape=(self._n,), maxshape=(None,),
-                dtype=h5py.string_dtype("utf-8"), chunks=(_META_CHUNK,))
-            self._has_locations = True
-        if self._has_locations:
-            f["locations"].resize(end, axis=0)
-            f["locations"][self._n:end] = self._loc_buf
+        for name in _STRING_COLUMNS:
+            self._flush_string_column(name, end)
         self._n = end
         self._img_buf.clear(); self._lbl_buf.clear()
         self._gt_buf.clear(); self._split_buf.clear()
-        self._loc_buf.clear()
+        for buf in self._str_bufs.values():
+            buf.clear()
         self._img_bytes = 0
+
+    def _flush_string_column(self, name: str, end: int):
+        """Write one aligned string column, creating it on first use.
+
+        The dataset appears the first time a non-empty value is seen, sized
+        to the rows already written so those read back as "" and every row
+        stays aligned with ``images``. An export with nothing to say in this
+        column writes no dataset at all, which is what keeps files written
+        before the column existed appendable.
+        """
+        buf = self._str_bufs[name]
+        f = self._f
+        if not self._has_str.get(name) and any(buf):
+            f.create_dataset(
+                name, shape=(self._n,), maxshape=(None,),
+                dtype=h5py.string_dtype("utf-8"), chunks=(_META_CHUNK,))
+            self._has_str[name] = True
+        if self._has_str.get(name):
+            f[name].resize(end, axis=0)
+            f[name][self._n:end] = buf
 
     def close(self) -> int:
         """Flush, close the file and return the total sample count."""
@@ -493,7 +518,7 @@ class H5DatasetWriter:
 
 
 def _positive_windows(pts, img_width, img_height, width, height, offset):
-    """The example crops for every label: ``{(x0, y0): class_index}``.
+    """The example crops for every label: ``{(x0, y0): (class_index, object_id)}``.
 
     Each label yields a crop centred on it plus eight more shifted by
     ``offset`` px - up, down, left, right and the four diagonals. The object is
@@ -508,32 +533,35 @@ def _positive_windows(pts, img_width, img_height, width, height, offset):
     tile will present it at inference.
 
     Two labels close together can also generate the same crop; it is kept once,
-    for whichever label sits nearest its centre.
+    for whichever label sits nearest its centre - and that label's object id
+    goes with it, so the crop names the object it is actually framed on.
+
+    ``pts`` are ``(x, y, class_index, object_id)``.
     """
-    windows: dict[tuple[int, int], tuple[int, float]] = {}
+    windows: dict[tuple[int, int], tuple[int, str, float]] = {}
     max_x, max_y = img_width - width, img_height - height
     if max_x < 0 or max_y < 0:
         return {}
 
-    def offer(x0, y0, x, y, class_index):
+    def offer(x0, y0, x, y, class_index, object_id):
         """Record a crop, keeping whichever label sits nearest its centre."""
         x0 = min(max(x0, 0), max_x)
         y0 = min(max(y0, 0), max_y)
         away = max(abs(x - (x0 + width / 2.0)), abs(y - (y0 + height / 2.0)))
         held = windows.get((x0, y0))
-        if held is None or away < held[1]:
-            windows[(x0, y0)] = (class_index, away)
+        if held is None or away < held[2]:
+            windows[(x0, y0)] = (class_index, object_id, away)
 
     # Pass 1: the exactly-centred crop for every label, using the same centring
     # rule as the sub-image GeoTIFF export. Dicts keep insertion order, so these
     # are written to the dataset before any shifted copy - the first snippet of
     # each label is the one framed exactly like its sub-image.
     bases = []
-    for x, y, class_index in pts:
+    for x, y, class_index, object_id in pts:
         base_x, base_y = centered_window(
             x, y, width, height, img_width, img_height)
-        bases.append((base_x, base_y, x, y, class_index))
-        offer(base_x, base_y, x, y, class_index)
+        bases.append((base_x, base_y, x, y, class_index, object_id))
+        offer(base_x, base_y, x, y, class_index, object_id)
         # Where the label lands inside its centred crop. Anything other than
         # (width//2, height//2) means the crop was shifted off an image edge -
         # log it so a real off-centre export can be traced to its label.
@@ -544,14 +572,15 @@ def _positive_windows(pts, img_width, img_height, width, height, offset):
 
     # Pass 2: the eight offsets, measured from each label's centred crop.
     if offset > 0:
-        for base_x, base_y, x, y, class_index in bases:
+        for base_x, base_y, x, y, class_index, object_id in bases:
             for dy in (-offset, 0, offset):
                 for dx in (-offset, 0, offset):
                     if dx == 0 and dy == 0:
                         continue  # already placed in pass 1
-                    offer(base_x + dx, base_y + dy, x, y, class_index)
+                    offer(base_x + dx, base_y + dy, x, y, class_index,
+                          object_id)
 
-    return {pos: held[0] for pos, held in windows.items()}
+    return {pos: (held[0], held[1]) for pos, held in windows.items()}
 
 
 def _excluded_grid(positive_positions, xs, ys, width, height):
@@ -653,7 +682,8 @@ def export_image(writer, path, labels, height, width, overlap, channels,
     for lab in labels:
         ci = class_to_index.get(lab.class_name)
         if ci is not None:
-            pts.append((float(lab.pixel_x), float(lab.pixel_y), ci))
+            pts.append((float(lab.pixel_x), float(lab.pixel_y), ci,
+                        str(getattr(lab, "object_id", "") or "")))
 
     # Every painted mask on this image, in source-pixel anchoring. Each
     # example crop gets every mask that intersects it (re-anchored by pure
@@ -679,14 +709,14 @@ def export_image(writer, path, labels, height, width, overlap, channels,
         positives = _positive_windows(
             pts, src.width, src.height, width, height, offset)
 
-        for (x0, y0), class_index in positives.items():
+        for (x0, y0), (class_index, object_id) in positives.items():
             if cancel_check and cancel_check():
                 return added, negative_counts, 0
             arr = window_pixels(Window(x0, y0, width, height))
             if arr is None:
                 continue  # entirely nodata
             row = writer.add(arr, class_index, True, split_value,
-                             location=location)
+                             location=location, object_id=object_id)
             for entry in mask_entries:
                 layer = entry_in_window(entry, x0, y0, width, height)
                 if layer.any():
@@ -706,7 +736,7 @@ def export_image(writer, path, labels, height, width, overlap, channels,
         guarded = set(positives)
         if protect_labels:
             guarded |= set(_positive_windows(
-                [(float(l.pixel_x), float(l.pixel_y), 0)
+                [(float(l.pixel_x), float(l.pixel_y), 0, "")
                  for l in protect_labels],
                 src.width, src.height, width, height, offset))
         excluded = _excluded_grid(guarded, xs, ys, width, height)
