@@ -22,8 +22,8 @@ import rasterio
 from PyQt5.QtCore import QPointF, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import (
-    QCheckBox, QComboBox, QGridLayout, QHBoxLayout, QLabel, QScrollArea,
-    QVBoxLayout, QWidget)
+    QCheckBox, QComboBox, QGridLayout, QHBoxLayout, QLabel, QPushButton,
+    QScrollArea, QVBoxLayout, QWidget)
 
 from .debug_log import debug
 from .orientation_math import (
@@ -32,6 +32,12 @@ from .snippets import SnippetLoader, snippet_frame
 
 SNIPPET_SIZE = 224      # source pixels per cell, shown 1:1
 GRID_COLUMNS = 3
+# Cells built at once. Every cell is a 224 px widget with its own pixmap
+# and a queued file read, so building the whole class was 10.3 s of frozen
+# window for 4,000 labels (and superlinear: 0.3 s at 200, 1.4 s at 1,000).
+# A page is instant, and the work for labels nobody has scrolled to is
+# never done at all.
+PAGE_SIZE = 60
 MIN_DRAG_PX = 6         # anything shorter is a click, not a direction
 
 # Committed-orientation colours. Amber: drawn by hand on this snippet.
@@ -171,6 +177,8 @@ class OrientationEditor(QWidget):
         self._loader = SnippetLoader(self)
         self._loader.ready.connect(self._on_snippet_ready)
         self._entries: list = []
+        self._entries_by_id: dict = {}
+        self._page = 0          # which page of PAGE_SIZE cells is built
         self._cells: dict[int, OrientationCell] = {}
         self._captions: dict[int, QLabel] = {}
         self._geo_cache: dict[str, tuple] = {}   # path -> (affine, crs, w, h)
@@ -181,7 +189,10 @@ class OrientationEditor(QWidget):
         controls = QHBoxLayout()
         controls.addWidget(QLabel("Class:"))
         self.class_combo = QComboBox()
-        self.class_combo.currentIndexChanged.connect(self._rebuild)
+        # A different class is a different set of labels: start at its
+        # first page rather than wherever the last class was.
+        self.class_combo.currentIndexChanged.connect(
+            self._on_filter_changed)
         controls.addWidget(self.class_combo, 1)
 
         # Draw once, orient the whole linked group: the heading measured
@@ -211,11 +222,30 @@ class OrientationEditor(QWidget):
         self._scroll.setWidget(self._grid_host)
         layout.addWidget(self._scroll)
 
+        pager = QHBoxLayout()
+        self.unoriented_check = QCheckBox("Unoriented only")
+        self.unoriented_check.setToolTip(
+            "Show only labels that have no orientation yet - what a review\n"
+            "pass is looking for.")
+        self.unoriented_check.toggled.connect(self._on_filter_changed)
+        pager.addWidget(self.unoriented_check)
+        pager.addStretch(1)
+        self.prev_button = QPushButton("< Previous")
+        self.prev_button.clicked.connect(lambda: self._step_page(-1))
+        pager.addWidget(self.prev_button)
+        self.page_label = QLabel("")
+        pager.addWidget(self.page_label)
+        self.next_button = QPushButton("Next >")
+        self.next_button.clicked.connect(lambda: self._step_page(1))
+        pager.addWidget(self.next_button)
+        layout.addLayout(pager)
+
     # -- data in ------------------------------------------------------------
 
     def set_labels(self, entries: list):
         """Same entry dicts the snippet sidebar takes; grid follows class."""
         self._entries = list(entries)
+        self._entries_by_id = {e["label_id"]: e for e in self._entries}
         classes = sorted({e["class_name"] for e in self._entries})
         current = self.class_combo.currentText()
         self.class_combo.blockSignals(True)
@@ -226,6 +256,28 @@ class OrientationEditor(QWidget):
         self.class_combo.blockSignals(False)
         self._rebuild()
 
+    def _on_filter_changed(self, _checked=False):
+        """The filter changes which labels exist, so start from page one."""
+        self._page = 0
+        self._rebuild()
+
+    def _step_page(self, delta: int):
+        pages = max(1, self._page_count())
+        self._page = max(0, min(pages - 1, self._page + delta))
+        self._rebuild()
+
+    def _shown_entries(self) -> list:
+        """The labels this class (and filter) covers, in a stable order."""
+        wanted = self.class_combo.currentText()
+        shown = [e for e in self._entries if e["class_name"] == wanted]
+        if self.unoriented_check.isChecked():
+            shown = [e for e in shown
+                     if e.get("orientation_px_rad") is None]
+        return shown
+
+    def _page_count(self) -> int:
+        return max(1, -(-len(self._shown_entries()) // PAGE_SIZE))
+
     def _rebuild(self):
         self._loader.cancel_all()
         while self._grid.count():
@@ -235,8 +287,16 @@ class OrientationEditor(QWidget):
         self._cells.clear()
         self._captions.clear()
 
-        wanted = self.class_combo.currentText()
-        shown = [e for e in self._entries if e["class_name"] == wanted]
+        every = self._shown_entries()
+        pages = max(1, -(-len(every) // PAGE_SIZE))
+        self._page = max(0, min(pages - 1, self._page))
+        start = self._page * PAGE_SIZE
+        shown = every[start:start + PAGE_SIZE]
+        self.page_label.setText(
+            f"{start + 1}-{start + len(shown)} of {len(every)}"
+            if every else "none")
+        self.prev_button.setEnabled(self._page > 0)
+        self.next_button.setEnabled(self._page < pages - 1)
         for i, entry in enumerate(shown):
             label_id = entry["label_id"]
             cell = OrientationCell(label_id, SNIPPET_SIZE)
@@ -261,10 +321,7 @@ class OrientationEditor(QWidget):
                                  SNIPPET_SIZE)
 
     def _entry(self, label_id: int) -> dict | None:
-        for entry in self._entries:
-            if entry["label_id"] == label_id:
-                return entry
-        return None
+        return getattr(self, "_entries_by_id", {}).get(label_id)
 
     def _set_caption(self, entry):
         caption = self._captions.get(entry["label_id"])

@@ -250,6 +250,12 @@ class TiledLayer:
         # (e.g. [2, 4, 8, 16, 32, 64]); empty when the file has no pyramids.
         # `_src_level_dims` holds the (width, height) of each overview level.
         self._overviews: list[int] = []
+        # Whether that list is an answer or an absence. A project file does
+        # not record pyramid factors, so a layer built from stored metadata
+        # has not been asked yet - and reading the empty list as "no
+        # pyramids" made the first load full resolution (up to the 150 MP
+        # cap) for an image that may have a 1/64 overview sitting there.
+        self._overviews_known = False
         self._src_level_dims: list[tuple[int, int]] = []
         # Full-resolution reprojected dimensions, kept stable across level
         # switches so overview selection always compares against native res.
@@ -309,7 +315,9 @@ class TiledLayer:
         self._src_transform = metadata.get("src_transform")
         self._src_width = int(metadata["src_width"])
         self._src_height = int(metadata["src_height"])
-        factors = list(metadata.get("overviews") or [])
+        factors = metadata.get("overviews")
+        self._overviews_known = factors is not None
+        factors = list(factors or [])
         self._overviews = factors
         self._src_level_dims = [
             (max(1, self._src_width // f), max(1, self._src_height // f))
@@ -527,6 +535,10 @@ class TiledLayer:
             self._full_height = result['full_height']
         if result.get('overviews'):
             self._overviews = result['overviews']
+        if result.get('overviews') is not None:
+            # The result comes from a real open, so this settles it either
+            # way: a file with no pyramids is now known to have none.
+            self._overviews_known = True
         if result.get('level_dims'):
             self._src_level_dims = result['level_dims']
         self._src_crs = result['src_crs']
@@ -553,6 +565,7 @@ class TiledLayer:
         except Exception:
             factors = []
         self._overviews = factors
+        self._overviews_known = True
         self._src_level_dims = [
             (max(1, src.width // f), max(1, src.height // f)) for f in factors
         ]
@@ -1355,9 +1368,11 @@ def stored_layer_metadata(file_path: str, group_path: str,
             'src_transform': src_transform,
             'src_width': int(src_width),
             'src_height': int(src_height),
-            # Pyramid factors are not recorded in the project; the first
-            # real load reads and applies them (apply_level_result).
-            'overviews': [],
+            # Pyramid factors are not recorded in the project. None means
+            # UNKNOWN (not "none"): the first load asks for a cheap coarse
+            # level rather than assuming full resolution is the only
+            # option, and the real factors arrive with its result.
+            'overviews': None,
             'geo': True,
         }
     except Exception as exc:  # noqa: BLE001 - fall back to opening the file
@@ -2797,6 +2812,12 @@ class MapCanvas(QGraphicsView):
 
     def _desired_level(self, layer: TiledLayer, units_per_pixel: float) -> int:
         """The overview level this layer should be holding at this zoom."""
+        if not layer._overviews_known:
+            # Nothing has opened this file yet. Ask for a cheap decimation:
+            # if the image is small this IS full resolution, and if it is
+            # large the read that answers it also reports the real pyramid
+            # factors, after which the normal choice applies.
+            return layer.budget_level(1, BACKDROP_MAX_PIXELS)
         if not layer.has_overviews():
             # No pyramids: full resolution, or the coarsest decimation that
             # fits in memory for an image too big to hold whole (without a
@@ -2820,6 +2841,12 @@ class MapCanvas(QGraphicsView):
         """
         if layer._load_failed is not None:
             return      # nothing to retry until the imagery could be back
+        if not layer._overviews_known:
+            if not layer.is_fully_loaded():
+                level = self._desired_level(layer, units_per_pixel)
+                layer._target_level = level
+                self._dispatch_level_load(layer_id, layer, level)
+            return
         if not layer.has_overviews():
             if not layer.is_fully_loaded():
                 level = self._desired_level(layer, units_per_pixel)
@@ -3085,6 +3112,7 @@ class MapCanvas(QGraphicsView):
                 self._dispatch_level_load(layer_id, layer, layer._target_level)
             return
 
+        first_answer = not layer._overviews_known
         layer.apply_level_result(result)
         debug(f"applied level {level}: {layer.name} "
               f"{layer._width}x{layer._height}")
@@ -3093,6 +3121,12 @@ class MapCanvas(QGraphicsView):
         # built from this data the moment it is shown.
         if layer.visible:
             self._rebuild_layer_tiles(layer)
+        if first_answer and layer.visible:
+            # The pyramid factors have just arrived with this result, so the
+            # level chosen without them may be wrong for the current zoom -
+            # ask again now rather than waiting for the view to move.
+            self._apply_layer_lod(layer_id, layer,
+                                  self._scene_units_per_pixel())
 
     def _on_level_load_error(self, layer_id: str, level: int, message: str,
                              runnable=None):

@@ -38,8 +38,8 @@ import rasterio
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
-    QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel,
-    QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout)
+    QApplication, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout,
+    QLabel, QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout)
 
 
 # ---------------------------------------------------------------------------
@@ -73,10 +73,23 @@ class Resolution:
     note: str = ""
 
 
+def _part_key(part: str) -> str:
+    """One path component, comparable across the two path flavours.
+
+    A POSIX absolute path parses with the root component "/", but building
+    a prefix from those parts and stringifying it (infer_prefix_rule)
+    yields Windows separators, which re-parse with the root "\\". The
+    anchors then differed and the prefix matched nothing - so a project
+    recorded on Linux and relocated on Windows resolved the one file the
+    user pointed at and reported every sibling as not found.
+    """
+    return "/" if part in ("/", "\\") else part.lower()
+
+
 def _tail_overlap(a: str, b: str) -> int:
     """How many trailing path components two paths share (case-insensitive)."""
-    pa = [p.lower() for p in _parse(a).parts]
-    pb = [p.lower() for p in _parse(b).parts]
+    pa = [_part_key(p) for p in _parse(a).parts]
+    pb = [_part_key(p) for p in _parse(b).parts]
     n = 0
     while n < len(pa) and n < len(pb) and pa[-1 - n] == pb[-1 - n]:
         n += 1
@@ -207,30 +220,40 @@ def apply_prefix_rule(missing_path: str, rule: tuple[str, str]) -> str | None:
     norm_path = _parse(missing_path)
     norm_old = _parse(old_prefix)
     old_parts = norm_old.parts
-    if [p.lower() for p in norm_path.parts[:len(old_parts)]] != \
-            [p.lower() for p in old_parts]:
+    if [_part_key(p) for p in norm_path.parts[:len(old_parts)]] != \
+            [_part_key(p) for p in old_parts]:
         return None
     candidate = os.path.join(new_prefix, *norm_path.parts[len(old_parts):])
     return candidate if os.path.isfile(candidate) else None
 
 
-def build_basename_index(base_dir: str, wanted_names: set[str]) -> dict:
+def build_basename_index(base_dir: str, wanted_names: set[str],
+                         progress=None) -> dict:
     """One walk of *base_dir*: {lowercase basename: [full paths]}.
 
     Only names in *wanted_names* (lowercased) are collected, so indexing a
     huge tree costs one traversal and stores next to nothing.
+
+    ``progress`` is called as ``progress(files_seen, matches)`` every so
+    often; a network tree can take a while and the dialog is modal.
     """
     index: dict[str, list[str]] = {}
+    seen = 0
+    matches = 0
     for root, _dirs, files in os.walk(base_dir):
         for name in files:
+            seen += 1
             key = name.lower()
             if key in wanted_names:
                 index.setdefault(key, []).append(os.path.join(root, name))
+                matches += 1
+        if progress is not None:
+            progress(seen, matches)
     return index
 
 
 def match_missing(images: list, index: dict,
-                  verify=verify_candidate) -> list[Resolution]:
+                  verify=verify_candidate, progress=None) -> list[Resolution]:
     """Match each missing image against a basename index.
 
     One verified candidate wins outright. Several survivors fall back to the
@@ -239,7 +262,10 @@ def match_missing(images: list, index: dict,
     feature must never produce.
     """
     results = []
-    for image in images:
+    total = len(images)
+    for done, image in enumerate(images):
+        if progress is not None and done % 25 == 0:
+            progress(done, total)
         old_path = image.path
         candidates = index.get(_parse(old_path).name.lower(), [])
         survivors = [c for c in candidates if verify(c, image)]
@@ -337,6 +363,9 @@ class RelocateImagesDialog(QDialog):
         self.tree.resizeColumnToContents(0)
         layout.addWidget(self.tree)
 
+        self.status = QLabel("")
+        layout.addWidget(self.status)
+
         buttons = QHBoxLayout()
         search_btn = QPushButton("Search a folder...")
         search_btn.setToolTip(
@@ -371,8 +400,26 @@ class RelocateImagesDialog(QDialog):
     def run_directory_search(self, base_dir: str):
         """Index *base_dir* and match every image (separated for testing)."""
         wanted = {_parse(i.path).name.lower() for i in self._images}
-        index = build_basename_index(base_dir, wanted)
-        self._show_results(match_missing(self._images, index))
+        index = build_basename_index(
+            base_dir, wanted,
+            progress=lambda seen, hits: self._say(
+                f"Searching: {seen} files seen, {hits} name matches..."))
+        results = match_missing(
+            self._images, index,
+            progress=lambda done, total: self._say(
+                f"Verifying: {done} of {total} images..."))
+        self._say("")
+        self._show_results(results)
+
+    def _say(self, text: str):
+        """Show what a long pass is doing, and let the window repaint.
+
+        Both passes open rasters to verify candidates - one per candidate
+        per image - and ran with no progress and no event pumping at all,
+        so a search of a large tree looked like a hung dialog.
+        """
+        self.status.setText(text)
+        QApplication.processEvents()
 
     def _locate_one(self):
         current = self.tree.currentItem() or self.tree.topLevelItem(0)
@@ -385,11 +432,27 @@ class RelocateImagesDialog(QDialog):
         if chosen:
             self.run_prefix_relocation(old_path, chosen)
 
-    def run_prefix_relocation(self, old_path: str, new_path: str):
-        """Infer the prefix rule from one located file and apply it to all."""
+    def run_prefix_relocation(self, old_path: str, new_path: str,
+                              sample_every: int = 100):
+        """Infer the prefix rule from one located file and apply it to all.
+
+        Rule matches are verified on the first few and then one in
+        ``sample_every``, the policy silently_resolve already uses: the
+        rule was inferred from a file that WAS verified, twin surveys
+        share dimensions and CRS anyway (the protection is the path
+        structure), and header-verifying every sibling opened one raster
+        per image - minutes of frozen dialog on a big project. A sampled
+        failure abandons the rule, and everything after it is reported as
+        not found rather than trusted.
+        """
         rule = infer_prefix_rule(old_path, new_path)
         results = []
-        for image in self._images:
+        checked = 0
+        since_sample = 0
+        total = len(self._images)
+        for done, image in enumerate(self._images):
+            if done % 25 == 0:
+                self._say(f"Applying: {done} of {total} images...")
             if image.path == old_path:
                 # The located file itself still gets verified: pointing at
                 # the wrong file must not silently rehome its labels.
@@ -402,11 +465,26 @@ class RelocateImagesDialog(QDialog):
                              "recorded size/CRS"))
                 continue
             candidate = apply_prefix_rule(image.path, rule) if rule else None
-            if candidate and verify_candidate(candidate, image):
-                results.append(Resolution(image.path, FOUND, candidate))
-            else:
+            if not candidate:
                 results.append(Resolution(
                     image.path, MISSING, note="not at the inferred location"))
+                continue
+            since_sample += 1
+            if checked < 4 or since_sample >= sample_every:
+                since_sample = 0
+                checked += 1
+                if not verify_candidate(candidate, image):
+                    rule = None      # the rule betrayed us; trust no more
+                    results.append(Resolution(
+                        image.path, MISSING,
+                        note="the inferred location does not match this "
+                             "image's recorded size/CRS"))
+                    continue
+            # An unsampled match is trusted on existence alone, which
+            # apply_prefix_rule has already established (it returns None
+            # for a path that is not a file).
+            results.append(Resolution(image.path, FOUND, candidate))
+        self._say("")
         self._show_results(results)
 
     def _show_results(self, results: list):
