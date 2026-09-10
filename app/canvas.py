@@ -3853,47 +3853,6 @@ class MapCanvas(QGraphicsView):
         y = math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)) * R
         return x, y
 
-    def _get_layer_at_position(
-            self, easting: float, northing: float) -> tuple[str, str]:
-        """Get the name and group of the layer at the given position.
-
-        First checks if cursor is within any layer bounds (returns topmost visible layer).
-        If not within any bounds, returns the layer whose center is closest.
-
-        Returns:
-            Tuple of (layer_name, group_path). Layer name prefixed with ~ if showing nearest.
-        """
-        # Check layers in reverse z-order (top to bottom)
-        layers_in_bounds = []
-        for layer_id in reversed(self._layer_order):
-            if layer_id not in self._layers:
-                continue
-            layer = self._layers[layer_id]
-            if layer.visible and layer.contains_point(easting, northing):
-                layers_in_bounds.append(layer)
-
-        # If cursor is within one or more layers, return the topmost one
-        if layers_in_bounds:
-            return (layers_in_bounds[0].name, layers_in_bounds[0].group_path)
-
-        # Otherwise, find the layer with closest center
-        closest_layer = None
-        min_distance = float('inf')
-
-        for layer_id, layer in self._layers.items():
-            if not layer.visible:
-                continue
-            dist = layer.distance_to_center(easting, northing)
-            if dist < min_distance:
-                min_distance = dist
-                closest_layer = layer
-
-        if closest_layer:
-            # Prefix with ~ to indicate "closest to"
-            return (f"~{closest_layer.name}", closest_layer.group_path)
-
-        return ("", "")
-
     def _layer_and_name_at(self, easting: float, northing: float):
         """``(layer, name, group)`` under a position, in a single pass.
 
