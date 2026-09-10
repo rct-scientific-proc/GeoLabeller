@@ -16,6 +16,24 @@ WGS84 = CRS.from_epsg(4326)
 # Earth's mean radius in meters (WGS84)
 EARTH_RADIUS_M = 6371008.8
 
+# Transformers to and from WGS84, shared by every ImageData with the same
+# CRS. Building one costs about a third of a millisecond, which is nothing
+# per image and 26,000 constructions - most of a 4.7 s frozen first
+# autosave - across a 13k-image project, where the images overwhelmingly
+# share one CRS. Keyed by EPSG; the same pattern as canvas.py's
+# _stored_meta_transformers. Built and used on the UI thread.
+_wgs84_transformers: dict = {}
+
+
+def _transformer_pair(epsg: int):
+    """(to_wgs84, from_wgs84) for an EPSG code, built at most once."""
+    pair = _wgs84_transformers.get(epsg)
+    if pair is None:
+        pair = (Transformer.from_crs(epsg, 4326, always_xy=True),
+                Transformer.from_crs(4326, epsg, always_xy=True))
+        _wgs84_transformers[epsg] = pair
+    return pair
+
 
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Calculate geodesic distance between two WGS84 points using Haversine formula.
@@ -358,12 +376,10 @@ class ImageData:
         if (cached_epsg != self.crs_epsg
                 or getattr(self, "_to_wgs84_transformer", None) is None
                 or getattr(self, "_from_wgs84_transformer", None) is None):
-            self._to_wgs84_transformer = Transformer.from_crs(
-                self.crs_epsg, 4326, always_xy=True
-            )
-            self._from_wgs84_transformer = Transformer.from_crs(
-                4326, self.crs_epsg, always_xy=True
-            )
+            # Shared per CRS rather than built per image - see
+            # _wgs84_transformers.
+            (self._to_wgs84_transformer,
+             self._from_wgs84_transformer) = _transformer_pair(self.crs_epsg)
             self._cached_transformer_epsg = self.crs_epsg
         return True
 
@@ -499,28 +515,49 @@ class ImageData:
         if self.location:
             d["location"] = self.location
 
-        # Include corner coordinates in WGS84 for ground truth export
-        corners = self.get_corner_coords()
-        if corners is not None:
-            d["corners_wgs84"] = {
-                "top_left": {"lat": corners["top_left"][0], "lon": corners["top_left"][1]},
-                "top_right": {"lat": corners["top_right"][0], "lon": corners["top_right"][1]},
-                "bottom_right": {"lat": corners["bottom_right"][0], "lon": corners["bottom_right"][1]},
-                "bottom_left": {"lat": corners["bottom_left"][0], "lon": corners["bottom_left"][1]}
-            }
-
-            # Calculate geodesic width and height in meters using Haversine
-            tl = corners["top_left"]
-            tr = corners["top_right"]
-            bl = corners["bottom_left"]
-
-            geodesic_width = haversine_distance(tl[0], tl[1], tr[0], tr[1])
-            geodesic_height = haversine_distance(tl[0], tl[1], bl[0], bl[1])
-
-            d["geodesic_width_m"] = round(geodesic_width, 3)
-            d["geodesic_height_m"] = round(geodesic_height, 3)
+        # Corner coordinates and geodesic extents for ground truth export.
+        d.update(self._derived_geometry())
 
         return d
+
+    def _derived_geometry(self) -> dict:
+        """The corners_wgs84 / geodesic extent block, computed at most once.
+
+        These are convenience fields - the ICD marks them derived, never
+        read back - and they depend only on the affine, the CRS and the
+        image size, none of which change while a project is open. They were
+        recomputed from scratch on every save and every 60-second autosave:
+        four pyproj transforms per image, 52,000 of them on a 13k-image
+        project, on the UI thread.
+
+        Returns a fresh copy each call, because the snapshot is handed to a
+        background writer while the user carries on editing.
+        """
+        signature = (tuple(self.affine_coeffs) if self.affine_coeffs else None,
+                     self.crs_epsg, self.original_width, self.original_height)
+        cached = getattr(self, "_derived_cache", None)
+        if cached is None or cached[0] != signature:
+            block = {}
+            corners = self.get_corner_coords()
+            if corners is not None:
+                block["corners_wgs84"] = {
+                    name: {"lat": lat, "lon": lon}
+                    for name, (lat, lon) in corners.items()}
+                tl = corners["top_left"]
+                tr = corners["top_right"]
+                bl = corners["bottom_left"]
+                block["geodesic_width_m"] = round(
+                    haversine_distance(tl[0], tl[1], tr[0], tr[1]), 3)
+                block["geodesic_height_m"] = round(
+                    haversine_distance(tl[0], tl[1], bl[0], bl[1]), 3)
+            self._derived_cache = (signature, block)
+            cached = self._derived_cache
+
+        block = dict(cached[1])
+        if "corners_wgs84" in block:
+            block["corners_wgs84"] = {name: dict(value) for name, value
+                                      in block["corners_wgs84"].items()}
+        return block
 
     @classmethod
     def from_dict(cls, data: dict, version: str = "2.1") -> "ImageData":
