@@ -264,6 +264,11 @@ class TiledLayer:
         # The in-flight background load runnable for this layer (if any), so it
         # can be cancelled when superseded by a newer zoom or culled from view.
         self._pending_runnable = None
+        # The message from the last load failure, or None. Retrying a load
+        # that cannot work costs a blocking open per tile-update pass, so a
+        # failed layer is skipped until something could have changed:
+        # free_data, a relocation, or an explicit retry.
+        self._load_failed = None
 
 
         # Lazy loading state
@@ -994,8 +999,10 @@ class TiledLayer:
         """Release pixel data from memory, keeping bounds and metadata.
 
         Removes rendered tiles from the scene and frees the RGBA array.
-        The layer can be reloaded later via ensure_loaded().
+        The layer can be reloaded later via ensure_loaded(), and that
+        reload is allowed to try again even if the last one failed.
         """
+        self._load_failed = None
         if scene is not None:
             for item in self.tiles.values():
                 scene.removeItem(item)
@@ -1730,6 +1737,11 @@ class MapCanvas(QGraphicsView):
     # Signal emitted when background imagery loading starts/stops: (is_loading)
     loading_changed = pyqtSignal(bool)
 
+    # (file_path, message) the first time a layer's imagery will not load.
+    # Without it a folder gone from a network share produced nothing but
+    # debug lines and a blank canvas.
+    layer_load_failed = pyqtSignal(str, str)
+
     # Signal emitted when the view rotation changes: (degrees). Non-zero means
     # the view no longer points north-up, so lat/lon rulers become meaningless.
 
@@ -2012,6 +2024,9 @@ class MapCanvas(QGraphicsView):
         # the cycle ends) or "hidden" (kept on being hidden, released only by
         # the budget or Free Group).
         self._warmed: dict[str, str] = {}
+        # Set when a pass culls a loaded layer; the trim then runs once for
+        # the pass instead of once per culled layer.
+        self._offscreen_trim_pending = False
 
         # Background-load tracking for the loading spinner. `_active_loads`
         # counts in-flight overview loads; the throbber shows while > 0.
@@ -2196,6 +2211,12 @@ class MapCanvas(QGraphicsView):
                 layer.geo = False
                 layer._fully_loaded = False
                 self._cancel_layer_load(layer)
+                # The reprojected array is no longer what this layer shows,
+                # and clearing _fully_loaded hides it from every budget:
+                # it used to sit allocated - up to 600 MB per pyramid-less
+                # image - until the user panned onto that image again or
+                # ran Free Group. Tiles are cleared below regardless.
+                layer.free_data(self._scene)
             # The stack is sized from source pixel dimensions; read them if
             # this (lazy) layer has never been opened.
             if layer._src_width <= 0 or layer._src_height <= 0:
@@ -2266,6 +2287,7 @@ class MapCanvas(QGraphicsView):
                 layer.geo = True
                 layer._fully_loaded = False
                 self._cancel_layer_load(layer)
+                layer.free_data(self._scene)    # raw array, same reason
             self._clear_layer_tiles(layer)
         self._waterfall_was_geo.clear()
         self._waterfall_saved_bounds.clear()
@@ -2421,7 +2443,18 @@ class MapCanvas(QGraphicsView):
                 if layer.detail_tiles:
                     self._clear_detail_tiles(layer_id, layer)
                 self._cancel_layer_load(layer)
+                # Its pixels are kept - a small pan back must not re-read
+                # them - but under the same budget everything else is
+                # under. Held with no budget at all, a glide through a
+                # 200-image waterfall accumulated every image it passed.
+                if layer.is_fully_loaded():
+                    self._warmed.pop(layer_id, None)
+                    self._warmed[layer_id] = "offscreen"   # most recent last
+                    self._offscreen_trim_pending = True
                 continue
+
+            if self._warmed.get(layer_id) == "offscreen":
+                del self._warmed[layer_id]      # back in view, budgeted no more
 
             # Level-of-detail: pick an overview level for the current zoom and
             # (re)load this layer off-thread if it differs from what is loaded.
@@ -2435,6 +2468,14 @@ class MapCanvas(QGraphicsView):
             # Then the windowed detail on top, where the whole-image array
             # cannot reach the zoom's level.
             self._update_detail_tiles(layer_id, layer)
+
+        if self._offscreen_trim_pending:
+            # Once per pass, not once per culled layer: _trim_warmed walks
+            # the whole pool. In-view layers are protected by the visible
+            # check inside it (they are still layer.visible), so the ones
+            # evicted are the least recently seen off-screen images.
+            self._offscreen_trim_pending = False
+            self._trim_offscreen()
 
     @staticmethod
     def _layer_intersects_view(
@@ -2595,9 +2636,14 @@ class MapCanvas(QGraphicsView):
             return
 
         level = layer.resolution_level(self._scene_units_per_pixel())
-        if level >= layer.budget_level(1):
+        if level >= layer.budget_level(1, BACKDROP_MAX_PIXELS):
             # The coarse whole-image array is already at least this detailed,
-            # so tiles would add nothing.
+            # so tiles would add nothing. Compared against the level the
+            # backdrop is ACTUALLY loaded at (_desired_level uses the same
+            # 4 MP cap): against the 150 MP cap instead, a pyramided mosaic
+            # had a band of two or more zoom levels where the backdrop was
+            # all there was and every backdrop pixel covered several screen
+            # pixels - the range a user zooms through to orient.
             self._clear_detail_tiles(layer_id, layer)
             return
 
@@ -2763,6 +2809,8 @@ class MapCanvas(QGraphicsView):
         new level is applied by _on_level_loaded. Panning at a fixed zoom, once
         loaded, is a no-op.
         """
+        if layer._load_failed is not None:
+            return      # nothing to retry until the imagery could be back
         if not layer.has_overviews():
             if not layer.is_fully_loaded():
                 level = self._desired_level(layer, units_per_pixel)
@@ -2847,10 +2895,38 @@ class MapCanvas(QGraphicsView):
             self._apply_layer_lod(layer_id, layer, units_per_pixel)
         self._trim_warmed(set(layer_ids))
 
+    def _trim_offscreen(self):
+        """Free off-screen pixels beyond the warm budget, oldest first.
+
+        A layer culled from view keeps its array so a small pan back is
+        free. _trim_warmed cannot do this job as it stands - it drops any
+        entry whose layer is still `visible`, which every culled layer is -
+        so off-screen entries are budgeted here, newest kept.
+        """
+        held = 0
+        for layer_id in reversed(list(self._warmed)):     # newest first
+            if self._warmed.get(layer_id) != "offscreen":
+                continue
+            layer = self._layers.get(layer_id)
+            if layer is None or not layer.is_fully_loaded():
+                del self._warmed[layer_id]
+                continue
+            resident = layer._loaded_level or 1
+            held += layer.level_pixel_count(resident)
+            if held <= WARM_MAX_PIXELS:
+                continue
+            self._cancel_layer_load(layer)
+            layer.free_data(self._scene)
+            del self._warmed[layer_id]
+
     def _trim_warmed(self, protect: set):
         """Free held images, least recently wanted first, until within budget."""
         held = 0
         for layer_id in reversed(list(self._warmed)):     # newest first
+            if self._warmed.get(layer_id) == "offscreen":
+                # Culled-from-view entries are still `visible` by design and
+                # carry their own budget (_trim_offscreen); leave them be.
+                continue
             layer = self._layers.get(layer_id)
             if layer is None or layer.visible:
                 # Gone, or switched on since - either way not ours any more.
@@ -3023,6 +3099,18 @@ class MapCanvas(QGraphicsView):
             layer._loading_level = None
             layer._pending_runnable = None
         debug(f"load FAILED: {layer_id} level={level}: {message}")
+        if layer is None:
+            return
+        # Remember it. Nothing consumed this before, so the next tile pass
+        # (up to 20 a second while panning) re-dispatched the same failing
+        # load: on an unreachable share each open blocks for seconds, the
+        # four pool threads fill with dead opens, and every healthy layer
+        # queues behind them - the canvas stops loading anything at all,
+        # with no message shown.
+        first = layer._load_failed is None
+        layer._load_failed = message
+        if first:
+            self.layer_load_failed.emit(layer.file_path, message)
 
     def _on_level_load_cancelled(self, layer_id: str, level: int,
                                  runnable=None):

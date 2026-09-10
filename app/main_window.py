@@ -443,6 +443,7 @@ class MainWindow(QMainWindow):
         self.layer_panel.group_location_edit_requested.connect(
             self._on_group_location_edit)
 
+        self.canvas.layer_load_failed.connect(self._on_layer_load_failed)
         self.canvas.coordinates_changed.connect(self._update_coordinates)
         self.canvas.label_placed.connect(self._on_label_placed)
         self.canvas.label_removed.connect(self._on_label_removed)
@@ -2471,6 +2472,18 @@ class MainWindow(QMainWindow):
         except Exception as e:
             debug(f"autosave failed: {type(e).__name__}: {e}")
             self.autosave_failed.emit(f"{type(e).__name__}: {e}")
+
+    def _on_layer_load_failed(self, file_path: str, message: str):
+        """Say why a layer stays blank - once per layer, not per retry.
+
+        The canvas stops retrying that layer, so without this the user
+        gets a blank image and no reason at all. Free Group (or a
+        relocation) lets it try again.
+        """
+        name = os.path.basename(file_path) or file_path
+        self.statusBar.showMessage(
+            f"Could not load {name}: {message}. Use Locate Missing Images, "
+            f"or Free Group to retry.", 12000)
 
     def _on_autosave_failed(self, message: str):
         """Tell the user once that crash recovery is not working.

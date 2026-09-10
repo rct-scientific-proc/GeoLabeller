@@ -168,11 +168,26 @@ def _source_window(src, dst_crs, bounds, level: int):
         return None
 
     # Window in decimated pixels, widened by the margin and snapped outward.
-    window = rasterio.windows.from_bounds(*src_bounds, transform=grid_transform)
-    col_off = math.floor(window.col_off) - EDGE_MARGIN_PX
-    row_off = math.floor(window.row_off) - EDGE_MARGIN_PX
-    col_end = math.ceil(window.col_off + window.width) + EDGE_MARGIN_PX
-    row_end = math.ceil(window.row_off + window.height) + EDGE_MARGIN_PX
+    # The four corners are projected through the inverse transform and
+    # min/maxed, exactly as tiles_for_bounds does. rasterio's from_bounds
+    # would be shorter, but it refuses any transform whose signs disagree
+    # with min/max-ordered bounds: a south-up raster (positive y pixel
+    # size), a west-flipped one, or a 90-degree rotation raised WindowError
+    # for every tile, so such an image showed its coarse backdrop and never
+    # sharpened, with one exception logged per tile per update pass.
+    inverse = ~grid_transform
+    west, south, east, north = src_bounds
+    cols, rows = [], []
+    for wx, wy in ((west, north), (east, south), (west, south), (east, north)):
+        col, row = inverse * (wx, wy)
+        cols.append(col)
+        rows.append(row)
+    if not all(math.isfinite(v) for v in cols + rows):
+        return None
+    col_off = math.floor(min(cols)) - EDGE_MARGIN_PX
+    row_off = math.floor(min(rows)) - EDGE_MARGIN_PX
+    col_end = math.ceil(max(cols)) + EDGE_MARGIN_PX
+    row_end = math.ceil(max(rows)) + EDGE_MARGIN_PX
 
     # Clamp to the decimated grid; a tile over the edge keeps what exists.
     col_off = max(0, min(col_off, read_w))
