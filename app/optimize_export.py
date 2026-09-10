@@ -123,6 +123,16 @@ def optimize_geotiff(src_path, dst_path, overviews=DEFAULT_OVERVIEWS,
                         else 2
                     )
 
+        # A JPEG source carries photometric=YCbCr (and jpeg_quality) in
+        # its profile, and both are invalid for any other compression:
+        # GDAL rejects the combination outright, which failed every
+        # JPEG-compressed ortho on the default DEFLATE setting. Drop them
+        # unless JPEG is what we are writing.
+        if str(profile.get("compress", "")).lower() != "jpeg":
+            if str(profile.get("photometric", "")).upper() == "YCBCR":
+                profile.pop("photometric", None)
+            profile.pop("jpeg_quality", None)
+
         # Write to a temp file, then atomically replace, so a cancelled or
         # crashed run never leaves a half-written output in place.
         tmp_path = dst_path.with_suffix(dst_path.suffix + ".tmp")

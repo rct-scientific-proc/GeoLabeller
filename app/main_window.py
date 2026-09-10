@@ -308,9 +308,13 @@ class MainWindow(QMainWindow):
         self._setup_menu()
         self._setup_toolbar()
 
-        # Start auto-save and crash detection
+        # Read the previous session's marker BEFORE arming this one -
+        # _start_crash_detection writes the file _check_for_recovery would
+        # otherwise find, so the check always said "crashed" and every
+        # clean-but-unsaved exit produced a false recovery prompt.
+        crashed_last_time = CRASH_MARKER_FILE.exists()
         self._start_crash_detection()
-        self._check_for_recovery()
+        self._check_for_recovery(crashed_last_time)
 
     def _setup_ui(self):
         """Set up the main UI layout."""
@@ -575,7 +579,9 @@ class MainWindow(QMainWindow):
 
         snippet_action = QAction("&Snippet Panel", self)
         snippet_action.setCheckable(True)
-        snippet_action.setShortcut("Ctrl+Shift+S")
+        # NOT Ctrl+Shift+S: that is Save Project As, and two actions
+        # claiming one chord makes Qt fire neither.
+        snippet_action.setShortcut("Ctrl+B")
         snippet_action.setStatusTip(
             "A column of every label's snippet, framed exactly as the "
             "exports write them")
@@ -1946,8 +1952,12 @@ class MainWindow(QMainWindow):
             removed = set(self.project.classes) - set(new_classes)
             if removed:
                 # Warn about label deletion
-                count = sum(
-                    1 for l in self.project.labels if l.class_name in removed)
+                # get_all_labels(), not project.labels - LabelProject has
+                # no such attribute, and reaching for it raised
+                # AttributeError before the confirmation dialog, so no
+                # class could ever be removed.
+                count = sum(1 for _image, label in self.project.get_all_labels()
+                            if label.class_name in removed)
                 if count > 0:
                     reply = QMessageBox.question(
                         self,
@@ -1957,12 +1967,18 @@ class MainWindow(QMainWindow):
                     if reply == QMessageBox.No:
                         return
 
-            # Update classes
-            self.project.classes = new_classes
-
-            # Remove labels for deleted classes
+            # Delete each removed class and its labels FIRST: remove_class
+            # is a no-op once the name is gone from project.classes, so
+            # assigning the new list before calling it left every label of
+            # a "removed" class behind, pointing at a class that no longer
+            # exists (and silently dropped from exports). Masked until now
+            # by the AttributeError above, which fired first.
             for class_name in removed:
                 self.project.remove_class(class_name)
+
+            # Then adopt the new list, which also carries additions and any
+            # reordering the user made.
+            self.project.classes = new_classes
 
             self._update_class_combo()
             self._refresh_label_markers()
@@ -2263,14 +2279,14 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Warning: Could not start crash detection: {e}")
 
-    def _check_for_recovery(self):
-        """Check for recovery file on startup and offer to restore.
+    def _check_for_recovery(self, has_crash_marker: bool):
+        """Offer to restore the previous session when it crashed.
 
-        If a crash marker exists along with a recovery file, it means
-        the previous session crashed without saving.
+        ``has_crash_marker`` must be sampled by the caller before
+        _start_crash_detection() arms this session's own marker; reading
+        it here would only ever find the file we just wrote.
         """
         try:
-            has_crash_marker = CRASH_MARKER_FILE.exists()
             has_recovery = RECOVERY_FILE.exists()
 
             if has_crash_marker and has_recovery:
@@ -3849,7 +3865,12 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.process)
         thread.finished.connect(self._on_preload_thread_finished)
 
-        dlg.canceled.connect(worker.cancel)
+        # DirectConnection: the worker lives on another thread that is
+        # inside process() for the whole run, so a queued cancel() would
+        # only be delivered once the work it was meant to stop had
+        # finished. cancel() only sets a bool, which is safe to do from
+        # the UI thread; the worker reads it between layers.
+        dlg.canceled.connect(worker.cancel, Qt.DirectConnection)
         dlg.canceled.connect(thread.quit)
 
         thread.start()
