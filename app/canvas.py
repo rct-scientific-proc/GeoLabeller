@@ -1121,6 +1121,10 @@ class AsyncFileLoader(QObject):
     # Emitted when a batch of files is complete: (loaded_count, error_count)
     batch_complete = pyqtSignal(int, int)
 
+    # Emitted instead of batch_complete when the batch was cancelled, so a
+    # superseded loader can never look like a finished one.
+    cancelled = pyqtSignal()
+
     # Emitted periodically during loading: (files_processed, total_files)
     progress_update = pyqtSignal(int, int)
 
@@ -1164,6 +1168,13 @@ class AsyncFileLoader(QObject):
         with rasterio.Env(**env_options):
             loaded_count, error_count = self._process_files(total)
 
+        if self._cancelled:
+            # A cancelled loader must go quiet. Its batch_complete used to
+            # arrive after the replacement loader had started, and the slot
+            # then wait()ed on the NEW loader - freezing the window for the
+            # whole second batch and running the completion handlers twice.
+            self.cancelled.emit()
+            return
         self.batch_complete.emit(loaded_count, error_count)
 
     def _process_files(self, total: int) -> tuple:
@@ -1355,6 +1366,7 @@ class AsyncFileLoaderThread(QThread):
     file_loaded = pyqtSignal(str, dict)
     file_error = pyqtSignal(str, str)
     batch_complete = pyqtSignal(int, int)
+    cancelled = pyqtSignal()
     progress_update = pyqtSignal(int, int)
 
     def __init__(self, parent=None):
@@ -1366,6 +1378,7 @@ class AsyncFileLoaderThread(QThread):
         self._loader.file_loaded.connect(self.file_loaded.emit)
         self._loader.file_error.connect(self.file_error.emit)
         self._loader.batch_complete.connect(self.batch_complete.emit)
+        self._loader.cancelled.connect(self.cancelled.emit)
         self._loader.progress_update.connect(self.progress_update.emit)
 
     def set_files(self, files: list[tuple[str, str]],
@@ -3120,10 +3133,28 @@ class MapCanvas(QGraphicsView):
             self._warmed.pop(layer_id, None)
 
     def clear_layers(self):
-        """Remove all layers from the canvas."""
+        """Remove all layers from the canvas, and stop their work.
+
+        Cancelling the in-flight loads matters as much as dropping the
+        layers: the runnables do not check whether their layer still
+        exists until they have finished reprojecting it, so a project
+        closed mid-load used to keep four worker threads busy on imagery
+        nobody would ever see - and the next project's first loads queued
+        behind them.
+        """
+        if self._waterfall_active:
+            # Nothing to restore the saved bounds onto once the layers are
+            # gone; leaving the flag set hides waypoints and suppresses
+            # detail tiles for whatever loads next.
+            self.clear_waterfall()
         for layer_id in list(self._layers.keys()):
-            self._clear_detail_tiles(layer_id, self._layers[layer_id])
-            self._layers[layer_id].remove_from_scene(self._scene)
+            layer = self._layers[layer_id]
+            self._cancel_layer_load(layer)
+            self._clear_detail_tiles(layer_id, layer)
+            layer.remove_from_scene(self._scene)
+        self._tile_build_queue.clear()
+        self._tile_build_queued.clear()
+        self._tile_build_timer.stop()
         self._layers.clear()
         self._warmed.clear()
         self._layer_order.clear()

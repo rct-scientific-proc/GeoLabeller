@@ -34,7 +34,7 @@ from PyQt5.QtWidgets import (
 
 from .axis_ruler import MapCanvasWithAxes
 from .canvas import (MapCanvas, CanvasMode, STEP_CYCLE_MODES,
-                     AsyncFileLoaderThread, TiledLayer)
+                     AsyncFileLoaderThread, LoadCancelled, TiledLayer)
 from .class_editor import ClassEditorDialog, DescriptionEditorDialog
 from .goto_location import (GoToLocationDialog, WaypointDialog,
                             format_lat_lon)
@@ -98,7 +98,12 @@ class GroupMemoryWorker(QObject):
                 # Load into a throwaway layer so the live layer (which the
                 # renderer may read at any time) is never mutated here.
                 tmp = TiledLayer(file_path, lazy=True, geo=geo)
-                tmp.ensure_loaded()
+                # Polled between the read and each reproject pass. Without
+                # it the only cancellation point was between layers, so
+                # Cancel - or closing the window - waited out a full-
+                # resolution reprojection of up to 150 MP: tens of seconds
+                # on a large mosaic, with the window not repainting.
+                tmp.ensure_loaded(cancel_check=lambda: self._cancelled)
                 result = {
                     'rgba': tmp._rgba_data,
                     'width': tmp._width,
@@ -115,6 +120,8 @@ class GroupMemoryWorker(QObject):
                     'level': tmp._loaded_level,
                 }
                 self.layer_ready.emit(layer_id, result)
+            except LoadCancelled:
+                break
             except Exception as e:
                 self.error.emit(layer_id, str(e))
             self.progress.emit(i + 1, total)
@@ -2127,11 +2134,7 @@ class MainWindow(QMainWindow):
                 return
 
         # Cancel any pending async operations
-        self._async_ui_timer.stop()
-        if self._async_loader is not None:
-            self._async_loader.cancel()
-            self._async_loader = None
-        self._async_pending_files.clear()
+        self._supersede_async_loading()
         self._async_missing_files.clear()
 
         self._hide_progress()
@@ -2166,7 +2169,9 @@ class MainWindow(QMainWindow):
         )
         if file_path:
             try:
-                # Clear existing state
+                # Before clearing anything: a loader still running would
+                # keep feeding the tree the user is about to replace.
+                self._supersede_async_loading()
                 self.canvas.clear_label_markers()
                 self.canvas.clear_layers()
                 self.layer_panel.clear()
@@ -2197,12 +2202,14 @@ class MainWindow(QMainWindow):
 
     def _start_project_image_loading(self):
         """Start async loading of project images."""
-        # The group cache holds QTreeWidgetItems, which _open_project has
-        # just destroyed via layer_panel.clear(). Carried across a project
-        # switch it hands back deleted widgets, and addChild raises
-        # "wrapped C/C++ object ... has been deleted" - so the cache is
-        # owned by the load that fills it, not by the window.
-        self._async_group_cache = {}
+        # Whatever was loading is not this project's business, and its
+        # queued files would otherwise land in this project's tree - and be
+        # saved into it. This also resets the group cache, which holds
+        # QTreeWidgetItems that _open_project has just destroyed via
+        # layer_panel.clear(): carried across a project switch it hands
+        # back deleted widgets and addChild raises "wrapped C/C++ object
+        # ... has been deleted".
+        self._supersede_async_loading()
 
         # A project shared from another machine often travels WITH its
         # imagery; resolving missing paths against the project file's own
@@ -2279,6 +2286,13 @@ class MainWindow(QMainWindow):
         self.layer_panel.begin_batch_update()
         try:
             for image in images:
+                if self.canvas.is_path_loaded(image.path):
+                    # Already on the canvas. Relocation re-enters this whole
+                    # routine for the WHOLE project, so without this guard
+                    # every already-loaded image gained a second tree row -
+                    # 20k duplicates per Apply, with the old row's checkbox
+                    # no longer following its layer.
+                    continue
                 meta = stored_layer_metadata(
                     image.path, image.group or "",
                     image.original_width, image.original_height,
@@ -3408,13 +3422,7 @@ class MainWindow(QMainWindow):
         # thread reference, and the first one's completion then wait()ed on
         # the SECOND, freezing the UI and tearing progress state down under
         # a live load.
-        if self._async_loader is not None:
-            self._async_loader.cancel()
-            self._async_loader.wait()
-            self._async_loader.deleteLater()
-            self._async_loader = None
-            self._async_ui_timer.stop()
-            self._async_pending_files.clear()
+        self._supersede_async_loading()
 
         # Store state for the async operation
         self._async_group_cache: dict[Path, any] = {}
@@ -3445,6 +3453,42 @@ class MainWindow(QMainWindow):
         # Start the UI update timer
         self._async_ui_timer.start()
         self._async_loader.start()
+
+    def _supersede_async_loading(self):
+        """Stop and forget any running file loader, and its queued work.
+
+        Every path that abandons what is loading goes through here: a new
+        project, an opened project, another directory import. Doing it in
+        pieces was how files from a directory import kept arriving in the
+        project the user had opened in the meantime - added to its tree
+        AND written into it on the next save - and how a stale group cache
+        reached a deleted QTreeWidgetItem.
+        """
+        self._async_ui_timer.stop()
+        loader = self._async_loader
+        if loader is not None:
+            # Disconnected first: cancel() cannot un-queue signals already
+            # emitted, and those slots would otherwise act on the loader
+            # that is going away.
+            try:
+                loader.file_loaded.disconnect()
+                loader.file_error.disconnect()
+                loader.batch_complete.disconnect()
+                loader.cancelled.disconnect()
+                loader.progress_update.disconnect()
+            except TypeError:
+                pass            # nothing was connected
+            loader.cancel()
+            loader.wait()
+            loader.deleteLater()
+            self._async_loader = None
+        self._async_pending_files.clear()
+        self._async_group_cache = {}
+
+    def _stale_loader_signal(self) -> bool:
+        """True when a signal came from a loader that has been superseded."""
+        sender = self.sender()
+        return sender is not None and sender is not self._async_loader
 
     def _remove_empty_groups(self, item):
         """Recursively remove empty group items from the layer tree.
@@ -3557,6 +3601,8 @@ class MainWindow(QMainWindow):
         Queues the file for processing - actual tree updates happen via timer
         to avoid reentrancy issues when user interacts with UI during loading.
         """
+        if self._stale_loader_signal():
+            return
         if self.canvas.is_path_loaded(file_path):
             return
 
@@ -3654,12 +3700,16 @@ class MainWindow(QMainWindow):
 
     def _on_async_file_error(self, file_path: str, error: str):
         """Handle a file failing to load."""
+        if self._stale_loader_signal():
+            return
         name = os.path.basename(file_path)
         debug(f"failed to load {file_path}: {error}")
         self.statusBar.showMessage(f"Failed to load {name}: {error}", 8000)
 
     def _on_async_progress(self, processed: int, total: int):
         """Handle progress updates during async loading."""
+        if self._stale_loader_signal():
+            return
         self._update_progress(processed)
         self.statusBar.showMessage(
             f"Loading files: {processed}/{total} ({
@@ -3668,6 +3718,11 @@ class MainWindow(QMainWindow):
 
     def _on_async_batch_complete(self, loaded: int, errors: int):
         """Handle async loading completion for both directory and project modes."""
+        if self._stale_loader_signal():
+            # A superseded loader finishing is not this load finishing:
+            # acting on it stopped the live load's timer and wait()ed on
+            # the live loader, freezing the window for its whole batch.
+            return
         # Stop the UI update timer
         self._async_ui_timer.stop()
 
@@ -4169,13 +4224,18 @@ class MainWindow(QMainWindow):
                 self._async_loader.wait()
             self._async_loader = None
 
-        # Cancel and wait for any running group memory worker
+        # Cancel and wait for any running group memory worker. The wait
+        # is bounded: the worker polls its cancel flag mid-load, but a read
+        # stalled on a dead network share answers nothing, and a window
+        # that will not close reads as a hang. A daemon-like abandon is
+        # safe here - the process is going away.
         if hasattr(self, '_group_mem_thread') and self._group_mem_thread is not None:
             if self._group_mem_thread.isRunning():
                 if self._group_mem_worker:
                     self._group_mem_worker.cancel()
                 self._group_mem_thread.quit()
-                self._group_mem_thread.wait()
+                if not self._group_mem_thread.wait(3000):
+                    debug("group preload did not stop in 3 s; abandoning it")
             self._group_mem_thread = None
             self._group_mem_worker = None
 
