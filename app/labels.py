@@ -563,6 +563,14 @@ class LabelProject:
     # User-defined class names
     classes: list[str] = field(default_factory=list)
 
+    # Preset description strings for the active-description picker: like the
+    # class list, but for PointLabel.description. Selecting one makes every
+    # newly placed label carry it (e.g. labelling a whole "spring" pass
+    # without retyping); a label's description itself stays free text, and
+    # editing this list never touches existing labels - the presets are only
+    # a faster way to fill the field.
+    descriptions: list[str] = field(default_factory=list)
+
     # Images with their labels (keyed by path for easy lookup)
     images: dict[str, ImageData] = field(default_factory=dict)
 
@@ -697,9 +705,14 @@ class LabelProject:
         lat: float,
         image_name: str,
         image_group: str = "",
-        image_path: str = ""
+        image_path: str = "",
+        description: str = ""
     ) -> PointLabel:
-        """Add a new point label to an image."""
+        """Add a new point label to an image.
+
+        ``description`` seeds the label's free-text description (the active
+        preset when one is selected); it stays editable per label.
+        """
         # Ensure image exists
         if image_path not in self.images:
             self.add_image(image_path, image_name, image_group)
@@ -710,7 +723,8 @@ class LabelProject:
             pixel_x=pixel_x,
             pixel_y=pixel_y,
             lon=lon,
-            lat=lat
+            lat=lat,
+            description=description
         )
         self._next_id += 1
         self.images[image_path].labels.append(label)
@@ -928,7 +942,7 @@ class LabelProject:
         return {
             # Single-digit minors only ("4.0" came after "3.9", never
             # "3.10"): the ICD pins readers to STRING comparison.
-            "version": "4.1",
+            "version": "4.2",
             # Copied, not referenced: the recovery snapshot is handed to a
             # background writer and the user carries on editing meanwhile.
             # The image and waypoint entries are freshly built dictionaries,
@@ -937,7 +951,11 @@ class LabelProject:
             "images": [img.to_dict() for img in self.images.values()],
             "waypoints": [wp.to_dict() for wp in self.waypoints],
             "_next_id": self._next_id,
-            "_next_waypoint_id": self._next_waypoint_id
+            "_next_waypoint_id": self._next_waypoint_id,
+            # Written only when any exist, so projects without description
+            # presets serialise exactly as they did before 4.2.
+            **({"descriptions": list(self.descriptions)}
+               if self.descriptions else {})
         }
 
     def save(self, file_path: str | Path):
@@ -953,6 +971,8 @@ class LabelProject:
 
         project = cls()
         project.classes = data.get("classes", [])
+        # Description presets arrived in 4.2; older projects have none.
+        project.descriptions = [str(d) for d in data.get("descriptions", [])]
         project._next_id = data.get("_next_id", 1)
 
         # Waypoints arrived in 3.3; older projects simply have none. The id

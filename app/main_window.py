@@ -35,7 +35,7 @@ from PyQt5.QtWidgets import (
 from .axis_ruler import MapCanvasWithAxes
 from .canvas import (MapCanvas, CanvasMode, STEP_CYCLE_MODES,
                      AsyncFileLoaderThread, TiledLayer)
-from .class_editor import ClassEditorDialog
+from .class_editor import ClassEditorDialog, DescriptionEditorDialog
 from .goto_location import (GoToLocationDialog, WaypointDialog,
                             format_lat_lon)
 from .labels import LabelProject, ImageData, haversine_distance
@@ -523,6 +523,13 @@ class MainWindow(QMainWindow):
         edit_classes_action.triggered.connect(self._edit_classes)
         labels_menu.addAction(edit_classes_action)
 
+        edit_descriptions_action = QAction("Edit &Descriptions...", self)
+        edit_descriptions_action.setStatusTip(
+            "Preset descriptions applied to newly placed labels "
+            "(Shift+1-9 to switch, Shift+0 for none)")
+        edit_descriptions_action.triggered.connect(self._edit_descriptions)
+        labels_menu.addAction(edit_descriptions_action)
+
         orientation_action = QAction("&Orientation Editor...", self)
         orientation_action.setStatusTip(
             "Draw each label's orientation across a grid of its class's "
@@ -728,6 +735,18 @@ class MainWindow(QMainWindow):
         self.class_combo.currentTextChanged.connect(self._on_class_changed)
         toolbar.addWidget(self.class_combo)
 
+        # Active description preset: applied to every newly placed label.
+        # Index 0 is always the "apply nothing" entry (Shift+0).
+        toolbar.addWidget(QLabel(" Description: "))
+        self.description_combo = QComboBox()
+        self.description_combo.setMinimumWidth(150)
+        self.description_combo.setToolTip(
+            "Applied to every label you place (Shift+1-9 to switch, "
+            "Shift+0 for none). Edit the presets under Labels > Edit "
+            "Descriptions...")
+        toolbar.addWidget(self.description_combo)
+        self._update_description_combo()
+
     def keyPressEvent(self, event: QKeyEvent):
         """Handle global key press events.
 
@@ -745,8 +764,17 @@ class MainWindow(QMainWindow):
             event.accept()
             return
 
+        # Shift+1-9 switch the active description preset; Shift+0 clears it.
+        # Checked before the plain digits, which switch classes.
+        if event.modifiers() & Qt.ShiftModifier:
+            number = self._SHIFTED_DIGITS.get(event.key())
+            if number is not None and self._select_description(number):
+                event.accept()
+                return
+
         # Handle 1-9 keys for quick class switching
-        if Qt.Key_1 <= event.key() <= Qt.Key_9:
+        if (Qt.Key_1 <= event.key() <= Qt.Key_9
+                and not event.modifiers() & Qt.ShiftModifier):
             class_index = event.key() - Qt.Key_1  # 0-8
             if class_index < len(self.project.classes):
                 self.class_combo.setCurrentIndex(class_index)
@@ -775,6 +803,16 @@ class MainWindow(QMainWindow):
                 elif etype == QEvent.KeyRelease and not event.isAutoRepeat():
                     self.canvas.stop_waterfall_glide()
                 return True  # Event consumed either way
+            if etype == QEvent.KeyPress and mode in STEP_CYCLE_MODES:
+                # Ctrl+Space steps backwards, consistent with the canvas
+                # handler. (This block sat unreachable below the glide-speed
+                # one for a while - Space on the tree then toggled a
+                # checkbox instead of stepping the cycle.)
+                if event.modifiers() & Qt.ControlModifier:
+                    self._cycle_to_prev_layer()
+                else:
+                    self._cycle_to_next_layer()
+                return True  # Event consumed
         # Glide speed works from the tree too, matching the canvas handler.
         if (etype == QEvent.KeyPress
                 and self.canvas._mode == CanvasMode.WATERFALL
@@ -783,13 +821,6 @@ class MainWindow(QMainWindow):
             faster = event.key() in (Qt.Key_Plus, Qt.Key_Equal)
             self.canvas.adjust_waterfall_speed(2.0 if faster else 0.5)
             return True
-            if etype == QEvent.KeyPress and mode in STEP_CYCLE_MODES:
-                # Ctrl+Space steps backwards, consistent with the canvas handler.
-                if event.modifiers() & Qt.ControlModifier:
-                    self._cycle_to_prev_layer()
-                else:
-                    self._cycle_to_next_layer()
-                return True  # Event consumed
         return super().eventFilter(obj, event)
 
     def _set_mode(self, mode: CanvasMode):
@@ -1103,6 +1134,68 @@ class MainWindow(QMainWindow):
         elif self.project.classes:
             self.class_combo.setCurrentIndex(0)
 
+        # The description picker follows the same project switches (open,
+        # new, combine, recovery) - refreshed here so no site can update
+        # one picker and forget the other.
+        self._update_description_combo()
+
+    # The picker's "apply nothing" entry (index 0, Shift+0).
+    NO_DESCRIPTION = "(none)"
+
+    def _update_description_combo(self):
+        """Rebuild the description picker: "(none)" plus the presets."""
+        current = self.description_combo.currentText()
+        self.description_combo.blockSignals(True)
+        self.description_combo.clear()
+        self.description_combo.addItem(self.NO_DESCRIPTION)
+        self.description_combo.addItems(self.project.descriptions)
+        if current in self.project.descriptions:
+            self.description_combo.setCurrentText(current)
+        else:
+            self.description_combo.setCurrentIndex(0)
+        self.description_combo.blockSignals(False)
+
+    def _active_description(self) -> str:
+        """The preset applied to newly placed labels ("" for none)."""
+        if self.description_combo.currentIndex() <= 0:
+            return ""
+        return self.description_combo.currentText()
+
+    def _edit_descriptions(self):
+        """Open the description-preset editor (Labels menu)."""
+        dialog = DescriptionEditorDialog(self.project.descriptions, self)
+        if dialog.exec_():
+            # Unlike classes, nothing to reconcile: presets only seed NEW
+            # labels, so editing the list never touches existing ones.
+            self.project.descriptions = dialog.get_descriptions()
+            self._update_description_combo()
+
+    def _select_description(self, number: int):
+        """Shift+1-9 / Shift+0: activate preset ``number`` (0 = none)."""
+        if number == 0:
+            self.description_combo.setCurrentIndex(0)
+            self.statusBar.showMessage("Description: none", 2000)
+            return True
+        if number <= len(self.project.descriptions):
+            self.description_combo.setCurrentIndex(number)   # 0 is "(none)"
+            self.statusBar.showMessage(
+                f"Description: {self.description_combo.currentText()}", 2000)
+            return True
+        return False
+
+    # With Shift held, the number row reports the SHIFTED symbol as the key
+    # on most layouts (Shift+1 arrives as Key_Exclam on US keyboards), so
+    # both spellings map to their digit. Layout-specific beyond US symbols
+    # is not attempted; the toolbar dropdown always works.
+    _SHIFTED_DIGITS = {
+        Qt.Key_0: 0, Qt.Key_1: 1, Qt.Key_2: 2, Qt.Key_3: 3, Qt.Key_4: 4,
+        Qt.Key_5: 5, Qt.Key_6: 6, Qt.Key_7: 7, Qt.Key_8: 8, Qt.Key_9: 9,
+        Qt.Key_ParenRight: 0, Qt.Key_Exclam: 1, Qt.Key_At: 2,
+        Qt.Key_NumberSign: 3, Qt.Key_Dollar: 4, Qt.Key_Percent: 5,
+        Qt.Key_AsciiCircum: 6, Qt.Key_Ampersand: 7, Qt.Key_Asterisk: 8,
+        Qt.Key_ParenLeft: 9,
+    }
+
     def _get_class_color(self, class_name: str) -> QColor:
         """Get the color for a class."""
         if class_name in self.project.classes:
@@ -1125,14 +1218,16 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage("No class selected", 3000)
             return
 
-        # Add to project
+        # Add to project, seeded with the active description preset (the
+        # toolbar picker / Shift+1-9), so a "spring" pass never retypes it.
         label = self.project.add_label(
             class_name=class_name,
             pixel_x=pixel_x, pixel_y=pixel_y,
             lon=lon, lat=lat,
             image_name=image_name,
             image_group=image_group,
-            image_path=image_path
+            image_path=image_path,
+            description=self._active_description()
         )
         debug(f"label added: #{label.id} '{class_name}' on {image_name} "
               f"at pixel ({pixel_x:.1f}, {pixel_y:.1f}) "
@@ -1151,6 +1246,10 @@ class MainWindow(QMainWindow):
             color,
             pixel_x=pixel_x,
             pixel_y=pixel_y)
+
+        # The marker tooltip shows the description, like the refresh path.
+        if label.description:
+            self.canvas.set_label_description(label.id, label.description)
 
         # Add to labeled images panel incrementally (O(1) instead of full refresh)
         image = self.project.images.get(image_path)

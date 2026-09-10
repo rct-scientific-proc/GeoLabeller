@@ -49,6 +49,8 @@ SHORTCUT_SECTIONS = [
         ("Right-click + drag", "Pan the view"),
         ("Ctrl+Left-click label", "Label options (Cycle modes)"),
         ("1-9", "Quick-switch to class 1-9"),
+        ("Shift+1-9", "Quick-switch description preset 1-9"),
+        ("Shift+0", "No description (new labels get none)"),
         ("Escape", "Cancel link mode"),
     ]),
     ("Chain Linking", [
@@ -68,6 +70,7 @@ SHORTCUT_SECTIONS = [
     ("Waterfall Mode", [
         ("Hold Space", "Glide up through the image stack"),
         ("Hold Ctrl+Space", "Glide down (starts at the bottom)"),
+        ("+ / -", "Glide speed up / down"),
         ("Left-click", "Place label (group labels stay visible)"),
         ("Right-click label", "Label options (remove, link, measure)"),
         ("Right-click + drag", "Pan within the stack"),

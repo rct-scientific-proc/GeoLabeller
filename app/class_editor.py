@@ -86,3 +86,57 @@ class ClassEditorDialog(QDialog):
                 seen.add(c)
                 unique_classes.append(c)
         return unique_classes
+
+
+class DescriptionEditorDialog(QDialog):
+    """Edit the project's description presets (the Shift+1-9 picker).
+
+    Unlike classes, removing a preset touches nothing: labels keep whatever
+    description they carry - the presets are only a faster way to fill the
+    field on newly placed labels.
+    """
+
+    def __init__(self, current_descriptions: list[str], parent=None):
+        """Initialize with the current preset list."""
+        super().__init__(parent)
+        self.setWindowTitle("Edit Descriptions")
+        self.setMinimumSize(340, 400)
+
+        layout = QVBoxLayout(self)
+        instructions = QLabel(
+            "Enter description presets, one per line. The active preset "
+            "(toolbar dropdown, or Shift+1-9; Shift+0 for none) is applied "
+            "to every newly placed label.\n\n"
+            "The first nine lines map to Shift+1-9. Removing a preset "
+            "never changes existing labels."
+        )
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+
+        self.text_edit = QPlainTextEdit()
+        self.text_edit.setPlainText("\n".join(current_descriptions))
+        self.text_edit.setPlaceholderText(
+            "e.g.\nspring foliage\nwinter, bare branches")
+        layout.addWidget(self.text_edit)
+
+        button_layout = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(self.accept)
+        ok_btn.setDefault(True)
+        button_layout.addWidget(ok_btn)
+        layout.addLayout(button_layout)
+
+    def get_descriptions(self) -> list[str]:
+        """The preset list: stripped, non-empty, first occurrence wins."""
+        lines = [line.strip()
+                 for line in self.text_edit.toPlainText().split("\n")]
+        seen = set()
+        unique = []
+        for line in lines:
+            if line and line not in seen:
+                seen.add(line)
+                unique.append(line)
+        return unique
