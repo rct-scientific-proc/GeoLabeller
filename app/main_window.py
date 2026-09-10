@@ -46,7 +46,8 @@ from .h5_export import (EXAMPLES_ALL, EXAMPLES_OBJECT,
                         EXAMPLES_OBJECT_VISIBLE, EXAMPLES_VISIBLE,
                         ExportImage, H5ExportDialog, H5ExportWorker,
                         HARD_NEGATIVE, NEGATIVES_ALL, NEGATIVES_FLAGGED,
-                        NEGATIVES_SAME, NEGATIVES_VISIBLE, centered_window)
+                        NEGATIVES_SAME, NEGATIVES_VISIBLE, centered_window,
+                        estimate_export)
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
 from .mask_editor import MaskEditor
@@ -2915,8 +2916,22 @@ class MainWindow(QMainWindow):
                 labels=examples,
                 examples_only=not slide,
                 location=img.location if img is not None else "",
-                protect=list(img.labels) if img is not None else []))
+                protect=list(img.labels) if img is not None else [],
+                src_width=img.original_width if img is not None else 0,
+                src_height=img.original_height if img is not None else 0))
         return images
+
+    def _h5_estimate(self, infos, dialog) -> dict:
+        """What the dialog's current settings would write - no file reads."""
+        options = dialog.options()
+        images = self._h5_images_for(
+            infos, options["examples_scope"], options["negatives_scope"],
+            options.get("object_ids") or [])
+        return estimate_export(
+            images, options["width"], options["height"], options["overlap"],
+            options["channels"], options["positive_offset"],
+            pixel_dtype=options["pixel_dtype"],
+            class_names=list(self.project.classes))
 
     def _export_object_snippets(self, object_ids):
         """Export the snippets of one linked object (or several)."""
@@ -2956,10 +2971,11 @@ class MainWindow(QMainWindow):
                 self, "HDF5 Export", "No layers are loaded to export.")
             return
 
-        dialog = H5ExportDialog(self._h5_counts(infos), self,
-                                defaults=self._h5_last_options,
-                                selection=self._h5_selection(infos,
-                                                             object_ids))
+        dialog = H5ExportDialog(
+            self._h5_counts(infos), self,
+            defaults=self._h5_last_options,
+            selection=self._h5_selection(infos, object_ids),
+            estimator=lambda dlg: self._h5_estimate(infos, dlg))
         if not dialog.exec_():
             return
 

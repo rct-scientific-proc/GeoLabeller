@@ -72,6 +72,11 @@ class ExportImage:
     # labels are always protected; this is what is protected *as well*, so
     # the default can never protect less than before.
     protect: list = field(default_factory=list)
+    # The raster's pixel dimensions, when the project knows them. Used only
+    # by estimate_export, so the dialog can count what a run would write
+    # without opening a single file; the export itself reads the real size.
+    src_width: int = 0
+    src_height: int = 0
 
 # How far, in pixels, the eight surrounding example crops sit from the one
 # centred on the label - see _positive_windows. A quarter of the default 64px
@@ -213,6 +218,89 @@ def _snippet_positions(total: int, window: int, step: int) -> list[int]:
     if positions[-1] != total - window:
         positions.append(total - window)
     return positions
+
+
+def estimate_export(images, width, height, overlap, channels,
+                    positive_offset, pixel_dtype="uint8",
+                    class_names=None) -> dict:
+    """What an export would contain, without reading a single raster.
+
+    Everything here is arithmetic on label positions and the grid step, so
+    the dialog can answer "how big is this?" as the user types. Returns
+    ``examples``, ``negatives``, ``per_class`` ({name: count}) and ``bytes``
+    - an estimate of the image data alone, which dominates the file.
+
+    ``images`` are :class:`ExportImage`; each must carry ``src_width`` and
+    ``src_height`` for its negatives to be counted (they come from the
+    project, so no header read is needed). An image whose size is unknown
+    contributes its examples and no negative estimate.
+    """
+    offset = max(0, int(positive_offset))
+    step_x = max(1, int(round(width * (1.0 - overlap))))
+    step_y = max(1, int(round(height * (1.0 - overlap))))
+    examples = 0
+    negatives = 0
+    per_class: dict = {}
+    for request in images:
+        src_w = int(getattr(request, "src_width", 0) or 0)
+        src_h = int(getattr(request, "src_height", 0) or 0)
+        crops = {}
+        if src_w >= width and src_h >= height:
+            pts = [(float(l.pixel_x), float(l.pixel_y), 0,
+                    getattr(l, "class_name", "")) for l in request.labels]
+            crops = _positive_windows(pts, src_w, src_h, width, height,
+                                      offset)
+        elif request.labels:
+            # Unknown or undersized: every label still yields its crops, we
+            # just cannot say how the ring merges at the edges.
+            crops = {(i, 0): (0, l.class_name)
+                     for i, l in enumerate(request.labels)}
+        examples += len(crops)
+        for _pos, (_index, name) in crops.items():
+            per_class[name] = per_class.get(name, 0) + 1
+
+        if request.examples_only or src_w < width or src_h < height:
+            continue
+        guarded = set(crops)
+        if request.protect:
+            guarded |= set(_positive_windows(
+                [(float(l.pixel_x), float(l.pixel_y), 0, "")
+                 for l in request.protect], src_w, src_h, width, height,
+                offset))
+        xs = _snippet_positions(src_w, width, step_x)
+        ys = _snippet_positions(src_h, height, step_y)
+        blocked = _excluded_grid(guarded, xs, ys, width, height)
+        negatives += int(blocked.size - blocked.sum())
+
+    stored_channels = 1 if pixel_dtype == "float32" else channels
+    itemsize = 4 if pixel_dtype == "float32" else 1
+    total = examples + negatives
+    if class_names:
+        per_class = {name: per_class.get(name, 0) for name in class_names
+                     if per_class.get(name)}
+    return {"examples": examples, "negatives": negatives,
+            "total": total, "per_class": per_class,
+            "bytes": total * width * height * stored_channels * itemsize}
+
+
+def format_estimate(estimate: dict) -> str:
+    """The estimate as the one line the dialog shows."""
+    if not estimate["total"]:
+        return "Nothing to export with these settings."
+    size = estimate["bytes"]
+    for unit in ("bytes", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            readable = (f"{size:.0f} {unit}" if unit == "bytes"
+                        else f"{size:.1f} {unit}")
+            break
+        size /= 1024.0
+    parts = [f"{estimate['total']:,} snippets",
+             f"{estimate['examples']:,} examples",
+             f"{estimate['negatives']:,} hard negatives"]
+    spread = ", ".join(f"{name} {count:,}"
+                       for name, count in estimate["per_class"].items())
+    line = "  \u00b7  ".join(parts) + f"  \u00b7  ~{readable}"
+    return line + (f"\n{spread}" if spread else "")
 
 
 class H5DatasetWriter:
@@ -905,7 +993,7 @@ class H5ExportDialog(QDialog):
     """
 
     def __init__(self, counts=None, parent=None, defaults=None,
-                 selection=None):
+                 selection=None, estimator=None):
         """Build the dialog.
 
         ``counts`` sizes the scope options - keys ``all``, ``visible``,
@@ -918,10 +1006,15 @@ class H5ExportDialog(QDialog):
         ``classes`` ({class name: count} across those instances, so a linked
         object whose views disagree about a class shows the disagreement
         before it is exported). ``None`` for the whole-project export.
+
+        ``estimator`` is called with this dialog and must return an
+        ``estimate_export`` dict - what the current settings would write.
+        It runs on every change, so it must not touch the filesystem.
         """
         super().__init__(parent)
         self._counts = dict(counts or {})
         self._selection = dict(selection) if selection else None
+        self._estimator = estimator
         self._defaults = dict(defaults or {})
         self.setWindowTitle("Export HDF5 Dataset")
         self.setMinimumWidth(500)
@@ -1156,6 +1249,16 @@ class H5ExportDialog(QDialog):
         self._append_note.setStyleSheet("color: #0066cc;")
         layout.addWidget(self._append_note)
 
+        # What the current settings would actually write. Pure arithmetic
+        # on the label positions and the grid step - no raster is opened -
+        # so it can follow every keystroke. Without it the only way to find
+        # out was to press Export: at 64 px with 50% overlap one 12k x 12k
+        # mosaic is about 140,000 windows, and the difference between a 2 GB
+        # file and a 200 GB one is one spin box.
+        self.estimate_label = QLabel("")
+        self.estimate_label.setWordWrap(True)
+        layout.addWidget(self.estimate_label)
+
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.buttons.button(QDialogButtonBox.Ok).setText("Export")
@@ -1183,6 +1286,27 @@ class H5ExportDialog(QDialog):
         # The axes may have been set before their toggled signals were
         # connected, so run the handler once for the initial enabled states.
         self._on_scope_changed()
+        for spin in (self.height_spin, self.width_spin, self.overlap_spin,
+                     self.offset_spin):
+            spin.valueChanged.connect(self._refresh_estimate)
+        self.offset_check.toggled.connect(self._refresh_estimate)
+        self.channel_combo.currentIndexChanged.connect(self._refresh_estimate)
+        self.pixel_format_combo.currentIndexChanged.connect(
+            self._refresh_estimate)
+        self._refresh_estimate()
+
+    def _refresh_estimate(self, *_args):
+        """Show what the current settings would write."""
+        if self._estimator is None:
+            return
+        try:
+            estimate = self._estimator(self)
+        except Exception as exc:      # noqa: BLE001 - a count must not block
+            debug(f"h5 estimate failed: {type(exc).__name__}: {exc}")
+            self.estimate_label.setText("")
+            return
+        self.estimate_label.setText(format_estimate(estimate)
+                                    if estimate else "")
 
     def _apply_settings(self, settings):
         """Set the widgets from a settings dict; missing keys are left alone."""
@@ -1338,6 +1462,7 @@ class H5ExportDialog(QDialog):
         """Keep the split controls and the OK button in step with the axes."""
         self._neg_box.setEnabled(self._writes_negatives())
         self._update_ok_enabled()
+        self._refresh_estimate()
 
     def _writes_negatives(self) -> bool:
         """Will this export write any hard negatives at all?
