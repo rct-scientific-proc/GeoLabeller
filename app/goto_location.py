@@ -99,7 +99,9 @@ def parse_lat_lon(text: str) -> tuple[float, float] | None:
     Accepts decimal degrees ("40.7536, -73.9832"), hemisphere letters on
     either side of the number ("40.7536N 73.9832W", "N40 W73") and
     degrees/minutes/seconds ("40 45 12.9 N, 73 58 59.5 W"). Latitude comes
-    first unless the hemisphere letters say otherwise.
+    first unless the hemisphere letters say otherwise. Returns None when
+    the letters disagree with themselves - two latitudes or two
+    longitudes name no position, and a guess would be a wrong one.
     """
     if not text or not text.strip():
         return None
@@ -112,7 +114,16 @@ def parse_lat_lon(text: str) -> tuple[float, float] | None:
     (first, first_hemisphere), (second, second_hemisphere) = parsed
 
     # Hemisphere letters name the axis, so "W73.98, N40.75" works too.
-    if first_hemisphere in ("E", "W") or second_hemisphere in ("N", "S"):
+    axes = tuple("lat" if h in ("N", "S") else "lon" if h in ("E", "W")
+                 else None for h in (first_hemisphere, second_hemisphere))
+    if axes[0] is not None and axes[0] == axes[1]:
+        # Both letters name the SAME axis - two latitudes, or two
+        # longitudes. There is no position in that, and guessing one used
+        # to hand back a confident wrong answer: "40N 75N" parsed as
+        # 75N 40E, several thousand kilometres from anywhere the user
+        # meant.
+        return None
+    if axes[0] == "lon" or axes[1] == "lat":
         lat, lon = second, first
     else:
         lat, lon = first, second

@@ -60,6 +60,11 @@ def decode_rle(runs: list, width: int, height: int) -> np.ndarray:
     pixels - a corrupt mask must fail loudly, not render shifted.
     """
     total = width * height
+    if any(run < 0 for run in runs):
+        # A negative run can make the sum come out right while the decode
+        # walks backwards over pixels it already wrote - exactly the
+        # silently shifted mask the exact-cover check exists to prevent.
+        raise ValueError("mask RLE contains a negative run")
     if sum(runs) != total:
         raise ValueError(
             f"mask RLE covers {sum(runs)} pixels, window has {total}")
@@ -98,6 +103,8 @@ def _entry_row_spans(entry: dict):
     ew, eh = int(entry["width"]), int(entry["height"])
     ex0, ey0 = int(entry["x0"]), int(entry["y0"])
     runs = entry_runs(entry)
+    if any(run < 0 for run in runs):
+        raise ValueError("mask RLE contains a negative run")
     if sum(runs) != ew * eh:
         raise ValueError(
             f"mask RLE covers {sum(runs)} pixels, window has {ew * eh}")
