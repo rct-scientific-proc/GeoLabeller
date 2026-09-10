@@ -1,5 +1,6 @@
 """Layer panel for managing loaded layers and groups."""
 import os
+import time
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem,
     QMenu, QInputDialog, QMessageBox, QStyle, QApplication,
@@ -14,6 +15,16 @@ from PyQt5.QtGui import QColor
 # whole-tree emission used to rewrite every image's project group from its
 # tree ancestry, which is not the same string for non-georeferenced images.
 GROUP_PATH_ROLE = Qt.UserRole + 2
+
+# (checked layers, total layers) cached on a GROUP item. The whole-tree
+# recompute is the source of truth and writes these as it goes; the
+# incremental paths below read them, so a single checkbox change costs the
+# changed item's ancestry rather than a walk of every item in the tree.
+GROUP_COUNTS_ROLE = Qt.UserRole + 3
+
+# How long a group toggle works before yielding to the event loop.
+# Matches the async loader's slice, so both feel the same.
+_TOGGLE_PUMP_SECONDS = 0.030
 
 
 class LayerTreeWidget(QTreeWidget):
@@ -120,10 +131,12 @@ class LayerPanel(QWidget):
         self._batch_mode = False
         self.tree.blockSignals(False)
         self.tree.setUpdatesEnabled(True)
-        # One aggregate recompute for the whole batch. Per-add recomputes
-        # were a full-tree walk EACH - measured at 94 of the 238 seconds a
-        # 13k-image project took to load.
-        self.refresh_group_check_states()
+        # No aggregate recompute here: adds fold themselves into the cached
+        # group counts as they go (_add_counts_upward). This used to be one
+        # full-tree walk per batch, and the async loader opens a batch per
+        # 50 ms slice - 23 ms of walking each, some 2,000 times over a
+        # 20k-image import, on the very thread the async path exists to
+        # keep free.
         self.tree.update()
 
     def add_layer(self, layer_id: str, file_path: str,
@@ -165,12 +178,10 @@ class LayerPanel(QWidget):
         self._layer_items[layer_id] = item
         self._path_items[file_path] = item
 
-        # A new layer can change its group's aggregate (e.g. a hidden layer
-        # added to a fully-shown group makes it partial). During a batch the
-        # recompute waits for end_batch_update - once for the whole batch,
-        # not a full-tree walk per added layer.
-        if not self._batch_mode:
-            self.refresh_group_check_states()
+        # A new layer changes its group aggregate (a hidden layer added to a
+        # fully-shown group makes it partial): folded into the cached counts,
+        # which costs the item's depth rather than a walk of the whole tree.
+        self._add_counts_upward(item, 1 if visible else 0, 1)
 
     def add_group(self, name: str, parent: QTreeWidgetItem = None,
                   visible: bool = True):
@@ -224,7 +235,7 @@ class LayerPanel(QWidget):
             # Group boxes mirror their layers (on, off, or partial). During
             # a group toggle the toggle's own final refresh covers it.
             if not self._group_toggle_active:
-                self.refresh_group_check_states()
+                self._refresh_ancestors(item)
 
         elif item_type == "group":
             # A user click lands on Checked or Unchecked (a partial box goes
@@ -319,7 +330,77 @@ class LayerPanel(QWidget):
             state = Qt.PartiallyChecked
         if item.checkState(0) != state:
             item.setCheckState(0, state)
+        item.setData(0, GROUP_COUNTS_ROLE, (checked, total))
         return checked, total
+
+    @staticmethod
+    def _state_for(checked: int, total: int):
+        """The box a group with these layer counts should show."""
+        if total == 0 or checked == 0:
+            return Qt.Unchecked
+        return Qt.Checked if checked == total else Qt.PartiallyChecked
+
+    def _refresh_ancestors(self, item: QTreeWidgetItem):
+        """Recompute the group boxes above one changed item.
+
+        Only an item's own ancestors can change when it does, so the full
+        recursive walk (measured at 25 ms on a 20k-layer tree, and run
+        twice per cycle step) is not needed for a single check change.
+        Each ancestor is summed from its DIRECT children, using the counts
+        cached on child groups, so the cost is the item's siblings plus its
+        depth rather than the whole tree.
+        """
+        blocked = self.tree.signalsBlocked()
+        self.tree.blockSignals(True)
+        try:
+            parent = item.parent()
+            while parent is not None:
+                checked = total = 0
+                for i in range(parent.childCount()):
+                    child = parent.child(i)
+                    if child.data(0, Qt.UserRole + 1) == "layer":
+                        total += 1
+                        checked += child.checkState(0) == Qt.Checked
+                    else:
+                        counts = child.data(0, GROUP_COUNTS_ROLE)
+                        if counts is None:
+                            counts = self._refresh_group_item(child)
+                        checked += counts[0]
+                        total += counts[1]
+                parent.setData(0, GROUP_COUNTS_ROLE, (checked, total))
+                state = self._state_for(checked, total)
+                if parent.checkState(0) != state:
+                    parent.setCheckState(0, state)
+                parent = parent.parent()
+        finally:
+            self.tree.blockSignals(blocked)
+
+    def _add_counts_upward(self, item: QTreeWidgetItem, checked: int,
+                           total: int):
+        """Fold a newly added layer into its ancestors' cached counts.
+
+        An add is unambiguous - one more layer, checked or not - so the
+        aggregates stay right without recomputing anything. This is what
+        lets a 20k-image import stop paying a full-tree walk per 50 ms
+        slice of loading (23 ms each, some 2,000 slices).
+        """
+        blocked = self.tree.signalsBlocked()
+        self.tree.blockSignals(True)
+        try:
+            parent = item.parent()
+            while parent is not None:
+                counts = parent.data(0, GROUP_COUNTS_ROLE)
+                if counts is None:
+                    counts = self._refresh_group_item(parent)
+                else:
+                    counts = (counts[0] + checked, counts[1] + total)
+                    parent.setData(0, GROUP_COUNTS_ROLE, counts)
+                    state = self._state_for(*counts)
+                    if parent.checkState(0) != state:
+                        parent.setCheckState(0, state)
+                parent = parent.parent()
+        finally:
+            self.tree.blockSignals(blocked)
 
     def _check_parents_of_visible_items(self):
         """Recompute group boxes after drag-drop moves items between groups."""
@@ -352,6 +433,13 @@ class LayerPanel(QWidget):
         """
         check_state = Qt.Checked if checked else Qt.Unchecked
         progress_count = [0]  # Use list for mutable closure
+        # Pump on a time budget, not every fifth layer. Each pump flushes
+        # the canvas repaint that every visibility signal posts, so a fifth
+        # of a 20,000-layer group is 4,000 full canvas repaints - the walk
+        # spends its time painting intermediate states nobody sees. A 30 ms
+        # budget keeps the window as responsive as the async loader is,
+        # which uses the same pattern.
+        deadline = [time.perf_counter() + _TOGGLE_PUMP_SECONDS]
 
         def process_item(parent: QTreeWidgetItem):
             """Recursively apply the check state to descendants, emitting progress per layer."""
@@ -375,8 +463,12 @@ class LayerPanel(QWidget):
                     progress_count[0] += 1
                     if emit_progress:
                         self.batch_visibility_progress.emit(progress_count[0])
-                        # Allow UI to update periodically
-                        if progress_count[0] % 5 == 0:
+                        now = time.perf_counter()
+                        if now >= deadline[0]:
+                            deadline[0] = now + _TOGGLE_PUMP_SECONDS
+                            # Signals are live here on purpose: a user click
+                            # during the walk reaches _on_item_changed, which
+                            # queues it and can supersede this walk.
                             QApplication.processEvents()
                 elif child_type == "group":
                     process_item(child)
@@ -497,8 +589,7 @@ class LayerPanel(QWidget):
                 menu.addSeparator()
                 remove_action = menu.addAction("Remove")
                 remove_action.triggered.connect(
-                    lambda _, items=selected: [
-                        self._remove_item(it) for it in items])
+                    lambda _, items=selected: self._remove_items(items))
 
                 menu.exec_(self.tree.mapToGlobal(position))
                 return
@@ -642,17 +733,70 @@ class LayerPanel(QWidget):
         if layer_ids:
             self.group_free_requested.emit(layer_ids)
 
-    def _remove_item(self, item: QTreeWidgetItem):
-        """Remove an item (and, via MainWindow, its images) for good."""
-        item_type = item.data(0, Qt.UserRole + 1)
-        # Removing the Non-Georeferenced root while still caching it meant
-        # every later non-geo import appended to a detached subtree: the
-        # canvas and project got the images, the panel showed nothing.
+    def _remove_items(self, items: list):
+        """Remove a whole selection: one question, one refresh, one batch.
+
+        Removing each item separately asked its own Yes/No - forty selected
+        layers meant forty dialogs, each followed by a full recompute and a
+        project-wide refresh of the labelled, snippet and hard-negative
+        panels - and answering No to one of them did not stop the rest.
+        """
+        # A selection often holds both a group and layers inside it; those
+        # layers would otherwise be counted twice and removed twice.
+        outermost = [item for item in items
+                     if not any(other is not item
+                                and self._is_ancestor_of(other, item)
+                                for other in items)]
+        entries = []
+        for item in outermost:
+            self._collect_layer_entries(item, entries)
+        seen = set()
+        unique = []
+        for layer_id, path in entries:
+            if layer_id in seen:
+                continue
+            seen.add(layer_id)
+            unique.append((layer_id, path))
+        entries = unique
+
+        message = None
+        if self.removal_describer is not None and entries:
+            message = self.removal_describer(entries)
+        elif any(item.data(0, Qt.UserRole + 1) == "group"
+                 and item.childCount() > 0 for item in outermost):
+            message = "This selection contains layers. Remove anyway?"
+        if message is not None:
+            reply = QMessageBox.question(
+                self, "Remove", message,
+                QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.No:
+                return
+
+        for item in outermost:
+            self._detach_item(item)
+        for layer_id, _path in entries:
+            self._drop_layer_from_caches(layer_id)
+        self.refresh_group_check_states()
+        for layer_id, _path in entries:
+            self.layer_removed.emit(layer_id)
+        if entries:
+            self.layers_removed.emit(entries)
+
+    def _detach_item(self, item: QTreeWidgetItem):
+        """Take an item out of the tree, forgetting it if it is the root."""
         if self._nongeo_root is not None and (
                 item is self._nongeo_root
                 or self._is_ancestor_of(item, self._nongeo_root)):
             self._nongeo_root = None
+        parent = item.parent()
+        if parent:
+            parent.removeChild(item)
+        else:
+            self.tree.takeTopLevelItem(self.tree.indexOfTopLevelItem(item))
 
+    def _remove_item(self, item: QTreeWidgetItem):
+        """Remove an item (and, via MainWindow, its images) for good."""
+        item_type = item.data(0, Qt.UserRole + 1)
         # (layer_id, file_path) for every layer this removal covers.
         entries = []
         self._collect_layer_entries(item, entries)
@@ -672,13 +816,11 @@ class LayerPanel(QWidget):
             if reply == QMessageBox.No:
                 return
 
-        # Get parent and remove from tree
-        parent = item.parent()
-        if parent:
-            parent.removeChild(item)
-        else:
-            index = self.tree.indexOfTopLevelItem(item)
-            self.tree.takeTopLevelItem(index)
+        # Out of the tree. Removing the Non-Georeferenced root while still
+        # caching it meant every later non-geo import appended to a detached
+        # subtree: the canvas and project got the images, the panel showed
+        # nothing.
+        self._detach_item(item)
 
         # Drop removed layers from O(1) lookup caches
         for layer_id, _path in entries:
@@ -731,36 +873,60 @@ class LayerPanel(QWidget):
             if file_path and self._path_items.get(file_path) is item:
                 del self._path_items[file_path]
 
+    # Above this many actually-changed layers, recomputing every group
+    # from scratch is cheaper than walking each changed item's ancestry.
+    _ANCESTOR_REFRESH_LIMIT = 32
+
+    def _set_layers_checked(self, layer_ids: list[str], checked: bool):
+        """Set many layers at once, then tell the world once.
+
+        Signals stay blocked for the whole loop and the event loop is NOT
+        pumped inside it. Pumping while blocked delivered user clicks whose
+        itemChanged never fired - the canvas kept the old visibility while
+        the tree showed the new one - and any re-entrant code ending with
+        an absolute blockSignals(False) unblocked the tree mid-loop, after
+        which every remaining setCheckState ran a full recompute. The loop
+        is fast enough not to need the pump: 20,000 layers measured at
+        45 ms with the aggregates below.
+        """
+        if not layer_ids:
+            return
+        want = Qt.Checked if checked else Qt.Unchecked
+        was = Qt.Unchecked if checked else Qt.Checked
+        total = len(layer_ids)
+        self.batch_visibility_started.emit(total)
+        changed_items = []
+        changed_layers = []
+
+        blocked = self.tree.signalsBlocked()
+        self.tree.blockSignals(True)
+        try:
+            for i, layer_id in enumerate(layer_ids, start=1):
+                item = self._layer_items.get(layer_id)
+                if item is not None and item.checkState(0) == was:
+                    item.setCheckState(0, want)
+                    changed_items.append(item)
+                    changed_layers.append(layer_id)
+                self.batch_visibility_progress.emit(i)
+        finally:
+            self.tree.blockSignals(blocked)
+
+        if len(changed_items) > self._ANCESTOR_REFRESH_LIMIT:
+            self.refresh_group_check_states()
+        else:
+            for item in changed_items:
+                self._refresh_ancestors(item)
+
+        for layer_id in changed_layers:
+            self.layer_visibility_changed.emit(layer_id, checked)
+
     def uncheck_layers(self, layer_ids: list[str]):
         """Uncheck (hide) layers by their IDs.
 
         Args:
             layer_ids: List of layer IDs to uncheck
         """
-        if not layer_ids:
-            return
-
-        total = len(layer_ids)
-        self.batch_visibility_started.emit(total)
-        changed_layers = []
-
-        # Block signals to prevent cascading _on_item_changed calls
-        self.tree.blockSignals(True)
-        for i, layer_id in enumerate(layer_ids, start=1):
-            item = self._layer_items.get(layer_id)
-            if item is not None and item.checkState(0) == Qt.Checked:
-                item.setCheckState(0, Qt.Unchecked)
-                changed_layers.append(layer_id)
-            self.batch_visibility_progress.emit(i)
-            if i % 50 == 0:
-                QApplication.processEvents()
-        self.tree.blockSignals(False)
-        self.refresh_group_check_states()
-
-        # Emit visibility changed signals for each layer that was actually
-        # changed
-        for layer_id in changed_layers:
-            self.layer_visibility_changed.emit(layer_id, False)
+        self._set_layers_checked(layer_ids, False)
 
         self.batch_visibility_finished.emit()
 
@@ -770,30 +936,7 @@ class LayerPanel(QWidget):
         Args:
             layer_ids: List of layer IDs to check
         """
-        if not layer_ids:
-            return
-
-        total = len(layer_ids)
-        self.batch_visibility_started.emit(total)
-        changed_layers = []
-
-        # Block signals to prevent cascading _on_item_changed calls
-        self.tree.blockSignals(True)
-        for i, layer_id in enumerate(layer_ids, start=1):
-            item = self._layer_items.get(layer_id)
-            if item is not None and item.checkState(0) == Qt.Unchecked:
-                item.setCheckState(0, Qt.Checked)
-                changed_layers.append(layer_id)
-            self.batch_visibility_progress.emit(i)
-            if i % 50 == 0:
-                QApplication.processEvents()
-        self.tree.blockSignals(False)
-        self.refresh_group_check_states()
-
-        # Emit visibility changed signals for each layer that was actually
-        # changed
-        for layer_id in changed_layers:
-            self.layer_visibility_changed.emit(layer_id, True)
+        self._set_layers_checked(layer_ids, True)
 
         self.batch_visibility_finished.emit()
 
@@ -1014,6 +1157,7 @@ class LayerPanel(QWidget):
 
         nongeo_parent.addChild(item)
         item.setData(0, GROUP_PATH_ROLE, self._get_group_path(item))
+        self._add_counts_upward(item, 1 if visible else 0, 1)
 
         # Register in O(1) lookup caches
         self._layer_items[layer_id] = item
@@ -1037,7 +1181,7 @@ class LayerPanel(QWidget):
         found_item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
         self.tree.blockSignals(False)
         # Group boxes follow their layers, whichever way this one flipped.
-        self.refresh_group_check_states()
+        self._refresh_ancestors(found_item)
 
     def is_layer_checked(self, layer_id: str) -> bool:
         """Check if a specific layer is checked (visible).
