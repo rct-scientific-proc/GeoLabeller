@@ -48,6 +48,9 @@ class SnippetPanel(QWidget):
         self._loader.ready.connect(self._on_snippet_ready)
         self._entries: list = []          # current project labels, unfiltered
         self._items: dict[int, QListWidgetItem] = {}
+        # What the strip currently shows, one _view_key per tile in order.
+        # A rebuild compares against this and touches only what differs.
+        self._view_keys: list = []
         self._setup_ui()
 
     # -- UI -----------------------------------------------------------------
@@ -188,36 +191,91 @@ class SnippetPanel(QWidget):
             return [e for e in self._entries if e["class_name"] == wanted]
         return self._entries
 
+    @staticmethod
+    def _caption_for(entry) -> str:
+        caption = f"{entry['class_name']}  ·  {entry['image_name']}"
+        if entry.get("group_id"):
+            caption = f"[{entry['group_id']}]  {caption}"
+        return caption
+
+    def _view_key(self, entry, size: int) -> tuple:
+        """Everything about an entry that changes what its tile shows."""
+        return (entry["label_id"], self._caption_for(entry),
+                entry["image_path"], int(round(entry["pixel_x"])),
+                int(round(entry["pixel_y"])), size)
+
     def _rebuild(self):
-        self._loader.cancel_all()
-        self.list.clear()
-        self._items.clear()
         size = self.size_spin.value()
-        # Items are created before their icons arrive (snippets load async),
-        # and with uniform item sizes the view caches the FIRST size hint it
-        # computes - a text-only strip - leaving every icon painted into a
-        # ~17px-tall rect until some resize forces a relayout. Pin an
-        # explicit icon+caption hint up front so geometry never depends on
-        # icon timing. Must stay inside the grid cell set by
-        # _apply_display_size.
-        display = min(size, 256)
-        hint = QSize(display + 12, display + 32)
-        for entry in self._filtered():
-            label_id = entry["label_id"]
-            caption = f"{entry['class_name']}  ·  {entry['image_name']}"
-            if entry.get("group_id"):
-                caption = f"[{entry['group_id']}]  {caption}"
-            item = QListWidgetItem(caption)
-            item.setSizeHint(hint)
-            item.setData(self._ID_ROLE, label_id)
-            item.setToolTip(
-                f"{entry['class_name']} on {Path(entry['image_path']).name}"
-                + (f"\nGroup: {entry['group_id']}" if entry.get("group_id")
-                   else ""))
-            self.list.addItem(item)
-            self._items[label_id] = item
-            self._loader.request(label_id, entry["image_path"],
+        keys = [self._view_key(e, size) for e in self._filtered()]
+        # Nothing the strip shows has changed, so keep the tiles - and the
+        # icons already read for them. Every rebuild used to clear the list
+        # and re-request every snippet, so editing one label's description
+        # re-read the lot: measured at 1.6 s for 2,000 labels, with the
+        # discarded read queue growing behind every edit.
+        if keys == self._view_keys:
+            return
+        self._rebuild_items(keys, size)
+
+    def _rebuild_items(self, keys, size: int):
+        """Bring the strip in line with ``keys``, reusing unchanged tiles."""
+        previous = {key[0]: key for key in self._view_keys}
+        entries = {e["label_id"]: e for e in self._filtered()}
+
+        # Take the existing tiles out without destroying them, so a tile
+        # whose key is unchanged keeps the icon it already has.
+        held = {}
+        self.list.setUpdatesEnabled(False)
+        try:
+            while self.list.count():
+                item = self.list.takeItem(0)
+                held[item.data(self._ID_ROLE)] = item
+            self._items.clear()
+
+            requests = []
+            for key in keys:
+                label_id = key[0]
+                entry = entries.get(label_id)
+                if entry is None:
+                    continue
+                item = held.pop(label_id, None)
+                if item is None or previous.get(label_id) != key:
+                    item = self._make_item(entry, size)
+                    requests.append(entry)
+                self.list.addItem(item)
+                self._items[label_id] = item
+        finally:
+            self.list.setUpdatesEnabled(True)
+
+        # Tiles that left the strip: stop their reads rather than letting
+        # them finish for a tile that no longer exists.
+        for label_id in held:
+            self._loader.cancel(label_id)
+
+        self._view_keys = list(keys)
+        for entry in requests:
+            self._loader.request(entry["label_id"], entry["image_path"],
                                  entry["pixel_x"], entry["pixel_y"], size)
+
+    def _make_item(self, entry, size: int):
+        """One strip tile, sized before its icon arrives.
+
+        Items are created before their icons arrive (snippets load async),
+        and with uniform item sizes the view caches the FIRST size hint it
+        computes - a text-only strip - leaving every icon painted into a
+        ~17px-tall rect until some resize forces a relayout. Pin an
+        explicit icon+caption hint up front so geometry never depends on
+        icon timing. Must stay inside the grid cell set by
+        _apply_display_size.
+        """
+        display = min(size, 256)
+        item = QListWidgetItem(self._caption_for(entry))
+        item.setSizeHint(QSize(display + 12, display + 32))
+        item.setData(self._ID_ROLE, entry["label_id"])
+        item.setToolTip(
+            f"{entry['class_name']} on {Path(entry['image_path']).name}"
+            + (f"\nGroup: {entry['group_id']}" if entry.get("group_id")
+               else ""))
+        return item
 
     def _on_size_changed(self):
         self._apply_display_size()

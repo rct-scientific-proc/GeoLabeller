@@ -226,10 +226,12 @@ class _SnippetSignals(QObject):
 class _SnippetRunnable(QRunnable):
     """One windowed read on the pool."""
 
-    def __init__(self, key, image_path, px, py, size, token, signals):
+    def __init__(self, key, image_path, px, py, size, token, signals,
+                 loader):
         super().__init__()
         self._args = (key, image_path, px, py, size, token)
         self._signals = signals
+        self._loader = loader
         self._cancelled = False
 
     def cancel(self):
@@ -238,7 +240,13 @@ class _SnippetRunnable(QRunnable):
     def run(self):
         key, image_path, px, py, size, token = self._args
         try:
-            if self._cancelled:
+            # A queued read whose token is no longer the loader's current
+            # one has been cancelled or superseded, and its result would be
+            # discarded on arrival. Checking BEFORE the read is what makes
+            # cancellation mean anything: a filter change used to leave
+            # every queued runnable to open its file and read a snippet
+            # nobody would ever see.
+            if self._cancelled or not self._loader.is_current(key, token):
                 arr = None
             else:
                 arr = read_label_snippet(image_path, px, py, size)
@@ -293,7 +301,7 @@ class SnippetLoader(QObject):
             lambda k, arr, t, s=signals, c=content:
                 self._on_finished(k, arr, t, s, c))
         runnable = _SnippetRunnable(key, image_path, pixel_x, pixel_y,
-                                    size_px, token, signals)
+                                    size_px, token, signals, self)
         self._pool.start(runnable)
 
     def _on_finished(self, key, arr, token, signals, content):
@@ -307,8 +315,27 @@ class SnippetLoader(QObject):
                 self._cache.popitem(last=False)
         self.ready.emit(key, arr)
 
+    def is_current(self, key, token) -> bool:
+        """Is this still the newest request for ``key``?
+
+        Read from worker threads: a plain dict lookup, no iteration, so it
+        needs no lock. See _SnippetRunnable.run. A None token is never
+        current - tokens start at 1, so None means "no request", which a
+        forgotten key also reports.
+        """
+        return token is not None and self._tokens.get(key) == token
+
+    def cancel(self, key):
+        """Drop one outstanding request; a queued read for it will bail."""
+        self._tokens.pop(key, None)
+
     def cancel_all(self):
-        """Forget every outstanding request (e.g. on a filter change)."""
+        """Forget every outstanding request (e.g. on a filter change).
+
+        Clearing the tokens also disarms whatever is still queued: each
+        runnable checks is_current() before opening its file, so cancelled
+        work costs a dictionary lookup instead of a windowed raster read.
+        """
         self._tokens.clear()
 
     def clear_cache(self):
