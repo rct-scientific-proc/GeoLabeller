@@ -378,9 +378,14 @@ class MainWindow(QMainWindow):
         self.layer_panel.reveal_label_requested.connect(self._reveal_label)
         self.snippet_panel.reveal_requested.connect(self._reveal_label)
         self.layer_panel.layer_removed.connect(self.canvas.remove_layer)
-        # After the canvas drops it, prune any hard-negative mirror entry.
-        self.layer_panel.layer_removed.connect(
-            lambda _lid: self._refresh_hard_negative_panel())
+        # The batch signal carries the file paths (the canvas has already
+        # dropped its layers by then): delete the images and their labels
+        # from the PROJECT and refresh everything that listed them.
+        self.layer_panel.layers_removed.connect(self._on_layers_removed)
+        # The panel's removal confirmation states what will actually be
+        # deleted; only the project knows the counts.
+        self.layer_panel.main_panel.removal_describer = \
+            self._describe_layer_removal
 
         # Connect batch visibility progress signals for group toggle
         self.layer_panel.batch_visibility_started.connect(
@@ -1944,6 +1949,59 @@ class MainWindow(QMainWindow):
 
             self._update_class_combo()
             self._refresh_label_markers()
+
+    def _describe_layer_removal(self, entries: list) -> "str | None":
+        """Confirmation text for removing these layers, or None for no prompt.
+
+        ``entries`` is the panel's [(layer_id, file_path), ...]. Removal is
+        a PROJECT deletion, so the prompt must say what really goes: how
+        many images and how many labels. A single image with no labels is
+        the one case removed without asking - nothing of consequence dies.
+        """
+        paths = {path for _layer_id, path in entries}
+        n_labels = sum(len(self.project.images[p].labels)
+                       for p in paths if p in self.project.images)
+        if len(entries) == 1 and n_labels == 0:
+            return None
+        message = (f"Remove {len(entries)} image(s) from the project?"
+                   if len(entries) > 1
+                   else "Remove this image from the project?")
+        if n_labels:
+            message += (f"\n\n{n_labels} label(s) on "
+                        f"{'them' if len(entries) > 1 else 'it'} "
+                        "will be deleted.")
+        else:
+            message += "\n\nNo labels will be deleted."
+        return message
+
+    def _on_layers_removed(self, entries: list):
+        """Complete a panel removal: delete the images from the project.
+
+        The per-layer signal already dropped the canvas layers; this batch
+        removes the ImageData entries (labels included, markers cleared)
+        and refreshes every surface that listed them. Before this existed,
+        "Remove" was view-only - the images and labels survived in the
+        project and all came back on the next open.
+        """
+        removed_images = removed_labels = 0
+        for _layer_id, file_path in entries:
+            image = self.project.images.get(file_path)
+            if image is None:
+                continue
+            for label in image.labels:
+                self.canvas.remove_label_marker(label.id)
+            removed_labels += len(image.labels)
+            self.project.remove_image(file_path)
+            removed_images += 1
+        if not removed_images:
+            return
+        self.layer_panel.refresh_labeled_panel(self.project)
+        self._refresh_snippet_panel()
+        self._refresh_hard_negative_panel()
+        self._update_waterfall_projections()
+        self.statusBar.showMessage(
+            f"Removed {removed_images} image(s) and {removed_labels} "
+            "label(s) from the project", 5000)
 
     def _clear_all_labels(self):
         """Clear all labels after confirmation."""

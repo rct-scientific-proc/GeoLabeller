@@ -91,7 +91,7 @@ SHORTCUT_SECTIONS = [
     ("Layer Panel", [
         ("Checkbox", "Toggle layer/group visibility"),
         ("Right-click group", "Select/Unselect, Expand/Collapse all"),
-        ("Right-click layer", "Zoom to layer, Remove"),
+        ("Right-click layer", "Zoom to layer, Remove (deletes from project)"),
         ("Drag & Drop", "Reorder layers/groups"),
     ]),
     ("Labeled Images Panel", [

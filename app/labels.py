@@ -732,6 +732,21 @@ class LabelProject:
         self._index_label(label, image_path)
         return label
 
+    def remove_image(self, path: str) -> "ImageData | None":
+        """Remove an image AND all its labels from the project.
+
+        This is what makes the layer panel's "Remove" a real deletion:
+        without it, removed images survived in the project and every one of
+        them came back on the next open. Returns the removed entry (labels
+        already unindexed), or None when the path is unknown.
+        """
+        image = self.images.pop(path, None)
+        if image is None:
+            return None
+        for label in image.labels:
+            self._unindex_label(label)
+        return image
+
     def remove_label(self, label_id: int):
         """Remove a label by ID from its image. O(1) lookup via index."""
         if label_id not in self._label_id_index:

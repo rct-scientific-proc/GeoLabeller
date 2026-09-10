@@ -29,6 +29,11 @@ class LayerPanel(QWidget):
     layer_group_changed = pyqtSignal(str, str)  # layer_id, group_path
     zoom_to_layer_requested = pyqtSignal(str)  # layer_id
     layer_removed = pyqtSignal(str)  # layer_id
+    # One removal gesture as a batch: [(layer_id, file_path), ...], emitted
+    # after the per-layer layer_removed signals. MainWindow deletes the
+    # images (and their labels) from the PROJECT here - "Remove" used to be
+    # view-only, and every removed image came back on the next open.
+    layers_removed = pyqtSignal(list)
 
     # Group memory management signals: emitted with list of layer_ids
     group_preload_requested = pyqtSignal(list)  # layer_ids to fully load
@@ -61,6 +66,11 @@ class LayerPanel(QWidget):
         self._group_toggle_item = None
         self._group_toggle_superseded = False
         self._pending_group_toggles: list = []   # (item, checked) to replay
+        # MainWindow supplies this: given [(layer_id, file_path), ...] it
+        # returns the removal confirmation text (image/label counts from
+        # the project the panel cannot see), or None when no prompt is
+        # needed (a single unlabelled image). Unset, a generic prompt runs.
+        self.removal_describer = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -588,22 +598,27 @@ class LayerPanel(QWidget):
             self.group_free_requested.emit(layer_ids)
 
     def _remove_item(self, item: QTreeWidgetItem):
-        """Remove an item from the tree."""
+        """Remove an item (and, via MainWindow, its images) for good."""
         item_type = item.data(0, Qt.UserRole + 1)
 
-        if item_type == "group" and item.childCount() > 0:
+        # (layer_id, file_path) for every layer this removal covers.
+        entries = []
+        self._collect_layer_entries(item, entries)
+
+        # Confirm with what will actually be deleted. The describer knows
+        # the project (image and label counts); without one, fall back to
+        # the old generic group prompt.
+        message = None
+        if self.removal_describer is not None and entries:
+            message = self.removal_describer(entries)
+        elif item_type == "group" and item.childCount() > 0:
+            message = "This group contains layers. Remove anyway?"
+        if message is not None:
             reply = QMessageBox.question(
-                self,
-                "Remove Group",
-                "This group contains layers. Remove anyway?",
-                QMessageBox.Yes | QMessageBox.No
-            )
+                self, "Remove", message,
+                QMessageBox.Yes | QMessageBox.No)
             if reply == QMessageBox.No:
                 return
-
-        # Collect layer IDs to remove (for groups, get all children)
-        layer_ids_to_remove = []
-        self._collect_layer_ids(item, layer_ids_to_remove)
 
         # Get parent and remove from tree
         parent = item.parent()
@@ -614,16 +629,27 @@ class LayerPanel(QWidget):
             self.tree.takeTopLevelItem(index)
 
         # Drop removed layers from O(1) lookup caches
-        for layer_id in layer_ids_to_remove:
+        for layer_id, _path in entries:
             self._drop_layer_from_caches(layer_id)
 
         # Removing the only unchecked (or only checked) child changes the
         # remaining group's aggregate.
         self.refresh_group_check_states()
 
-        # Emit removal signals for each layer
-        for layer_id in layer_ids_to_remove:
+        # Per-layer canvas cleanup first, then the batch for the project
+        # side (which needs the file paths the canvas no longer has).
+        for layer_id, _path in entries:
             self.layer_removed.emit(layer_id)
+        if entries:
+            self.layers_removed.emit(entries)
+
+    def _collect_layer_entries(self, item: QTreeWidgetItem, entries: list):
+        """Recursively collect (layer_id, file_path) from item's subtree."""
+        if item.data(0, Qt.UserRole + 1) == "layer":
+            entries.append((item.data(0, Qt.UserRole), item.toolTip(0)))
+        else:
+            for i in range(item.childCount()):
+                self._collect_layer_entries(item.child(i), entries)
 
     def _collect_layer_ids(self, item: QTreeWidgetItem, layer_ids: list):
         """Recursively collect layer IDs from an item and its children."""
@@ -1624,6 +1650,7 @@ class CombinedLayerPanel(QWidget):
     zoom_to_layer_requested = pyqtSignal(str)
     reveal_label_requested = pyqtSignal(int)  # label_id
     layer_removed = pyqtSignal(str)
+    layers_removed = pyqtSignal(list)  # [(layer_id, file_path), ...]
 
     # Hard-negative mirror section
     hard_negative_unflag_requested = pyqtSignal(str)  # layer_id
@@ -1701,6 +1728,7 @@ class CombinedLayerPanel(QWidget):
         self.main_panel.zoom_to_layer_requested.connect(
             self.zoom_to_layer_requested)
         self.main_panel.layer_removed.connect(self.layer_removed)
+        self.main_panel.layers_removed.connect(self.layers_removed)
 
         # Forward batch progress signals
         self.main_panel.batch_visibility_started.connect(
