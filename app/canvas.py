@@ -4094,13 +4094,45 @@ class MapCanvas(QGraphicsView):
         self.clear_waterfall_projections()
         if not self._waterfall_active:
             return
+        # One lat/lon bounding box per stacked layer, computed once from its
+        # corners, so a label outside an image is rejected by four float
+        # comparisons instead of a pyproj transform. Every (label, layer)
+        # pair used to cost a transform: about 5 us each, which is ten
+        # seconds per label placed over a 100-image stack in a 20k-label
+        # project - and this runs on every label added, removed or linked.
+        # The box is a superset of the footprint (a rotated raster's corners
+        # bound more ground than it covers), so a pair that passes still
+        # goes through the exact test below; only certain misses are
+        # skipped.
+        candidates = []
+        for layer_id in self._waterfall_layer_order:
+            layer = self._layers.get(layer_id)
+            if (layer is None or layer.bounds is None
+                    or layer._src_crs is None):
+                continue
+            box = None
+            try:
+                corners = [layer.pixel_to_latlon(px, py) for px, py in
+                           ((0, 0), (layer._src_width, 0),
+                            (layer._src_width, layer._src_height),
+                            (0, layer._src_height))]
+                if all(c is not None for c in corners):
+                    lons = [c[0] for c in corners]
+                    lats = [c[1] for c in corners]
+                    pad = 1e-6
+                    box = (min(lons) - pad, min(lats) - pad,
+                           max(lons) + pad, max(lats) + pad)
+            except Exception:
+                box = None      # no box: fall back to testing every label
+            candidates.append((layer, box))
+
         for (label_id, lon, lat, class_name, color, source_path,
              ring_color) in label_infos:
-            for layer_id in self._waterfall_layer_order:
-                layer = self._layers.get(layer_id)
-                if (layer is None or layer.bounds is None
-                        or layer._src_crs is None
-                        or layer.file_path == source_path):
+            for layer, box in candidates:
+                if layer.file_path == source_path:
+                    continue
+                if box is not None and not (box[0] <= lon <= box[2]
+                                            and box[1] <= lat <= box[3]):
                     continue
                 try:
                     px, py = layer.latlon_to_pixel(lon, lat)
