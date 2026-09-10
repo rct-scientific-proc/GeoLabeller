@@ -83,6 +83,11 @@ _DEFAULT_CHUNK = 1
 # Rows buffered in memory before a bulk write - independent of the HDF5 chunk
 # size, so a chunk of 1 doesn't force one resize/write per sample.
 _FLUSH_BATCH = 512
+# ...but capped by bytes as well, because the row count says nothing about
+# what a row costs: the dialog allows snippets up to 8192 px, and 512 rows
+# of 1024 px RGB is ~1.5 GiB buffered plus another ~1.5 GiB for the stack
+# the write builds. Whichever limit is reached first triggers the flush.
+_FLUSH_BYTES = 64 * 1024 * 1024
 # The 1-D label/gt/split datasets are tiny per element, so a larger chunk keeps
 # metadata overhead low with negligible read amplification.
 _META_CHUNK = 4096
@@ -199,6 +204,10 @@ class H5DatasetWriter:
         self._compression = compression
         self._n = 0
         self._img_buf, self._lbl_buf, self._gt_buf, self._split_buf = [], [], [], []
+        # Buffered bytes, so the flush is bounded by memory as well as
+        # by row count (see _FLUSH_BYTES).
+        self._img_bytes = 0
+        self._mask_bytes = 0
         # Painted snippet masks ride along in their own aligned table:
         # mask_pixels[j] is a binary (H, W) layer belonging to sample row
         # mask_sample[j], named mask_names[j]. A separate table (rather than
@@ -362,18 +371,22 @@ class H5DatasetWriter:
         self._gt_buf.append(gt)
         self._split_buf.append(split_value)
         self._loc_buf.append(str(location or ""))
+        self._img_bytes += getattr(image_hwc, "nbytes", 0)
         row = self._n + len(self._img_buf) - 1
-        if len(self._img_buf) >= _FLUSH_BATCH:
+        if (len(self._img_buf) >= _FLUSH_BATCH
+                or self._img_bytes >= _FLUSH_BYTES):
             self._flush()
         return row
 
     def add_mask(self, sample_row: int, name: str, mask):
         """Buffer one named binary mask belonging to sample ``sample_row``."""
-        self._mask_px_buf.append(
-            np.asarray(mask, dtype="uint8"))
+        pixels = np.asarray(mask, dtype="uint8")
+        self._mask_px_buf.append(pixels)
         self._mask_row_buf.append(int(sample_row))
         self._mask_name_buf.append(str(name))
-        if len(self._mask_px_buf) >= _FLUSH_BATCH:
+        self._mask_bytes += pixels.nbytes
+        if (len(self._mask_px_buf) >= _FLUSH_BATCH
+                or self._mask_bytes >= _FLUSH_BYTES):
             self._flush_masks()
 
     def _ensure_mask_datasets(self):
@@ -411,6 +424,7 @@ class H5DatasetWriter:
         self._mask_px_buf.clear()
         self._mask_row_buf.clear()
         self._mask_name_buf.clear()
+        self._mask_bytes = 0
 
     def _flush(self):
         """Write buffered samples to the resizable datasets."""
@@ -440,6 +454,7 @@ class H5DatasetWriter:
         self._img_buf.clear(); self._lbl_buf.clear()
         self._gt_buf.clear(); self._split_buf.clear()
         self._loc_buf.clear()
+        self._img_bytes = 0
 
     def close(self) -> int:
         """Flush, close the file and return the total sample count."""

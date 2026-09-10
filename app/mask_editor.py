@@ -382,6 +382,8 @@ class MaskEditor(QWidget):
         self._loader = SnippetLoader(self)
         self._loader.ready.connect(self._on_snippet_ready)
         self._entries: list = []
+        self._items_by_label: dict = {}          # label_id -> strip row
+        self._entries_by_label: dict = {}        # label_id -> entry
         self._current: "dict | None" = None      # selected entry
         self._frame = (0, 0, MASK_SNIPPET_SIZE, MASK_SNIPPET_SIZE)
         # The as-stored entries, by name: committing a stroke merges the
@@ -518,6 +520,11 @@ class MaskEditor(QWidget):
         self.snippet_list.blockSignals(True)
         self.snippet_list.clear()
         self.snippet_list.blockSignals(False)
+        # label_id -> row, so a delivered thumbnail lands in O(1). Scanning
+        # the strip per delivery made the strip O(n^2) on the UI thread, and
+        # a cache hit delivers synchronously inside this very loop.
+        self._items_by_label = {}
+        self._entries_by_label = {e["label_id"]: e for e in self._entries}
         wanted = self.class_combo.currentText()
         show_all = wanted == self.ALL_CLASSES
         for entry in self._entries:
@@ -532,6 +539,7 @@ class MaskEditor(QWidget):
             item = QListWidgetItem(caption)
             item.setData(self._ID_ROLE, entry["label_id"])
             self.snippet_list.addItem(item)
+            self._items_by_label[entry["label_id"]] = item
             self._loader.request(entry["label_id"], entry["image_path"],
                                  entry["pixel_x"], entry["pixel_y"], 96)
         if self.snippet_list.count():
@@ -568,19 +576,17 @@ class MaskEditor(QWidget):
         return super().eventFilter(obj, event)
 
     def _on_snippet_ready(self, label_id, arr):
-        for i in range(self.snippet_list.count()):
-            item = self.snippet_list.item(i)
-            if item.data(self._ID_ROLE) == label_id and arr is not None:
-                h, w = arr.shape[:2]
-                image = QImage(arr.data, w, h, 3 * w, QImage.Format_RGB888)
-                item.setIcon(QIcon(QPixmap.fromImage(image)))
-                return
+        if arr is None:
+            return
+        item = getattr(self, "_items_by_label", {}).get(label_id)
+        if item is None:
+            return          # a delivery for a strip that has moved on
+        h, w = arr.shape[:2]
+        image = QImage(arr.data, w, h, 3 * w, QImage.Format_RGB888)
+        item.setIcon(QIcon(QPixmap.fromImage(image)))
 
     def _entry(self, label_id) -> "dict | None":
-        for entry in self._entries:
-            if entry["label_id"] == label_id:
-                return entry
-        return None
+        return getattr(self, "_entries_by_label", {}).get(label_id)
 
     # -- selection ----------------------------------------------------------
 

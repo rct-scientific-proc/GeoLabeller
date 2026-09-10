@@ -2024,6 +2024,11 @@ class MapCanvas(QGraphicsView):
         # the cycle ends) or "hidden" (kept on being hidden, released only by
         # the budget or Free Group).
         self._warmed: dict[str, str] = {}
+        # Layer ids currently shown. A 20k-image project has all of them
+        # hidden until the user picks some, and the hit test, the tile pass
+        # and the cull all only care about the shown ones - walking every
+        # layer instead cost 2.7 ms per mouse move at 20k.
+        self._visible_layer_ids: set = set()
         # Set when a pass culls a loaded layer; the trim then runs once for
         # the pass instead of once per culled layer.
         self._offscreen_trim_pending = False
@@ -2066,6 +2071,8 @@ class MapCanvas(QGraphicsView):
             self._next_id += 1
 
             self._layers[layer_id] = layer
+            if visible:
+                self._visible_layer_ids.add(layer_id)
             self._layer_order.append(layer_id)
             self._path_to_layer[file_path] = layer_id
             # Appending goes on top: only the NEW layer needs a z-value.
@@ -2429,8 +2436,10 @@ class MapCanvas(QGraphicsView):
         cull_bounds = self._effective_cull_bounds()
         units_per_pixel = self._scene_units_per_pixel()
 
-        for layer_id, layer in self._layers.items():
-            if not layer.visible:
+        for layer_id in list(self._visible_layer_ids):
+            layer = self._layers.get(layer_id)
+            if layer is None:
+                self._visible_layer_ids.discard(layer_id)
                 continue
 
             # Cull layers entirely outside the (possibly inflated) viewport:
@@ -3154,6 +3163,10 @@ class MapCanvas(QGraphicsView):
         if layer_id in self._layers:
             layer = self._layers[layer_id]
             layer.set_visibility(visible)
+            if visible:
+                self._visible_layer_ids.add(layer_id)
+            else:
+                self._visible_layer_ids.discard(layer_id)
             for item in layer.detail_tiles.values():
                 item.setVisible(visible)
             if visible:
@@ -3218,6 +3231,7 @@ class MapCanvas(QGraphicsView):
                 del self._path_to_layer[file_path]
             if layer_id in self._layer_order:
                 self._layer_order.remove(layer_id)
+            self._visible_layer_ids.discard(layer_id)
             self._warmed.pop(layer_id, None)
 
     def clear_layers(self):
@@ -3244,6 +3258,7 @@ class MapCanvas(QGraphicsView):
         self._tile_build_queued.clear()
         self._tile_build_timer.stop()
         self._layers.clear()
+        self._visible_layer_ids.clear()
         self._warmed.clear()
         self._layer_order.clear()
         self._path_to_layer.clear()
@@ -4035,12 +4050,27 @@ class MapCanvas(QGraphicsView):
         nearest layer: a context-menu toggle must apply to the image actually
         under the cursor, not to whichever happens to be closest.
         """
-        for layer_id in reversed(self._layer_order):
+        return self._topmost_visible_at(easting, northing)
+
+    def _topmost_visible_at(self, easting: float,
+                            northing: float) -> "str | None":
+        """The shown layer with the highest z containing this point.
+
+        z_value is the layer's index in the z-order, maintained by
+        add_layer and update_layer_order, so this answers exactly what a
+        reverse walk of _layer_order did - without touching the layers
+        that are not shown.
+        """
+        best_id = None
+        best_z = None
+        for layer_id in self._visible_layer_ids:
             layer = self._layers.get(layer_id)
-            if (layer is not None and layer.visible
-                    and layer.contains_point(easting, northing)):
-                return layer_id
-        return None
+            if layer is None or not layer.contains_point(easting, northing):
+                continue
+            z = layer.z_value
+            if best_z is None or z > best_z:
+                best_id, best_z = layer_id, z
+        return best_id
 
     def _get_layer_and_info_at_position(
             self, easting: float, northing: float) -> tuple:
@@ -4050,13 +4080,14 @@ class MapCanvas(QGraphicsView):
             Tuple of (layer, layer_name, group_path). Layer is None if not found.
             Layer name prefixed with ~ if showing nearest.
         """
-        # Check layers in reverse z-order (top to bottom)
-        for layer_id in reversed(self._layer_order):
-            if layer_id not in self._layers:
-                continue
-            layer = self._layers[layer_id]
-            if layer.visible and layer.contains_point(easting, northing):
-                return (layer, layer.name, layer.group_path)
+        # Topmost shown layer containing the point. Iterating the shown
+        # set and taking the highest z is O(shown); walking the whole
+        # z-order was O(all layers) - 2.7 ms per mouse move at 20k, on
+        # every motion event.
+        hit = self._topmost_visible_at(easting, northing)
+        if hit is not None:
+            layer = self._layers[hit]
+            return (layer, layer.name, layer.group_path)
 
         # Not within any layer bounds
         return (None, "", "")

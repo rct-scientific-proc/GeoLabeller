@@ -15,6 +15,7 @@ image, and everything expensive is cacheable:
 - SnippetLoader runs reads on a small pool and drops stale deliveries by
   token, the same idiom the canvas's tile loads use.
 """
+import threading
 from collections import OrderedDict
 from pathlib import Path
 
@@ -164,6 +165,12 @@ def _window_pixels(src, window, channels, nodata, scaling=None):
 # labels cluster on few files. Never invalidated within a session - source
 # imagery does not change under the application.
 _scaling_cache: dict[str, object] = {}
+# The read behind a miss is a 3 x 1024 x 1024 decimated masked read plus
+# per-band percentiles. Four snippet threads reaching an untouched file at
+# once - which is exactly what a strip of labels on one image does - all
+# missed and all computed it. One computes; the rest wait on its event.
+_scaling_lock = threading.Lock()
+_scaling_pending: dict[str, "threading.Event"] = {}
 
 
 def cached_band_scaling(src):
@@ -174,9 +181,35 @@ def cached_band_scaling(src):
     the SAME contrast everywhere it is drawn. Keyed by the dataset's path.
     """
     key = src.name
-    if key not in _scaling_cache:
-        _scaling_cache[key] = _band_scaling(src)
-    return _scaling_cache[key]
+    while True:
+        with _scaling_lock:
+            if key in _scaling_cache:
+                return _scaling_cache[key]
+            waiting = _scaling_pending.get(key)
+            if waiting is None:
+                waiting = threading.Event()
+                _scaling_pending[key] = waiting
+                mine = True
+            else:
+                mine = False
+        if not mine:
+            # Someone else is sampling this raster; take their answer.
+            waiting.wait(timeout=30.0)
+            with _scaling_lock:
+                if key in _scaling_cache:
+                    return _scaling_cache[key]
+                # The computing thread died or timed out; try it ourselves.
+                _scaling_pending.pop(key, None)
+            continue
+        try:
+            value = _band_scaling(src)
+        finally:
+            with _scaling_lock:
+                _scaling_pending.pop(key, None)
+            waiting.set()
+        with _scaling_lock:
+            _scaling_cache[key] = value
+        return value
 
 
 def apply_band_stretch(band: np.ndarray, scaling, band_index: int):
@@ -308,7 +341,12 @@ class SnippetLoader(QObject):
 
     ready = pyqtSignal(object, object)   # key, (H, W, 3) uint8 array
 
-    _CACHE_ENTRIES = 256
+    # Budgeted in bytes, not entries: a 512 px source snippet is 786 KB
+    # and 256 of them is ~192 MB, while a 64 px one is 12 KB and 256 of
+    # them cache almost nothing. 64 MB holds ~5,000 of the default 224 px
+    # snippets, so a panel rebuild over a few thousand labels re-serves
+    # from memory instead of re-reading every file.
+    _CACHE_BYTES = 64 * 1024 * 1024
 
     def __init__(self, parent=None, max_workers: int = 4):
         super().__init__(parent)
@@ -319,6 +357,7 @@ class SnippetLoader(QObject):
         self._counter = 0
         self._signals_alive: set = set()
         self._cache: OrderedDict = OrderedDict()   # content key -> array
+        self._cache_bytes = 0
 
     def request(self, key, image_path: str, pixel_x: float, pixel_y: float,
                 size_px: int):
@@ -348,10 +387,19 @@ class SnippetLoader(QObject):
             return   # superseded while reading; a newer delivery is coming
         del self._tokens[key]
         if arr is not None:
-            self._cache[content] = arr
-            while len(self._cache) > self._CACHE_ENTRIES:
-                self._cache.popitem(last=False)
+            self._store(content, arr)
         self.ready.emit(key, arr)
+
+    def _store(self, content, arr):
+        """Cache one snippet, evicting oldest until inside the byte budget."""
+        previous = self._cache.pop(content, None)
+        if previous is not None:
+            self._cache_bytes -= previous.nbytes
+        self._cache[content] = arr
+        self._cache_bytes += arr.nbytes
+        while self._cache_bytes > self._CACHE_BYTES and len(self._cache) > 1:
+            _key, evicted = self._cache.popitem(last=False)
+            self._cache_bytes -= evicted.nbytes
 
     def is_current(self, key, token) -> bool:
         """Is this still the newest request for ``key``?
@@ -379,3 +427,4 @@ class SnippetLoader(QObject):
     def clear_cache(self):
         """Drop cached pixels (e.g. when snippet size changes everywhere)."""
         self._cache.clear()
+        self._cache_bytes = 0
