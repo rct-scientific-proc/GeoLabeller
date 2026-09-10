@@ -689,6 +689,13 @@ class LabelProject:
         image = self.images.pop(old_path)
         image.path = new_path
         self.images[new_path] = image
+        # The label index is keyed by path, so re-point every label on this
+        # image. Left stale, get_label_by_id returns nothing for them -
+        # link, measure and describe silently do nothing, and remove_label
+        # unindexes a label it can no longer reach, so the "deleted" label
+        # survives in image.labels and is written on the next save.
+        for label in image.labels:
+            self._label_id_index[label.id] = (new_path, label)
         return True
 
     def set_hard_negative_source(self, path: str, flagged: bool):
@@ -1042,6 +1049,14 @@ class LabelProject:
 
         # Rebuild the object_id index after loading
         project._rebuild_index()
+        # Never hand out an id a label already holds. The stored counter is
+        # authoritative for files this application wrote, but a truncated,
+        # merged or hand-edited file can carry a stale one - and a duplicate
+        # id makes two labels indistinguishable to every index and to
+        # remove_label, which would delete both.
+        highest = max((label_id for label_id in project._label_id_index),
+                      default=0)
+        project._next_id = max(project._next_id, highest + 1)
         # The shared-group_id contract holds for files this application
         # wrote, but a hand-edited or merged file can arrive with a group
         # disagreeing with itself. Repair on load - first non-empty name in

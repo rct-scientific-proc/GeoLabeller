@@ -1678,6 +1678,23 @@ class MainWindow(QMainWindow):
             return
         self.snippet_panel.set_labels(self._label_entries())
 
+    def _reseat_open_editors(self):
+        """Re-seat the orientation and mask editors on the CURRENT project.
+
+        Both are long-lived windows holding their own snapshot of label
+        entries, and both commit by bare label id. Left alone across a
+        project switch or a Clear All Labels, the next stroke or drawn
+        heading is applied to whatever label now carries that id - in a
+        different project - or dropped silently. Re-seating them (with an
+        empty list when there is nothing to show) keeps the window that is
+        open honest about what it is editing.
+        """
+        entries = self._label_entries()
+        for editor in (self._orientation_editor, self._mask_editor):
+            if editor is not None:
+                editor.set_labels(entries)
+        self._refresh_snippet_panel()
+
     def _open_orientation_editor(self):
         """Open (or refresh) the orientation editor window."""
         if self._orientation_editor is None:
@@ -2019,7 +2036,7 @@ class MainWindow(QMainWindow):
             self.canvas.clear_label_markers()
             # Refresh labeled images panel (now empty)
             self.layer_panel.refresh_labeled_panel(self.project)
-            self._refresh_snippet_panel()
+            self._reseat_open_editors()
             self.statusBar.showMessage("All labels cleared", 3000)
 
     def _new_project(self):
@@ -2060,6 +2077,7 @@ class MainWindow(QMainWindow):
         self._refresh_waypoints()  # the new project has none
         self._refresh_hard_negative_panel()
         self._update_class_combo()
+        self._reseat_open_editors()
         self.setWindowTitle(app_title())
         self.statusBar.showMessage("New project created", 3000)
 
@@ -2104,6 +2122,12 @@ class MainWindow(QMainWindow):
 
     def _start_project_image_loading(self):
         """Start async loading of project images."""
+        # The group cache holds QTreeWidgetItems, which _open_project has
+        # just destroyed via layer_panel.clear(). Carried across a project
+        # switch it hands back deleted widgets, and addChild raises
+        # "wrapped C/C++ object ... has been deleted" - so the cache is
+        # owned by the load that fills it, not by the window.
+        self._async_group_cache = {}
 
         # A project shared from another machine often travels WITH its
         # imagery; resolving missing paths against the project file's own
@@ -2176,8 +2200,6 @@ class MainWindow(QMainWindow):
         """
         from .canvas import stored_layer_metadata
 
-        if not hasattr(self, "_async_group_cache"):
-            self._async_group_cache = {}
         count = 0
         self.layer_panel.begin_batch_update()
         try:
@@ -3636,6 +3658,7 @@ class MainWindow(QMainWindow):
         self._refresh_label_markers()
         self._refresh_waypoints()
         self._refresh_hard_negative_panel()
+        self._reseat_open_editors()
 
         # Update window title (handle recovery case where _project_path is None)
         if self._project_path:
