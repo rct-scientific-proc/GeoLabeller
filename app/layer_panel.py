@@ -543,21 +543,27 @@ class LayerPanel(QWidget):
             checked: True to check all children, False to uncheck
         """
         check_state = Qt.Checked if checked else Qt.Unchecked
-
-        def set_children_state(parent: QTreeWidgetItem):
-            """Recursively apply the check state to all descendants, including nested groups."""
-            for i in range(parent.childCount()):
-                child = parent.child(i)
-                child.setCheckState(0, check_state)
-                # Recurse into nested groups
-                if child.data(0, Qt.UserRole + 1) == "group":
-                    set_children_state(child)
-
-        set_children_state(item)
-        # Also set the group item itself
-        item.setCheckState(0, check_state)
-        # Ancestors may now be partial (or no longer partial).
-        self.refresh_group_check_states()
+        if item.checkState(0) != check_state:
+            # Writing the group box runs the batched toggle in
+            # _on_item_changed: signals blocked, one visibility emission
+            # per layer that actually changes, ONE group recompute for the
+            # whole subtree. This walk used to set each child with signals
+            # live, so every layer triggered its own full-tree recompute -
+            # measured at 4.2 s for a 2,000-layer group against 0.02 s for
+            # the checkbox that does the same thing.
+            item.setCheckState(0, check_state)
+            return
+        # The box already reads that way, so setCheckState would emit
+        # nothing and the menu action would silently do nothing even
+        # though a child may disagree with it. Drive the same batched path
+        # directly instead of falling back to a per-layer walk.
+        self._group_toggle_active = True
+        try:
+            self._run_group_toggle(item, checked)
+        finally:
+            self._group_toggle_active = False
+            self._group_toggle_item = None
+            self._pending_group_toggles.clear()
 
     def _expand_all_children(self, item: QTreeWidgetItem):
         """Recursively expand an item and all its children.
@@ -1356,6 +1362,13 @@ class LabeledLayerPanel(QWidget):
     def _set_group_checked(self, item: QTreeWidgetItem, checked: bool):
         """Set check state for a group and all its children."""
         check_state = Qt.Checked if checked else Qt.Unchecked
+        if item.checkState(0) == check_state:
+            # setCheckState emits nothing when the state does not change,
+            # which made "Select all" a silent no-op whenever the box
+            # already read Checked - the one case a user clicks it to fix
+            # children that disagree. Apply the same handler directly.
+            self._on_item_changed(item, 0)
+            return
         item.setCheckState(0, check_state)
         # Children will be updated by _on_item_changed
 
