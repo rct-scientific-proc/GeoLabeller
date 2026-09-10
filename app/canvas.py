@@ -1293,7 +1293,8 @@ def _web_mercator_estimate(src_crs, src_transform,
 
 def stored_layer_metadata(file_path: str, group_path: str,
                           src_width: int, src_height: int,
-                          affine_coeffs, crs_epsg) -> "dict | None":
+                          affine_coeffs, crs_epsg,
+                          crs_wkt=None) -> "dict | None":
     """Build an AsyncFileLoader-shaped layer_data dict WITHOUT touching disk.
 
     The project file records each image's dimensions, affine transform and
@@ -1311,12 +1312,16 @@ def stored_layer_metadata(file_path: str, group_path: str,
     Returns None when the stored metadata is incomplete; the caller falls
     back to the file-opening path.
     """
-    if (not affine_coeffs or len(affine_coeffs) != 6 or not crs_epsg
+    if (not affine_coeffs or len(affine_coeffs) != 6
+            or (not crs_epsg and not crs_wkt)
             or not src_width or not src_height):
         return None
     try:
         src_transform = Affine(*affine_coeffs)
-        src_crs = CRS.from_epsg(int(crs_epsg))
+        # A CRS with no EPSG code (a local grid, an ESRI projection) is
+        # carried as WKT instead - it loads with zero I/O just the same.
+        src_crs = (CRS.from_epsg(int(crs_epsg)) if crs_epsg
+                   else CRS.from_wkt(crs_wkt))
         est = _web_mercator_estimate(
             src_crs, src_transform, src_width, src_height)
         if est is None:
@@ -2055,8 +2060,10 @@ class MapCanvas(QGraphicsView):
             return layer_id
 
         except Exception as e:
-            print(f"Error loading {file_path}: {e}")
-            traceback.print_exc()
+            # debug(), not print(): the frozen build has no stdout at all.
+            debug(f"error loading {file_path}: "
+                  f"{type(e).__name__}: {e}")
+            debug(traceback.format_exc())
             return None
 
     def add_pixel_layer(self, file_path: str, group_path: str = "",
@@ -2104,8 +2111,10 @@ class MapCanvas(QGraphicsView):
             return layer_id
 
         except Exception as e:
-            print(f"Error loading pixel layer {file_path}: {e}")
-            traceback.print_exc()
+            # debug(), not print(): the frozen build has no stdout at all.
+            debug(f"error loading pixel layer {file_path}: "
+                  f"{type(e).__name__}: {e}")
+            debug(traceback.format_exc())
             return None
 
     def _get_pixel_zone_column(self, group_path: str, layer_width: int) -> float:

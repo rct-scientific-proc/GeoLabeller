@@ -33,7 +33,7 @@ from PyQt5.QtWidgets import (
 from .masks import (entry_in_window, fill_enclosed, mask_statistics,
                     merged_entry)
 from .snippets import (SnippetLoader, read_label_snippet,
-                       read_label_window_raw)
+                       read_label_window_raw, snippet_frame)
 
 MASK_SNIPPET_SIZE = 224     # default source pixels painted on
 MAX_DISPLAY_PX = 448        # starting-view cap; the user zooms from there
@@ -77,6 +77,10 @@ class MaskPaintCanvas(QWidget):
         self._w = self._h = MASK_SNIPPET_SIZE
         self._scale = float(display_scale(MASK_SNIPPET_SIZE))
         self._pan_last = None       # global pos while drag-panning
+        # No imagery means no idea what is being painted over, and (when the
+        # image size is unknown too) no idea where in the source the strokes
+        # would land - so the canvas refuses them outright.
+        self._read_only = False
         # Brush preview: the cell under the cursor plus the outline edges of
         # the exact pixel set a stamp there would paint.
         self._hover_cell = None
@@ -111,6 +115,12 @@ class MaskPaintCanvas(QWidget):
         self._active = name
         self._overlay_cache.clear()
         self.update()
+
+    def set_read_only(self, read_only: bool):
+        """Show the masks but accept no strokes."""
+        self._read_only = bool(read_only)
+        self.setCursor(Qt.ForbiddenCursor if self._read_only
+                       else Qt.CrossCursor)
 
     def invalidate_layer(self, name: str):
         """Redraw one layer whose array was changed outside a stroke."""
@@ -304,7 +314,8 @@ class MaskPaintCanvas(QWidget):
             self._pan_last = event.globalPos()
             self.setCursor(Qt.ClosedHandCursor)
             return
-        if self._active is None or self._active not in self._layers:
+        if (self._read_only or self._active is None
+                or self._active not in self._layers):
             return
         if event.button() == Qt.LeftButton:
             self._stroke_value = True
@@ -579,6 +590,7 @@ class MaskEditor(QWidget):
         self._raw = None
         self._raw_nodata = None
         self._stored_by_name = {}
+        self._unreadable = False
         size = self.size_spin.value()
         if entry is None:
             self.canvas.set_snippet(None, size, size)
@@ -591,7 +603,21 @@ class MaskEditor(QWidget):
         if raw is not None:
             self._raw, self._frame, self._raw_nodata = raw
         else:
-            self._frame = (0, 0, size, size)
+            # The file would not open. Anchoring the window at (0, 0) - the
+            # old fallback - showed the masks in the wrong place and, worse,
+            # committed edits into the image's top-left corner. Take the
+            # frame from the dimensions the project already recorded, and
+            # in either case let nothing be edited: a user looking at a
+            # grey canvas and an empty-looking mask has no way to tell a
+            # missing image from an empty one, and Delete is one click away.
+            self._unreadable = True
+            dims = self._dims_for(entry)
+            if dims:
+                self._frame = snippet_frame(entry["pixel_x"],
+                                            entry["pixel_y"], size,
+                                            dims[0], dims[1])
+            else:
+                self._frame = (0, 0, size, size)
         x0, y0, w, h = self._frame
         # Stored masks re-anchor into the current crop (paint-time snippet
         # size may differ from today's).
@@ -605,8 +631,19 @@ class MaskEditor(QWidget):
         self.canvas.set_snippet(display, w, h)
         active = self._order[0] if self._order else None
         self.canvas.set_layers(self._layers, self._order, active)
+        self._set_editable(not self._unreadable)
         self._refresh_mask_list(select=active)
         self._refresh_stats()
+
+    def _set_editable(self, editable: bool):
+        """Paint, Add, Delete and Fill all follow the snippet's readability."""
+        self.canvas.set_read_only(not editable)
+        for button in (self.add_button, self.delete_button, self.fill_button):
+            button.setEnabled(editable)
+        tip = ("" if editable else
+               "The image could not be read, so its masks are read-only.")
+        for button in (self.add_button, self.delete_button):
+            button.setToolTip(tip)
 
     def _on_size_changed(self):
         # Strokes commit as they happen, so the entry dicts already hold the
@@ -743,6 +780,11 @@ class MaskEditor(QWidget):
         item.setText(caption)
 
     def _refresh_stats(self):
+        if getattr(self, "_unreadable", False):
+            self.stats_label.setText(
+                "Image unreadable - masks shown read-only.\n"
+                f"{self._current['image_path'] if self._current else ''}")
+            return
         name = self._active_name()
         if (name is None or self._raw is None
                 or name not in self._layers):

@@ -92,8 +92,9 @@ def verify_candidate(candidate: str, image) -> bool:
     """
     width = getattr(image, "original_width", 0)
     height = getattr(image, "original_height", 0)
-    epsg = getattr(image, "crs_epsg", None)
-    if not width and not height and epsg is None:
+    # The CRS may be recorded as an EPSG code or, when it has none, as WKT.
+    stored_crs = image.get_crs() if hasattr(image, "get_crs") else None
+    if not width and not height and stored_crs is None:
         return True   # nothing recorded to check against
     try:
         with rasterio.open(candidate) as src:
@@ -101,10 +102,8 @@ def verify_candidate(candidate: str, image) -> bool:
                 return False
             if height and src.height != height:
                 return False
-            if epsg is not None:
-                src_epsg = src.crs.to_epsg() if src.crs is not None else None
-                if src_epsg != epsg:
-                    return False
+            if stored_crs is not None and src.crs != stored_crs:
+                return False
     except Exception:
         return False
     return True

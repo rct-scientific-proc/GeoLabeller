@@ -38,7 +38,7 @@ from .canvas import (MapCanvas, CanvasMode, STEP_CYCLE_MODES,
 from .class_editor import ClassEditorDialog, DescriptionEditorDialog
 from .goto_location import (GoToLocationDialog, WaypointDialog,
                             format_lat_lon)
-from .labels import LabelProject, ImageData, haversine_distance
+from .labels import LabelProject, combine_projects, haversine_distance
 from .layer_panel import CombinedLayerPanel
 from .optimize_export import OptimizeExportDialog, OptimizeWorker, plan_output_path
 from .h5_export import (H5ExportDialog, H5ExportWorker, HARD_NEGATIVE,
@@ -176,12 +176,19 @@ CYCLE_PREFETCH_RADIUS = 1
 
 
 def _write_recovery_snapshot(
-        snapshot: dict, recovery_path: Path, crash_marker_path: Path):
+        snapshot: dict, recovery_path: Path, crash_marker_path: Path,
+        report=None):
     """Write a recovery snapshot to disk on a background thread.
 
     Uses compact JSON separators (no indentation) since the recovery file is
     machine-read, and writes via a temp file + atomic rename so a crash
     during write never leaves the recovery file half-serialized.
+
+    ``report`` is called with the failure message when the write fails.
+    This used to print() it, which the Windows build (base="gui", no
+    stdout) discards entirely: a profile that had gone read-only meant
+    every autosave failed in silence, and the user found out that crash
+    recovery had never been running only after a crash.
     """
     try:
         tmp_path = recovery_path.with_suffix(recovery_path.suffix + ".tmp")
@@ -190,8 +197,9 @@ def _write_recovery_snapshot(
         os.replace(tmp_path, recovery_path)
         crash_marker_path.write_text(datetime.now().isoformat())
     except Exception as e:
-        # Background thread: log only, don't surface to user.
-        print(f"Warning: Auto-save write failed: {e}")
+        debug(f"autosave write failed: {type(e).__name__}: {e}")
+        if report is not None:
+            report(f"{type(e).__name__}: {e}")
 
 # Colors for different classes (cycles through these)
 CLASS_COLORS = [
@@ -208,6 +216,10 @@ CLASS_COLORS = [
 
 class MainWindow(QMainWindow):
     """Main window with canvas and layer panel."""
+
+    # Autosave runs on a plain background thread, so a failure there can
+    # only reach the UI as a signal. Qt delivers it on the UI thread.
+    autosave_failed = pyqtSignal(str)
 
     def __init__(self):
         """Initialize the window, canvas, layer panel, menus, and project state."""
@@ -295,6 +307,11 @@ class MainWindow(QMainWindow):
         self._group_mem_worker: GroupMemoryWorker | None = None
         self._group_mem_dialog = None
         self._group_mem_total = 0
+        self._group_mem_errors: list = []
+        # Said once per session: repeating it every minute would be noise,
+        # and the first one is the one that matters.
+        self._autosave_warned = False
+        self.autosave_failed.connect(self._on_autosave_failed)
         self._group_mem_label = ""
 
         # Optimized-export worker state (background tiled/pyramid conversion).
@@ -2220,7 +2237,7 @@ class MainWindow(QMainWindow):
         for image in self.project.images.values():
             if not os.path.exists(image.path):
                 missing_files.append(image.path)
-            elif (image.affine_coeffs and image.crs_epsg
+            elif (image.affine_coeffs and image.crs_key() is not None
                     and image.original_width and image.original_height):
                 # The project records everything a lazy layer needs, so
                 # this image loads with ZERO file I/O. Entries without the
@@ -2265,7 +2282,7 @@ class MainWindow(QMainWindow):
                 meta = stored_layer_metadata(
                     image.path, image.group or "",
                     image.original_width, image.original_height,
-                    image.affine_coeffs, image.crs_epsg)
+                    image.affine_coeffs, image.crs_epsg, image.crs_wkt)
                 if meta is None:
                     # Corrupt stored metadata: hand it to the worker path.
                     self._project_geotiff_files.append(
@@ -2319,7 +2336,9 @@ class MainWindow(QMainWindow):
             # Start auto-save timer
             self._autosave_timer.start()
         except Exception as e:
-            print(f"Warning: Could not start crash detection: {e}")
+            debug(f"crash detection could not start: {type(e).__name__}: {e}")
+            # Without the timer there is no autosave at all this session.
+            self.autosave_failed.emit(f"{type(e).__name__}: {e}")
 
     def _check_for_recovery(self, has_crash_marker: bool):
         """Offer to restore the previous session when it crashed.
@@ -2354,7 +2373,7 @@ class MainWindow(QMainWindow):
             # until user explicitly saves
 
         except Exception as e:
-            print(f"Warning: Error checking for recovery: {e}")
+            debug(f"recovery check failed: {type(e).__name__}: {e}")
 
     def _restore_from_recovery(self):
         """Restore project state from recovery file."""
@@ -2415,14 +2434,36 @@ class MainWindow(QMainWindow):
 
             self._autosave_thread = threading.Thread(
                 target=_write_recovery_snapshot,
-                args=(snapshot, recovery_path, crash_marker_path),
+                args=(snapshot, recovery_path, crash_marker_path,
+                      self.autosave_failed.emit),
                 name="GeoLabelAutosave",
                 daemon=True,
             )
             self._autosave_thread.start()
         except Exception as e:
-            # Don't show error to user for background auto-save
-            print(f"Warning: Auto-save failed: {e}")
+            debug(f"autosave failed: {type(e).__name__}: {e}")
+            self.autosave_failed.emit(f"{type(e).__name__}: {e}")
+
+    def _on_autosave_failed(self, message: str):
+        """Tell the user once that crash recovery is not working.
+
+        Silence here was the whole defect: the recovery file lives under
+        the roaming profile, which can be read-only or offline, and the
+        only report was a print() the Windows build discards.
+        """
+        if self._autosave_warned:
+            return
+        self._autosave_warned = True
+        text = (f"Auto-save is failing - crash recovery is NOT active "
+                f"({message}). Save your project manually.")
+        # Crash detection is armed before the status bar is built, so the
+        # very first failure has nowhere to go yet; the event loop's next
+        # turn is after __init__ has finished.
+        if getattr(self, "statusBar", None) is None:
+            QTimer.singleShot(0, lambda: self.statusBar.showMessage(text,
+                                                                    15000))
+            return
+        self.statusBar.showMessage(text, 15000)
 
     def _clear_recovery_file(self):
         """Clear the recovery file (called after manual save or new project)."""
@@ -2430,7 +2471,7 @@ class MainWindow(QMainWindow):
             if RECOVERY_FILE.exists():
                 RECOVERY_FILE.unlink()
         except Exception as e:
-            print(f"Warning: Could not clear recovery file: {e}")
+            debug(f"recovery file not cleared: {type(e).__name__}: {e}")
 
     def _clean_exit(self):
         """Clean up crash detection on normal exit."""
@@ -2447,7 +2488,7 @@ class MainWindow(QMainWindow):
                 CRASH_MARKER_FILE.unlink()
             # Recovery file is preserved until user explicitly saves
         except Exception as e:
-            print(f"Warning: Could not clean up on exit: {e}")
+            debug(f"exit cleanup failed: {type(e).__name__}: {e}")
 
     def _save_project(self):
         """Save the current project."""
@@ -2520,54 +2561,10 @@ class MainWindow(QMainWindow):
             output_file += '.geolabel'
 
         try:
-            # Load both projects
             project1 = LabelProject.load(file1)
             project2 = LabelProject.load(file2)
-
-            # Combine classes (deduplicate while preserving order)
-            combined_classes = list(
-                dict.fromkeys(
-                    project1.classes +
-                    project2.classes))
-
-            # Create combined project and deep-copy images/labels from project1
-            combined = LabelProject()
-            combined.classes = combined_classes
-
-            # Helper: clone ImageData (and contained labels) to avoid mutating
-            # originals
-            def clone_image(image: ImageData) -> ImageData:
-                """Deep-copy an ImageData (and its labels) via serialization."""
-                return ImageData.from_dict(image.to_dict())
-
-            # Track maximum label id
-            max_id = 0
-
-            for path, image in project1.images.items():
-                new_img = clone_image(image)
-                combined.images[path] = new_img
-                for lbl in new_img.labels:
-                    if lbl.id > max_id:
-                        max_id = lbl.id
-
-            # Offset for project2 labels to ensure unique IDs
-            id_offset = max_id
-
-            # Merge images and labels from project2 (cloned, with remapped ids)
-            for path, image in project2.images.items():
-                cloned = clone_image(image)
-                for lbl in cloned.labels:
-                    lbl.id = lbl.id + id_offset
-                    if lbl.id > max_id:
-                        max_id = lbl.id
-
-                if path in combined.images:
-                    combined.images[path].labels.extend(cloned.labels)
-                else:
-                    combined.images[path] = cloned
-
-            # Set next id
-            combined._next_id = max_id + 1
+            combined = combine_projects(project1, project2)
+            combined_classes = combined.classes
 
             # Save combined project
             combined.save(output_file)
@@ -2579,7 +2576,9 @@ class MainWindow(QMainWindow):
                 f"Successfully combined projects:\n\n"
                 f"• Classes: {len(combined_classes)}\n"
                 f"• Images: {len(combined.images)}\n"
-                f"• Labels: {combined.label_count}\n\n"
+                f"• Labels: {combined.label_count}\n"
+                f"• Waypoints: {len(combined.waypoints)}\n"
+                f"• Description presets: {len(combined.descriptions)}\n\n"
                 f"Saved to: {Path(output_file).name}"
             )
 
@@ -3656,7 +3655,7 @@ class MainWindow(QMainWindow):
     def _on_async_file_error(self, file_path: str, error: str):
         """Handle a file failing to load."""
         name = os.path.basename(file_path)
-        print(f"Failed to load {file_path}: {error}")
+        debug(f"failed to load {file_path}: {error}")
         self.statusBar.showMessage(f"Failed to load {name}: {error}", 8000)
 
     def _on_async_progress(self, processed: int, total: int):
@@ -3794,7 +3793,8 @@ class MainWindow(QMainWindow):
         return [img for img in self.project.images.values()
                 if img.group == group_path or img.group.startswith(prefix)]
 
-    def _on_group_location_edit(self, group_path: str):
+    def _on_group_location_edit(self, group_path: str,
+                                file_paths: "list | None" = None):
         """Right-click a group > Set Location...: tag every image in it.
 
         The tag is stored per image (so it survives regrouping) but edited
@@ -3803,6 +3803,14 @@ class MainWindow(QMainWindow):
         images agree on one; an empty entry clears the tag.
         """
         images = self._images_in_group(group_path)
+        if not images and file_paths:
+            # A non-georeferenced group's tree path ("Non-Georeferenced/
+            # tileA") is not its project group (the import path), so the
+            # string match finds nothing there. The layers under the group
+            # name their images directly.
+            images = [img for img in (self.project.images.get(p)
+                                      for p in file_paths)
+                      if img is not None]
         if not images:
             QMessageBox.information(
                 self, "Set Location",
@@ -3898,6 +3906,7 @@ class MainWindow(QMainWindow):
         self._group_mem_worker = worker
         self._group_mem_dialog = dlg
         self._group_mem_total = total
+        self._group_mem_errors = []
         self._group_mem_label = label
 
         worker.progress.connect(self._on_preload_progress)
@@ -3956,6 +3965,20 @@ class MainWindow(QMainWindow):
             self._group_mem_dialog.setValue(self._group_mem_total)
         if self._group_mem_thread is not None:
             self._group_mem_thread.quit()
+        # The dialog runs to "N/N" whatever happened - the worker reports
+        # progress for failed layers too - so a group with missing files
+        # looked like a complete success. Say what did not load.
+        failed = len(self._group_mem_errors)
+        if failed:
+            names = ", ".join(
+                Path(self.canvas.get_layer_file_path(lid) or lid).name
+                for lid, _msg in self._group_mem_errors[:3])
+            if failed > 3:
+                names += f" and {failed - 3} more"
+            self.statusBar.showMessage(
+                f"{self._group_mem_total - failed} of "
+                f"{self._group_mem_total} layers preloaded - "
+                f"{failed} failed ({names})", 10000)
 
     def _on_preload_thread_finished(self):
         """Refresh tiles for now-loaded layers and drop worker refs (main thread)."""
@@ -3965,8 +3988,9 @@ class MainWindow(QMainWindow):
         self._group_mem_dialog = None
 
     def _on_preload_error(self, layer_id: str, msg: str):
-        """Log a per-layer preload failure."""
-        print(f"Group preload error on {layer_id}: {msg}")
+        """Record a per-layer preload failure so the total can report it."""
+        debug(f"group preload error on {layer_id}: {msg}")
+        self._group_mem_errors.append((layer_id, msg))
 
     def _show_progress(self, maximum: int, label: str = "Loading"):
         """Show the progress indicator with a maximum value."""

@@ -25,13 +25,17 @@ EARTH_RADIUS_M = 6371008.8
 _wgs84_transformers: dict = {}
 
 
-def _transformer_pair(epsg: int):
-    """(to_wgs84, from_wgs84) for an EPSG code, built at most once."""
-    pair = _wgs84_transformers.get(epsg)
+def _transformer_pair(crs_key):
+    """(to_wgs84, from_wgs84) for a CRS, built at most once.
+
+    ``crs_key`` is an EPSG code, or the WKT of a CRS that has none -
+    pyproj accepts either, and both are hashable, so one cache serves both.
+    """
+    pair = _wgs84_transformers.get(crs_key)
     if pair is None:
-        pair = (Transformer.from_crs(epsg, 4326, always_xy=True),
-                Transformer.from_crs(4326, epsg, always_xy=True))
-        _wgs84_transformers[epsg] = pair
+        pair = (Transformer.from_crs(crs_key, 4326, always_xy=True),
+                Transformer.from_crs(4326, crs_key, always_xy=True))
+        _wgs84_transformers[crs_key] = pair
     return pair
 
 
@@ -323,6 +327,13 @@ class ImageData:
     # CRS EPSG code for the affine transform (e.g., 3857 for Web Mercator)
     crs_epsg: Optional[int] = None
 
+    # WKT of the CRS, written ONLY when it has no EPSG code - a local grid,
+    # an ESRI-defined projection, a custom datum. Without it those images
+    # keep an affine with no CRS at all: no lat/lon, no corners or geodesic
+    # fields in the export, and the zero-I/O load path skips them, so every
+    # project open re-reads their headers. Empty for the ordinary case.
+    crs_wkt: Optional[str] = None
+
     # This image holds confusers but no true positives, and the user wants the
     # model to see them: the H5 export can opt in to sliding the whole image
     # into gt=False hard negatives even under a labels-only scope.
@@ -349,7 +360,11 @@ class ImageData:
         """
         self.affine_coeffs = [affine.a, affine.b, affine.c,
                               affine.d, affine.e, affine.f]
+        # to_epsg() returns None for any CRS pyproj cannot match to the
+        # registry with confidence. Keep the WKT for those rather than
+        # storing an affine whose coordinates mean nothing.
         self.crs_epsg = crs.to_epsg()
+        self.crs_wkt = None if self.crs_epsg is not None else crs.to_wkt()
         # Invalidate cached transformers so they are rebuilt for the new CRS
         self._to_wgs84_transformer = None
         self._from_wgs84_transformer = None
@@ -357,30 +372,46 @@ class ImageData:
 
     def get_crs(self) -> Optional[CRS]:
         """Get the CRS object, or None if not set."""
-        if self.crs_epsg is None:
-            return None
-        return CRS.from_epsg(self.crs_epsg)
+        if self.crs_epsg is not None:
+            return CRS.from_epsg(self.crs_epsg)
+        if self.crs_wkt:
+            try:
+                return CRS.from_wkt(self.crs_wkt)
+            except Exception:      # unparseable WKT: no worse than none
+                return None
+        return None
+
+    def crs_key(self):
+        """What names this image's CRS: its EPSG code, else its WKT."""
+        if self.crs_epsg is not None:
+            return self.crs_epsg
+        return self.crs_wkt or None
 
     def _ensure_transformers(self) -> bool:
         """Lazily build and cache pyproj transformers for this image's CRS.
 
         Returns True if transformers are available, False if no CRS is set.
         Cached transformers are reused across calls and invalidated when the
-        image's ``crs_epsg`` changes (e.g. via :meth:`set_affine`).
+        image's CRS changes (e.g. via :meth:`set_affine`).
         """
-        if self.crs_epsg is None:
+        key = self.crs_key()
+        if key is None:
             return False
         # Use private attrs lazily; getattr() avoids needing dataclass fields
         # which would otherwise affect equality/serialization.
-        cached_epsg = getattr(self, "_cached_transformer_epsg", None)
-        if (cached_epsg != self.crs_epsg
+        cached_key = getattr(self, "_cached_transformer_epsg", None)
+        if (cached_key != key
                 or getattr(self, "_to_wgs84_transformer", None) is None
                 or getattr(self, "_from_wgs84_transformer", None) is None):
             # Shared per CRS rather than built per image - see
             # _wgs84_transformers.
-            (self._to_wgs84_transformer,
-             self._from_wgs84_transformer) = _transformer_pair(self.crs_epsg)
-            self._cached_transformer_epsg = self.crs_epsg
+            try:
+                (self._to_wgs84_transformer,
+                 self._from_wgs84_transformer) = _transformer_pair(key)
+            except Exception:      # a CRS pyproj cannot use at all
+                self._cached_transformer_epsg = None
+                return False
+            self._cached_transformer_epsg = key
         return True
 
     def pixel_to_latlon(self, pixel_x: float, pixel_y: float) -> Optional[tuple[float, float]]:
@@ -455,7 +486,7 @@ class ImageData:
         # transform per label. This is the dominant cost when serialising
         # images with many labels.
         left_edge_by_label: dict[int, tuple[float, float]] = {}
-        if (self.affine_coeffs is not None and self.crs_epsg is not None
+        if (self.affine_coeffs is not None and self.crs_key() is not None
                 and self.labels and self._ensure_transformers()):
             affine = self.get_affine()
             # Project pixel (0, pixel_y) to native CRS via affine, then
@@ -507,6 +538,8 @@ class ImageData:
             d["affine_coeffs"] = self.affine_coeffs
         if self.crs_epsg is not None:
             d["crs_epsg"] = self.crs_epsg
+        elif self.crs_wkt:
+            d["crs_wkt"] = self.crs_wkt
 
         # Written only when set, so projects without the flag are unchanged
         # and older readers see exactly what they saw before.
@@ -534,7 +567,8 @@ class ImageData:
         background writer while the user carries on editing.
         """
         signature = (tuple(self.affine_coeffs) if self.affine_coeffs else None,
-                     self.crs_epsg, self.original_width, self.original_height)
+                     self.crs_key(), self.original_width,
+                     self.original_height)
         cached = getattr(self, "_derived_cache", None)
         if cached is None or cached[0] != signature:
             block = {}
@@ -588,6 +622,7 @@ class ImageData:
             reader=reader,
             affine_coeffs=data.get("affine_coeffs"),
             crs_epsg=data.get("crs_epsg"),
+            crs_wkt=data.get("crs_wkt"),
             hard_negative_source=bool(data.get("hard_negative_source", False)),
             location=str(data.get("location", ""))
         )
@@ -1001,7 +1036,7 @@ class LabelProject:
         return {
             # Single-digit minors only ("4.0" came after "3.9", never
             # "3.10"): the ICD pins readers to STRING comparison.
-            "version": "4.2",
+            "version": "4.3",
             # Copied, not referenced: the recovery snapshot is handed to a
             # background writer and the user carries on editing meanwhile.
             # The image and waypoint entries are freshly built dictionaries,
@@ -1122,3 +1157,65 @@ class LabelProject:
         self._object_id_index.clear()
         self._label_id_index.clear()
 
+
+
+def combine_projects(project1: "LabelProject",
+                     project2: "LabelProject") -> "LabelProject":
+    """Merge two projects into a new one, taking everything from both.
+
+    Everything means everything the format carries: classes, images and
+    their labels, per-image settings, waypoints and description presets.
+    The merge used to copy only classes, images and labels, so combining
+    two annotators' work silently produced a file with no waypoints, no
+    description presets, and - for an image both had opened - only the
+    first project's location tag and hard-negative flag.
+
+    Neither input is modified; ids that collide are renumbered.
+    """
+    combined = LabelProject()
+    combined.classes = list(dict.fromkeys(
+        list(project1.classes) + list(project2.classes)))
+
+    def clone_image(image: ImageData) -> ImageData:
+        """Deep-copy an ImageData (and its labels) via serialization."""
+        return ImageData.from_dict(image.to_dict())
+
+    max_id = 0
+    for path, image in project1.images.items():
+        cloned = clone_image(image)
+        combined.images[path] = cloned
+        for label in cloned.labels:
+            max_id = max(max_id, label.id)
+
+    # project2's label ids are shifted clear of project1's.
+    id_offset = max_id
+    for path, image in project2.images.items():
+        cloned = clone_image(image)
+        for label in cloned.labels:
+            label.id += id_offset
+            max_id = max(max_id, label.id)
+        existing = combined.images.get(path)
+        if existing is None:
+            combined.images[path] = cloned
+            continue
+        existing.labels.extend(cloned.labels)
+        # An image in both projects: neither side's per-image settings are
+        # authoritative, so take whichever is set rather than dropping the
+        # second annotator's.
+        existing.hard_negative_source = (existing.hard_negative_source
+                                         or cloned.hard_negative_source)
+        if not existing.location and cloned.location:
+            existing.location = cloned.location
+
+    combined.descriptions = list(dict.fromkeys(
+        list(project1.descriptions) + list(project2.descriptions)))
+
+    # Both projects number waypoints from 1, so their ids collide; add
+    # them through add_waypoint to renumber, keeping the names.
+    for source in (project1, project2):
+        for waypoint in source.waypoints:
+            combined.add_waypoint(waypoint.lat, waypoint.lon, waypoint.name)
+
+    combined._next_id = max_id + 1
+    combined._rebuild_index()
+    return combined

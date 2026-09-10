@@ -9,6 +9,13 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 
 
+# The group path a layer item was last seen under. Drag-drop compares
+# against it so only layers that actually moved report a group change - the
+# whole-tree emission used to rewrite every image's project group from its
+# tree ancestry, which is not the same string for non-georeferenced images.
+GROUP_PATH_ROLE = Qt.UserRole + 2
+
+
 class LayerTreeWidget(QTreeWidget):
     """Tree widget that emits signal after drag-drop."""
 
@@ -41,7 +48,10 @@ class LayerPanel(QWidget):
 
     # Right-click a group > Set Location...: MainWindow runs the dialog and
     # applies the tag to every project image in the group.
-    group_location_edit_requested = pyqtSignal(str)  # group_path
+    # group_path, file paths of the layers under it. The tree path is not
+    # the project group for non-georeferenced images, so the paths are what
+    # actually finds them.
+    group_location_edit_requested = pyqtSignal(str, list)
 
     # Batch progress signals for group toggle operations
     batch_visibility_started = pyqtSignal(int)  # total items to process
@@ -142,6 +152,8 @@ class LayerPanel(QWidget):
             parent.addChild(item)
         else:
             self.tree.addTopLevelItem(item)
+
+        item.setData(0, GROUP_PATH_ROLE, self._get_group_path(item))
 
         # Register in O(1) lookup caches
         self._layer_items[layer_id] = item
@@ -394,14 +406,28 @@ class LayerPanel(QWidget):
         return "/".join(parts)
 
     def _emit_all_layer_group_changes(self):
-        """Emit group change signals for all layers."""
+        """Report the layers a drag-drop actually moved - and only those.
+
+        This used to emit for EVERY layer in the tree, and the handler
+        writes what it is given straight into the project. A tree path is
+        the project group for georeferenced images, but not for
+        non-georeferenced ones: those live under a "Non-Georeferenced" root
+        whose subgroup shows only the leaf of the import path. So one drag
+        anywhere in the tree rewrote every non-geo image's group to
+        "Non-Georeferenced/<leaf>", nesting another literal root level on
+        each save-and-reopen and changing the group written into the H5
+        export. Comparing against the path each item was last seen under
+        also drops the emission from O(all layers) to O(moved).
+        """
         def emit_for_item(item: QTreeWidgetItem):
-            """Recursively emit a group-change signal for each layer descendant."""
+            """Recursively report layer descendants whose group changed."""
             item_type = item.data(0, Qt.UserRole + 1)
             if item_type == "layer":
                 layer_id = item.data(0, Qt.UserRole)
                 group_path = self._get_group_path(item)
-                self.layer_group_changed.emit(layer_id, group_path)
+                if group_path != item.data(0, GROUP_PATH_ROLE):
+                    item.setData(0, GROUP_PATH_ROLE, group_path)
+                    self.layer_group_changed.emit(layer_id, group_path)
             else:
                 for i in range(item.childCount()):
                     emit_for_item(item.child(i))
@@ -511,8 +537,7 @@ class LayerPanel(QWidget):
                     "(e.g. \"New York Area\"); stored in the project and "
                     "carried into the HDF5 export.")
                 location_action.triggered.connect(
-                    lambda: self.group_location_edit_requested.emit(
-                        self._full_group_path(item)))
+                    lambda: self._request_group_location(item))
 
                 menu.addSeparator()
                 preload_action = menu.addAction("Preload Group")
@@ -588,6 +613,14 @@ class LayerPanel(QWidget):
             if child.data(0, Qt.UserRole + 1) == "group":
                 self._collapse_all_children(child)
         item.setExpanded(False)
+
+    def _request_group_location(self, item: QTreeWidgetItem):
+        """Ask for a location tag on a group, naming its images by path."""
+        entries = []
+        self._collect_layer_entries(item, entries)
+        self.group_location_edit_requested.emit(
+            self._full_group_path(item),
+            [path for _lid, path in entries if path])
 
     def _request_group_preload(self, item: QTreeWidgetItem):
         """Collect all layer IDs in a group and emit preload signal."""
@@ -955,6 +988,7 @@ class LayerPanel(QWidget):
         item.setIcon(0, style.standardIcon(QStyle.SP_FileIcon))
 
         nongeo_parent.addChild(item)
+        item.setData(0, GROUP_PATH_ROLE, self._get_group_path(item))
 
         # Register in O(1) lookup caches
         self._layer_items[layer_id] = item
@@ -1722,7 +1756,7 @@ class CombinedLayerPanel(QWidget):
     group_free_requested = pyqtSignal(list)  # layer_ids
 
     # Group location tag (right-click a group > Set Location...)
-    group_location_edit_requested = pyqtSignal(str)  # group_path
+    group_location_edit_requested = pyqtSignal(str, list)
 
     # Batch progress signals
     batch_visibility_started = pyqtSignal(int)  # total items
