@@ -82,6 +82,12 @@ BACKDROP_MAX_PIXELS = 4_000_000
 # have to be a million pixels across per screen pixel to reach it, so it is
 # a runaway guard rather than a limit anyone meets.
 _MAX_DECIMATION = 1 << 20
+# Re-reading a file to hold FEWER pixels has to be worth the read. Below
+# this much freed, it is not: a 256x256 image already showing 1/4 that the
+# zoom would rather have at 1/16 frees 3,904 pixels - 15 KB - for a whole
+# open and reproject, and a mission of those pays that per image. Refining
+# is never withheld this way; only coarsening, which is an optimisation.
+_COARSEN_MIN_SAVING = 250_000
 
 # Ceiling on the pixels held for images that are loaded but not on screen -
 # the cycle's neighbours and the images just stepped off. ~256 MB of RGBA.
@@ -3139,6 +3145,17 @@ class MapCanvas(QGraphicsView):
                 debug(f"memory cap: {layer.name} limited to 1/{desired} "
                       f"({layer.level_pixel_count(desired) / 1e6:.0f} MP of "
                       f"{layer.level_pixel_count(1) / 1e6:.0f} MP full res)")
+        if (layer.is_fully_loaded() and layer._loaded_level
+                and desired > layer._loaded_level):
+            freed = (layer.level_pixel_count(layer._loaded_level)
+                     - layer.level_pixel_count(desired))
+            if freed < _COARSEN_MIN_SAVING:
+                # Already small enough that shrinking it further would cost
+                # more than it saves. Settle the target where the data is,
+                # so nothing keeps asking for a level nobody will load.
+                layer._target_level = layer._loaded_level
+                return
+
         layer._target_level = desired
 
         if layer.is_fully_loaded() and layer._loaded_level == desired:
@@ -3420,8 +3437,11 @@ class MapCanvas(QGraphicsView):
                 # loading ahead of its turn has nothing to draw yet.
                 if layer.visible:
                     self._rebuild_layer_tiles(layer)
-            if layer._target_level != layer._loaded_level:
-                self._dispatch_level_load(layer_id, layer, layer._target_level)
+            # Re-decide rather than chasing the stored target: the level
+            # this result arrived at may well be good enough now, and
+            # _apply_layer_lod is where that judgement lives.
+            self._apply_layer_lod(layer_id, layer,
+                                  self._scene_units_per_pixel())
             return
 
         first_answer = not layer._overviews_known
