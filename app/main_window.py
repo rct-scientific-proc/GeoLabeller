@@ -3664,17 +3664,32 @@ class MainWindow(QMainWindow):
             # Disconnected first: cancel() cannot un-queue signals already
             # emitted, and those slots would otherwise act on the loader
             # that is going away.
+            #
+            # ONE AT A TIME, and nothing here may raise. These were five
+            # statements in a single try/except TypeError, and `cancelled`
+            # is emitted but never connected - so its disconnect raised
+            # every time, jumped to the except, and progress_update was
+            # never reached. The outgoing loader stayed wired to the
+            # window, was deleted, and then delivered into it: a second
+            # directory import ended the process outright.
+            for name in ("file_loaded", "file_error", "batch_complete",
+                         "cancelled", "progress_update"):
+                try:
+                    getattr(loader, name).disconnect()
+                except Exception as exc:      # noqa: BLE001
+                    # Nothing connected (TypeError), or PyQt can no longer
+                    # find the signal on a half-torn-down object. Either
+                    # way this is tidying up, and tidying up must not cost
+                    # the user their session.
+                    debug(f"supersede: {name} not disconnected: "
+                          f"{type(exc).__name__}: {exc}")
             try:
-                loader.file_loaded.disconnect()
-                loader.file_error.disconnect()
-                loader.batch_complete.disconnect()
-                loader.cancelled.disconnect()
-                loader.progress_update.disconnect()
-            except TypeError:
-                pass            # nothing was connected
-            loader.cancel()
-            loader.wait()
-            loader.deleteLater()
+                loader.cancel()
+                loader.wait()
+                loader.deleteLater()
+            except Exception as exc:          # noqa: BLE001
+                debug(f"supersede: stopping the loader failed: "
+                      f"{type(exc).__name__}: {exc}")
             self._async_loader = None
         self._async_pending_files.clear()
         self._async_group_cache = {}

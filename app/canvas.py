@@ -1557,8 +1557,39 @@ class AsyncFileLoaderThread(QThread):
         self._loader.set_files(files, assume_no_sidecars)
 
     def cancel(self):
-        """Cancel loading."""
+        """Cancel loading, and stop forwarding what is already in flight.
+
+        The forwarding goes too, and that is the point. A superseded
+        loader is cancelled, waited for and deleted - but the worker's
+        emissions cross threads, so they are QUEUED, and they arrive
+        after the wrapper they were aimed at has gone. PyQt then raises
+
+            AttributeError: 'AsyncFileLoaderThread' does not have a
+            signal with the signature file_loaded(QString,PyQt_PyObject)
+
+        on the main thread, from inside event delivery, where nothing is
+        in a position to catch it. It reached the process-wide excepthook
+        and took the window with it: importing a second directory while
+        the first was still loading closed the application.
+
+        Breaking the connections drops those queued deliveries with them.
+        A cancelled batch has nothing left to say anyway - that is what
+        cancelling means.
+        """
         self._loader.cancel()
+        self._stop_forwarding()
+
+    def _stop_forwarding(self) -> None:
+        """Break the worker's connections to this wrapper's signals."""
+        for name in ("file_loaded", "file_error", "batch_complete",
+                     "cancelled", "progress_update"):
+            try:
+                getattr(self._loader, name).disconnect()
+            except Exception as exc:      # noqa: BLE001
+                # Nothing connected, or gone already. This runs while a
+                # loader is being abandoned; it must never raise.
+                debug(f"loader forwarding for {name} not broken: "
+                      f"{type(exc).__name__}: {exc}")
 
     def run(self):
         """Run the loading in the background thread."""
