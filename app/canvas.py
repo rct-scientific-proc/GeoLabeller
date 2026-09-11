@@ -2936,16 +2936,28 @@ class MapCanvas(QGraphicsView):
     def _uses_detail_tiles(self, layer: TiledLayer) -> bool:
         """Whether this layer needs windowed detail rather than the whole image.
 
-        Only for georeferenced images big enough that the whole-image path
-        cannot reach full resolution. Waterfall mode is excluded: it rewrites
-        bounds into the pixel zone, so the geographic tile grid means nothing
-        there.
+        Any georeferenced image whose full-resolution array is bigger than
+        a backdrop may be. Zoomed out, the zoom-sized backdrop carries the
+        view on its own and no tiles are read; zoomed in, the backdrop stays
+        within its budget and windowed tiles carry the detail.
+
+        This used to be gated on the 150 MP memory ceiling instead - only
+        an image too large to hold whole got tiles - so a 16 MP image
+        zoomed in to 10 m of ground (a label click) decoded and warped the
+        whole raster at full resolution: 2,441 ms and 64 MB held, to show
+        thirteen metres of four kilometres. One windowed tile of that view
+        costs 178 ms and 1 MB. Measured across 1.6.0 to 1.9.5, this was
+        the same at every version: not a regression, but the cost users
+        were feeling.
+
+        Waterfall mode is excluded: it rewrites bounds into the pixel zone,
+        so the geographic tile grid means nothing there.
         """
         return (not self._waterfall_active
                 and layer.geo
                 and layer.bounds is not None
                 and layer._src_crs is not None
-                and layer.level_pixel_count(1) > MAX_LEVEL_PIXELS)
+                and layer.level_pixel_count(1) > BACKDROP_MAX_PIXELS)
 
     def _update_detail_tiles(self, layer_id: str, layer: TiledLayer):
         """Bring a layer's detail tiles in line with the current view."""
@@ -3213,12 +3225,19 @@ class MapCanvas(QGraphicsView):
 
         if not layer.is_fully_loaded():
             # Nothing on screen yet: load the cheapest level first for a fast
-            # preview; _on_level_loaded then chases the desired level. With no
-            # pyramid there IS no cheap preview - a coarser read costs about
-            # what the wanted one does - so ask for the wanted level directly
-            # rather than paying for two reads.
-            preview = (layer.coarsest_level() if layer.has_overviews()
-                       else desired)
+            # preview; _on_level_loaded then chases the desired level. Only
+            # worth it when the wanted level is slow enough to wait for -
+            # past the backdrop budget. Below it the target itself is cheap
+            # (a 1 MP read of a 16 MP pyramid is ~140 ms) and the preview is
+            # a second read and a second paint for nothing: fitting one
+            # image among its neighbours issued 20 reads, 8 of them a
+            # preview superseded the moment it landed. With no pyramid there
+            # is no cheap preview at all - a coarser read costs about what
+            # the wanted one does.
+            worth_a_preview = (layer.has_overviews()
+                               and layer.level_pixel_count(desired)
+                               > BACKDROP_MAX_PIXELS)
+            preview = layer.coarsest_level() if worth_a_preview else desired
             self._dispatch_level_load(layer_id, layer, preview)
             return
 
