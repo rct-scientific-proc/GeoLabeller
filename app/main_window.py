@@ -135,6 +135,7 @@ class GroupMemoryWorker(QObject):
                     'height': tmp._height,
                     'bounds': tmp.bounds,
                     'full_width': tmp._full_width,
+                    'full_grid': tmp._full_grid,
                     'full_height': tmp._full_height,
                     'overviews': tmp._overviews,
                     'level_dims': tmp._src_level_dims,

@@ -284,6 +284,17 @@ class TiledLayer:
         # Full-resolution reprojected dimensions, kept stable across level
         # switches so overview selection always compares against native res.
         self._full_width = 0
+        # The full-resolution REPROJECTED grid, (affine, width, height), as
+        # one unit. Constant for a file, and what every level load
+        # recomputed with calculate_default_transform to learn what it
+        # already knew: ~1.6 ms a call, a third of a coarse read. Learned by
+        # the first geo load and carried in the header from then on.
+        #
+        # Kept apart from _full_width/_full_height deliberately: the pixel
+        # zone writes SOURCE dimensions into those, so a layer coming back
+        # from the waterfall would otherwise reuse the wrong grid - it did,
+        # and its bounds landed 8 km off.
+        self._full_grid = None
         self._full_height = 0
         # Overview decimation factor of the data currently in `_rgba_data`.
         self._loaded_level = 1
@@ -364,6 +375,7 @@ class TiledLayer:
             "bounds": self.bounds,
             "width": self._full_width,
             "height": self._full_height,
+            "full_grid": self._full_grid,
             "src_crs": self._src_crs,
             "src_transform": self._src_transform,
             "src_width": self._src_width,
@@ -390,6 +402,7 @@ class TiledLayer:
 
         self._src_crs = metadata.get("src_crs")
         self._src_transform = metadata.get("src_transform")
+        self._full_grid = metadata.get("full_grid")
         self._src_width = int(metadata["src_width"])
         self._src_height = int(metadata["src_height"])
         factors = metadata.get("overviews")
@@ -633,6 +646,8 @@ class TiledLayer:
             self._full_width = result['full_width']
         if result.get('full_height'):
             self._full_height = result['full_height']
+        if result.get('full_grid') is not None:
+            self._full_grid = result['full_grid']
         if result.get('overviews'):
             self._overviews = result['overviews']
         if result.get('overviews') is not None:
@@ -704,14 +719,23 @@ class TiledLayer:
             level = max(1, level)
 
             dst_crs = WEB_MERCATOR
-            transform, width, height = calculate_default_transform(
-                src.crs, dst_crs, src.width, src.height, *src.bounds
-            )
-
-            # Remember the full-resolution reprojected dimensions (used for
-            # overview level selection) before reducing for this level.
-            self._full_width = width
-            self._full_height = height
+            if self._full_grid is not None:
+                # Already known - from this layer's own first geo load, or
+                # handed over in the header by the live layer. The same
+                # arithmetic on the same bounds gives the same answer.
+                transform, width, height = self._full_grid
+                self._full_width = width
+                self._full_height = height
+            else:
+                transform, width, height = calculate_default_transform(
+                    src.crs, dst_crs, src.width, src.height, *src.bounds
+                )
+                # Remember the full-resolution grid (used for overview level
+                # selection, and to spare the next load this call) before
+                # reducing for this level.
+                self._full_grid = (transform, width, height)
+                self._full_width = width
+                self._full_height = height
 
             # Hard floor on memory, applied here rather than only where the
             # level is chosen: a non-lazy layer loads straight from __init__ at
@@ -1831,6 +1855,7 @@ class _LevelLoadRunnable(QRunnable):
                 'bounds': tmp.bounds,
                 'full_width': tmp._full_width,
                 'full_height': tmp._full_height,
+                'full_grid': tmp._full_grid,
                 'overviews': tmp._overviews,
                 'level_dims': tmp._src_level_dims,
                 'src_crs': tmp._src_crs,
