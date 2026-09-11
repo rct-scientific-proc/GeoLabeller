@@ -2850,15 +2850,17 @@ class MapCanvas(QGraphicsView):
             self._clear_detail_tiles(layer_id, layer)
             return
 
-        level = layer.resolution_level(self._scene_units_per_pixel())
-        if level >= layer.budget_level(1, BACKDROP_MAX_PIXELS):
+        units_per_pixel = self._scene_units_per_pixel()
+        level = layer.resolution_level(units_per_pixel)
+        if level >= self._backdrop_level(layer, units_per_pixel):
             # The coarse whole-image array is already at least this detailed,
             # so tiles would add nothing. Compared against the level the
-            # backdrop is ACTUALLY loaded at (_desired_level uses the same
-            # 4 MP cap): against the 150 MP cap instead, a pyramided mosaic
-            # had a band of two or more zoom levels where the backdrop was
-            # all there was and every backdrop pixel covered several screen
-            # pixels - the range a user zooms through to orient.
+            # backdrop is ACTUALLY loaded at - the same expression
+            # _desired_level uses, so the two cannot drift apart. Against
+            # the 150 MP cap instead, a pyramided mosaic had a band of two
+            # or more zoom levels where the backdrop was all there was and
+            # every backdrop pixel covered several screen pixels - the
+            # range a user zooms through to orient.
             self._clear_detail_tiles(layer_id, layer)
             return
 
@@ -3023,24 +3025,40 @@ class MapCanvas(QGraphicsView):
             if key[0] == layer_id:
                 self._pending_tiles.pop(key).cancel()
 
+    def _backdrop_level(self, layer: TiledLayer,
+                        units_per_pixel: float) -> int:
+        """The level of a whole-image array that is only a backdrop.
+
+        Two ceilings, both of which have to hold: no more than the
+        backdrop budget can afford, and no finer than the zoom can show.
+
+        The budget alone used to decide it, so every image too large to
+        hold whole decoded ~4 MP no matter how far out the view was -
+        sighting a survey of big mosaics meant 4 MP per image to draw
+        something twenty pixels wide. Measured on a pyramided 36 MP
+        GeoTIFF: 268 ms at the 4 MP cap, 16 ms at the level the zoom
+        actually wanted, per image, on the same four loader threads.
+
+        Also the answer for a layer nothing has opened yet: there is no
+        pyramid to choose from, but a read decimated to what the zoom can
+        show is cheap whether or not one turns out to exist, and the read
+        reports the real factors either way.
+        """
+        return layer.budget_level(
+            layer.select_overview_level(units_per_pixel),
+            BACKDROP_MAX_PIXELS)
+
     def _desired_level(self, layer: TiledLayer, units_per_pixel: float) -> int:
         """The overview level this layer should be holding at this zoom."""
         if not layer._overviews_known:
-            # Nothing has opened this file yet, so there is no pyramid to
-            # choose from - but the zoom still says how much detail can be
-            # SEEN, and a read decimated to that is cheap whether or not a
-            # pyramid turns out to exist. Capped at the backdrop budget as
-            # well, since zoomed in there is no zoom-derived saving and a
-            # first look should stay cheap either way. The read that
-            # answers this also reports the real factors, after which the
+            # Nothing has opened this file yet. The read that answers this
+            # also reports the real pyramid factors, after which the
             # normal choice applies.
-            return layer.budget_level(
-                layer.select_overview_level(units_per_pixel),
-                BACKDROP_MAX_PIXELS)
+            return self._backdrop_level(layer, units_per_pixel)
         if self._uses_detail_tiles(layer):
-            # Windowed tiles carry the detail; this array only has to be a
-            # cheap backdrop behind them.
-            return layer.budget_level(1, BACKDROP_MAX_PIXELS)
+            # Windowed tiles carry the detail; this array is only the
+            # backdrop behind them.
+            return self._backdrop_level(layer, units_per_pixel)
         return layer.select_overview_level(units_per_pixel)
 
     def _apply_layer_lod(self, layer_id: str, layer: TiledLayer,
