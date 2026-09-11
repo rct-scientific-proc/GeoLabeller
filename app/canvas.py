@@ -78,6 +78,10 @@ MAX_LEVEL_PIXELS = 150_000_000
 # quick rather than detailed. Chasing the zoom with it would reintroduce the
 # very cost the tiles exist to avoid.
 BACKDROP_MAX_PIXELS = 4_000_000
+# Decimation is by doubling, and this bounds the doubling: a raster would
+# have to be a million pixels across per screen pixel to reach it, so it is
+# a runaway guard rather than a limit anyone meets.
+_MAX_DECIMATION = 1 << 20
 
 # Ceiling on the pixels held for images that are loaded but not on screen -
 # the cycle's neighbours and the images just stepped off. ~256 MB of RGBA.
@@ -470,12 +474,25 @@ class TiledLayer:
                 (Web Mercator metres for geo layers). Larger = more zoomed out.
 
         Returns:
-            A decimation factor where 1 means full resolution. Always returns 1
-            when the file has no overviews or when the view is zoomed in past
-            native resolution.
+            A decimation factor where 1 means full resolution. Returns 1 when
+            the view is zoomed in past native resolution, or when there is
+            nothing to measure against (no extent, no size, a nonsense scale).
+
+        A file with no pyramid is decimated by powers of two instead of by
+        its overview factors. It used to be pinned at full resolution on the
+        grounds that there was nothing cheaper to show - but a windowed read
+        with out_shape decimates any raster (see budget_level, and the
+        first load of every image, which happens before any pyramid is
+        known). What a missing pyramid really costs is that the read is
+        slower per pixel, not that it is unavailable: on a 36 MP
+        pyramid-less GeoTIFF, full resolution took 4,031 ms and held 144 MB
+        against 174 ms and 2 MB at 1/8. Zoomed out over a survey that was
+        the difference between imagery appearing at once and one image
+        arriving per second.
         """
         full_width = self._full_width or self._width
-        if not self._overviews or full_width <= 0 or scene_units_per_pixel <= 0:
+        if (full_width <= 0 or scene_units_per_pixel <= 0
+                or self.bounds is None):
             return self.budget_level(1)
 
         # Scene units covered by one full-resolution data pixel.
@@ -487,11 +504,16 @@ class TiledLayer:
         # Pick the largest decimation factor whose level resolution is still no
         # finer than one screen pixel (overviews are sorted ascending).
         best = 1
-        for f in self._overviews:
-            if native_res * f <= scene_units_per_pixel:
-                best = f
-            else:
-                break
+        if self._overviews:
+            for f in self._overviews:
+                if native_res * f <= scene_units_per_pixel:
+                    best = f
+                else:
+                    break
+        else:
+            while (best < _MAX_DECIMATION
+                    and native_res * (best * 2) <= scene_units_per_pixel):
+                best *= 2
         return self.budget_level(best)
 
     def resolution_level(self, scene_units_per_pixel: float) -> int:
@@ -558,7 +580,7 @@ class TiledLayer:
         # by an arbitrary factor still works - a windowed read with out_shape
         # uses the nearest overview and reduces from there - it is just slower.
         factor = level
-        while factor < 1 << 20 and self.level_pixel_count(factor) > limit:
+        while factor < _MAX_DECIMATION and self.level_pixel_count(factor) > limit:
             factor *= 2
         return factor
 
@@ -3004,17 +3026,17 @@ class MapCanvas(QGraphicsView):
     def _desired_level(self, layer: TiledLayer, units_per_pixel: float) -> int:
         """The overview level this layer should be holding at this zoom."""
         if not layer._overviews_known:
-            # Nothing has opened this file yet. Ask for a cheap decimation:
-            # if the image is small this IS full resolution, and if it is
-            # large the read that answers it also reports the real pyramid
-            # factors, after which the normal choice applies.
-            return layer.budget_level(1, BACKDROP_MAX_PIXELS)
-        if not layer.has_overviews():
-            # No pyramids: full resolution, or the coarsest decimation that
-            # fits in memory for an image too big to hold whole (without a
-            # pyramid there is nothing cheaper to show in the meantime, so
-            # this is the only load it gets).
-            return layer.budget_level(1)
+            # Nothing has opened this file yet, so there is no pyramid to
+            # choose from - but the zoom still says how much detail can be
+            # SEEN, and a read decimated to that is cheap whether or not a
+            # pyramid turns out to exist. Capped at the backdrop budget as
+            # well, since zoomed in there is no zoom-derived saving and a
+            # first look should stay cheap either way. The read that
+            # answers this also reports the real factors, after which the
+            # normal choice applies.
+            return layer.budget_level(
+                layer.select_overview_level(units_per_pixel),
+                BACKDROP_MAX_PIXELS)
         if self._uses_detail_tiles(layer):
             # Windowed tiles carry the detail; this array only has to be a
             # cheap backdrop behind them.
@@ -3038,16 +3060,6 @@ class MapCanvas(QGraphicsView):
                 layer._target_level = level
                 self._dispatch_level_load(layer_id, layer, level)
             return
-        if not layer.has_overviews():
-            if not layer.is_fully_loaded():
-                level = self._desired_level(layer, units_per_pixel)
-                if level > 1:
-                    debug(f"memory cap: {layer.name} has no pyramids and is "
-                          f"too large for full resolution; loading at 1/{level}")
-                layer._target_level = level
-                self._dispatch_level_load(layer_id, layer, level)
-            return
-
         desired = self._desired_level(layer, units_per_pixel)
         if desired > 1 and layer.level_pixel_count(1) > MAX_LEVEL_PIXELS:
             # Detail is capped rather than zoom-limited; say so once per change
@@ -3069,8 +3081,13 @@ class MapCanvas(QGraphicsView):
 
         if not layer.is_fully_loaded():
             # Nothing on screen yet: load the cheapest level first for a fast
-            # preview; _on_level_loaded then chases the desired level.
-            self._dispatch_level_load(layer_id, layer, layer.coarsest_level())
+            # preview; _on_level_loaded then chases the desired level. With no
+            # pyramid there IS no cheap preview - a coarser read costs about
+            # what the wanted one does - so ask for the wanted level directly
+            # rather than paying for two reads.
+            preview = (layer.coarsest_level() if layer.has_overviews()
+                       else desired)
+            self._dispatch_level_load(layer_id, layer, preview)
             return
 
         # Already showing a preview at another level: refine to the target
@@ -3332,8 +3349,7 @@ class MapCanvas(QGraphicsView):
                 # loading ahead of its turn has nothing to draw yet.
                 if layer.visible:
                     self._rebuild_layer_tiles(layer)
-            if (layer.has_overviews()
-                    and layer._target_level != layer._loaded_level):
+            if layer._target_level != layer._loaded_level:
                 self._dispatch_level_load(layer_id, layer, layer._target_level)
             return
 
