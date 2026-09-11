@@ -52,7 +52,8 @@ from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
 from .mask_editor import MaskEditor
 from .orientation import OrientationEditor
-from .relocate import RelocateImagesDialog, silently_resolve
+from .relocate import (RelocateImagesDialog, missing_images,
+                       silently_resolve)
 from .snippet_panel import SnippetPanel
 from .resources import icd_path
 from .version import app_title
@@ -2253,6 +2254,19 @@ class MainWindow(QMainWindow):
         # A project shared from another machine often travels WITH its
         # imagery; resolving missing paths against the project file's own
         # folder fixes that case before the user sees a single warning.
+        # ONE existence sweep for the whole open. Everything below that
+        # needs to know whether a file is there reads this, rather than
+        # asking the disk again: three sweeps over 20k paths on a share
+        # was minutes of frozen window before any imagery appeared.
+        def scan_progress(done, total):
+            if done == 0:
+                self._show_progress(total, "Checking project imagery")
+            else:
+                self._update_progress(done)
+            QApplication.processEvents()
+
+        missing_paths = missing_images(self.project, progress=scan_progress)
+
         if self._project_path is not None:
             def relocation_progress(done, total):
                 # Repurpose the load progress bar for the relocation scan
@@ -2267,7 +2281,7 @@ class MainWindow(QMainWindow):
 
             fixed = silently_resolve(
                 self.project, str(self._project_path.parent),
-                progress=relocation_progress)
+                progress=relocation_progress, missing=missing_paths)
             if fixed:
                 self.statusBar.showMessage(
                     f"Relocated {fixed} image(s) next to the project file - "
@@ -2280,8 +2294,13 @@ class MainWindow(QMainWindow):
         missing_files = []
         fast_images = []
 
+        # A relocated image is re-keyed in the project, so a path from the
+        # sweep that is STILL a key is a path that is still missing -
+        # derived, not re-stated.
+        still_missing = {p for p in missing_paths if p in self.project.images}
+
         for image in self.project.images.values():
-            if not os.path.exists(image.path):
+            if image.path in still_missing:
                 missing_files.append(image.path)
             elif (image.affine_coeffs and image.crs_key() is not None
                     and image.original_width and image.original_height):
@@ -3963,17 +3982,30 @@ class MainWindow(QMainWindow):
         # them - a project shared from another machine usually has ALL of
         # them somewhere on this one, just under different paths.
         if self._async_missing_files:
+            known = self._async_missing_files
             self._async_missing_files = []  # consumed; recomputed on demand
-            self._offer_relocation()
+            self._offer_relocation(known)
 
-    def _missing_project_images(self) -> list:
-        """The ImageData entries whose recorded paths do not exist."""
+    def _missing_project_images(self, known_paths: list | None = None) -> list:
+        """The ImageData entries whose recorded paths do not exist.
+
+        ``known_paths`` skips the sweep when the caller has just done one.
+        """
+        if known_paths is not None:
+            wanted = set(known_paths)
+            return [img for img in self.project.images.values()
+                    if img.path in wanted]
         return [img for img in self.project.images.values()
                 if not os.path.exists(img.path)]
 
-    def _offer_relocation(self):
-        """Show the relocation dialog for whatever is currently missing."""
-        missing = self._missing_project_images()
+    def _offer_relocation(self, known_paths: list | None = None):
+        """Show the relocation dialog for whatever is currently missing.
+
+        ``known_paths`` is the sweep the project open already did. The menu
+        action passes nothing and gets a fresh look, which is right - the
+        user may have plugged the drive in since.
+        """
+        missing = self._missing_project_images(known_paths)
         if not missing:
             QMessageBox.information(
                 self, "Locate Missing Images",

@@ -139,8 +139,36 @@ def resolve_against_dir(missing_path: str, base_dir: str) -> str | None:
     return best
 
 
+def missing_images(project, progress=None, report_every: int = 200) -> list:
+    """The image paths in *project* that do not exist, in project order.
+
+    The one existence sweep of a project open. It used to be done three
+    separate times over every image - here, in the caller's fast/worker
+    split, and again by the missing-image check at the end of the load -
+    with no result shared between them. A stat costs nothing locally and
+    1-10 ms on the SMB and NFS shares this imagery actually lives on, so
+    at 20,000 images the repeats were minutes of frozen window before the
+    zero-I/O load could start.
+
+    ``progress`` (done, total) is called every *report_every* paths, and
+    once at zero before the first stat, so a UI caller can show and pump
+    something. The sweep at the top of silently_resolve reported nothing
+    at all, which is why the window froze with an unpainted progress bar.
+    """
+    paths = list(project.images)
+    total = len(paths)
+    missing = []
+    for i, path in enumerate(paths):
+        if progress is not None and i % report_every == 0:
+            progress(i, total)
+        if not os.path.exists(path):
+            missing.append(path)
+    return missing
+
+
 def silently_resolve(project, project_dir: str, verify=verify_candidate,
-                     progress=None, sample_every: int = 100) -> int:
+                     progress=None, sample_every: int = 100,
+                     missing: list | None = None) -> int:
     """Fix missing image paths relative to the project file's folder.
 
     The zero-UI case: the imagery travelled with the project. Returns how
@@ -158,9 +186,19 @@ def silently_resolve(project, project_dir: str, verify=verify_candidate,
     verified tail search, which re-infers a rule from what it finds - a
     tree copied folder-by-folder settles onto each folder's rule after one
     verified open. ``progress`` (done, total) is called periodically so the
-    caller can keep its UI alive.
+    caller can keep its UI alive, counting from 0 to the number of missing
+    images.
+
+    ``missing`` is the existence sweep, for a caller that has already done
+    one: it needs the same answer for its own bookkeeping, and on a network
+    share the sweep is the expensive part. A UI caller should always pass
+    it - run missing_images(project, progress=...) first, under its own
+    label. Without it the sweep here is unreported, because it counts over
+    ALL images while the loop below counts over the missing ones, and
+    feeding both through one callback walks the progress bar backwards.
     """
-    missing = [p for p in list(project.images) if not os.path.exists(p)]
+    if missing is None:
+        missing = missing_images(project)
     total = len(missing)
     relocated = 0
     rule = None
