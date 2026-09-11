@@ -422,9 +422,39 @@ class H5DatasetWriter:
                 f"Cannot append: the existing file stores {existing_dtype} "
                 f"pixels, not {self.pixel_dtype} - mixing the two would "
                 "give the samples two different value scales.")
+        self._validate_alignment()
         existing = list(f["classes"].asstr()[:]) if "classes" in f else []
         if existing != self.classes:
             self._reconcile_classes(existing)
+
+    def _validate_alignment(self):
+        """Refuse to append to a file whose aligned columns disagree.
+
+        images / labels / gt / split / locations / object_ids are read by
+        row index - sample i is images[i] with class labels[i] - so they
+        only mean anything while they are the same length. A flush writes
+        them one after another and is not atomic: an I/O failure partway
+        (a full disk) can resize images and stop before labels, and _n is
+        not advanced, so the file is left short in one column and long in
+        another. Appending to it would stack more rows on the mismatch and
+        every sample after the break would carry the wrong class.
+
+        Nothing here repairs it - truncating would throw away rows, and
+        guessing which column is right is not this code's business. It
+        stops, and says where.
+        """
+        f = self._f
+        rows = f["images"].shape[0]
+        for name in ("labels", "gt", "split") + _STRING_COLUMNS:
+            if name not in f:
+                continue
+            if f[name].shape[0] != rows:
+                raise ValueError(
+                    f"Cannot append: this file's datasets disagree about how "
+                    f"many samples it holds - images has {rows} but "
+                    f"{name} has {f[name].shape[0]}. It was probably left "
+                    f"part-written by an export that failed mid-flush; "
+                    f"export to a new file instead.")
 
     def _reconcile_classes(self, existing):
         """Bring an existing file's label indices onto the new class list.
