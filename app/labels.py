@@ -1118,9 +1118,35 @@ class LabelProject:
         }
 
     def save(self, file_path: str | Path):
-        """Save project to JSON file."""
-        with open(file_path, 'w') as f:
-            json.dump(self.to_dict(), f, indent=2)
+        """Save project to JSON file.
+
+        Written to a temp file beside the destination and renamed over it,
+        so the copy already on disk survives a failure mid-write. Opening
+        the destination with "w" truncates it before a single byte of the
+        new project is written: a full disk, a dropped share or the
+        process going away partway through left an unparseable .geolabel
+        where the user's work had been, with the autosave snapshot as the
+        only remaining copy. The recovery writer has always worked this
+        way (_write_recovery_snapshot in main_window).
+
+        The temp file must sit in the destination's own directory -
+        os.replace is only atomic within one filesystem - and is removed
+        if the write fails. The exception is re-raised either way: the
+        caller shows "Failed to save project" on it, and a save that
+        quietly did nothing would be worse than the truncation.
+        """
+        destination = Path(file_path)
+        tmp_path = destination.with_suffix(destination.suffix + ".tmp")
+        try:
+            with open(tmp_path, 'w') as f:
+                json.dump(self.to_dict(), f, indent=2)
+            os.replace(tmp_path, destination)
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass          # never mask the real failure with cleanup
+            raise
 
     @classmethod
     def load(cls, file_path: str | Path) -> "LabelProject":
