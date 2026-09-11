@@ -2817,9 +2817,22 @@ class MainWindow(QMainWindow):
         return bool(img is not None and img.hard_negative_source)
 
     def _h5_counts(self, infos) -> dict:
-        """How many loaded images each scope option covers."""
+        """How many loaded images each scope option covers.
+
+        ``unloaded_labelled`` is the one count that is NOT about a scope:
+        images the project has labels for that are not on the canvas at
+        all - their file was missing when the project opened, or a
+        relocation was declined. The export is built from loaded layers, so
+        those labels cannot be written whatever is chosen here, and saying
+        nothing made a short dataset look like a complete one.
+        """
         visible = [i for i in infos if i.get("visible")]
+        loaded = {i["file_path"] for i in infos}
+        unloaded_labelled = sum(
+            1 for path, image in self.project.images.items()
+            if path not in loaded and self._h5_labels_for(path))
         return {
+            "unloaded_labelled": unloaded_labelled,
             "all": len(infos),
             "visible": len(visible),
             "labelled_all": sum(1 for i in infos
@@ -2846,9 +2859,16 @@ class MainWindow(QMainWindow):
         loaded_paths = {i["file_path"] for i in infos}
         instances = 0
         instances_visible = 0
+        instances_unloaded = 0
         classes: dict = {}
         for path, image in self.project.images.items():
             if path not in loaded_paths:
+                # This object was labelled here too, but the image is not
+                # on the canvas - so the export cannot reach it. Counted,
+                # and said, rather than quietly narrowing the object.
+                if any(getattr(l, "object_id", None) in wanted
+                       for l in image.labels):
+                    instances_unloaded += 1
                 continue
             here = [l for l in image.labels
                     if getattr(l, "object_id", None) in wanted]
@@ -2861,7 +2881,9 @@ class MainWindow(QMainWindow):
                 classes[label.class_name] = classes.get(label.class_name,
                                                         0) + 1
         return {"ids": list(object_ids), "instances": instances,
-                "instances_visible": instances_visible, "classes": classes}
+                "instances_visible": instances_visible,
+                "instances_unloaded": instances_unloaded,
+                "classes": classes}
 
     def _h5_images_for(self, infos, examples_scope, negatives_scope,
                        object_ids) -> list:

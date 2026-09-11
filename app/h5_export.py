@@ -1279,6 +1279,14 @@ class H5ExportDialog(QDialog):
         self._append_note.setStyleSheet("color: #0066cc;")
         layout.addWidget(self._append_note)
 
+        # Labels the export cannot reach whatever is chosen above.
+        self.unreachable_label = QLabel("")
+        self.unreachable_label.setWordWrap(True)
+        unreachable = self._unreachable_note()
+        if unreachable:
+            self.unreachable_label.setText(unreachable)
+        layout.addWidget(self.unreachable_label)
+
         # What the current settings would actually write. Pure arithmetic
         # on the label positions and the grid step - no raster is opened -
         # so it can follow every keystroke. Without it the only way to find
@@ -1402,6 +1410,29 @@ class H5ExportDialog(QDialog):
         button.toggled.connect(self._on_scope_changed)
         box.addWidget(button)
         bucket.append((value, button))
+
+    def _unreachable_note(self) -> str:
+        """What this export cannot include, and why - or "".
+
+        An image the project has labels for but the canvas has not loaded
+        (its file was missing at open, or a relocation was declined) cannot
+        contribute: the export reads pixels, and there are none to read.
+        Better said here, before the export, than discovered by counting
+        rows afterwards.
+        """
+        if self._selection:
+            missing = self._selection.get("instances_unloaded", 0)
+            if missing:
+                return (f"{missing} image(s) this object was labelled in are "
+                        "not loaded, and cannot be exported. Load them (or "
+                        "relocate their files) to include those views.")
+            return ""
+        missing = self._counts.get("unloaded_labelled", 0)
+        if missing:
+            return (f"{missing} labelled image(s) are not loaded and cannot "
+                    "be exported, whichever scope is chosen. Their labels "
+                    "will be missing from the file.")
+        return ""
 
     def _selection_summary(self) -> str:
         """One line naming the object(s) and how their views are classed."""
