@@ -504,16 +504,21 @@ class TiledLayer:
         # Pick the largest decimation factor whose level resolution is still no
         # finer than one screen pixel (overviews are sorted ascending).
         best = 1
-        if self._overviews:
-            for f in self._overviews:
-                if native_res * f <= scene_units_per_pixel:
-                    best = f
-                else:
-                    break
-        else:
-            while (best < _MAX_DECIMATION
-                    and native_res * (best * 2) <= scene_units_per_pixel):
-                best *= 2
+        for f in self._overviews:
+            if native_res * f <= scene_units_per_pixel:
+                best = f
+            else:
+                break
+        # Then keep doubling past the deepest overview if the zoom is still
+        # coarser than it. A pyramid stops where whoever built it stopped -
+        # gdaladdo's usual "2 4 8" leaves a 36 MP image bottoming out at
+        # 0.56 MP - and a survey seen from far out wants far less than that.
+        # Reading past the end is not expensive: GDAL decimates from the
+        # coarsest level it does have (measured 77 ms at the deepest
+        # overview, 18 ms four steps past it).
+        while (best < _MAX_DECIMATION
+                and native_res * (best * 2) <= scene_units_per_pixel):
+            best *= 2
         return self.budget_level(best)
 
     def resolution_level(self, scene_units_per_pixel: float) -> int:
@@ -1398,6 +1403,54 @@ def _web_mercator_estimate(src_crs, src_transform,
     return (west, south, east, north), width, height
 
 
+class _OrderedIds:
+    """A set of layer ids that remembers the order they arrived in.
+
+    The tile-update pass walks the visible layers and dispatches their
+    loads, and the loader pool is FIFO, so whatever order this iterates
+    in is the order imagery appears on screen. Until 1.9.1 the pass
+    walked `self._layers` - a dict, so insertion order, which is the
+    order images were added and therefore the order of the tree. Swapping
+    it for a plain set (fc1c71e, to stop the pass costing something
+    proportional to the whole project rather than to what is on screen)
+    kept the speed and lost the order: a set iterates by hash, so a group
+    loaded in an arbitrary order and users noticed imagery "popping in
+    randomly" where it used to sweep through the group.
+
+    A dict gives both - insertion order, and membership in one lookup.
+    Only the handful of set operations the canvas actually uses are here;
+    anything else should be added deliberately rather than inherited.
+    """
+
+    __slots__ = ("_ids",)
+
+    def __init__(self):
+        self._ids: dict = {}
+
+    def add(self, layer_id: str) -> None:
+        # An id already present keeps its place: being shown twice does
+        # not make a layer newer than its neighbours.
+        self._ids[layer_id] = None
+
+    def discard(self, layer_id: str) -> None:
+        self._ids.pop(layer_id, None)
+
+    def clear(self) -> None:
+        self._ids.clear()
+
+    def __contains__(self, layer_id: str) -> bool:
+        return layer_id in self._ids
+
+    def __iter__(self):
+        return iter(self._ids)
+
+    def __len__(self) -> int:
+        return len(self._ids)
+
+    def __repr__(self) -> str:
+        return f"_OrderedIds({list(self._ids)!r})"
+
+
 def stored_layer_metadata(file_path: str, group_path: str,
                           src_width: int, src_height: int,
                           affine_coeffs, crs_epsg,
@@ -2162,7 +2215,7 @@ class MapCanvas(QGraphicsView):
         # hidden until the user picks some, and the hit test, the tile pass
         # and the cull all only care about the shown ones - walking every
         # layer instead cost 2.7 ms per mouse move at 20k.
-        self._visible_layer_ids: set = set()
+        self._visible_layer_ids = _OrderedIds()
         # Set when a pass culls a loaded layer; the trim then runs once for
         # the pass instead of once per culled layer.
         self._offscreen_trim_pending = False
