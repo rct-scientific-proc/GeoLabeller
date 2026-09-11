@@ -21,14 +21,24 @@ from PyQt5.QtWidgets import (
 # Degree/minute/second marks, including the typographic ones a copy-paste
 # tends to bring along, are just separators once the numbers are tokenised.
 _DEGREE_MARKS = re.compile(r"[°º'′’\"″”]")
-_TOKENS = re.compile(r"[-+]?\d+(?:\.\d+)?|[NSEW]|,")
+# A minus that a text editor has prettified. Word, Google Docs and most web
+# pages substitute U+2212 or an en dash for the hyphen, and the tokeniser
+# below would not match those - so the sign was not rejected, it was DROPPED
+# and the coordinate came back mirrored into the other hemisphere. These are
+# folded to ASCII before tokenising rather than added to the token pattern,
+# so every later comparison still sees a plain "-".
+_MINUS_MARKS = re.compile(r"[‐‑‒–—―−﹘﹣－]")
+# A leading-dot decimal (".98") is a real spelling; without the second
+# alternative the dot was skipped and the number read as 98.
+_TOKENS = re.compile(r"[-+]?(?:\d+(?:\.\d+)?|\.\d+)|[NSEW]|,")
 
 MAX_LATITUDE = 85.05112878  # Web Mercator is undefined beyond this
 
 
 def _tokenise(text: str) -> list[list[str]] | None:
     """Split text into one token group per coordinate, or None if unusable."""
-    cleaned = _DEGREE_MARKS.sub(" ", text.upper())
+    cleaned = _MINUS_MARKS.sub("-", text.upper())
+    cleaned = _DEGREE_MARKS.sub(" ", cleaned)
     groups: list[list[str]] = []
     current: list[str] = []
     saw_hemisphere = False
