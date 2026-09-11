@@ -3320,6 +3320,12 @@ class MapCanvas(QGraphicsView):
             return self._layers[layer_id].file_path
         return None
 
+    def get_layer_group(self, layer_id: str) -> str | None:
+        """Get the group path a layer sits in ("" when ungrouped)."""
+        if layer_id in self._layers:
+            return self._layers[layer_id].group_path
+        return None
+
     def get_layer_infos(self) -> list[dict]:
         """Return per-layer info for all loaded layers, in display order.
 
@@ -3388,19 +3394,26 @@ class MapCanvas(QGraphicsView):
         self._schedule_tile_update()
 
     def zoom_to_point(self, lon: float, lat: float, size_meters: float = 10.0):
-        """Zoom the view to center on a point with a given extent in meters.
+        """Zoom the view to center on a point with a given GROUND extent.
 
         Args:
             lon: Longitude (WGS84)
             lat: Latitude (WGS84)
-            size_meters: The width/height of the view in meters (default 10m)
+            size_meters: The width/height of the view in metres ON THE
+                GROUND (default 10m)
+
+        Web Mercator metres are stretched by 1/cos(latitude), so asking for
+        a 10 m view in scene units gives 7.7 m of ground at 40 degrees and
+        5 m at 60. Two of the three callers divided that out themselves and
+        the third did not, so "Zoom to Label" framed a tighter view than
+        the other two the further north you worked. The correction belongs
+        here, once, where a fourth caller cannot forget it.
         """
         # Convert point to Web Mercator
         center_x, center_y = self._wgs84_to_web_mercator(lon, lat)
 
-        # In Web Mercator, units are meters, so size_meters directly gives the
-        # extent
-        half_size = size_meters / 2
+        mercator_size = size_meters / max(math.cos(math.radians(lat)), 1e-6)
+        half_size = mercator_size / 2
 
         west = center_x - half_size
         east = center_x + half_size

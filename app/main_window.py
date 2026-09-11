@@ -2,7 +2,6 @@
 import hashlib
 from collections import deque
 import json
-import math
 import os
 import platform
 import tempfile
@@ -1854,11 +1853,9 @@ class MainWindow(QMainWindow):
         width_m = dialog.view_width_m()
         self._goto_defaults = {"text": dialog.entered_text(), "width": width_m}
 
-        # zoom_to_point sizes the view in Web Mercator units, which are
-        # stretched by 1/cos(latitude); undo that so the width the user asked
-        # for is the width they get on the ground.
-        mercator_width = width_m / max(math.cos(math.radians(lat)), 1e-6)
-        self.canvas.zoom_to_point(lon, lat, size_meters=mercator_width)
+        # zoom_to_point takes ground metres and handles the Web Mercator
+        # stretch itself.
+        self.canvas.zoom_to_point(lon, lat, size_meters=width_m)
         self.canvas.mark_location(lon, lat)
         # Focus the map so Escape reaches it without needing a click first.
         self.canvas.setFocus()
@@ -1907,12 +1904,8 @@ class MainWindow(QMainWindow):
         wp = self.project.get_waypoint(waypoint_id)
         if wp is None:
             return
-        # zoom_to_point sizes the view in Web Mercator units, which are
-        # stretched by 1/cos(latitude); undo that so the view covers the
-        # ground width intended.
         width_m = float(self._goto_defaults.get("width", 200))
-        mercator_width = width_m / max(math.cos(math.radians(wp.lat)), 1e-6)
-        self.canvas.zoom_to_point(wp.lon, wp.lat, size_meters=mercator_width)
+        self.canvas.zoom_to_point(wp.lon, wp.lat, size_meters=width_m)
         self.canvas.setFocus()
         self.statusBar.showMessage(
             f"Moved to waypoint '{wp.name}' - "
@@ -2115,6 +2108,10 @@ class MainWindow(QMainWindow):
             removed_images += 1
         if not removed_images:
             return
+        # Removing an image can leave the OTHER half of a linked pair alone
+        # in its object group: without this the survivor keeps the halo that
+        # says it is linked, while the panel correctly shows it is not.
+        self._update_ring_colors()
         self.layer_panel.refresh_labeled_panel(self.project)
         self._refresh_snippet_panel()
         self._refresh_hard_negative_panel()
@@ -4249,8 +4246,13 @@ class MainWindow(QMainWindow):
             name = Path(file_path).stem
             width, height = self.canvas.get_layer_source_dimensions(layer_id)
             affine, crs = self.canvas.get_layer_transform(layer_id)
+            # In the group the layer is actually in - "" filed a flagged
+            # image at the project root, where Set Location could not find
+            # it and a reload put it back in the wrong place.
+            group = self.canvas.get_layer_group(layer_id) or ""
             img = self.project.add_image(
-                file_path, name, "", width, height, affine=affine, crs=crs)
+                file_path, name, group, width, height, affine=affine,
+                crs=crs)
         img.hard_negative_source = not img.hard_negative_source
         self._refresh_hard_negative_panel()
         self.statusBar.showMessage(
