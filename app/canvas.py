@@ -3434,6 +3434,36 @@ class MapCanvas(QGraphicsView):
             self._visible_layer_ids.discard(layer_id)
             self._warm_release(layer_id)
 
+    def shutdown(self, wait_ms: int = 2000):
+        """Stop the background pools, for a window that is going away.
+
+        Both pools are parented to this canvas, so ~QThreadPool runs when
+        it is destroyed - and that blocks until every RUNNING and every
+        QUEUED runnable has finished. The runnables bail out early only
+        when they are cancelled, and nothing cancelled them at close, so
+        closing during a cycle prefetch of large mosaics left the process
+        alive with no window for the sum of everything queued: a hang, as
+        far as Task Manager and the user are concerned, and long enough
+        for a relaunch to race it over the recovery file.
+
+        So: cancel what is in flight, drop what is merely queued, and
+        wait only briefly for the threads to notice. The wait is bounded
+        for the same reason the group-preload wait is - a read stalled on
+        a dead share answers nothing, and the process is going away
+        regardless.
+        """
+        for layer in self._layers.values():
+            self._cancel_layer_load(layer)
+        for key in list(self._pending_tiles):
+            runnable = self._pending_tiles.pop(key)
+            if runnable is not None:
+                runnable.cancel()
+        self._tile_build_queue.clear()
+        self._tile_build_queued.clear()
+        for pool in (self._level_load_pool, self._tile_pool):
+            pool.clear()               # queued but not yet started: dropped
+            pool.waitForDone(wait_ms)
+
     def clear_layers(self):
         """Remove all layers from the canvas, and stop their work.
 

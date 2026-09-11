@@ -4458,4 +4458,11 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_async_ui_timer'):
             self._async_ui_timer.stop()
 
+        # And the canvas's own pools. Without this the process outlived
+        # the window by however much level-load and tile work was queued -
+        # the pools are parented to the canvas, and destroying a
+        # QThreadPool waits for its whole queue.
+        if hasattr(self, 'canvas') and self.canvas is not None:
+            self.canvas.shutdown()
+
         super().closeEvent(event)
