@@ -58,7 +58,32 @@ def imported_modules(path: Path) -> set[str]:
             # level > 0 is a relative import - part of the application itself.
             if node.level == 0 and node.module:
                 found.add(node.module)
+                # `from PyQt5 import QtSvg` needs PyQt5.QtSvg to exist, and
+                # that is what the excludes list names. Recording only the
+                # package let an excluded submodule through the guard -
+                # the same dead-on-startup build this check exists to stop.
+                # A name that is not a module (`from app.labels import GEOD`)
+                # is harmless here: it can only match if someone excluded
+                # that exact dotted name.
+                for alias in node.names:
+                    if alias.name != "*":
+                        found.add(f"{node.module}.{alias.name}")
     return found
+
+
+def excluded_hit(module: str, excludes: set[str]) -> str | None:
+    """The entry in *excludes* that rules *module* out, or None.
+
+    Matching is per package boundary: excluding "concurrent" also rules out
+    "concurrent.futures", while excluding "PyQt5.QtSvg" says nothing about
+    "PyQt5.QtCore".
+    """
+    parts = module.split(".")
+    for i in range(len(parts)):
+        prefix = ".".join(parts[:i + 1])
+        if prefix in excludes:
+            return prefix
+    return None
 
 
 def main() -> int:
@@ -66,10 +91,7 @@ def main() -> int:
     problems = []
     for source in SOURCES:
         for module in sorted(imported_modules(source)):
-            # "concurrent" excluded also rules out "concurrent.futures".
-            parts = module.split(".")
-            hit = next((".".join(parts[:i + 1]) for i in range(len(parts))
-                        if ".".join(parts[:i + 1]) in excludes), None)
+            hit = excluded_hit(module, excludes)
             if hit:
                 problems.append((source.relative_to(ROOT), module, hit))
 
