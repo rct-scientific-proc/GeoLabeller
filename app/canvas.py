@@ -2114,6 +2114,13 @@ class MapCanvas(QGraphicsView):
         self._tile_signals: set = set()
         # (layer_id, level, tx, ty) -> runnable, for cancelling on scroll-out.
         self._pending_tiles: dict = {}
+        # layer_id -> {(level, tx, ty)} that came back with no data in them.
+        # read_tile can only answer that after a windowed read, a stretch and
+        # a reproject, and the answer does not change until the level does -
+        # but nothing recorded it, so every update pass (one per 50 ms while
+        # panning) asked again. Half the tiles of a diagonal survey strip
+        # are empty, and those reads kept the ones with data waiting.
+        self._empty_tiles: dict = {}
 
         # Images held in memory while off screen, so stepping onto them is
         # instant (see warm_layers). Insertion order is least-recently-wanted
@@ -2679,6 +2686,10 @@ class MapCanvas(QGraphicsView):
             self._scene.removeItem(layer.tiles[idx])
             del layer.tiles[idx]
 
+        layer_id = self._path_to_layer.get(layer.file_path)
+        if layer_id is not None:
+            self._drop_queued_builds(layer_id, visible_indices)
+
         missing = visible_indices - current_indices
         if not missing:
             return
@@ -2695,7 +2706,6 @@ class MapCanvas(QGraphicsView):
 
         rest = ordered[self._TILE_BUILD_BUDGET:]
         if rest:
-            layer_id = self._path_to_layer.get(layer.file_path)
             if layer_id is None:
                 return
             for idx in rest:
@@ -2704,6 +2714,27 @@ class MapCanvas(QGraphicsView):
                     self._tile_build_queued.add(key)
                     self._tile_build_queue.append(key)
             self._tile_build_timer.start(0)
+
+    def _drop_queued_builds(self, layer_id: str, wanted: set):
+        """Forget queued coarse-tile builds this layer no longer wants.
+
+        The drain checked only that the layer still existed, was visible
+        and was loaded - never that the view still wanted the tile. A
+        pyramid-less layer never reloads a level, so nothing else purged
+        the queue: a 150 MP image queued ~560 tiles at fit zoom and, after
+        a wheel-zoom, built every one of them off-screen ahead of the
+        dozen the new view actually needed.
+        """
+        if not self._tile_build_queue:
+            return
+        kept = [key for key in self._tile_build_queue
+                if key[0] != layer_id or key[1] in wanted]
+        if len(kept) != len(self._tile_build_queue):
+            dropped = {key for key in self._tile_build_queue
+                       if key[0] == layer_id and key[1] not in wanted}
+            self._tile_build_queued -= dropped
+            self._tile_build_queue.clear()
+            self._tile_build_queue.extend(kept)
 
     def _drain_tile_build_queue(self):
         """Build one budget's worth of queued tiles, then yield to the loop."""
@@ -2861,9 +2892,20 @@ class MapCanvas(QGraphicsView):
                 continue
             self._dispatch_tile_load(layer_id, layer, *key)
 
+    def _tile_known_empty(self, layer_id: str, level: int,
+                          tx: int, ty: int) -> bool:
+        """Has this tile already been read and found to hold no data?"""
+        return (level, tx, ty) in self._empty_tiles.get(layer_id, ())
+
+    def _forget_empty_tiles(self, layer_id: str):
+        """Drop what was learned about a layer's empty tiles."""
+        self._empty_tiles.pop(layer_id, None)
+
     def _dispatch_tile_load(self, layer_id: str, layer: TiledLayer,
                             level: int, tx: int, ty: int):
         """Queue one detail tile for background reading."""
+        if self._tile_known_empty(layer_id, level, tx, ty):
+            return          # read once, nothing in it, and that will not change
         signals = _TileLoadSignals()
         self._tile_signals.add(signals)
         signals.finished.connect(self._on_detail_tile_loaded)
@@ -2891,7 +2933,15 @@ class MapCanvas(QGraphicsView):
             return
         del self._pending_tiles[key]
         layer = self._layers.get(layer_id)
-        if layer is None or rgba is None:
+        if layer is None:
+            return
+        if rgba is None:
+            # Covered by the grid but holding no data - the nodata wedge of
+            # a reprojected image, or the blank side of a survey strip.
+            # Remembered so the next pass does not read it all over again.
+            # (A read that FAILED arrives at _on_detail_tile_failed instead
+            # and is not remembered: that one may well be transient.)
+            self._empty_tiles.setdefault(layer_id, set()).add((level, tx, ty))
             return
         # The view may have moved on while this was reading.
         if not self._uses_detail_tiles(layer) or not layer.visible:
@@ -2941,6 +2991,9 @@ class MapCanvas(QGraphicsView):
     def _clear_detail_tiles(self, layer_id: str, layer: TiledLayer):
         """Remove a layer's detail tiles and cancel any still reading."""
         layer._detail_level = None
+        # The verdicts are per level, and this is what runs when the level
+        # changes, so they go with the tiles.
+        self._forget_empty_tiles(layer_id)
         for item in layer.detail_tiles.values():
             self._scene.removeItem(item)
         layer.detail_tiles.clear()
@@ -3516,6 +3569,7 @@ class MapCanvas(QGraphicsView):
         self._tile_build_timer.stop()
         self._layers.clear()
         self._visible_layer_ids.clear()
+        self._empty_tiles.clear()
         self._world_rect_cache = None
         self._layer_order_stale = 0
         self._warmed.clear()
