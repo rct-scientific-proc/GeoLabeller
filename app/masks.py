@@ -98,16 +98,63 @@ def mask_entry(name: str, x0: int, y0: int, mask: np.ndarray) -> dict:
 # SOURCE-image coordinates - never on entry-sized arrays.
 # ---------------------------------------------------------------------------
 
-def _entry_row_spans(entry: dict):
-    """Yield the 1-runs of a serialized mask as absolute per-row spans."""
+def prepare_entry(entry: dict) -> dict:
+    """An entry with its RLE already parsed, for repeated window reads.
+
+    Reading a mask into a window costs one pass over its runs, but the
+    PARSE in front of that - splitting the string, int()-ing every token,
+    summing the lot to check the cover - was paid again on every call. The
+    H5 export asks each mask about each of the nine crops of every label,
+    so a densely masked image spent tens of seconds re-reading the same
+    strings (measured: 6.95 s for 7,200 crop/mask pairs).
+
+    The result is the entry plus the parsed runs and the bounding box of
+    the painted pixels, so a window that cannot touch the mask is rejected
+    on four comparisons instead of a walk. It is still an entry - the
+    name, anchor and size are all there - and passing it anywhere an entry
+    goes works, including straight back into this function.
+
+    The streaming invariant is untouched: runs, not pixels. Nothing here
+    is entry-sized.
+    """
+    if "_runs" in entry:
+        return entry
+    prepared = dict(entry)
+    runs = _validated_runs(entry)
+    prepared["_runs"] = runs
+    row0 = col0 = None
+    row1 = col1 = 0
+    for row, c0, c1 in _entry_row_spans(prepared):
+        if row0 is None:
+            row0, col0 = row, c0       # spans arrive in raster order
+        row1 = row + 1
+        col0 = min(col0, c0)
+        col1 = max(col1, c1)
+    prepared["_bbox"] = (None if row0 is None
+                         else (row0, row1, col0, col1))
+    return prepared
+
+
+def _validated_runs(entry: dict) -> list:
+    """The entry's runs, checked for the two ways an RLE can lie."""
+    runs = entry.get("_runs")
+    if runs is not None:
+        return runs
     ew, eh = int(entry["width"]), int(entry["height"])
-    ex0, ey0 = int(entry["x0"]), int(entry["y0"])
     runs = entry_runs(entry)
     if any(run < 0 for run in runs):
         raise ValueError("mask RLE contains a negative run")
     if sum(runs) != ew * eh:
         raise ValueError(
             f"mask RLE covers {sum(runs)} pixels, window has {ew * eh}")
+    return runs
+
+
+def _entry_row_spans(entry: dict):
+    """Yield the 1-runs of a serialized mask as absolute per-row spans."""
+    ew = int(entry["width"])
+    ex0, ey0 = int(entry["x0"]), int(entry["y0"])
+    runs = _validated_runs(entry)
     pos = 0
     value = False
     for run in runs:
@@ -226,9 +273,21 @@ def entry_in_window(entry: dict, x0: int, y0: int,
     Streams the entry's runs rather than decoding its window (which, for a
     full-image entry over survey imagery, would be a multi-gigabyte array):
     memory is the REQUESTED window only.
+
+    An entry through prepare_entry knows where its painted pixels are, so
+    a window that cannot touch them returns here without a walk - which is
+    most (crop, mask) pairs of an export, since a mask belongs to one
+    object and the crops are spread over the whole raster.
     """
     out = np.zeros((height, width), dtype=bool)
     wy1, wx1 = y0 + height, x0 + width
+    if "_bbox" in entry:
+        box = entry["_bbox"]
+        if box is None:
+            return out
+        row0, row1, col0, col1 = box
+        if row1 <= y0 or row0 >= wy1 or col1 <= x0 or col0 >= wx1:
+            return out
     for row, c0, c1 in _entry_row_spans(entry):
         if row >= wy1:
             break               # spans arrive in raster order

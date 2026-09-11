@@ -36,7 +36,7 @@ from PyQt5.QtCore import QObject, pyqtSignal
 
 # The framing and stretch live with the snippet service now, so the
 # sidebar/orientation views and the exports can never frame differently.
-from .masks import entry_in_window
+from .masks import entry_in_window, prepare_entry
 from .snippets import (centered_window, nodata_mask, _band_scaling,  # noqa: F401
                        _window_pixels)
 from PyQt5.QtWidgets import (
@@ -819,7 +819,10 @@ def export_image(writer, path, labels, height, width, overlap, channels,
     # example crop gets every mask that intersects it (re-anchored by pure
     # translation), so the mask table stays true to the ground even where
     # crops overlap or a neighbouring object's mask leaks into the window.
-    mask_entries = [entry for lab in labels
+    # Prepared once for the whole image, not once per crop: each of these
+    # is asked about every one of the nine crops of every label, and the
+    # RLE parse in front of that read used to be repeated every time.
+    mask_entries = [prepare_entry(entry) for lab in labels
                     for entry in getattr(lab, "masks", []) or []]
 
     with rasterio.open(path) as src:
