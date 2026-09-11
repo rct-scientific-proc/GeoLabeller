@@ -3638,14 +3638,52 @@ class MapCanvas(QGraphicsView):
         # used in scene coords, so shift by the floating origin.
         return self._world_rect_to_scene(rect)
 
+    def _shift_raw_scene_overlays(self, dx: float, dy: float):
+        """Carry the raw-scene overlays across a floating-origin move.
+
+        The ruler and measure items are deliberately NOT parented to
+        _origin_group - they want cosmetic pens and they outlive the
+        gesture that drew them - so everything in raw scene coordinates
+        has to be shifted by hand when the origin moves, or it ends up
+        drawn over unrelated ground.
+
+        The stored START POINTS go with the items. A line in progress is
+        anchored by _measure_start, and measuring the second click
+        against a start left behind in the old frame recorded a length
+        wrong by the whole origin delta - metres to hundreds of km -
+        straight onto the label and into the export, with nothing on
+        screen to suggest it. Reachable any time a go-to lands between
+        the two clicks of a line: a double-click in the labelled panel,
+        a waypoint, Zoom to Layer.
+        """
+        for item in (self._ruler_line, self._ruler_text,
+                     self._measure_temp_line, self._measure_committed_line):
+            if item is not None:
+                item.moveBy(-dx, -dy)
+        if self._measure_start is not None:
+            self._measure_start = QPointF(self._measure_start.x() - dx,
+                                          self._measure_start.y() - dy)
+        if self._ruler_start is not None:
+            self._ruler_start = QPointF(self._ruler_start.x() - dx,
+                                        self._ruler_start.y() - dy)
+        # The first click's VIEW position means nothing once the view has
+        # jumped somewhere else, so the too-short-line check is skipped for
+        # this pair rather than run against a stale point. A degenerate line
+        # is still rejected by the zero-length check in _handle_measure_click.
+        if (dx or dy) and self._measure_start_view is not None:
+            self._measure_start_view = None
+
     def _reset_origin_group(self, world_pt: QPointF):
         """Set the floating origin to `world_pt` without preserving the view.
 
         Used before an explicit fitInView (zoom-to-layer/point), which sets the
         view itself. `world_pt` is in world coords (x=easting, y=-northing).
         """
+        dx = world_pt.x() - self._origin.x()
+        dy = world_pt.y() - self._origin.y()
         self._origin = QPointF(world_pt)
         self._origin_group.setPos(-world_pt.x(), -world_pt.y())
+        self._shift_raw_scene_overlays(dx, dy)
 
     def _rebase_origin(self, world_pt: QPointF):
         """Move the floating origin to `world_pt`, keeping the view on the same
@@ -3655,16 +3693,13 @@ class MapCanvas(QGraphicsView):
         vc_world = QPointF(vc_scene.x() + self._origin.x(),
                            vc_scene.y() + self._origin.y())
         view = self.mapToScene(self.viewport().rect()).boundingRect()
-        # How far the scene shifts under everything (the origin group moves by
-        # -delta; transient overlay items in raw scene coords must follow).
+        # How far the scene shifts under everything (the origin group moves
+        # by -delta; the raw-scene overlays follow in the helper below).
         dx = world_pt.x() - self._origin.x()
         dy = world_pt.y() - self._origin.y()
         self._origin = QPointF(world_pt)
         self._origin_group.setPos(-world_pt.x(), -world_pt.y())
-        for item in (self._ruler_line, self._ruler_text,
-                     self._measure_temp_line, self._measure_committed_line):
-            if item is not None:
-                item.moveBy(-dx, -dy)
+        self._shift_raw_scene_overlays(dx, dy)
         new_center = QPointF(vc_world.x() - world_pt.x(),
                              vc_world.y() - world_pt.y())
         w = max(view.width(), 1e-9)
@@ -5220,8 +5255,8 @@ class MapCanvas(QGraphicsView):
         """Geodesic length in metres of a line between two scene points.
 
         Geographic display: scene coordinates are Web Mercator metres (scene
-        Y = -northing); both endpoints go to WGS84 and are measured with the
-        Haversine formula, so the result is true ground distance rather than
+        Y = -northing); both endpoints go to WGS84 and are measured on the
+        WGS84 ellipsoid, so the result is true ground distance rather than
         the latitude-inflated planar Web Mercator distance.
 
         Raw display (the waterfall stack): scene offsets are source PIXELS
