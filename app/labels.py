@@ -1,6 +1,7 @@
 """Label data model and storage for point annotations."""
 import json
 import math
+import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,6 +10,8 @@ from typing import Optional
 from affine import Affine
 from pyproj import Transformer
 from rasterio.crs import CRS
+
+from .debug_log import debug
 
 # WGS84 CRS (EPSG:4326)
 WGS84 = CRS.from_epsg(4326)
@@ -22,6 +25,63 @@ EARTH_RADIUS_M = 6371008.8
 # autosave - across a 13k-image project, where the images overwhelmingly
 # share one CRS. Keyed by EPSG; the same pattern as canvas.py's
 # _stored_meta_transformers. Built and used on the UI thread.
+def canonical_path(path: str) -> str:
+    """One spelling for one file, so an image cannot become two.
+
+    Qt's file dialog hands back "C:/dir/a.tif" while a directory walk
+    builds "C:\\dir\\a.tif", and a plain dict has no idea those are the
+    same raster: Add Directory on a folder and then Add Images on a file
+    inside it produced two project images and two canvas layers, with the
+    already-loaded guard unable to fire.
+
+    normpath settles "..", doubled separators and trailing slashes. On
+    Windows the separator is then written as "/": both spellings address
+    the same file there, and "/" is what this application's own dialogs
+    produce, so it is what most saved projects already hold and the choice
+    that rewrites fewest of them on load. On POSIX nothing is swapped - a
+    backslash is an ordinary character in a filename there, not a
+    separator. Carrying a project between the two platforms is the
+    relocation feature's job, not this one's.
+    """
+    if not path:
+        return path
+    canonical = os.path.normpath(path)
+    if os.sep == "\\":
+        canonical = canonical.replace("\\", "/")
+    return canonical
+
+
+class ImagePaths(dict):
+    """``LabelProject.images``, keyed by :func:`canonical_path`.
+
+    A dict subclass rather than normalising at each call site: there are
+    dozens of those across the canvas, the panels and the exports, and one
+    of them forgetting is the whole bug. Every read and write goes through
+    the same spelling here, whatever the caller was handed.
+    """
+
+    def __setitem__(self, key, value):
+        super().__setitem__(canonical_path(key), value)
+
+    def __getitem__(self, key):
+        return super().__getitem__(canonical_path(key))
+
+    def __delitem__(self, key):
+        super().__delitem__(canonical_path(key))
+
+    def __contains__(self, key):
+        return super().__contains__(canonical_path(key))
+
+    def get(self, key, default=None):
+        return super().get(canonical_path(key), default)
+
+    def pop(self, key, *default):
+        return super().pop(canonical_path(key), *default)
+
+    def setdefault(self, key, default=None):
+        return super().setdefault(canonical_path(key), default)
+
+
 _wgs84_transformers: dict = {}
 
 
@@ -643,8 +703,9 @@ class LabelProject:
     # a faster way to fill the field.
     descriptions: list[str] = field(default_factory=list)
 
-    # Images with their labels (keyed by path for easy lookup)
-    images: dict[str, ImageData] = field(default_factory=dict)
+    # Images with their labels, keyed by canonical_path so the same file
+    # reached two ways is one entry - see ImagePaths.
+    images: dict[str, ImageData] = field(default_factory=ImagePaths)
 
     # Named geographic bookmarks, in the order they were added
     waypoints: list[Waypoint] = field(default_factory=list)
@@ -730,6 +791,7 @@ class LabelProject:
             affine: Optional Affine transform (pixel -> projected coords)
             crs: Optional CRS for the affine transform
         """
+        path = canonical_path(path)
         if path not in self.images:
             self.images[path] = ImageData(
                 path=path, name=name, group=group,
@@ -1084,7 +1146,28 @@ class LabelProject:
             # Image-centric format (2.0 and later)
             for img_data in data.get("images", []):
                 image = ImageData.from_dict(img_data, version)
-                project.images[image.path] = image
+                image.path = canonical_path(image.path)
+                existing = project.images.get(image.path)
+                if existing is None:
+                    project.images[image.path] = image
+                    continue
+                # Two entries for one raster: a project written before
+                # paths were canonical could hold the same file under both
+                # separator spellings, each with its own labels. Merge
+                # rather than let the second overwrite the first - this is
+                # the only chance to repair it, and dropping a user's
+                # labels to tidy up a key is not a trade worth making.
+                debug(f"merging duplicate image entry: {image.path}")
+                existing.labels.extend(image.labels)
+                if not existing.location and image.location:
+                    existing.location = image.location
+                existing.hard_negative_source = (
+                    existing.hard_negative_source
+                    or image.hard_negative_source)
+                if existing.affine_coeffs is None:
+                    existing.affine_coeffs = image.affine_coeffs
+                    existing.crs_epsg = image.crs_epsg
+                    existing.crs_wkt = image.crs_wkt
         else:
             # Legacy format (version 1.0) - convert from label-centric
             for label_data in data.get("labels", []):

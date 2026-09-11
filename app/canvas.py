@@ -37,6 +37,7 @@ from rasterio.warp import calculate_default_transform, reproject, Resampling
 
 from .labels import haversine_distance
 from .debug_log import debug
+from .labels import ImagePaths, canonical_path
 from .snippets import apply_band_stretch, cached_band_scaling, nodata_mask
 from .tile_reader import (TILE_SIZE as DETAIL_TILE_SIZE, level_grid_for,
                           read_tile, tile_bounds, tile_span, tiles_for_bounds)
@@ -1958,7 +1959,11 @@ class MapCanvas(QGraphicsView):
         self._layers: dict[str, TiledLayer] = {}
         self._layer_order: list[str] = []
         # file_path -> layer_id for duplicate detection
-        self._path_to_layer: dict[str, str] = {}
+        # file path -> layer id. An ImagePaths, so every lookup gets the
+        # same spelling whatever the caller was handed: the two add routes
+        # used to make two layers for one raster, because Qt's dialog and
+        # os.walk write the separators differently.
+        self._path_to_layer: dict[str, str] = ImagePaths()
         self._next_id = 1
 
         # Pixel zone layout: group_path -> (origin_x, max_width)
@@ -2080,6 +2085,7 @@ class MapCanvas(QGraphicsView):
             visible: Whether the layer should be visible initially
         """
         # Check if this file is already loaded
+        file_path = canonical_path(file_path)
         if file_path in self._path_to_layer:
             return self._path_to_layer[file_path]
 
@@ -2138,6 +2144,7 @@ class MapCanvas(QGraphicsView):
             lazy: If True, only load bounds initially
             visible: Whether the layer should be visible initially
         """
+        file_path = canonical_path(file_path)
         if file_path in self._path_to_layer:
             return self._path_to_layer[file_path]
 
@@ -3312,7 +3319,7 @@ class MapCanvas(QGraphicsView):
 
     def is_path_loaded(self, file_path: str) -> bool:
         """Check if a file path is already loaded as a layer."""
-        return file_path in self._path_to_layer
+        return canonical_path(file_path) in self._path_to_layer
 
     def get_layer_file_path(self, layer_id: str) -> str | None:
         """Get the file path for a layer."""
@@ -4172,6 +4179,11 @@ class MapCanvas(QGraphicsView):
         """
         if color is None:
             color = QColor(255, 50, 50)  # Default red
+
+        # The marker carries this path for the rest of its life - the
+        # context menu, measuring and removal all read it back - so it is
+        # stored in the one spelling every path-keyed index uses.
+        image_path = canonical_path(image_path)
 
         # Determine scene position based on whether layer is georeferenced.
         # By path first: the label already knows which file it belongs to,
