@@ -82,12 +82,25 @@ BACKDROP_MAX_PIXELS = 4_000_000
 # have to be a million pixels across per screen pixel to reach it, so it is
 # a runaway guard rather than a limit anyone meets.
 _MAX_DECIMATION = 1 << 20
-# Re-reading a file to hold FEWER pixels has to be worth the read. Below
-# this much freed, it is not: a 256x256 image already showing 1/4 that the
-# zoom would rather have at 1/16 frees 3,904 pixels - 15 KB - for a whole
-# open and reproject, and a mission of those pays that per image. Refining
-# is never withheld this way; only coarsening, which is an optimisation.
-_COARSEN_MIN_SAVING = 250_000
+# Re-reading a file to hold FEWER pixels has to be worth the read, and
+# this is where the line sits: 64 KB of RGBA freed.
+#
+# Below it the read is waste. A 256x256 image showing 1/4 that the zoom
+# would rather have at 1/16 frees 3,904 pixels - 16 KB - for a whole open
+# and reproject, and a zoom-out gesture crossing four level boundaries
+# paid that four times, each step replacing what was on screen with
+# something blurrier.
+#
+# Above it the read earns its keep. The same image at FULL resolution is
+# 67,340 pixels, so coarsening frees 263 KB - and a mission of 400 such
+# images left at 1/1 while zoomed out holds 105 MB for nothing. An
+# earlier, blunter floor of a quarter-megapixel could never be reached by
+# an image this size at all, which welded it at full resolution however
+# far the view went out.
+#
+# Refining is never withheld this way; only coarsening, which is an
+# optimisation rather than something the user asked to see.
+_COARSEN_MIN_SAVING = 16_384
 
 # Ceiling on the pixels held for images that are loaded but not on screen -
 # the cycle's neighbours and the images just stepped off. ~256 MB of RGBA.
