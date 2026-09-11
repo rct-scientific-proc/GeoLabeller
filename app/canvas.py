@@ -35,7 +35,7 @@ from pyproj import Transformer
 from rasterio.crs import CRS
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 
-from .labels import haversine_distance
+from .labels import geodesic_distance
 from .debug_log import debug
 from .labels import ImagePaths, canonical_path
 from .snippets import apply_band_stretch, cached_band_scaling, nodata_mask
@@ -271,6 +271,9 @@ class TiledLayer:
         # The in-flight background load runnable for this layer (if any), so it
         # can be cancelled when superseded by a newer zoom or culled from view.
         self._pending_runnable = None
+        # Ground metres per source pixel, worked out once on demand and
+        # then fixed: the affine and CRS do not change under a loaded layer.
+        self._source_mpp: float | None = None
         # The message from the last load failure, or None. Retrying a load
         # that cannot work costs a blocking open per tile-update pass, so a
         # failed layer is skipped until something could have changed:
@@ -296,6 +299,25 @@ class TiledLayer:
             else:
                 self._load_pixel_data()
                 self._fully_loaded = True
+
+    def source_metres_per_pixel(self) -> float | None:
+        """Ground metres covered by one source pixel, or None.
+
+        Measured on the ellipsoid between the centres of two neighbouring
+        source pixels, so it is right for any CRS - projected in metres,
+        projected in feet, or geographic in degrees. Cached: the affine and
+        the CRS do not change under a loaded layer.
+        """
+        if self._source_mpp is None and self._src_transform is not None:
+            try:
+                here = self.pixel_to_latlon(0.5, 0.5)
+                across = self.pixel_to_latlon(1.5, 0.5)
+                if here is not None and across is not None:
+                    self._source_mpp = geodesic_distance(
+                        here[1], here[0], across[1], across[0]) or None
+            except Exception:      # noqa: BLE001 - a ruler must not raise
+                self._source_mpp = None
+        return self._source_mpp
 
     def header_metadata(self) -> dict:
         """This layer's header, in the shape a lazy TiledLayer accepts.
@@ -2452,32 +2474,79 @@ class MapCanvas(QGraphicsView):
         scale = self._view_scale()
         return 1.0 / scale if scale > 0 else 0.0
 
-    def view_ground_resolution(self) -> float:
-        """Return the view's true ground resolution in metres per pixel.
+    def view_ruler_scale(self) -> tuple[float, str]:
+        """What one view pixel covers: (amount, "m") or (amount, "px").
 
-        `_scene_units_per_pixel()` gives Web Mercator metres per pixel, which
-        overestimates real-world distance by 1/cos(latitude). This applies the
-        cos(latitude) correction using the latitude at the centre of the view,
-        yielding actual metres per pixel on the ground. Falls back to the raw
-        scene-units value at the equator (factor ≈ 1) or when there is nothing
-        to measure.
+        Geographic display gives ground metres. The pixel zone - the
+        waterfall stack and non-georeferenced imagery - is raw source
+        pixels, and those DO have a ground size whenever the image kept
+        its georeferencing, which is the same thing that lets measuring
+        work mid-waterfall. So the ruler reads in metres there too, taken
+        from the image under the middle of the view.
+
+        It falls back to source pixels, labelled as such, for a raster with
+        no georeferencing at all. Before this it printed the pixel zone's
+        raw scene units under an "m" - numbers that were not metres and
+        not pixels either.
+
+        The scale is per image, so it steps when the view centre crosses
+        from one stacked image to the next at a different resolution. That
+        is not the old crawl: that came from decoding the stack's synthetic
+        northing into a latitude that changed continuously as you glided.
         """
         units_per_pixel = self._scene_units_per_pixel()
         if units_per_pixel <= 0:
-            return 0.0
+            return 0.0, "m"
 
-        # View-centre latitude in WGS84 (scene Y is -northing in Web Mercator).
         rect = self.mapToScene(self.viewport().rect()).boundingRect()
-        easting, center_northing = self._scene_to_web(rect.center())
-        if self.is_in_pixel_zone(easting):
-            # Raw-pixel territory (the waterfall stack, non-geo images) has no
-            # latitude; the stack's fake northing decoded to one anyway, and
-            # the changing correction made the metre rulers' grid crawl
-            # sideways during a vertical glide. Scene units pass through
-            # uncorrected, so the readout is stable.
-            return units_per_pixel
-        _lon, lat = self._web_mercator_to_wgs84(0.0, center_northing)
-        return units_per_pixel * math.cos(math.radians(lat))
+        easting, northing = self._scene_to_web(rect.center())
+        if not self.is_in_pixel_zone(easting):
+            _lon, lat = self._web_mercator_to_wgs84(0.0, northing)
+            return units_per_pixel * math.cos(math.radians(lat)), "m"
+
+        source_pixels = units_per_pixel / PIXEL_ZONE_SCALE
+        layer = self._pixel_zone_layer_for_scale(easting, northing)
+        if layer is not None:
+            metres = layer.source_metres_per_pixel()
+            if metres:
+                return source_pixels * metres, "m"
+        return source_pixels, "px"
+
+    def _pixel_zone_layer_for_scale(self, easting: float,
+                                    northing: float) -> "TiledLayer | None":
+        """The stacked image whose scale the ruler should read, or None.
+
+        The one under the middle of the view, and when the middle is in a
+        gap between two stacked images - which a glide crosses between
+        every pair - the nearest one instead. Requiring a hit made the
+        ruler flip from metres to pixels and back on every gap, which is
+        the flicker this whole readout was once rewritten to stop.
+        """
+        hit = self._layer_id_at(easting, northing)
+        if hit is not None:
+            return self._layers.get(hit)
+
+        candidates = (self._waterfall_layer_order if self._waterfall_active
+                      else list(self._visible_layer_ids))
+        nearest = None
+        best = None
+        for layer_id in candidates:
+            layer = self._layers.get(layer_id)
+            if layer is None or layer.bounds is None:
+                continue
+            west, south, east, north = layer.bounds
+            # Distance from the view centre to the image's box, zero inside.
+            dx = max(west - easting, 0.0, easting - east)
+            dy = max(south - northing, 0.0, northing - north)
+            gap = dx * dx + dy * dy
+            if best is None or gap < best:
+                nearest, best = layer, gap
+        return nearest
+
+    def view_ground_resolution(self) -> float:
+        """Ground metres per view pixel, or 0.0 where there are none."""
+        amount, unit = self.view_ruler_scale()
+        return amount if unit == "m" else 0.0
 
     def _effective_cull_bounds(self) -> tuple[float, float, float, float]:
         """View bounds used for layer/tile culling decisions.
@@ -5170,10 +5239,10 @@ class MapCanvas(QGraphicsView):
             ll2 = layer.pixel_to_latlon(*layer.scene_to_pixel(e2, n2))
             if ll1 is None or ll2 is None:
                 return None
-            return haversine_distance(ll1[1], ll1[0], ll2[1], ll2[0])
+            return geodesic_distance(ll1[1], ll1[0], ll2[1], ll2[0])
         lon1, lat1 = self._web_mercator_to_wgs84(e1, n1)
         lon2, lat2 = self._web_mercator_to_wgs84(e2, n2)
-        return haversine_distance(lat1, lon1, lat2, lon2)
+        return geodesic_distance(lat1, lon1, lat2, lon2)
 
     def _exit_measure_mode(self):
         """Leave measure mode, removing any in-progress/committed line items."""

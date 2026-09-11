@@ -284,9 +284,15 @@ class MeterRuler(QWidget):
         painter.end()
 
     def _draw_ticks(self, painter: QPainter):
-        """Draw metre tick marks measured from the canvas's top-left corner."""
-        # True ground metres per view pixel (cos-latitude corrected).
-        mpp = self.canvas.view_ground_resolution()
+        """Draw tick marks measured from the canvas's top-left corner.
+
+        The canvas says what one view pixel covers AND in what unit: ground
+        metres wherever it can work them out - including the waterfall
+        stack, through each image's retained georeferencing - and source
+        pixels for a raster with no georeferencing at all, which are then
+        labelled "px" rather than passed off as metres.
+        """
+        mpp, unit = self.canvas.view_ruler_scale()
         if mpp <= 0:
             return
 
@@ -309,7 +315,7 @@ class MeterRuler(QWidget):
             pos = meters / mpp  # pixels from the origin edge
             if pos > extent_px:
                 break
-            label = self._format_meters(meters)
+            label = self._format_distance(meters, unit)
             label_w = fm.horizontalAdvance(label)
 
             if self.orientation == Qt.Horizontal:
@@ -330,15 +336,18 @@ class MeterRuler(QWidget):
             step += 1
 
     @staticmethod
-    def _format_meters(meters: float) -> str:
-        """Format a distance in metres compactly (m below 1 km, else km)."""
-        if meters == 0:
+    def _format_distance(amount: float, unit: str = "m") -> str:
+        """Format a tick compactly, in the unit the canvas could answer in."""
+        if amount == 0:
             return "0"
-        if meters >= 1000:
-            return f"{meters / 1000:g} km"
-        if meters >= 1:
-            return f"{meters:g} m"
-        return f"{meters:.2f} m"
+        if unit != "m":
+            return (f"{amount / 1000:g}k {unit}" if amount >= 10000
+                    else f"{amount:g} {unit}")
+        if amount >= 1000:
+            return f"{amount / 1000:g} km"
+        if amount >= 1:
+            return f"{amount:g} m"
+        return f"{amount:.2f} m"
 
 
 class MapCanvasWithAxes(QWidget):

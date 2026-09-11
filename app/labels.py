@@ -1,6 +1,5 @@
 """Label data model and storage for point annotations."""
 import json
-import math
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -8,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from affine import Affine
-from pyproj import Transformer
+from pyproj import Geod, Transformer
 from rasterio.crs import CRS
 
 from .debug_log import debug
@@ -16,15 +15,7 @@ from .debug_log import debug
 # WGS84 CRS (EPSG:4326)
 WGS84 = CRS.from_epsg(4326)
 
-# Earth's mean radius in meters (WGS84)
-EARTH_RADIUS_M = 6371008.8
 
-# Transformers to and from WGS84, shared by every ImageData with the same
-# CRS. Building one costs about a third of a millisecond, which is nothing
-# per image and 26,000 constructions - most of a 4.7 s frozen first
-# autosave - across a 13k-image project, where the images overwhelmingly
-# share one CRS. Keyed by EPSG; the same pattern as canvas.py's
-# _stored_meta_transformers. Built and used on the UI thread.
 def canonical_path(path: str) -> str:
     """One spelling for one file, so an image cannot become two.
 
@@ -82,6 +73,16 @@ class ImagePaths(dict):
         return super().setdefault(canonical_path(key), default)
 
 
+# The one ellipsoid in the application: label distances, the exported
+# geodesic_* fields and the orientation headings all measure on it.
+GEOD = Geod(ellps="WGS84")
+
+# Transformers to and from WGS84, shared by every ImageData with the same
+# CRS. Building one costs about a third of a millisecond, which is nothing
+# per image and 26,000 constructions - most of a 4.7 s frozen first
+# autosave - across a 13k-image project, where the images overwhelmingly
+# share one CRS. Keyed by EPSG; the same pattern as canvas.py's
+# _stored_meta_transformers. Built and used on the UI thread.
 _wgs84_transformers: dict = {}
 
 
@@ -99,8 +100,9 @@ def _transformer_pair(crs_key):
     return pair
 
 
-def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Calculate geodesic distance between two WGS84 points using Haversine formula.
+def geodesic_distance(lat1: float, lon1: float,
+                      lat2: float, lon2: float) -> float:
+    """Distance in metres between two WGS84 points, on the WGS84 ellipsoid.
 
     Args:
         lat1, lon1: First point (degrees)
@@ -108,18 +110,19 @@ def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
 
     Returns:
         Distance in meters
+
+    This used to be a Haversine on a sphere of mean radius, while the
+    orientation maths next door measured true-north headings on the
+    ellipsoid - two earth models in one project, and the fields written
+    from this one are named geodesic_*. The sphere reads short by 0.12% at
+    10 degrees, 0.25% at 40 and 0.36% at 60: half a metre on a 200 m
+    vessel at mid-latitude. Small, but it was systematic, it was in the
+    stored measurements and the export, and the name said otherwise.
+    Geod.inv costs the same as the hand-rolled formula did (0.5 us),
+    so there was nothing to weigh against it.
     """
-    # Convert to radians
-    lat1_r = math.radians(lat1)
-    lat2_r = math.radians(lat2)
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-
-    # Haversine formula
-    a = math.sin(dlat / 2) ** 2 + math.cos(lat1_r) * math.cos(lat2_r) * math.sin(dlon / 2) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-    return EARTH_RADIUS_M * c
+    _azimuth, _back_azimuth, distance = GEOD.inv(lon1, lat1, lon2, lat2)
+    return abs(distance)
 
 
 @dataclass
@@ -571,7 +574,7 @@ class ImageData:
             # Calculate distance from left edge of image to label position
             left_edge = left_edge_by_label.get(idx)
             if left_edge is not None:
-                distance_m = haversine_distance(
+                distance_m = geodesic_distance(
                     left_edge[0], left_edge[1],  # left edge lat, lon
                     label.lat, label.lon         # label lat, lon
                 )
@@ -641,9 +644,9 @@ class ImageData:
                 tr = corners["top_right"]
                 bl = corners["bottom_left"]
                 block["geodesic_width_m"] = round(
-                    haversine_distance(tl[0], tl[1], tr[0], tr[1]), 3)
+                    geodesic_distance(tl[0], tl[1], tr[0], tr[1]), 3)
                 block["geodesic_height_m"] = round(
-                    haversine_distance(tl[0], tl[1], bl[0], bl[1]), 3)
+                    geodesic_distance(tl[0], tl[1], bl[0], bl[1]), 3)
             self._derived_cache = (signature, block)
             cached = self._derived_cache
 

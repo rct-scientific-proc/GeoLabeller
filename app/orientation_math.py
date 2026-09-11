@@ -22,12 +22,12 @@ axis-aligned crops), so callers only add the crop's top-left offset.
 """
 import math
 
-from pyproj import Geod, Transformer
+from pyproj import Transformer
 
-from .labels import WGS84
+from .labels import GEOD as _GEOD, WGS84
 
-# WGS84 ellipsoid geodesics - the same datum the labels store lon/lat in.
-_GEOD = Geod(ellps="WGS84")
+# The ellipsoid lives in labels now, so the headings measured here and the
+# distances stored on a label cannot drift onto different earth models.
 
 
 def principal_angle_rad(col_start: float, row_start: float,

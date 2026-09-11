@@ -38,7 +38,7 @@ from .canvas import (MapCanvas, CanvasMode, STEP_CYCLE_MODES,
 from .class_editor import ClassEditorDialog, DescriptionEditorDialog
 from .goto_location import (GoToLocationDialog, WaypointDialog,
                             format_lat_lon)
-from .labels import LabelProject, combine_projects, haversine_distance
+from .labels import LabelProject, combine_projects, geodesic_distance
 from .layer_panel import CombinedLayerPanel
 from .optimize_export import (OptimizeExportDialog, OptimizeWorker,
                               plan_output_paths)
@@ -3138,8 +3138,8 @@ class MainWindow(QMainWindow):
             a_lon, a_lat = transformer.transform(ax, ay)
             b_lon, b_lat = transformer.transform(bx, by)
             c_lon, c_lat = transformer.transform(cx, cy)
-            mppx = haversine_distance(a_lat, a_lon, b_lat, b_lon)
-            mppy = haversine_distance(a_lat, a_lon, c_lat, c_lon)
+            mppx = geodesic_distance(a_lat, a_lon, b_lat, b_lon)
+            mppy = geodesic_distance(a_lat, a_lon, c_lat, c_lon)
             return mppx, mppy
         except Exception:
             return 0.0, 0.0
