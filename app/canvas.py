@@ -2109,6 +2109,13 @@ class MapCanvas(QGraphicsView):
         # the cycle ends) or "hidden" (kept on being hidden, released only by
         # the budget or Free Group).
         self._warmed: dict[str, str] = {}
+        # What each non-"offscreen" entry is charged against the budget, and
+        # the running sum of it. Without these the trim had to add up the
+        # whole pool on every call just to learn whether it had anything to
+        # do - and it is called once per layer hidden, so unchecking a group
+        # of k layers walked the pool k times.
+        self._warmed_charge: dict[str, int] = {}
+        self._warmed_pixels: int = 0
         # Layer ids currently shown. A 20k-image project has all of them
         # hidden until the user picks some, and the hit test, the tile pass
         # and the cull all only care about the shown ones - walking every
@@ -2591,13 +2598,12 @@ class MapCanvas(QGraphicsView):
                 # under. Held with no budget at all, a glide through a
                 # 200-image waterfall accumulated every image it passed.
                 if layer.is_fully_loaded():
-                    self._warmed.pop(layer_id, None)
-                    self._warmed[layer_id] = "offscreen"   # most recent last
+                    self._warm_hold(layer_id, "offscreen", layer)
                     self._offscreen_trim_pending = True
                 continue
 
             if self._warmed.get(layer_id) == "offscreen":
-                del self._warmed[layer_id]      # back in view, budgeted no more
+                self._warm_release(layer_id)    # back in view, budgeted no more
 
             # Level-of-detail: pick an overview level for the current zoom and
             # (re)load this layer off-thread if it differs from what is loaded.
@@ -3045,10 +3051,34 @@ class MapCanvas(QGraphicsView):
                 # on the next step; leave it to load when it is reached.
                 debug(f"prefetch: {layer.name} too large to hold ahead")
                 continue
-            self._warmed.pop(layer_id, None)
-            self._warmed[layer_id] = "cycle"       # most recently wanted, last
+            self._warm_hold(layer_id, "cycle", layer)
             self._apply_layer_lod(layer_id, layer, units_per_pixel)
         self._trim_warmed(set(layer_ids))
+
+    def _warm_hold(self, layer_id: str, kind: str, layer) -> None:
+        """Enrol a layer in the warm pool as the most recently wanted.
+
+        "offscreen" entries are not charged here: they are still visible
+        and carry their own budget in _trim_offscreen.
+        """
+        self._warm_release(layer_id)
+        self._warmed[layer_id] = kind          # most recent last
+        if kind == "offscreen":
+            return
+        # Charge the level actually in memory. Hiding a layer whose refine
+        # was cancelled mid-flight leaves _loaded_level data behind while
+        # _target_level points at the refine - budgeting the target
+        # under-counted a level-1 array by up to the level factor squared.
+        resident = (layer._loaded_level if layer.is_fully_loaded()
+                    else layer._target_level)
+        charge = layer.level_pixel_count(resident or 1)
+        self._warmed_charge[layer_id] = charge
+        self._warmed_pixels += charge
+
+    def _warm_release(self, layer_id: str) -> None:
+        """Take a layer out of the pool, and off the budget with it."""
+        self._warmed.pop(layer_id, None)
+        self._warmed_pixels -= self._warmed_charge.pop(layer_id, 0)
 
     def _trim_offscreen(self):
         """Free off-screen pixels beyond the warm budget, oldest first.
@@ -3064,7 +3094,7 @@ class MapCanvas(QGraphicsView):
                 continue
             layer = self._layers.get(layer_id)
             if layer is None or not layer.is_fully_loaded():
-                del self._warmed[layer_id]
+                self._warm_release(layer_id)
                 continue
             resident = layer._loaded_level or 1
             held += layer.level_pixel_count(resident)
@@ -3072,33 +3102,42 @@ class MapCanvas(QGraphicsView):
                 continue
             self._cancel_layer_load(layer)
             layer.free_data(self._scene)
-            del self._warmed[layer_id]
+            self._warm_release(layer_id)
 
     def _trim_warmed(self, protect: set):
-        """Free held images, least recently wanted first, until within budget."""
-        held = 0
-        for layer_id in reversed(list(self._warmed)):     # newest first
+        """Free held images, least recently wanted first, until within budget.
+
+        Runs once per layer hidden, so it must cost nothing when there is
+        nothing to free. It used to add up what every entry held on every
+        call - `continue` while under budget rather than stopping - which
+        made unchecking a group of k layers quadratic: measured at 1.72 s
+        and 12.5 M pool visits for 5,000 hides, inside the toggling dialog.
+
+        The pool keeps its own total now, so the common case returns
+        without looking at anything, and the rest walks only as far as it
+        actually frees. Evicting from the oldest end until the total fits
+        is the same set, in the same order, as the old walk from the newest
+        end keeping everything that fitted.
+        """
+        if self._warmed_pixels <= WARM_MAX_PIXELS:
+            return
+        for layer_id in list(self._warmed):               # oldest first
+            if self._warmed_pixels <= WARM_MAX_PIXELS:
+                break
             if self._warmed.get(layer_id) == "offscreen":
                 # Culled-from-view entries are still `visible` by design and
                 # carry their own budget (_trim_offscreen); leave them be.
                 continue
+            if layer_id in protect:
+                continue
             layer = self._layers.get(layer_id)
             if layer is None or layer.visible:
                 # Gone, or switched on since - either way not ours any more.
-                del self._warmed[layer_id]
-                continue
-            # Charge the level actually in memory. Hiding a layer whose
-            # refine was cancelled mid-flight leaves _loaded_level data behind
-            # while _target_level points at the refine - budgeting the target
-            # under-counted a level-1 array by up to the level factor squared.
-            resident = (layer._loaded_level if layer.is_fully_loaded()
-                        else layer._target_level)
-            held += layer.level_pixel_count(resident or 1)
-            if held <= WARM_MAX_PIXELS or layer_id in protect:
+                self._warm_release(layer_id)
                 continue
             self._cancel_layer_load(layer)
             layer.free_data(self._scene)
-            del self._warmed[layer_id]
+            self._warm_release(layer_id)
 
     def clear_warmed_layers(self):
         """Release what warm_layers holds (on leaving a cycle mode).
@@ -3114,7 +3153,7 @@ class MapCanvas(QGraphicsView):
             if layer is not None and not layer.visible:
                 self._cancel_layer_load(layer)
                 layer.free_data(self._scene)
-            del self._warmed[layer_id]
+            self._warm_release(layer_id)
 
     def free_layer_data(self, layer_id: str):
         """Release a layer's pixel data, cancelling any in-flight load first.
@@ -3133,7 +3172,7 @@ class MapCanvas(QGraphicsView):
         # A freed layer holds nothing; leaving it enrolled charged phantom
         # pixels against the warm budget and evicted images that were
         # genuinely held.
-        self._warmed.pop(layer_id, None)
+        self._warm_release(layer_id)
 
     def _dispatch_level_load(self, layer_id: str, layer: TiledLayer, level: int):
         """Start a background load of *layer* at *level*.
@@ -3324,6 +3363,14 @@ class MapCanvas(QGraphicsView):
             for item in layer.detail_tiles.values():
                 item.setVisible(visible)
             if visible:
+                # Switched on, so it is the user's again and not the
+                # pool's. The trim used to notice this only when it next
+                # walked the whole pool; now that it stops early, an
+                # entry nobody drops would charge the budget for a layer
+                # on screen. "offscreen" entries are visible BY DESIGN -
+                # culled from view, not switched off - so they stay.
+                if self._warmed.get(layer_id) != "offscreen":
+                    self._warm_release(layer_id)
                 # Deferred: a cycle step toggles visibility BEFORE it
                 # zooms, and updating synchronously here evaluated the
                 # LOD at the previous image's zoom - loading a level the
@@ -3341,8 +3388,7 @@ class MapCanvas(QGraphicsView):
                 # allows, and the least recently hidden are released once it
                 # does not. (Free Group remains the explicit release.)
                 if layer.is_fully_loaded():
-                    self._warmed.pop(layer_id, None)
-                    self._warmed[layer_id] = "hidden"    # most recent last
+                    self._warm_hold(layer_id, "hidden", layer)
                     self._trim_warmed(set())
             # For non-geo layers, toggle associated label markers
             if not layer.geo:
@@ -3386,7 +3432,7 @@ class MapCanvas(QGraphicsView):
             if layer_id in self._layer_order:
                 self._layer_order.remove(layer_id)
             self._visible_layer_ids.discard(layer_id)
-            self._warmed.pop(layer_id, None)
+            self._warm_release(layer_id)
 
     def clear_layers(self):
         """Remove all layers from the canvas, and stop their work.
@@ -3414,6 +3460,8 @@ class MapCanvas(QGraphicsView):
         self._layers.clear()
         self._visible_layer_ids.clear()
         self._warmed.clear()
+        self._warmed_charge.clear()
+        self._warmed_pixels = 0
         self._layer_order.clear()
         self._path_to_layer.clear()
         self._pixel_zone_groups.clear()
