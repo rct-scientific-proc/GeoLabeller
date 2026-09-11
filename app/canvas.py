@@ -2018,6 +2018,19 @@ class MapCanvas(QGraphicsView):
         # Layer storage
         self._layers: dict[str, TiledLayer] = {}
         self._layer_order: list[str] = []
+        # The united world clamp, and what it was computed from. Rebuilding
+        # it means a QRectF per layer INCLUDING every hidden lazy one a
+        # loaded project adds - 13.6 ms at 20k layers, paid about once per
+        # viewport of panning. Cached in WORLD coords, so the floating
+        # origin can move under it without a recompute.
+        self._world_rect_cache = None
+        # Ids left in _layer_order whose layer is gone. Removing one by one
+        # scanned the list twice per call, so removing a group of k layers
+        # from n was O(k*n) - 0.85 s for 5,000 of 20,000. Both readers of
+        # the order skip ids that are not in _layers, so a removed id can
+        # sit there harmlessly until enough have piled up to be worth one
+        # rebuild.
+        self._layer_order_stale = 0
         # file_path -> layer_id for duplicate detection
         # file path -> layer id. An ImagePaths, so every lookup gets the
         # same spelling whatever the caller was handed: the two add routes
@@ -3399,6 +3412,7 @@ class MapCanvas(QGraphicsView):
     def update_layer_order(self, layer_order: list[str]):
         """Update the rendering order of layers."""
         self._layer_order = layer_order
+        self._layer_order_stale = 0      # the caller's list is authoritative
         self._update_z_order()
 
     def _update_z_order(self):
@@ -3429,10 +3443,23 @@ class MapCanvas(QGraphicsView):
             del self._layers[layer_id]
             if file_path in self._path_to_layer:
                 del self._path_to_layer[file_path]
-            if layer_id in self._layer_order:
-                self._layer_order.remove(layer_id)
             self._visible_layer_ids.discard(layer_id)
             self._warm_release(layer_id)
+            self._invalidate_world_rect()
+            # Not removed from _layer_order here: that is a linear scan, and
+            # the panel emits one of these per layer in a removed subtree.
+            # Both readers of the order skip ids that are not in _layers, so
+            # the id can wait for a rebuild that costs one pass for all of
+            # them rather than one pass each.
+            self._layer_order_stale += 1
+            if self._layer_order_stale > max(64, len(self._layer_order) // 4):
+                self._compact_layer_order()
+
+    def _compact_layer_order(self):
+        """Drop the ids of removed layers from the render order, in one pass."""
+        self._layer_order = [layer_id for layer_id in self._layer_order
+                             if layer_id in self._layers]
+        self._layer_order_stale = 0
 
     def shutdown(self, wait_ms: int = 2000):
         """Stop the background pools, for a window that is going away.
@@ -3489,6 +3516,8 @@ class MapCanvas(QGraphicsView):
         self._tile_build_timer.stop()
         self._layers.clear()
         self._visible_layer_ids.clear()
+        self._world_rect_cache = None
+        self._layer_order_stale = 0
         self._warmed.clear()
         self._warmed_charge.clear()
         self._warmed_pixels = 0
@@ -3706,15 +3735,28 @@ class MapCanvas(QGraphicsView):
                 return self._world_rect_to_scene(
                     rect.adjusted(-mx, -my, mx, my))
 
-        rect = QRectF(self._world_rect_base)
-        for layer in self._layers.values():
-            if layer.bounds is None:
-                continue
-            west, south, east, north = layer.bounds
-            rect = rect.united(QRectF(west, -north, east - west, north - south))
+        cached = self._world_rect_cache
+        if cached is not None and cached[0] == len(self._layers):
+            # The count is belt and braces: an explicit invalidation covers
+            # a layer that MOVED, and this covers one that appeared or went
+            # without telling us.
+            rect = cached[1]
+        else:
+            rect = QRectF(self._world_rect_base)
+            for layer in self._layers.values():
+                if layer.bounds is None:
+                    continue
+                west, south, east, north = layer.bounds
+                rect = rect.united(
+                    QRectF(west, -north, east - west, north - south))
+            self._world_rect_cache = (len(self._layers), QRectF(rect))
         # _world_rect_base and layer bounds are in world coords; the clamp is
         # used in scene coords, so shift by the floating origin.
         return self._world_rect_to_scene(rect)
+
+    def _invalidate_world_rect(self):
+        """Forget the cached world clamp: some layer's bounds have moved."""
+        self._world_rect_cache = None
 
     def _shift_raw_scene_overlays(self, dx: float, dy: float):
         """Carry the raw-scene overlays across a floating-origin move.
