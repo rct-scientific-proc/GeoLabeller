@@ -297,6 +297,37 @@ class TiledLayer:
                 self._load_pixel_data()
                 self._fully_loaded = True
 
+    def header_metadata(self) -> dict:
+        """This layer's header, in the shape a lazy TiledLayer accepts.
+
+        A background load builds a THROWAWAY layer for the file - nothing
+        is shared with the live one - and that constructor read the header
+        again to establish bounds before the reprojection read it a second
+        time. The live layer already knows all of it, so handing this over
+        turns two GDAL opens per level load into one. Everything here is
+        either recomputed by the load itself (bounds, the reprojected
+        dimensions, the real overview factors) or ignored for a non-geo
+        layer, so a stale value cannot survive into the result.
+
+        ``overviews`` is None when this layer has never been opened, which
+        is the honest answer and keeps "unknown" distinct from "none" in
+        the throwaway too.
+        """
+        return {
+            "file_path": self.file_path,
+            "group_path": self.group_path,
+            "bounds": self.bounds,
+            "width": self._full_width,
+            "height": self._full_height,
+            "src_crs": self._src_crs,
+            "src_transform": self._src_transform,
+            "src_width": self._src_width,
+            "src_height": self._src_height,
+            "overviews": (list(self._overviews)
+                          if self._overviews_known else None),
+            "geo": self.geo,
+        }
+
     def _apply_prefetched_metadata(self, metadata: dict | None) -> bool:
         """Populate lazy-load state from an off-thread header read.
 
@@ -1587,14 +1618,20 @@ class _LevelLoadRunnable(QRunnable):
     """
 
     def __init__(self, layer_id: str, file_path: str, geo: bool, level: int,
-                 signals: "_LevelLoadSignals"):
-        """Store the layer identity, level and signal group for the load job."""
+                 signals: "_LevelLoadSignals", metadata: dict | None = None):
+        """Store the layer identity, level and signal group for the load job.
+
+        ``metadata`` is the live layer's header (see
+        TiledLayer.header_metadata): it saves the throwaway layer from
+        reading the file a second time just to find its bounds.
+        """
         super().__init__()
         self._layer_id = layer_id
         self._file_path = file_path
         self._geo = geo
         self._level = level
         self._signals = signals
+        self._metadata = metadata
         self._cancelled = False
 
     def cancel(self):
@@ -1633,7 +1670,8 @@ class _LevelLoadRunnable(QRunnable):
                             self._level, self)
             return
         try:
-            tmp = TiledLayer(self._file_path, lazy=True, geo=self._geo)
+            tmp = TiledLayer(self._file_path, lazy=True, geo=self._geo,
+                             metadata=self._metadata)
             # The flag is polled between the load's expensive stages, so a
             # superseded zoom frees this worker within one band's read
             # instead of holding it for the whole reprojection.
@@ -3062,7 +3100,8 @@ class MapCanvas(QGraphicsView):
             sig.connect(lambda *_a, s=signals: self._level_load_signals.discard(s))
 
         runnable = _LevelLoadRunnable(
-            layer_id, layer.file_path, layer.geo, level, signals)
+            layer_id, layer.file_path, layer.geo, level, signals,
+            metadata=layer.header_metadata())
         layer._pending_runnable = runnable
         self._level_load_pool.start(runnable)
 

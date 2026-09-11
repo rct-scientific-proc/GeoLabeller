@@ -33,7 +33,8 @@ from PyQt5.QtWidgets import (
 
 from .axis_ruler import MapCanvasWithAxes
 from .canvas import (MapCanvas, CanvasMode, STEP_CYCLE_MODES,
-                     AsyncFileLoaderThread, LoadCancelled, TiledLayer)
+                     AsyncFileLoaderThread, LoadCancelled, TiledLayer,
+                     _emit_safely)
 from .class_editor import ClassEditorDialog, DescriptionEditorDialog
 from .goto_location import (GoToLocationDialog, WaypointDialog,
                             format_lat_lon)
@@ -73,14 +74,16 @@ class GroupMemoryWorker(QObject):
     finished = pyqtSignal()
     error = pyqtSignal(str, str)            # (layer_id, error_message)
 
-    def __init__(self, layers: list[tuple[str, str, bool]]):
+    def __init__(self, layers: list[tuple[str, str, bool, dict]]):
         """Initialize the worker.
 
         Args:
-            layers: List of (layer_id, file_path, geo) tuples to preload. Only
-                identifiers and load parameters are passed - never the live
-                TiledLayer - so nothing shared with the renderer is touched off
-                the UI thread.
+            layers: List of (layer_id, file_path, geo, header) tuples to
+                preload. Only identifiers and load parameters are passed -
+                never the live TiledLayer - so nothing shared with the
+                renderer is touched off the UI thread. ``header`` is that
+                layer's TiledLayer.header_metadata(), a plain dict, which
+                saves the throwaway layer a second read of the file.
         """
         super().__init__()
         self._layers = layers
@@ -91,15 +94,34 @@ class GroupMemoryWorker(QObject):
         self._cancelled = True
 
     def process(self):
-        """Reproject each layer off-thread and emit its data for the UI thread."""
+        """Reproject each layer off-thread and emit its data for the UI thread.
+
+        The whole body is guarded. An exception escaping a slot running on a
+        QThread takes the process down on Windows - no traceback, no
+        summary, and the progress dialog left waiting on a `finished` that
+        never comes. Anything unexpected is reported as an error and the
+        run still finishes, the same contract _LevelLoadRunnable.run has
+        for the same reason.
+        """
+        try:
+            self._process()
+        except Exception as exc:      # noqa: BLE001 - never kill the thread
+            debug(f"group preload failed: {type(exc).__name__}: {exc}")
+            _emit_safely(self.error, "", f"{type(exc).__name__}: {exc}")
+        _emit_safely(self.finished)
+
+    def _process(self):
+        """Load each layer in turn; see process() for the guarantees."""
         total = len(self._layers)
-        for i, (layer_id, file_path, geo) in enumerate(self._layers):
+        for i, (layer_id, file_path, geo, metadata) in enumerate(
+                self._layers):
             if self._cancelled:
                 break
             try:
                 # Load into a throwaway layer so the live layer (which the
                 # renderer may read at any time) is never mutated here.
-                tmp = TiledLayer(file_path, lazy=True, geo=geo)
+                tmp = TiledLayer(file_path, lazy=True, geo=geo,
+                                 metadata=metadata)
                 # Polled between the read and each reproject pass. Without
                 # it the only cancellation point was between layers, so
                 # Cancel - or closing the window - waited out a full-
@@ -127,7 +149,6 @@ class GroupMemoryWorker(QObject):
             except Exception as e:
                 self.error.emit(layer_id, str(e))
             self.progress.emit(i + 1, total)
-        self.finished.emit()
 
 
 def get_recovery_dir() -> Path:
@@ -4053,9 +4074,12 @@ class MainWindow(QMainWindow):
         for lid in layer_ids:
             layer = self.canvas.get_layer(lid)
             if layer and not layer.is_fully_loaded():
-                # Pass only load parameters; the worker must not touch the
-                # live layer off the UI thread.
-                layers.append((lid, layer.file_path, layer.geo))
+                # Pass only load parameters - never the live layer, which
+                # the worker must not touch off the UI thread. The header
+                # goes with them so the worker's throwaway layer does not
+                # re-read the file just to find its bounds.
+                layers.append((lid, layer.file_path, layer.geo,
+                               layer.header_metadata()))
 
         if not layers:
             QMessageBox.information(self, "Preload Group",
