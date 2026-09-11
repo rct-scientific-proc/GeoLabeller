@@ -3995,7 +3995,7 @@ class MapCanvas(QGraphicsView):
             if pos is not None:
                 label_id, _ = self._get_label_at_position(pos)
             if label_id is not None:
-                self._enter_measure_mode(label_id)
+                self._enter_measure_mode(label_id, pos)
             else:
                 self.measure_mode_changed.emit(
                     False, "Hover over a label, then press M to measure")
@@ -4561,7 +4561,7 @@ class MapCanvas(QGraphicsView):
             elif action == box_link_action:
                 self.enter_box_link_mode(label_id)
             elif action == measure_action:
-                self._enter_measure_mode(label_id)
+                self._enter_measure_mode(label_id, view_pos)
             elif clear_measure_action is not None and action == clear_measure_action:
                 # Clearing is routed through the same signal; main_window
                 # resets length_m/width_m and calls set_label_measured(False).
@@ -4949,8 +4949,30 @@ class MapCanvas(QGraphicsView):
     # Measure mode: draw two lines on a label to record length + width (m)
     # ------------------------------------------------------------------
 
-    def _measure_target_layer(self, label_id: int) -> TiledLayer | None:
-        """Return the TiledLayer a label belongs to, via its stored image path."""
+    def _measure_target_layer(self, label_id: int,
+                              view_pos=None) -> TiledLayer | None:
+        """The layer whose georeferencing scales this measurement.
+
+        Normally the label's own image, found through the path stored on
+        its marker. In the WATERFALL that is not enough: a label is drawn
+        on every other stacked image it falls inside (the projections), and
+        a measurement started on one of those is drawn across THAT image's
+        pixels while the label belongs to another. Using the label's own
+        layer then scales the answer by the ratio of the two images'
+        ground resolutions - a 1.0 m/px and a 0.25 m/px pair turned one
+        drawn line into 127.72 m or 510.87 m depending only on which layer
+        the code asked. The strips are disjoint, so the image under the
+        cursor is unambiguous and is the one being measured.
+
+        Outside the waterfall, layers overlap geographically and the
+        label's own image remains the right answer (see _enter_measure_mode
+        on why both endpoints share one grid).
+        """
+        if self._waterfall_active and view_pos is not None:
+            easting, northing = self._scene_to_web(self.mapToScene(view_pos))
+            under_cursor = self._layer_id_at(easting, northing)
+            if under_cursor is not None:
+                return self._layers.get(under_cursor)
         if label_id not in self._label_items:
             return None
         ellipse, _ = self._label_items[label_id]
@@ -4958,8 +4980,12 @@ class MapCanvas(QGraphicsView):
         layer_id = self._path_to_layer.get(image_path) if image_path else None
         return self._layers.get(layer_id) if layer_id else None
 
-    def _enter_measure_mode(self, label_id: int):
+    def _enter_measure_mode(self, label_id: int, view_pos=None):
         """Begin drawing length/width measurement lines for a label.
+
+        ``view_pos`` is where the user asked to measure. In the waterfall it
+        decides which stacked image the line is scaled by - see
+        _measure_target_layer.
 
         Measurement needs source georeferencing to give metres. That is the
         layer's own CRS when displayed geographically, and the RETAINED
@@ -4968,7 +4994,7 @@ class MapCanvas(QGraphicsView):
         pixels to the ground there, so measuring keeps working mid-waterfall.
         Only a plain raster with no georeferencing at all is refused.
         """
-        layer = self._measure_target_layer(label_id)
+        layer = self._measure_target_layer(label_id, view_pos)
         if layer is None or (not layer.geo and (
                 layer._src_crs is None or layer._src_transform is None)):
             self.measure_mode_changed.emit(
