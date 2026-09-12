@@ -212,13 +212,20 @@ class TiledLayer:
     """
 
     def __init__(self, file_path: str, lazy: bool = False,
-                 geo: bool = True, metadata: dict | None = None):
+                 geo: bool = True, metadata: dict | None = None,
+                 dst_crs=None):
         """Initialize a tiled layer.
 
         Args:
             file_path: Path to the GeoTIFF file
             lazy: If True, only load bounds initially, defer full data loading
-            geo: If True (default), reproject to Web Mercator. If False, use raw pixel coordinates.
+            geo: If True (default), place this layer in the scene's projection.
+                If False, use raw pixel coordinates.
+            dst_crs: The scene's projection - what this layer's bounds and
+                pixels are expressed in. Defaults to Web Mercator, which is
+                what the whole canvas used before it was a choice. A source
+                already in this projection is not resampled at all (see
+                _same_grid_as); anything else is reprojected into it.
             metadata: Prefetched header data (an AsyncFileLoader layer_data
                 dict). When given with lazy=True the constructor does not
                 touch the file at all - the directory import already opened
@@ -227,6 +234,7 @@ class TiledLayer:
                 window for the whole import on network shares.
         """
         self.file_path = file_path
+        self._dst_crs = dst_crs if dst_crs is not None else WEB_MERCATOR
         self.name = Path(file_path).stem  # File name without extension
         self.group_path = ""  # Group hierarchy (e.g., "folder/subfolder")
         self.visible = True
@@ -376,6 +384,7 @@ class TiledLayer:
             "width": self._full_width,
             "height": self._full_height,
             "full_grid": self._full_grid,
+            "dst_crs": self._dst_crs,
             "src_crs": self._src_crs,
             "src_transform": self._src_transform,
             "src_width": self._src_width,
@@ -400,6 +409,8 @@ class TiledLayer:
         if self.geo and metadata.get("src_crs") is None:
             return False   # the geo path requires a CRS; let the opener raise
 
+        if metadata.get("dst_crs") is not None:
+            self._dst_crs = metadata["dst_crs"]
         self._src_crs = metadata.get("src_crs")
         self._src_transform = metadata.get("src_transform")
         self._full_grid = metadata.get("full_grid")
@@ -426,6 +437,27 @@ class TiledLayer:
         # after _load_pixel_bounds_only.
         return True
 
+    def _same_grid_as(self, src) -> bool:
+        """Can this source be placed in the scene without resampling?
+
+        Three things have to hold. The projections must match, or the
+        pixels mean something different in the scene. The transform must
+        be axis-aligned, because the canvas maps a layer's array onto its
+        bounds linearly - true of anything a warp produces, false of a
+        rotated source. And it must be north-up, since the array's first
+        row has to be the scene's top edge.
+
+        When all three hold the file's own affine IS the mapping into the
+        scene, Qt applies it while painting, and the warp - between two
+        thirds and 94% of what a load costs - does not happen.
+        """
+        if not self.geo or src.crs is None or self._dst_crs is None:
+            return False
+        if src.crs != self._dst_crs:
+            return False
+        t = src.transform
+        return (t.b == 0.0 and t.d == 0.0 and t.a > 0.0 and t.e < 0.0)
+
     def _load_bounds_only(self):
         """Load only the bounds and metadata, not the full raster data.
 
@@ -448,11 +480,17 @@ class TiledLayer:
                     "The file may not be a valid GeoTIFF."
                 )
 
-            # Calculate bounds in Web Mercator without loading pixel data
-            dst_crs = WEB_MERCATOR
-            transform, width, height = calculate_default_transform(
-                src.crs, dst_crs, src.width, src.height, *src.bounds
-            )
+            # Bounds in the scene's projection, without loading pixels.
+            # A source already in it needs no computing at all: its own grid
+            # IS the scene grid.
+            dst_crs = self._dst_crs
+            if self._same_grid_as(src):
+                transform = src.transform
+                width, height = src.width, src.height
+            else:
+                transform, width, height = calculate_default_transform(
+                    src.crs, dst_crs, src.width, src.height, *src.bounds
+                )
 
             self._full_width = width
             self._full_height = height
@@ -589,7 +627,7 @@ class TiledLayer:
                 return None
             cached = level_grid_for(
                 self._src_crs, self._src_transform, self._src_width,
-                self._src_height, WEB_MERCATOR, level)
+                self._src_height, self._dst_crs, level)
             self._level_grid_cache[level] = cached
         return cached
 
@@ -718,8 +756,16 @@ class TiledLayer:
 
             level = max(1, level)
 
-            dst_crs = WEB_MERCATOR
-            if self._full_grid is not None:
+            dst_crs = self._dst_crs
+            same_grid = self._same_grid_as(src)
+            if same_grid:
+                # No reprojection: the source grid is the scene grid, so the
+                # full-resolution "reprojected" grid is the source's own.
+                transform = src.transform
+                width, height = src.width, src.height
+                self._full_grid = (transform, width, height)
+                self._full_width, self._full_height = width, height
+            elif self._full_grid is not None:
                 # Already known - from this layer's own first geo load, or
                 # handed over in the header by the live layer. The same
                 # arithmetic on the same bounds gives the same answer.
@@ -756,7 +802,12 @@ class TiledLayer:
             src_read_transform = src.transform * src.transform.scale(
                 src.width / rd_w, src.height / rd_h)
 
-            if level > 1:
+            if same_grid:
+                # The destination IS the decimated source read: same shape,
+                # same affine. Every reproject below becomes an assignment.
+                transform = src_read_transform
+                width, height = rd_w, rd_h
+            elif level > 1:
                 dst_w = max(1, width // level)
                 dst_h = max(1, height // level)
                 transform, width, height = calculate_default_transform(
@@ -782,18 +833,21 @@ class TiledLayer:
             src_band1 = apply_band_stretch(src_band1, band_scaling, 0)
 
             self._checkpoint(cancel_check)
-            dst_band1 = np.full((height, width), np.nan, dtype=np.float32)
-            reproject(
-                source=src_band1,
-                destination=dst_band1,
-                src_transform=src_read_transform,
-                src_crs=src.crs,
-                dst_transform=transform,
-                dst_crs=dst_crs,
-                resampling=Resampling.bilinear,
-                src_nodata=np.nan,
-                dst_nodata=np.nan
-            )
+            if same_grid:
+                dst_band1 = src_band1
+            else:
+                dst_band1 = np.full((height, width), np.nan, dtype=np.float32)
+                reproject(
+                    source=src_band1,
+                    destination=dst_band1,
+                    src_transform=src_read_transform,
+                    src_crs=src.crs,
+                    dst_transform=transform,
+                    dst_crs=dst_crs,
+                    resampling=Resampling.bilinear,
+                    src_nodata=np.nan,
+                    dst_nodata=np.nan
+                )
             # ~4 bytes/px of source float32 with no further use; at the
             # 150 MP budget that is ~600 MB held across the whole of the
             # rest of this function unless dropped now.
@@ -833,18 +887,21 @@ class TiledLayer:
                     if nodata_at is not None:
                         src_band[nodata_at] = 0
 
-                    dst_band = np.zeros((height, width), dtype=np.uint8)
-                    reproject(
-                        source=src_band,
-                        destination=dst_band,
-                        src_transform=src_read_transform,
-                        src_crs=src.crs,
-                        dst_transform=transform,
-                        dst_crs=dst_crs,
-                        resampling=Resampling.bilinear,
-                        src_nodata=0,
-                        dst_nodata=0
-                    )
+                    if same_grid:
+                        dst_band = src_band
+                    else:
+                        dst_band = np.zeros((height, width), dtype=np.uint8)
+                        reproject(
+                            source=src_band,
+                            destination=dst_band,
+                            src_transform=src_read_transform,
+                            src_crs=src.crs,
+                            dst_transform=transform,
+                            dst_crs=dst_crs,
+                            resampling=Resampling.bilinear,
+                            src_nodata=0,
+                            dst_nodata=0
+                        )
                     bands_uint8.append(dst_band)
 
                 r, g, b = bands_uint8[0], bands_uint8[1], bands_uint8[2]
@@ -1350,7 +1407,7 @@ class AsyncFileLoader(QObject):
                         # take a minute.
                         est = None
                         try:
-                            est = _web_mercator_estimate(
+                            est = _scene_grid_estimate(
                                 src.crs, src.transform,
                                 src.width, src.height)
                         except Exception:
@@ -1405,9 +1462,9 @@ class AsyncFileLoader(QObject):
 _stored_meta_transformers: dict = {}
 
 
-def _web_mercator_estimate(src_crs, src_transform,
-                           src_width: int, src_height: int):
-    """Estimated Web Mercator (bounds, width, height) for a source grid.
+def _scene_grid_estimate(src_crs, src_transform,
+                         src_width: int, src_height: int, dst_crs=None):
+    """Estimated scene-projection (bounds, width, height) for a source grid.
 
     A sampling of the source boundary transformed through a cached
     transformer: sub-metre of rasterio's calculate_default_transform at a
@@ -1417,11 +1474,18 @@ def _web_mercator_estimate(src_crs, src_transform,
     CRS cannot be transformed finitely; the caller falls back to the
     full computation.
     """
-    key = src_crs.to_epsg() or src_crs.to_wkt()
+    dst_crs = dst_crs if dst_crs is not None else WEB_MERCATOR
+    key = (src_crs.to_epsg() or src_crs.to_wkt(),
+           dst_crs.to_epsg() or dst_crs.to_wkt())
+    if key[0] == key[1]:
+        # Already in the scene's projection: its own grid is the answer,
+        # exactly, with nothing to estimate.
+        return (rasterio.transform.array_bounds(
+            src_height, src_width, src_transform), src_width, src_height)
     transformer = _stored_meta_transformers.get(key)
     if transformer is None:
         transformer = Transformer.from_crs(
-            src_crs, WEB_MERCATOR, always_xy=True)
+            src_crs, dst_crs, always_xy=True)
         _stored_meta_transformers[key] = transformer
 
     left, bottom, right, top = rasterio.transform.array_bounds(
@@ -1525,7 +1589,7 @@ def stored_layer_metadata(file_path: str, group_path: str,
         # carried as WKT instead - it loads with zero I/O just the same.
         src_crs = (CRS.from_epsg(int(crs_epsg)) if crs_epsg
                    else CRS.from_wkt(crs_wkt))
-        est = _web_mercator_estimate(
+        est = _scene_grid_estimate(
             src_crs, src_transform, src_width, src_height)
         if est is None:
             return None
@@ -1706,12 +1770,14 @@ class _TileLoadRunnable(QRunnable):
     """
 
     def __init__(self, layer_id: str, file_path: str, level: int,
-                 tx: int, ty: int, signals: "_TileLoadSignals", grid=None):
+                 tx: int, ty: int, signals: "_TileLoadSignals", grid=None,
+                 dst_crs=None):
         """Store the tile identity and the signal group to report through.
 
         ``grid`` is the layer's cached level grid; every tile of a level
         shares it, and recomputing it per tile cost each read a redundant
-        densified CRS transform of the whole image bounds.
+        densified CRS transform of the whole image bounds. ``dst_crs`` is
+        the scene's projection, the same one the layer was given.
         """
         super().__init__()
         self._layer_id = layer_id
@@ -1721,6 +1787,7 @@ class _TileLoadRunnable(QRunnable):
         self._ty = ty
         self._signals = signals
         self._grid = grid
+        self._dst_crs = dst_crs if dst_crs is not None else WEB_MERCATOR
         self._cancelled = False
 
     def cancel(self):
@@ -1739,7 +1806,7 @@ class _TileLoadRunnable(QRunnable):
                 self._fail()
                 return
             with rasterio.open(self._file_path) as src:
-                rgba = read_tile(src, WEB_MERCATOR, self._level,
+                rgba = read_tile(src, self._dst_crs, self._level,
                                  self._tx, self._ty, grid=self._grid)
             if self._cancelled:
                 self._fail()
@@ -2290,6 +2357,12 @@ class MapCanvas(QGraphicsView):
         # hidden until the user picks some, and the hit test, the tile pass
         # and the cull all only care about the shown ones - walking every
         # layer instead cost 2.7 ms per mouse move at 20k.
+        # What the scene's coordinates MEAN. Web Mercator, as it always
+        # has been - but a value now rather than a constant in six places,
+        # because a layer already in the scene's projection needs no
+        # reprojecting, and reprojecting is most of what a load costs.
+        # Everything the canvas builds is handed this.
+        self.scene_crs = WEB_MERCATOR
         self._visible_layer_ids = _OrderedIds()
         # Set when a pass culls a loaded layer; the trim then runs once for
         # the pass instead of once per culled layer.
@@ -2327,7 +2400,8 @@ class MapCanvas(QGraphicsView):
             return self._path_to_layer[file_path]
 
         try:
-            layer = TiledLayer(file_path, lazy=lazy, metadata=metadata)
+            layer = TiledLayer(file_path, lazy=lazy, metadata=metadata,
+                               dst_crs=self.scene_crs)
             layer.visible = visible
 
             layer_id = f"layer_{self._next_id}"
@@ -2387,7 +2461,7 @@ class MapCanvas(QGraphicsView):
 
         try:
             layer = TiledLayer(file_path, lazy=lazy, geo=False,
-                               metadata=metadata)
+                               metadata=metadata, dst_crs=self.scene_crs)
             layer.visible = visible
             layer.group_path = group_path
 
@@ -3080,7 +3154,7 @@ class MapCanvas(QGraphicsView):
 
         runnable = _TileLoadRunnable(
             layer_id, layer.file_path, level, tx, ty, signals,
-            grid=layer.detail_grid(level))
+            grid=layer.detail_grid(level), dst_crs=self.scene_crs)
         self._pending_tiles[(layer_id, level, tx, ty)] = runnable
         self._tile_pool.start(runnable)
 
