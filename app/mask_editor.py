@@ -23,13 +23,14 @@ values, never from the display stretch.
 """
 import numpy as np
 
-from PyQt5.QtCore import QEvent, QLineF, QPoint, QSize, Qt, pyqtSignal
+from PyQt5.QtCore import (QEvent, QLineF, QPoint, QSettings, QSize, Qt,
+                          pyqtSignal)
 from PyQt5.QtGui import (QColor, QIcon, QImage, QKeySequence, QPainter,
                          QPen, QPixmap)
 from PyQt5.QtWidgets import (
     QComboBox, QHBoxLayout, QInputDialog, QLabel, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QShortcut,
-    QSpinBox, QVBoxLayout, QWidget)
+    QSpinBox, QSplitter, QVBoxLayout, QWidget)
 
 from .debug_log import debug
 from .masks import (entry_in_window, fill_enclosed, mask_statistics,
@@ -40,6 +41,10 @@ from .snippets import (SnippetLoader, read_label_snippet,
 MASK_SNIPPET_SIZE = 224     # default source pixels painted on
 MAX_DISPLAY_PX = 448        # starting-view cap; the user zooms from there
 DEFAULT_BRUSH_PX = 12       # brush diameter in SOURCE pixels
+
+# Where the editor remembers how the user last dragged its panes.
+_SETTINGS = ("GeoLabeller", "GeoLabeller")
+_SPLITTER_KEY = "mask_editor/splitter"
 MIN_ZOOM = 0.25             # far enough out to survey a huge snippet
 MAX_ZOOM = 32.0             # far enough in for single-pixel brushwork
 
@@ -443,15 +448,19 @@ class MaskEditor(QWidget):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        body = QHBoxLayout()
+        # Three panes the user can drag. They used to be fixed widths, so
+        # a caption like "vessel . survey_04_r006_c112.tif [3 masks]" was
+        # cut off with no way to widen it - and no way to give the paint
+        # canvas the room either.
+        self.body_splitter = QSplitter(Qt.Horizontal)
 
         # Snippet strip: which label is being painted.
         self.snippet_list = QListWidget()
         self.snippet_list.setIconSize(QSize(96, 96))
-        self.snippet_list.setFixedWidth(210)
+        self.snippet_list.setMinimumWidth(120)
         self.snippet_list.currentItemChanged.connect(self._on_snippet_picked)
         self.snippet_list.installEventFilter(self)
-        body.addWidget(self.snippet_list)
+        self.body_splitter.addWidget(self.snippet_list)
 
         # The paint surface, scrollable so any zoom level fits on screen.
         self.canvas = MaskPaintCanvas()
@@ -462,13 +471,16 @@ class MaskEditor(QWidget):
         self.canvas_scroll.setWidgetResizable(False)
         self.canvas_scroll.setAlignment(Qt.AlignCenter)
         self.canvas_scroll.setMinimumSize(360, 360)
-        body.addWidget(self.canvas_scroll, 1)
+        self.body_splitter.addWidget(self.canvas_scroll)
 
-        # Mask management + statistics.
-        side = QVBoxLayout()
+        # Mask management + statistics, in a pane of its own so the
+        # splitter has something to size.
+        self.mask_panel = QWidget()
+        self.mask_panel.setMinimumWidth(150)
+        side = QVBoxLayout(self.mask_panel)
+        side.setContentsMargins(0, 0, 0, 0)
         side.addWidget(QLabel("Masks on this snippet:"))
         self.mask_list = QListWidget()
-        self.mask_list.setFixedWidth(220)
         self.mask_list.currentItemChanged.connect(self._on_mask_picked)
         self.mask_list.installEventFilter(self)
         side.addWidget(self.mask_list)
@@ -490,12 +502,18 @@ class MaskEditor(QWidget):
         side.addWidget(QLabel("Object vs background (raw values):"))
         self.stats_label = QLabel("-")
         self.stats_label.setWordWrap(True)
-        self.stats_label.setFixedWidth(220)
         side.addWidget(self.stats_label)
         side.addStretch(1)
-        body.addLayout(side)
+        self.body_splitter.addWidget(self.mask_panel)
 
-        layout.addLayout(body, 1)
+        # Only the paint area grows when the window does; the two lists
+        # keep whatever the user dragged them to.
+        self.body_splitter.setStretchFactor(0, 0)
+        self.body_splitter.setStretchFactor(1, 1)
+        self.body_splitter.setStretchFactor(2, 0)
+        self.body_splitter.setChildrenCollapsible(False)
+        self._restore_splitter()
+        layout.addWidget(self.body_splitter, 1)
 
         # Where the work stands. Strokes commit to the project as they
         # happen, but "committed" is not "on disk", and saying so plainly
@@ -512,6 +530,28 @@ class MaskEditor(QWidget):
         layout.addLayout(footer)
         QShortcut(QKeySequence.Save, self,
                   activated=self.save_requested.emit)
+
+    def _restore_splitter(self):
+        """Reopen at the widths this user last dragged them to."""
+        saved = QSettings(*_SETTINGS).value(_SPLITTER_KEY)
+        if saved is not None:
+            try:
+                if self.body_splitter.restoreState(saved):
+                    return
+            except TypeError:
+                # Something else wrote this key, or it was hand-edited.
+                pass
+        self.body_splitter.setSizes([210, 620, 220])
+
+    def closeEvent(self, event):
+        """Remember the pane widths on the way out."""
+        try:
+            QSettings(*_SETTINGS).setValue(
+                _SPLITTER_KEY, self.body_splitter.saveState())
+        except Exception as exc:                  # noqa: BLE001
+            debug(f"mask editor splitter not saved: "
+                  f"{type(exc).__name__}: {exc}")
+        super().closeEvent(event)
 
     def set_save_state(self, text: str, saved: bool):
         """Show whether what has been painted is on disk yet."""
