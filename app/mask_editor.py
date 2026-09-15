@@ -30,7 +30,7 @@ from PyQt5.QtGui import (QColor, QIcon, QImage, QKeySequence, QPainter,
 from PyQt5.QtWidgets import (
     QComboBox, QHBoxLayout, QInputDialog, QLabel, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QShortcut,
-    QSpinBox, QSplitter, QVBoxLayout, QWidget)
+    QSlider, QSpinBox, QSplitter, QVBoxLayout, QWidget)
 
 from .debug_log import debug
 from .masks import (entry_in_window, fill_enclosed, mask_statistics,
@@ -63,6 +63,31 @@ MASK_COLORS = [
     QColor(245, 130, 48), QColor(145, 30, 180), QColor(70, 240, 240),
     QColor(240, 50, 230), QColor(230, 190, 60),
 ]
+
+
+def apply_display_adjust(rgb: np.ndarray, brightness: int,
+                         contrast: int) -> np.ndarray:
+    """``rgb`` brightened and contrast-stretched FOR DISPLAY ONLY.
+
+    Both are -100..100, zero meaning untouched. Contrast pivots around
+    mid-grey so a stretch opens a flat snippet out rather than washing it
+    to white, and the result is clipped back into the byte range.
+
+    Nothing that is measured or stored passes through here. The mask is
+    what the user painted, and the object-vs-background statistics are
+    computed from the raw source values, so neither moves when a slider
+    does - a panel that reported whatever contrast happened to be set
+    would be worse than no panel.
+    """
+    if not brightness and not contrast:
+        return rgb
+    # -100..100 -> 0..(near) 2, so -100 flattens and +100 roughly doubles
+    # the spread. Capped below 1 so the divisor can never reach zero.
+    gain = (1.0 + contrast / 100.0) if contrast >= 0 else \
+        max(0.02, 1.0 + contrast / 110.0)
+    adjusted = (rgb.astype(np.float32) - 128.0) * gain + 128.0
+    adjusted += brightness * 1.27
+    return np.clip(adjusted, 0, 255).astype(np.uint8)
 
 
 class MaskPaintCanvas(QWidget):
@@ -403,6 +428,10 @@ class MaskEditor(QWidget):
         self._layers: "dict[str, np.ndarray]" = {}
         self._order: list = []
         self._raw = None                          # (bands, h, w) source data
+        # The snippet's display pixels as read, before brightness and
+        # contrast. Kept so moving a slider is a redraw rather than a
+        # re-read of the file.
+        self._display_source = None
         self._raw_nodata = None                   # its declared nodata
         # Image (width, height) by path - one header read each, so every
         # stroke can serialize against the full image without touching disk.
@@ -411,7 +440,7 @@ class MaskEditor(QWidget):
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
-        controls = QHBoxLayout()
+        controls = self.tool_row = QHBoxLayout()
         controls.addWidget(QLabel("Class:"))
         self.class_combo = QComboBox()
         self.class_combo.currentIndexChanged.connect(self._rebuild_list)
@@ -439,6 +468,46 @@ class MaskEditor(QWidget):
         self.brush_spin.setSuffix(" px")
         self.brush_spin.setToolTip("Brush diameter in source pixels.")
         controls.addWidget(self.brush_spin)
+        layout.addLayout(controls)
+
+        # Display-only brightness and contrast: sonar and low-light aerial
+        # snippets can be nearly flat on screen, and an edge you cannot see
+        # is an edge you cannot paint.
+        #
+        # On a row of their own. Qt will not shrink a window below the
+        # widest row's minimum, and hanging these off the toolbar took
+        # that to 1404 px - off the edge of a 1366-wide laptop screen,
+        # with no way to drag it back. A strip of height is affordable
+        # where width is not.
+        controls = self.view_row = QHBoxLayout()
+        controls.addWidget(QLabel("Bright:"))
+        self.brightness_slider = QSlider(Qt.Horizontal)
+        self.brightness_slider.setRange(-100, 100)
+        self.brightness_slider.setValue(0)
+        self.brightness_slider.setFixedWidth(90)
+        self.brightness_slider.setToolTip(
+            "Brightens the VIEW only. Masks and the object/background\n"
+            "statistics come from the raw imagery and do not change.")
+        self.brightness_slider.valueChanged.connect(
+            self._apply_display_to_canvas)
+        controls.addWidget(self.brightness_slider)
+        controls.addWidget(QLabel("Contrast:"))
+        self.contrast_slider = QSlider(Qt.Horizontal)
+        self.contrast_slider.setRange(-100, 100)
+        self.contrast_slider.setValue(0)
+        self.contrast_slider.setFixedWidth(90)
+        self.contrast_slider.setToolTip(
+            "Stretches the VIEW around mid-grey. Masks and the\n"
+            "object/background statistics do not change.")
+        self.contrast_slider.valueChanged.connect(
+            self._apply_display_to_canvas)
+        controls.addWidget(self.contrast_slider)
+        self.reset_adjust_button = QPushButton("Reset")
+        self.reset_adjust_button.setToolTip(
+            "Back to the imagery as it is.")
+        self.reset_adjust_button.clicked.connect(self.reset_display_adjust)
+        controls.addWidget(self.reset_adjust_button)
+        controls.addStretch(1)
         layout.addLayout(controls)
 
         hint = QLabel("Left-drag paints the active mask, right-drag erases; "
@@ -676,6 +745,7 @@ class MaskEditor(QWidget):
         self._unreadable = False
         self._undecodable = set()
         size = self.size_spin.value()
+        self._display_source = None
         if entry is None:
             self.canvas.set_snippet(None, size, size)
             self.canvas.set_layers({}, [], None)
@@ -724,14 +794,42 @@ class MaskEditor(QWidget):
                 continue
             self._order.append(name)
             self._stored_by_name[name] = stored
-        display = read_label_snippet(entry["image_path"], entry["pixel_x"],
-                                     entry["pixel_y"], size)
-        self.canvas.set_snippet(display, w, h)
+        self._display_source = read_label_snippet(
+            entry["image_path"], entry["pixel_x"], entry["pixel_y"], size)
+        self.canvas.set_snippet(self._adjusted_display(), w, h)
         active = self._order[0] if self._order else None
         self.canvas.set_layers(self._layers, self._order, active)
         self._set_editable(not self._unreadable)
         self._refresh_mask_list(select=active)
         self._refresh_stats()
+
+    def _adjusted_display(self) -> "np.ndarray | None":
+        """The current snippet's pixels with the view settings applied."""
+        if self._display_source is None:
+            return None
+        return apply_display_adjust(self._display_source,
+                                    self.brightness_slider.value(),
+                                    self.contrast_slider.value())
+
+    def _apply_display_to_canvas(self):
+        """Redraw at the current brightness/contrast, without re-reading."""
+        adjusted = self._adjusted_display()
+        if adjusted is None:
+            return
+        h, w = adjusted.shape[:2]
+        self.canvas.set_snippet(adjusted, w, h)
+
+    def reset_display_adjust(self):
+        """Back to the imagery as it is."""
+        for slider in (self.brightness_slider, self.contrast_slider):
+            slider.blockSignals(True)
+            slider.setValue(0)
+            slider.blockSignals(False)
+        self._apply_display_to_canvas()
+
+    def canvas_display_pixels(self) -> "np.ndarray | None":
+        """What the canvas is currently showing (for tests)."""
+        return self._adjusted_display()
 
     def _set_editable(self, editable: bool):
         """Paint, Add, Delete and Fill all follow the snippet's readability."""
