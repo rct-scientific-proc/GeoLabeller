@@ -411,6 +411,13 @@ class MaskEditor(QWidget):
     _ID_ROLE = Qt.UserRole
     ALL_CLASSES = "All classes"
 
+    # Strip filter, in combo order. It opens on All, and deliberately:
+    # reopening a finished class onto an empty strip reads as lost work,
+    # which is the very fear the save indicators were added to settle.
+    # The counts sit on the filter, so "212 still need masks" is legible
+    # without hiding anything to find it out.
+    FILTER_ALL, FILTER_NEEDS, FILTER_MASKED = 0, 1, 2
+
     def __init__(self, parent=None):
         super().__init__(parent, Qt.Window)
         self.setWindowTitle("Mask Editor")
@@ -445,6 +452,20 @@ class MaskEditor(QWidget):
         self.class_combo = QComboBox()
         self.class_combo.currentIndexChanged.connect(self._rebuild_list)
         controls.addWidget(self.class_combo, 1)
+
+        # Which snippets are worth showing. A worklist, not an archive:
+        # "needs masks" is what someone opens this window to work through,
+        # and the count falling is how they see the work being done.
+        controls.addWidget(QLabel("Show:"))
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(["", "", ""])      # text is set with counts
+        self.filter_combo.setCurrentIndex(self.FILTER_ALL)
+        self.filter_combo.setToolTip(
+            "Which snippets the strip lists. A snippet you have just\n"
+            "masked stays put until you move off it, so painting never\n"
+            "moves the strip under you.")
+        self.filter_combo.currentIndexChanged.connect(self._on_filter_changed)
+        controls.addWidget(self.filter_combo)
         controls.addWidget(QLabel("Snippet:"))
         self.size_spin = QSpinBox()
         self.size_spin.setRange(16, 2048)
@@ -523,13 +544,23 @@ class MaskEditor(QWidget):
         # canvas the room either.
         self.body_splitter = QSplitter(Qt.Horizontal)
 
-        # Snippet strip: which label is being painted.
+        # Snippet strip: which label is being painted, with a line under
+        # it for when the filter leaves it empty - an empty strip on its
+        # own reads as a broken window rather than as a finished class.
+        self.strip_panel = QWidget()
+        strip_box = QVBoxLayout(self.strip_panel)
+        strip_box.setContentsMargins(0, 0, 0, 0)
         self.snippet_list = QListWidget()
         self.snippet_list.setIconSize(QSize(96, 96))
         self.snippet_list.setMinimumWidth(120)
         self.snippet_list.currentItemChanged.connect(self._on_snippet_picked)
         self.snippet_list.installEventFilter(self)
-        self.body_splitter.addWidget(self.snippet_list)
+        strip_box.addWidget(self.snippet_list, 1)
+        self.strip_label = QLabel("")
+        self.strip_label.setWordWrap(True)
+        self.strip_label.setVisible(False)
+        strip_box.addWidget(self.strip_label)
+        self.body_splitter.addWidget(self.strip_panel)
 
         # The paint surface, scrollable so any zoom level fits on screen.
         self.canvas = MaskPaintCanvas()
@@ -656,7 +687,102 @@ class MaskEditor(QWidget):
         self.class_combo.blockSignals(False)
         self._rebuild_list()
 
+    # -- the strip filter ---------------------------------------------------
+
+    def filter_mode(self) -> int:
+        """Which of FILTER_NEEDS / FILTER_MASKED / FILTER_ALL is showing."""
+        return self.filter_combo.currentIndex()
+
+    def set_filter_mode(self, mode: int):
+        self.filter_combo.setCurrentIndex(mode)
+
+    def strip_message(self) -> str:
+        """The line under the strip; empty when the strip has snippets."""
+        return self.strip_label.text()
+
+    def _on_filter_changed(self, _index):
+        self._rebuild_list()
+
+    def _in_class(self, entry: dict) -> bool:
+        wanted = self.class_combo.currentText()
+        return wanted == self.ALL_CLASSES or entry["class_name"] == wanted
+
+    @staticmethod
+    def _is_masked(entry: dict) -> bool:
+        return bool(entry.get("masks"))
+
+    def _matches_filter(self, entry: dict) -> bool:
+        mode = self.filter_mode()
+        if mode == self.FILTER_ALL:
+            return True
+        return self._is_masked(entry) == (mode == self.FILTER_MASKED)
+
+    def _update_filter_counts(self):
+        """Put the live counts on the filter, for the class in view.
+
+        This is the reassurance the request asked for: the number left to
+        do falls as masks are painted, in the same place the user chose
+        what to look at.
+        """
+        in_class = [e for e in self._entries if self._in_class(e)]
+        masked = sum(1 for e in in_class if self._is_masked(e))
+        labels = (f"All ({len(in_class)})",
+                  f"Needs masks ({len(in_class) - masked})",
+                  f"Masked ({masked})")
+        self.filter_combo.blockSignals(True)
+        for index, text in enumerate(labels):
+            self.filter_combo.setItemText(index, text)
+        self.filter_combo.blockSignals(False)
+
+    def _update_strip_message(self):
+        shown = self.snippet_list.count()
+        if shown or not self._entries:
+            self.strip_label.setText("")
+            self.strip_label.setVisible(False)
+            return
+        if self.filter_mode() == self.FILTER_NEEDS:
+            text = "All of these snippets have a mask. Nothing left to do."
+        elif self.filter_mode() == self.FILTER_MASKED:
+            text = "No snippet here has a mask yet."
+        else:
+            text = "No snippets in this class."
+        self.strip_label.setText(text)
+        self.strip_label.setVisible(True)
+
+    def _retire_row(self, label_id):
+        """Drop a snippet that no longer belongs, now the user has left it.
+
+        Finishing a snippet should take it off the worklist - but not
+        while it is the one under the brush, which would move the strip
+        mid-stroke. So it goes when the user moves on, and the count has
+        already told them it counted.
+        """
+        entry = self._entries_by_label.get(label_id)
+        item = self._items_by_label.get(label_id)
+        if entry is None or item is None or self._matches_filter(entry):
+            return
+        if self._current is not None and \
+                self._current["label_id"] == label_id:
+            return
+        row = self.snippet_list.row(item)
+        if row < 0:
+            return
+        self.snippet_list.blockSignals(True)
+        self.snippet_list.takeItem(row)
+        self.snippet_list.blockSignals(False)
+        self._items_by_label.pop(label_id, None)
+        self._loader.cancel(label_id)
+        self._update_strip_message()
+
+    def _on_masks_applied(self):
+        """The current snippet's mask list changed: refresh, do not rebuild."""
+        self._update_snippet_caption()
+        self._update_filter_counts()
+
     def _rebuild_list(self):
+        # No optional arguments here: class_combo.currentIndexChanged is
+        # connected straight to this slot, and PyQt hands a Python
+        # callable as many signal arguments as its signature will take.
         self._loader.cancel_all()
         self.snippet_list.blockSignals(True)
         self.snippet_list.clear()
@@ -668,8 +794,11 @@ class MaskEditor(QWidget):
         self._entries_by_label = {e["label_id"]: e for e in self._entries}
         wanted = self.class_combo.currentText()
         show_all = wanted == self.ALL_CLASSES
+        keep_id = self._current["label_id"] if self._current else None
         for entry in self._entries:
             if not show_all and entry["class_name"] != wanted:
+                continue
+            if not self._matches_filter(entry):
                 continue
             caption = entry["image_name"]
             if show_all:
@@ -683,10 +812,15 @@ class MaskEditor(QWidget):
             self._items_by_label[entry["label_id"]] = item
             self._loader.request(entry["label_id"], entry["image_path"],
                                  entry["pixel_x"], entry["pixel_y"], 96)
+        self._update_filter_counts()
         if self.snippet_list.count():
-            self.snippet_list.setCurrentRow(0)
+            row = 0
+            if keep_id is not None and keep_id in self._items_by_label:
+                row = self.snippet_list.row(self._items_by_label[keep_id])
+            self.snippet_list.setCurrentRow(row)
         else:
             self._show_entry(None)
+        self._update_strip_message()
 
     # -- snippet cycling ----------------------------------------------------
 
@@ -731,9 +865,11 @@ class MaskEditor(QWidget):
 
     # -- selection ----------------------------------------------------------
 
-    def _on_snippet_picked(self, item, _previous=None):
+    def _on_snippet_picked(self, item, previous=None):
         self._show_entry(None if item is None
                          else self._entry(item.data(self._ID_ROLE)))
+        if previous is not None:
+            self._retire_row(previous.data(self._ID_ROLE))
 
     def _show_entry(self, entry: "dict | None"):
         self._current = entry
@@ -972,7 +1108,7 @@ class MaskEditor(QWidget):
                    for name in self._order]
         self._stored_by_name = {e["name"]: e for e in entries}
         self._current["masks"] = entries
-        self._update_snippet_caption()
+        self._on_masks_applied()
         self.masks_changed.emit(self._current["label_id"], entries)
 
     def _update_snippet_caption(self):
