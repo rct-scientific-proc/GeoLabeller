@@ -28,7 +28,7 @@ from PyQt5.QtCore import (QEvent, QLineF, QPoint, QSettings, QSize, Qt,
 from PyQt5.QtGui import (QColor, QIcon, QImage, QKeySequence, QPainter,
                          QPen, QPixmap)
 from PyQt5.QtWidgets import (
-    QComboBox, QHBoxLayout, QInputDialog, QLabel, QListWidget,
+    QComboBox, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QShortcut,
     QSlider, QSpinBox, QSplitter, QVBoxLayout, QWidget)
 
@@ -587,8 +587,29 @@ class MaskEditor(QWidget):
         self.mask_list.currentItemChanged.connect(self._on_mask_picked)
         self.mask_list.installEventFilter(self)
         side.addWidget(self.mask_list)
+
+        # The ACTIVE mask name, the way the main window holds an active
+        # class: set once, then worked down the strip. The list never
+        # shrinks as masks are added - an earlier cut offered only names
+        # the snippet lacked, so the presets appeared to be used up.
+        # Editable, so a name that is not in the list yet is typed here
+        # rather than in a prompt, and joins the presets on use.
+        side.addWidget(QLabel("Mask name to add:"))
+        self.mask_name_combo = QComboBox()
+        self.mask_name_combo.setEditable(True)
+        self.mask_name_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.mask_name_combo.setToolTip(
+            "The name Add Mask gives the next mask. Type a new one, or\n"
+            "pick a name already used in this project; choosing a name\n"
+            "this snippet already has selects that mask to paint.")
+        self.mask_name_combo.currentIndexChanged.connect(
+            self._on_active_mask_name_picked)
+        side.addWidget(self.mask_name_combo)
+
         buttons = QHBoxLayout()
-        self.add_button = QPushButton("Add Mask...")
+        self.add_button = QPushButton("Add Mask")
+        self.add_button.setToolTip(
+            "Add a mask with the name above and start painting it.")
         self.add_button.clicked.connect(self._on_add_mask)
         buttons.addWidget(self.add_button)
         self.delete_button = QPushButton("Delete")
@@ -1025,20 +1046,50 @@ class MaskEditor(QWidget):
     # -- mask-name presets --------------------------------------------------
 
     def set_mask_names(self, names: list):
-        """The project's preset mask names, for the Add Mask picker."""
+        """The project's preset mask names, for the active-name picker."""
         self._mask_names = [str(n) for n in names]
+        self._reload_mask_name_combo()
 
     def mask_names(self) -> list:
         """Every preset held, whatever this snippet already carries."""
         return list(self._mask_names)
 
-    def mask_name_choices(self) -> list:
-        """Presets worth offering: the ones this snippet does not have.
+    def active_mask_name(self) -> str:
+        """The name Add Mask will use: picked, or typed into the combo."""
+        return self.mask_name_combo.currentText().strip()
 
-        Adding a name the snippet already carries is refused, so offering
-        it is offering a dead end.
+    def set_active_mask_name(self, name: str):
+        """Make ``name`` the one Add Mask uses (and paint it if present)."""
+        self.mask_name_combo.setCurrentText(name)
+        self._on_active_mask_name_picked()
+
+    def _reload_mask_name_combo(self):
+        """Refill the picker, keeping whatever name was active.
+
+        Every preset stays listed however many masks are painted: the
+        list is what this project calls things, not a tray of names to
+        be used up.
         """
-        return [n for n in self._mask_names if n not in self._layers]
+        keep = self.mask_name_combo.currentText()
+        self.mask_name_combo.blockSignals(True)
+        self.mask_name_combo.clear()
+        self.mask_name_combo.addItems(self._mask_names)
+        self.mask_name_combo.setCurrentText(keep or (self._mask_names[0]
+                                                     if self._mask_names
+                                                     else ""))
+        self.mask_name_combo.blockSignals(False)
+
+    def _on_active_mask_name_picked(self, *_args):
+        """Picking a name the snippet already carries selects that mask.
+
+        Choosing "hull" when there is a hull means paint the hull - the
+        same move as switching the active class and carrying on.
+        """
+        name = self.active_mask_name()
+        if name and name in self._layers and name != self._active_name():
+            self.canvas.set_active(name)
+            self._refresh_mask_list(select=name)
+            self._refresh_stats()
 
     def _remember_mask_name(self, name: str):
         """Keep a typed name, so the next snippet can be given it.
@@ -1051,31 +1102,29 @@ class MaskEditor(QWidget):
         if not name or name in self._mask_names:
             return
         self._mask_names.append(name)
+        self._reload_mask_name_combo()
         self.mask_names_changed.emit(list(self._mask_names))
 
-    def _ask_mask_name(self) -> "str | None":
-        """The Add Mask prompt: pick a preset, or type a new name."""
-        choices = self.mask_name_choices()
-        if choices:
-            name, accepted = QInputDialog.getItem(
-                self, "New Mask", "Mask name (pick one, or type a new one):",
-                choices, 0, True)
-        else:
-            name, accepted = QInputDialog.getText(
-                self, "New Mask", "Mask name (e.g. hull, deck, shadow):")
-        name = (name or "").strip()
-        return name if accepted and name else None
-
     def _on_add_mask(self):
+        """Add a mask with the active name and hand the brush to it.
+
+        No prompt. The name is already chosen - in the picker above the
+        button - so this is one click between deciding to mask something
+        and painting it, on every snippet in the strip.
+        """
         if self._current is None:
             return
-        name = self._ask_mask_name()
-        if name is None:
+        name = self.active_mask_name()
+        if not name:
+            self.set_save_state("Type or pick a mask name first.", False)
             return
         if name in self._layers:
-            QMessageBox.information(
-                self, "Mask exists",
-                f"This snippet already has a mask named '{name}'.")
+            # Already here: select it rather than refusing. The button
+            # means "paint this mask", and an error box in the middle of
+            # a run of snippets is worse than doing the obvious thing.
+            self.canvas.set_active(name)
+            self._refresh_mask_list(select=name)
+            self._refresh_stats()
             return
         _x0, _y0, w, h = self._frame
         self._layers[name] = np.zeros((h, w), dtype=bool)
