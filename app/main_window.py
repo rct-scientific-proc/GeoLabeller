@@ -35,10 +35,12 @@ from .axis_ruler import MapCanvasWithAxes
 from .canvas import (MapCanvas, CanvasMode, STEP_CYCLE_MODES,
                      AsyncFileLoaderThread, LoadCancelled, TiledLayer,
                      _emit_safely)
-from .class_editor import ClassEditorDialog, DescriptionEditorDialog
+from .class_editor import (ClassEditorDialog, DescriptionEditorDialog,
+                           MaskNameEditorDialog)
 from .goto_location import (GoToLocationDialog, WaypointDialog,
                             format_lat_lon)
-from .labels import LabelProject, combine_projects, geodesic_distance
+from .labels import (LabelProject, combine_projects, geodesic_distance,
+                     mask_names_in_use)
 from .layer_panel import CombinedLayerPanel
 from .optimize_export import (OptimizeExportDialog, OptimizeWorker,
                               plan_output_paths)
@@ -730,6 +732,13 @@ class MainWindow(QMainWindow):
         edit_descriptions_action.triggered.connect(self._edit_descriptions)
         labels_menu.addAction(edit_descriptions_action)
 
+        edit_mask_names_action = QAction("Edit &Mask Names...", self)
+        edit_mask_names_action.setStatusTip(
+            "Preset mask names offered by the mask editor when a mask "
+            "is added")
+        edit_mask_names_action.triggered.connect(self._edit_mask_names)
+        labels_menu.addAction(edit_mask_names_action)
+
         orientation_action = QAction("&Orientation Editor...", self)
         orientation_action.setStatusTip(
             "Draw each label's orientation across a grid of its class's "
@@ -1386,6 +1395,39 @@ class MainWindow(QMainWindow):
             self._mark_unsaved()
             self._update_description_combo()
 
+    def _mask_name_presets(self) -> list:
+        """The presets to offer, seeded from the masks already painted.
+
+        Projects predating 4.4 have no list but plenty of mask names, in
+        their masks. Seeding from those means the picker is useful on the
+        first open rather than after someone retypes a survey's worth of
+        names.
+        """
+        presets = list(self.project.mask_names)
+        known = set(presets)
+        for name in mask_names_in_use(self.project):
+            if name not in known:
+                known.add(name)
+                presets.append(name)
+        return presets
+
+    def _edit_mask_names(self):
+        """Open the mask-name preset editor (Labels menu)."""
+        dialog = MaskNameEditorDialog(self._mask_name_presets(), self)
+        if dialog.exec_():
+            # Like descriptions, nothing to reconcile: a mask already
+            # painted keeps its name; this list only feeds the picker.
+            self.project.mask_names = dialog.get_mask_names()
+            self._mark_unsaved()
+            editor = getattr(self, "_mask_editor", None)
+            if editor is not None:
+                editor.set_mask_names(self.project.mask_names)
+
+    def _on_mask_names_changed(self, names):
+        """A name typed in the mask editor joined the project's presets."""
+        self.project.mask_names = list(names)
+        self._mark_unsaved()
+
     def _select_description(self, number: int):
         """Shift+1-9 / Shift+0: activate preset ``number`` (0 = none)."""
         if number == 0:
@@ -1936,6 +1978,10 @@ class MainWindow(QMainWindow):
         open honest about what it is editing.
         """
         entries = self._label_entries()
+        if self._mask_editor is not None:
+            # The presets belong to the project too, so they are re-seated
+            # with the labels rather than left showing the old project's.
+            self._mask_editor.set_mask_names(self._mask_name_presets())
         for editor in (self._orientation_editor, self._mask_editor):
             if editor is not None:
                 editor.set_labels(entries)
@@ -1958,6 +2004,9 @@ class MainWindow(QMainWindow):
             self._mask_editor = MaskEditor()
             self._mask_editor.masks_changed.connect(self._on_masks_changed)
             self._mask_editor.save_requested.connect(self._save_project)
+            self._mask_editor.mask_names_changed.connect(
+                self._on_mask_names_changed)
+        self._mask_editor.set_mask_names(self._mask_name_presets())
         self._mask_editor.set_labels(self._label_entries())
         self._push_save_state()
         self._mask_editor.show()

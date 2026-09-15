@@ -407,6 +407,8 @@ class MaskEditor(QWidget):
     # window's Ctrl+S never reaches it, and painters could not tell whether
     # their work was anywhere but in memory.
     save_requested = pyqtSignal()
+    # The project's mask-name presets, after a typed name joined them.
+    mask_names_changed = pyqtSignal(list)
 
     _ID_ROLE = Qt.UserRole
     ALL_CLASSES = "All classes"
@@ -424,6 +426,7 @@ class MaskEditor(QWidget):
         self._loader = SnippetLoader(self)
         self._loader.ready.connect(self._on_snippet_ready)
         self._entries: list = []
+        self._mask_names: list = []              # the project's presets
         self._items_by_label: dict = {}          # label_id -> strip row
         self._entries_by_label: dict = {}        # label_id -> entry
         self._current: "dict | None" = None      # selected entry
@@ -1019,13 +1022,55 @@ class MaskEditor(QWidget):
         self.canvas.set_active(item.text() if item is not None else None)
         self._refresh_stats()
 
+    # -- mask-name presets --------------------------------------------------
+
+    def set_mask_names(self, names: list):
+        """The project's preset mask names, for the Add Mask picker."""
+        self._mask_names = [str(n) for n in names]
+
+    def mask_names(self) -> list:
+        """Every preset held, whatever this snippet already carries."""
+        return list(self._mask_names)
+
+    def mask_name_choices(self) -> list:
+        """Presets worth offering: the ones this snippet does not have.
+
+        Adding a name the snippet already carries is refused, so offering
+        it is offering a dead end.
+        """
+        return [n for n in self._mask_names if n not in self._layers]
+
+    def _remember_mask_name(self, name: str):
+        """Keep a typed name, so the next snippet can be given it.
+
+        The name used on this snippet is nearly always the name wanted on
+        the next one; making the user retype it is what produced the
+        near-miss names in the first place.
+        """
+        name = name.strip()
+        if not name or name in self._mask_names:
+            return
+        self._mask_names.append(name)
+        self.mask_names_changed.emit(list(self._mask_names))
+
+    def _ask_mask_name(self) -> "str | None":
+        """The Add Mask prompt: pick a preset, or type a new name."""
+        choices = self.mask_name_choices()
+        if choices:
+            name, accepted = QInputDialog.getItem(
+                self, "New Mask", "Mask name (pick one, or type a new one):",
+                choices, 0, True)
+        else:
+            name, accepted = QInputDialog.getText(
+                self, "New Mask", "Mask name (e.g. hull, deck, shadow):")
+        name = (name or "").strip()
+        return name if accepted and name else None
+
     def _on_add_mask(self):
         if self._current is None:
             return
-        name, accepted = QInputDialog.getText(
-            self, "New Mask", "Mask name (e.g. hull, deck, shadow):")
-        name = name.strip()
-        if not accepted or not name:
+        name = self._ask_mask_name()
+        if name is None:
             return
         if name in self._layers:
             QMessageBox.information(
@@ -1035,6 +1080,7 @@ class MaskEditor(QWidget):
         _x0, _y0, w, h = self._frame
         self._layers[name] = np.zeros((h, w), dtype=bool)
         self._order.append(name)
+        self._remember_mask_name(name)
         self.canvas.set_layers(self._layers, self._order, name)
         self._refresh_mask_list(select=name)
         self._emit_masks()

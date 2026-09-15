@@ -140,3 +140,53 @@ class DescriptionEditorDialog(QDialog):
                 seen.add(line)
                 unique.append(line)
         return unique
+
+
+class MaskNameEditorDialog(QDialog):
+    """Edit the project's mask-name presets (the mask editor's picker).
+
+    Like descriptions, editing this list touches no existing data: a mask
+    already painted keeps the name it was painted with. It only decides
+    what the picker offers next - which is the point, because the name is
+    what the exported channel is keyed by, and "hull", "Hull" and "hul"
+    become three different masks otherwise.
+    """
+
+    def __init__(self, current_names: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit Mask Names")
+        self.setMinimumSize(340, 400)
+
+        layout = QVBoxLayout(self)
+        instructions = QLabel(
+            "Enter mask names, one per line. The mask editor offers these "
+            "when a mask is added, and a name typed there joins the list.\n\n"
+            "Renaming or removing a line never changes a mask already "
+            "painted - it only changes what is offered next."
+        )
+        instructions.setWordWrap(True)
+        layout.addWidget(instructions)
+
+        self.text_edit = QPlainTextEdit()
+        self.text_edit.setPlainText("\n".join(current_names))
+        self.text_edit.setPlaceholderText("e.g.\nhull\ndeck\nshadow")
+        layout.addWidget(self.text_edit)
+
+        button_layout = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(self.accept)
+        ok_btn.setDefault(True)
+        button_layout.addWidget(ok_btn)
+        layout.addLayout(button_layout)
+
+    def get_mask_names(self) -> list[str]:
+        """The preset list: stripped, non-empty, first occurrence wins."""
+        names: dict[str, None] = {}
+        for line in self.text_edit.toPlainText().split("\n"):
+            line = line.strip()
+            if line:
+                names.setdefault(line, None)
+        return list(names)

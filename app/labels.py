@@ -707,6 +707,14 @@ class LabelProject:
     # a faster way to fill the field.
     descriptions: list[str] = field(default_factory=list)
 
+    # Preset mask names for the mask editor's picker. Mask names are what
+    # the exported channels are keyed by, and typing one per snippet is
+    # how a survey ends up with "hull", "Hull" and "hul" as three
+    # different masks - discovered at export, when it is expensive. A
+    # typed name still works and joins this list; editing the list never
+    # renames a mask already painted.
+    mask_names: list[str] = field(default_factory=list)
+
     # Images with their labels, keyed by canonical_path so the same file
     # reached two ways is one entry - see ImagePaths.
     images: dict[str, ImageData] = field(default_factory=ImagePaths)
@@ -1102,7 +1110,7 @@ class LabelProject:
         return {
             # Single-digit minors only ("4.0" came after "3.9", never
             # "3.10"): the ICD pins readers to STRING comparison.
-            "version": "4.3",
+            "version": "4.4",
             # Copied, not referenced: the recovery snapshot is handed to a
             # background writer and the user carries on editing meanwhile.
             # The image and waypoint entries are freshly built dictionaries,
@@ -1115,7 +1123,10 @@ class LabelProject:
             # Written only when any exist, so projects without description
             # presets serialise exactly as they did before 4.2.
             **({"descriptions": list(self.descriptions)}
-               if self.descriptions else {})
+               if self.descriptions else {}),
+            # Likewise for mask-name presets, added at 4.4.
+            **({"mask_names": list(self.mask_names)}
+               if self.mask_names else {})
         }
 
     def save(self, file_path: str | Path):
@@ -1182,6 +1193,8 @@ class LabelProject:
         project.classes = data.get("classes", [])
         # Description presets arrived in 4.2; older projects have none.
         project.descriptions = [str(d) for d in data.get("descriptions", [])]
+        # Mask-name presets arrived in 4.4, likewise.
+        project.mask_names = [str(n) for n in data.get("mask_names", [])]
         project._next_id = data.get("_next_id", 1)
 
         # Waypoints arrived in 3.3; older projects simply have none. The id
@@ -1345,6 +1358,8 @@ def combine_projects(project1: "LabelProject",
 
     combined.descriptions = list(dict.fromkeys(
         list(project1.descriptions) + list(project2.descriptions)))
+    combined.mask_names = list(dict.fromkeys(
+        list(project1.mask_names) + list(project2.mask_names)))
 
     # Both projects number waypoints from 1, so their ids collide; add
     # them through add_waypoint to renumber, keeping the names.
@@ -1355,3 +1370,20 @@ def combine_projects(project1: "LabelProject",
     combined._next_id = max_id + 1
     combined._rebuild_index()
     return combined
+
+
+def mask_names_in_use(project: "LabelProject") -> list[str]:
+    """Every mask name actually painted in ``project``, first seen first.
+
+    Seeds the preset list for projects that predate it: the names are
+    already there, in the masks, and nobody should have to retype what
+    they have spent a survey painting.
+    """
+    names: dict[str, None] = {}
+    for image in project.images.values():
+        for label in image.labels:
+            for mask in label.masks or ():
+                name = str(mask.get("name", "")).strip()
+                if name:
+                    names.setdefault(name, None)
+    return list(names)
