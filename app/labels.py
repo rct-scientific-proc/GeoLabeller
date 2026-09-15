@@ -1,4 +1,5 @@
 """Label data model and storage for point annotations."""
+import hashlib
 import json
 import os
 import uuid
@@ -1137,9 +1138,10 @@ class LabelProject:
         """
         destination = Path(file_path)
         tmp_path = destination.with_suffix(destination.suffix + ".tmp")
+        data = self.to_dict()
         try:
             with open(tmp_path, 'w') as f:
-                json.dump(self.to_dict(), f, indent=2)
+                json.dump(data, f, indent=2)
             os.replace(tmp_path, destination)
         except Exception:
             try:
@@ -1147,6 +1149,28 @@ class LabelProject:
             except OSError:
                 pass          # never mask the real failure with cleanup
             raise
+        # What was written, so a caller can fingerprint it without building
+        # the whole dict a second time (see content_digest).
+        return data
+
+    def content_digest(self, data: dict | None = None) -> str:
+        """A fingerprint of everything this project would save.
+
+        SHA-256 of the canonical JSON of to_dict(): keys sorted, no
+        whitespace, so the same content always gives the same digest and
+        any change to what would be written gives a different one. That is
+        what "are there unsaved changes?" actually means - not whether some
+        edit remembered to say so, which is easy to forget and impossible
+        to audit. Changing a value back is, correctly, no change.
+
+        Pass ``data`` when the dict already exists (save() returns it).
+        Cost: about 0.2 s warm for a 13,000-image project. SHA-256 because
+        this app runs on FIPS-enabled machines, where MD5 and SHA-1 raise.
+        """
+        if data is None:
+            data = self.to_dict()
+        canonical = json.dumps(data, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @classmethod
     def load(cls, file_path: str | Path) -> "LabelProject":

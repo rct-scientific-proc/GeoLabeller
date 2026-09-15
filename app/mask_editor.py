@@ -24,11 +24,12 @@ values, never from the display stretch.
 import numpy as np
 
 from PyQt5.QtCore import QEvent, QLineF, QPoint, QSize, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
+from PyQt5.QtGui import (QColor, QIcon, QImage, QKeySequence, QPainter,
+                         QPen, QPixmap)
 from PyQt5.QtWidgets import (
     QComboBox, QHBoxLayout, QInputDialog, QLabel, QListWidget,
-    QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QSpinBox,
-    QVBoxLayout, QWidget)
+    QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QShortcut,
+    QSpinBox, QVBoxLayout, QWidget)
 
 from .debug_log import debug
 from .masks import (entry_in_window, fill_enclosed, mask_statistics,
@@ -372,6 +373,10 @@ class MaskEditor(QWidget):
 
     # (label_id, [mask entries]) - the label's full replacement mask list.
     masks_changed = pyqtSignal(int, list)
+    # "Save the project now" - this is a window of its own, so the main
+    # window's Ctrl+S never reaches it, and painters could not tell whether
+    # their work was anywhere but in memory.
+    save_requested = pyqtSignal()
 
     _ID_ROLE = Qt.UserRole
     ALL_CLASSES = "All classes"
@@ -491,6 +496,33 @@ class MaskEditor(QWidget):
         body.addLayout(side)
 
         layout.addLayout(body, 1)
+
+        # Where the work stands. Strokes commit to the project as they
+        # happen, but "committed" is not "on disk", and saying so plainly
+        # is the whole point of this line.
+        footer = QHBoxLayout()
+        self.save_status = QLabel("")
+        self.save_status.setWordWrap(True)
+        footer.addWidget(self.save_status, 1)
+        self.save_button = QPushButton("Save Project")
+        self.save_button.setToolTip(
+            "Write the project - masks included - to its file (Ctrl+S).")
+        self.save_button.clicked.connect(self.save_requested.emit)
+        footer.addWidget(self.save_button)
+        layout.addLayout(footer)
+        QShortcut(QKeySequence.Save, self,
+                  activated=self.save_requested.emit)
+
+    def set_save_state(self, text: str, saved: bool):
+        """Show whether what has been painted is on disk yet."""
+        self.save_status.setText(text)
+        self.save_status.setStyleSheet(
+            "color: #2e7d32;" if saved else "color: #b26a00;")
+        self.save_button.setEnabled(not saved)
+
+    def save_status_text(self) -> str:
+        """The status line's current text (for tests and diagnostics)."""
+        return self.save_status.text()
 
     # -- data in ------------------------------------------------------------
 

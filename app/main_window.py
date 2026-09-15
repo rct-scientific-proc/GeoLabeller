@@ -171,6 +171,7 @@ CRASH_MARKER_FILE = RECOVERY_DIR / ".running"
 
 # Auto-save interval in milliseconds (60 seconds)
 AUTOSAVE_INTERVAL_MS = 60000
+RECOVERY_SOON_MS = 5000
 
 # Sidecar suffixes GDAL discovers by listing an image's directory: world
 # files, external overviews/statistics, projection and mask files. When a
@@ -256,7 +257,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         """Initialize the window, canvas, layer panel, menus, and project state."""
         super().__init__()
-        self.setWindowTitle(app_title())
+        self._apply_title(app_title())
         self.setMinimumSize(1024, 768)
 
         # Create the debug logger on the UI thread up front (before any
@@ -325,6 +326,17 @@ class MainWindow(QMainWindow):
         self._autosave_timer = QTimer()
         self._autosave_timer.setInterval(AUTOSAVE_INTERVAL_MS)
         self._autosave_timer.timeout.connect(self._autosave_recovery)
+        # A recovery snapshot brought forward after an edit, so a crash in
+        # the middle of painting costs seconds rather than up to a minute.
+        # Single-shot and restarted by each edit, so a burst of strokes
+        # writes once when it settles.
+        self._recovery_soon_timer = QTimer()
+        self._recovery_soon_timer.setSingleShot(True)
+        self._recovery_soon_timer.setInterval(RECOVERY_SOON_MS)
+        self._recovery_soon_timer.timeout.connect(self._autosave_recovery)
+        # The digest of the project as last saved or opened; None for a
+        # recovered session, which has never been saved anywhere.
+        self._saved_digest: "str | None" = None
 
         # Background autosave plumbing: a single worker thread at a time
         # writes the recovery file. The snapshot dict is always built on
@@ -375,7 +387,118 @@ class MainWindow(QMainWindow):
         # clean-but-unsaved exit produced a false recovery prompt.
         crashed_last_time = CRASH_MARKER_FILE.exists()
         self._start_crash_detection()
+        # An empty project has nothing to lose. Before the recovery check,
+        # which replaces this with a "recovered" baseline if it restores.
+        self._set_saved_baseline()
         self._check_for_recovery(crashed_last_time)
+
+    # -- unsaved changes ----------------------------------------------------
+
+    def _apply_title(self, text: str):
+        """Set the window title with room for Qt's modified marker."""
+        self.setWindowTitle(f"{text}[*]")
+
+    def _set_saved_baseline(self, recovered: bool = False,
+                            data: "dict | None" = None):
+        """Record the project as it is now as what is safely on disk.
+
+        Called after a successful save, after opening a project, and for a
+        new project. A recovered session has no baseline at all: it was
+        never saved anywhere, so any content it has is unsaved.
+        """
+        self._saved_digest = (None if recovered
+                              else self.project.content_digest(data))
+        self.setWindowModified(recovered)
+        self._push_save_state()
+
+    def _has_unsaved_changes(self) -> bool:
+        """Would closing now lose anything?
+
+        Decided by content: the project's digest against the one recorded
+        when it was last saved or opened. Nothing here depends on an edit
+        having reported itself, so no edit path - including a direct
+        assignment to a label's masks - can slip past, and changing
+        something back to how it was is correctly not a change.
+        """
+        current = self.project.content_digest()
+        if self._saved_digest is None:
+            return current != LabelProject().content_digest()
+        return current != self._saved_digest
+
+    def _mark_unsaved(self):
+        """Show that something has changed since the last save.
+
+        Only the live signs - the title's asterisk and the mask editor's
+        status line - follow this. Whether closing asks is decided by
+        _has_unsaved_changes, which does not rely on being told.
+        """
+        self.setWindowModified(True)
+        self._push_save_state(stored=True)
+
+    def _push_save_state(self, stored: bool = False,
+                         label_id: "int | None" = None):
+        """Tell the mask editor, if it is open, where its work stands."""
+        editor = getattr(self, "_mask_editor", None)
+        if editor is None:
+            return
+        name = self._project_path.name if self._project_path else None
+        if self.isWindowModified():
+            what = (f"Masks for label #{label_id}" if label_id is not None
+                    else "Your changes")
+            where = (f"not yet saved to {name}" if name
+                     else "not yet saved - this project has no file yet")
+            editor.set_save_state(
+                f"\N{CHECK MARK} {what} stored in the project, {where}. "
+                "Press Ctrl+S or Save Project to write it to disk.",
+                saved=False)
+        elif name:
+            editor.set_save_state(
+                f"\N{CHECK MARK} All changes saved to {name} at "
+                f"{datetime.now():%H:%M:%S}.", saved=True)
+        else:
+            editor.set_save_state("Nothing to save yet.", saved=True)
+
+    def _ask_save_changes(self, action: str) -> str:
+        """Ask whether to save first: "save", "discard" or "cancel".
+
+        Its own method so tests can answer it - a real modal box under the
+        offscreen platform takes the process down.
+        """
+        name = self._project_path.name if self._project_path else "this project"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Unsaved Changes")
+        box.setText(f"Save changes to {name} before you {action}?")
+        box.setInformativeText(
+            "Labels, masks and other edits made since the last save will be "
+            "lost if you don't save them.")
+        box.setStandardButtons(
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
+        box.setDefaultButton(QMessageBox.Save)
+        choice = box.exec_()
+        if choice == QMessageBox.Save:
+            return "save"
+        if choice == QMessageBox.Discard:
+            return "discard"
+        return "cancel"
+
+    def _confirm_unsaved_changes(self, action: str) -> bool:
+        """True when it is safe to go ahead and drop the current project.
+
+        Asks only when there is something to lose. "Save" proceeds only if
+        the save actually happened: a Save As the user cancels, or a save
+        that fails, keeps the project open rather than losing it on the
+        way out of the attempt to keep it.
+        """
+        if not self._has_unsaved_changes():
+            return True
+        choice = self._ask_save_changes(action)
+        if choice == "cancel":
+            return False
+        if choice == "discard":
+            return True
+        self._save_project()
+        return not self._has_unsaved_changes()
 
     def _setup_ui(self):
         """Set up the main UI layout."""
@@ -1260,6 +1383,7 @@ class MainWindow(QMainWindow):
             # Unlike classes, nothing to reconcile: presets only seed NEW
             # labels, so editing the list never touches existing ones.
             self.project.descriptions = dialog.get_descriptions()
+            self._mark_unsaved()
             self._update_description_combo()
 
     def _select_description(self, number: int):
@@ -1312,6 +1436,7 @@ class MainWindow(QMainWindow):
 
         # Add to project, seeded with the active description preset (the
         # toolbar picker / Shift+1-9), so a "spring" pass never retypes it.
+        self._mark_unsaved()
         label = self.project.add_label(
             class_name=class_name,
             pixel_x=pixel_x, pixel_y=pixel_y,
@@ -1371,6 +1496,7 @@ class MainWindow(QMainWindow):
               f"[{self.project.label_count - 1} remaining]")
         # Remove from project
         self.project.remove_label(label_id)
+        self._mark_unsaved()
 
         # Remove visual marker
         self.canvas.remove_label_marker(label_id)
@@ -1463,6 +1589,7 @@ class MainWindow(QMainWindow):
         object_id = self.project.link_labels(label_id1, label_id2)
 
         if object_id:
+            self._mark_unsaved()
             # Update the linked status for all labels with this object_id
             linked_labels = self.project.get_linked_labels(label_id1)
             for _, label in linked_labels:
@@ -1510,6 +1637,7 @@ class MainWindow(QMainWindow):
         if not accepted:
             return
         label.description = text.strip()
+        self._mark_unsaved()
         self.canvas.set_label_description(label_id, label.description)
         self._label_row_changed(label_id)
         self.statusBar.showMessage(
@@ -1533,6 +1661,7 @@ class MainWindow(QMainWindow):
         if not accepted:
             return
         changed = self.project.set_group_id(label_id, text)
+        self._mark_unsaved()
         for lid in changed:
             # Marker may not exist when its image is not loaded; the
             # refresh path re-applies it later, like the description.
@@ -1550,6 +1679,7 @@ class MainWindow(QMainWindow):
         old_linked = self.project.get_linked_labels(label_id)
 
         self.project.unlink_label(label_id)
+        self._mark_unsaved()
 
         # Update the unlinked label; it left the named group, so its group
         # name is gone too.
@@ -1616,6 +1746,7 @@ class MainWindow(QMainWindow):
                 targets = [lbl for _, lbl in linked]
 
         has_measurement = length_m is not None or width_m is not None
+        self._mark_unsaved()
         for lbl in targets:
             lbl.length_m = length_m
             lbl.width_m = width_m
@@ -1826,7 +1957,9 @@ class MainWindow(QMainWindow):
         if self._mask_editor is None:
             self._mask_editor = MaskEditor()
             self._mask_editor.masks_changed.connect(self._on_masks_changed)
+            self._mask_editor.save_requested.connect(self._save_project)
         self._mask_editor.set_labels(self._label_entries())
+        self._push_save_state()
         self._mask_editor.show()
         self._mask_editor.raise_()
         self._mask_editor.activateWindow()
@@ -1841,6 +1974,9 @@ class MainWindow(QMainWindow):
         if label is None:
             return
         label.masks = list(masks)
+        self.setWindowModified(True)
+        self._push_save_state(stored=True, label_id=label_id)
+        self._recovery_soon_timer.start()
         n = len(label.masks)
         self.statusBar.showMessage(
             f"Label #{label_id}: {n} mask{'s' if n != 1 else ''} stored",
@@ -1854,6 +1990,7 @@ class MainWindow(QMainWindow):
         label.orientation_px_rad = px_rad
         label.orientation_deg = deg
         label.orientation_derived = bool(derived) and px_rad is not None
+        self._mark_unsaved()
         if px_rad is None:
             self.statusBar.showMessage(
                 f"Orientation cleared for label #{label_id}", 3000)
@@ -1902,6 +2039,7 @@ class MainWindow(QMainWindow):
     def _add_waypoint_at(self, lon: float, lat: float, name: str = ""):
         """Add a waypoint at a WGS84 position (from the map right-click)."""
         wp = self.project.add_waypoint(lat, lon, name=name)
+        self._mark_unsaved()
         self.canvas.add_waypoint_marker(wp.id, wp.name, wp.lon, wp.lat)
         self.layer_panel.refresh_waypoints(
             self.project.waypoints, format_lat_lon)
@@ -1944,6 +2082,7 @@ class MainWindow(QMainWindow):
         if not accepted or not name.strip():
             return
         self.project.rename_waypoint(waypoint_id, name)
+        self._mark_unsaved()
         self.canvas.add_waypoint_marker(wp.id, wp.name, wp.lon, wp.lat)
         self.layer_panel.refresh_waypoints(
             self.project.waypoints, format_lat_lon)
@@ -1956,6 +2095,7 @@ class MainWindow(QMainWindow):
             return
         name = wp.name
         self.project.remove_waypoint(waypoint_id)
+        self._mark_unsaved()
         self.canvas.remove_waypoint_marker(waypoint_id)
         self.layer_panel.refresh_waypoints(
             self.project.waypoints, format_lat_lon)
@@ -2076,6 +2216,7 @@ class MainWindow(QMainWindow):
             # a "removed" class behind, pointing at a class that no longer
             # exists (and silently dropped from exports). Masked until now
             # by the AttributeError above, which fired first.
+            self._mark_unsaved()
             for class_name in removed:
                 self.project.remove_class(class_name)
 
@@ -2131,6 +2272,7 @@ class MainWindow(QMainWindow):
             removed_images += 1
         if not removed_images:
             return
+        self._mark_unsaved()
         # Removing an image can leave the OTHER half of a linked pair alone
         # in its object group: without this the survivor keeps the halo that
         # says it is linked, while the panel correctly shows it is not.
@@ -2156,6 +2298,7 @@ class MainWindow(QMainWindow):
         )
         if reply == QMessageBox.Yes:
             self.project.clear()
+            self._mark_unsaved()
             self.canvas.clear_label_markers()
             # Refresh labeled images panel (now empty)
             self.layer_panel.refresh_labeled_panel(self.project)
@@ -2164,15 +2307,11 @@ class MainWindow(QMainWindow):
 
     def _new_project(self):
         """Create a new project."""
-        if self.project.label_count > 0 or self.project.images:
-            reply = QMessageBox.question(
-                self,
-                "New Project",
-                "Discard current project and labels?",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            if reply == QMessageBox.No:
-                return
+        # Asks only when there is unsaved work. The old prompt asked
+        # whenever the project had labels, saved or not - and said nothing
+        # about saving, only about discarding.
+        if not self._confirm_unsaved_changes("start a new project"):
+            return
 
         # Cancel any pending async operations
         self._supersede_async_loading()
@@ -2183,6 +2322,7 @@ class MainWindow(QMainWindow):
         # Clear project state
         self.project = LabelProject()
         self._project_path = None
+        self._set_saved_baseline()
 
         # Clear cycle mode state
         self._cycle_layers.clear()
@@ -2197,11 +2337,13 @@ class MainWindow(QMainWindow):
         self._refresh_hard_negative_panel()
         self._update_class_combo()
         self._reseat_open_editors()
-        self.setWindowTitle(app_title())
+        self._apply_title(app_title())
         self.statusBar.showMessage("New project created", 3000)
 
     def _open_project(self):
         """Open a project file."""
+        if not self._confirm_unsaved_changes("open another project"):
+            return
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Open Project",
@@ -2219,6 +2361,10 @@ class MainWindow(QMainWindow):
 
                 self.project = LabelProject.load(file_path)
                 self._project_path = Path(file_path)
+                # What is on disk. Anything the load goes on to change -
+                # imagery relocated beside the project, metadata backfilled
+                # into an older file - is a real change, worth saving.
+                self._set_saved_baseline()
 
                 # Show progress for loading images
                 num_images = len(self.project.images)
@@ -2231,7 +2377,7 @@ class MainWindow(QMainWindow):
                     self._refresh_label_markers()
                     self._refresh_waypoints()
                     self._refresh_hard_negative_panel()
-                    self.setWindowTitle(
+                    self._apply_title(
                         f"{app_title()} - {self._project_path.name}")
                     self.statusBar.showMessage(
                         f"Opened project with {
@@ -2452,6 +2598,7 @@ class MainWindow(QMainWindow):
         """Restore project state from recovery file."""
         try:
             self.project = LabelProject.load(RECOVERY_FILE)
+            self._set_saved_baseline(recovered=True)
 
             # Show progress for loading images
             num_images = len(self.project.images)
@@ -2464,7 +2611,7 @@ class MainWindow(QMainWindow):
                 self._refresh_waypoints()
                 self._refresh_hard_negative_panel()
 
-            self.setWindowTitle(f"{app_title()} - Recovered Session (unsaved)")
+            self._apply_title(f"{app_title()} - Recovered Session (unsaved)")
             self.statusBar.showMessage(
                 f"Restored {self.project.label_count} labels from recovery", 5000)
 
@@ -2598,9 +2745,10 @@ class MainWindow(QMainWindow):
     def _do_save(self, path: Path):
         """Perform the actual save operation."""
         try:
-            self.project.save(path)
+            data = self.project.save(path)
             self._project_path = path
-            self.setWindowTitle(f"{app_title()} - {path.name}")
+            self._set_saved_baseline(data=data)
+            self._apply_title(f"{app_title()} - {path.name}")
             self.statusBar.showMessage(
                 f"Saved {
                     self.project.label_count} labels to {
@@ -3400,6 +3548,7 @@ class MainWindow(QMainWindow):
                 self.project.add_image(
                     file_path, name, "", width, height,
                     affine=affine, crs=crs)
+                self._mark_unsaved()
 
         # A re-added image whose path is flagged in the project should show
         # up in the mirror section straight away.
@@ -3549,6 +3698,7 @@ class MainWindow(QMainWindow):
                 self.project.add_image(
                     file_path_str, name, group_path_str, width, height,
                     affine=affine, crs=crs)
+                self._mark_unsaved()
                 loaded_count += 1
 
         progress.setValue(len(image_files))
@@ -3885,6 +4035,7 @@ class MainWindow(QMainWindow):
                         self.project.add_image(
                             file_path, name, group_path, width, height,
                             affine=affine, crs=crs)
+                        self._mark_unsaved()
                     else:
                         # Project mode reached the worker because this
                         # entry's stored metadata was incomplete (an older
@@ -3984,9 +4135,9 @@ class MainWindow(QMainWindow):
 
         # Update window title (handle recovery case where _project_path is None)
         if self._project_path:
-            self.setWindowTitle(f"{app_title()} - {self._project_path.name}")
+            self._apply_title(f"{app_title()} - {self._project_path.name}")
         else:
-            self.setWindowTitle(f"{app_title()} - Recovered Session (unsaved)")
+            self._apply_title(f"{app_title()} - Recovered Session (unsaved)")
 
         # Build status message
         msg = f"Opened project with {self.project.label_count} labels"
@@ -4043,6 +4194,7 @@ class MainWindow(QMainWindow):
             if self.project.relocate_image(
                     old_path, os.path.abspath(res.new_path)):
                 applied += 1
+                self._mark_unsaved()
             else:
                 refused += 1
         if not applied and not refused:
@@ -4108,6 +4260,7 @@ class MainWindow(QMainWindow):
         location = location.strip()
         for img in images:
             img.location = location
+        self._mark_unsaved()
         self.statusBar.showMessage(
             (f'Tagged {len(images)} image(s) in "{group_path}" as '
              f'"{location}"' if location else
@@ -4348,6 +4501,7 @@ class MainWindow(QMainWindow):
                 file_path, name, group, width, height, affine=affine,
                 crs=crs)
         img.hard_negative_source = not img.hard_negative_source
+        self._mark_unsaved()
         self._refresh_hard_negative_panel()
         self.statusBar.showMessage(
             f"'{img.name}' "
@@ -4386,6 +4540,7 @@ class MainWindow(QMainWindow):
         file_path = self.canvas.get_layer_file_path(layer_id)
         if file_path:
             self.project.update_image_group(file_path, group_path)
+            self._mark_unsaved()
 
     def _show_shortcuts(self):
         """Show the keyboard shortcut reference."""
@@ -4445,6 +4600,19 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close - ensure async loaders are properly cleaned up."""
+        # First, before anything is torn down: closing with unsaved work
+        # used to discard it without a word. Recovery is only offered after
+        # a crash, and _clean_exit below removes the crash marker.
+        if not self._confirm_unsaved_changes("close"):
+            event.ignore()
+            return
+        # The editors are windows of their own and would otherwise outlive
+        # this one, editing a project nobody can save.
+        for editor in (getattr(self, "_mask_editor", None),
+                       getattr(self, "_orientation_editor", None)):
+            if editor is not None:
+                editor.close()
+
         # Clean up crash detection and recovery
         self._clean_exit()
 
