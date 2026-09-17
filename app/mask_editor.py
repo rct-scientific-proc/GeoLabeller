@@ -45,6 +45,7 @@ DEFAULT_BRUSH_PX = 12       # brush diameter in SOURCE pixels
 # Where the editor remembers how the user last dragged its panes.
 _SETTINGS = ("GeoLabeller", "GeoLabeller")
 _SPLITTER_KEY = "mask_editor/splitter"
+_OVERLAP_KEY = "mask_editor/allow_overlap"
 MIN_ZOOM = 0.25             # far enough out to survey a huge snippet
 MAX_ZOOM = 32.0             # far enough in for single-pixel brushwork
 
@@ -106,6 +107,13 @@ class MaskPaintCanvas(QWidget):
         self._last_pos: "QPoint | None" = None
         self._stroke_value = True
         self._painting = False
+        # Whether a stroke may paint over pixels another mask owns. Off by
+        # default, by request: masks are normally exclusive regions. The
+        # wall is the union of the OTHER layers, built on the first stamp
+        # of a stroke and dropped at its end - a drag is hundreds of
+        # stamps, and the other layers cannot change mid-stroke.
+        self._allow_overlap = False
+        self._blocked: "np.ndarray | None" = None
         self._w = self._h = MASK_SNIPPET_SIZE
         self._scale = float(display_scale(MASK_SNIPPET_SIZE))
         self._pan_last = None       # global pos while drag-panning
@@ -140,13 +148,42 @@ class MaskPaintCanvas(QWidget):
         self._layers = layers
         self._order = order
         self._active = active
+        self._blocked = None
         self._overlay_cache.clear()
         self.update()
 
     def set_active(self, name: "str | None"):
         self._active = name
+        self._blocked = None
         self._overlay_cache.clear()
         self.update()
+
+    def allow_overlap(self) -> bool:
+        return self._allow_overlap
+
+    def set_allow_overlap(self, allow: bool):
+        self._allow_overlap = bool(allow)
+        self._blocked = None
+
+    def end_stroke(self):
+        """A stroke is over: the next one rebuilds its wall from scratch."""
+        self._blocked = None
+
+    def _wall(self) -> "np.ndarray | None":
+        """Pixels this stroke may not paint: every other mask's, when
+        overlap is off. None when there is nothing to stop."""
+        if self._allow_overlap or self._active is None:
+            return None
+        if self._blocked is None:
+            others = [layer for name, layer in self._layers.items()
+                      if name != self._active and layer is not None]
+            if not others:
+                return None
+            wall = np.zeros((self._h, self._w), dtype=bool)
+            for layer in others:
+                wall |= layer
+            self._blocked = wall
+        return self._blocked
 
     def set_read_only(self, read_only: bool):
         """Show the masks but accept no strokes."""
@@ -323,6 +360,12 @@ class MaskPaintCanvas(QWidget):
             return
         yy, xx = np.ogrid[y_lo:y_hi, x_lo:x_hi]
         disc = (xx - cx) ** 2 + (yy - cy) ** 2 <= r * r
+        if self._stroke_value:
+            # Erasing is never blocked: it only ever removes from this
+            # mask, so it cannot create an overlap.
+            wall = self._wall()
+            if wall is not None:
+                disc = disc & ~wall[y_lo:y_hi, x_lo:x_hi]
         layer[y_lo:y_hi, x_lo:x_hi][disc] = self._stroke_value
 
     def _stroke_to(self, pos):
@@ -395,6 +438,7 @@ class MaskPaintCanvas(QWidget):
                                                  Qt.RightButton):
             self._painting = False
             self._last_pos = None
+            self.end_stroke()
             self.stroke_finished.emit()
 
 
@@ -622,7 +666,27 @@ class MaskEditor(QWidget):
             "inside in one click. Refused when the outline has a gap\n"
             "(nothing is actually enclosed).")
         self.fill_button.clicked.connect(self._on_fill_enclosed)
-        side.addWidget(self.fill_button)
+        tools = QHBoxLayout()
+        tools.addWidget(self.fill_button)
+
+        # Whether masks may share pixels. Off by default, by request:
+        # a hull and its shadow are exclusive regions, and with it off
+        # the other masks are walls - a stroke stops at them, and Fill
+        # Enclosed treats them as edges, so a shadow drawn up to the
+        # hull is closed by the hull. Remembered per user, not stored in
+        # the project: it is a way of working, not data.
+        self.overlap_button = QPushButton("Allow Overlap")
+        self.overlap_button.setCheckable(True)
+        self.overlap_button.setChecked(self._remembered_overlap())
+        self.overlap_button.setToolTip(
+            "On: masks may be painted over each other.\n"
+            "Off: a stroke stops at other masks' pixels, and Fill\n"
+            "Enclosed treats them as edges - draw the shadow up to the\n"
+            "hull and the hull closes it.")
+        self.overlap_button.toggled.connect(self.canvas.set_allow_overlap)
+        self.canvas.set_allow_overlap(self.overlap_button.isChecked())
+        tools.addWidget(self.overlap_button)
+        side.addLayout(tools)
         side.addWidget(QLabel("Object vs background (raw values):"))
         self.stats_label = QLabel("-")
         self.stats_label.setWordWrap(True)
@@ -655,6 +719,18 @@ class MaskEditor(QWidget):
         QShortcut(QKeySequence.Save, self,
                   activated=self.save_requested.emit)
 
+    @staticmethod
+    def _remembered_overlap() -> bool:
+        """Last session's Allow Overlap; off when never set."""
+        value = QSettings(*_SETTINGS).value(_OVERLAP_KEY)
+        if isinstance(value, bool):
+            return value
+        # QSettings hands back a string on some backends.
+        return str(value).strip().lower() in ("true", "1")
+
+    def allow_overlap(self) -> bool:
+        return self.overlap_button.isChecked()
+
     def _restore_splitter(self):
         """Reopen at the widths this user last dragged them to."""
         saved = QSettings(*_SETTINGS).value(_SPLITTER_KEY)
@@ -670,8 +746,9 @@ class MaskEditor(QWidget):
     def closeEvent(self, event):
         """Remember the pane widths on the way out."""
         try:
-            QSettings(*_SETTINGS).setValue(
-                _SPLITTER_KEY, self.body_splitter.saveState())
+            settings = QSettings(*_SETTINGS)
+            settings.setValue(_SPLITTER_KEY, self.body_splitter.saveState())
+            settings.setValue(_OVERLAP_KEY, self.allow_overlap())
         except Exception as exc:                  # noqa: BLE001
             debug(f"mask editor splitter not saved: "
                   f"{type(exc).__name__}: {exc}")
@@ -1156,7 +1233,17 @@ class MaskEditor(QWidget):
         name = self._active_name()
         if name is None or name not in self._layers:
             return
-        filled, added = fill_enclosed(self._layers[name])
+        barrier = None
+        if not self.allow_overlap():
+            # The other masks are walls: the shadow drawn up to the hull
+            # is closed by the hull's edge, and the fill stops there.
+            others = [layer for other, layer in self._layers.items()
+                      if other != name and layer is not None]
+            if others:
+                barrier = np.zeros_like(self._layers[name])
+                for layer in others:
+                    barrier |= layer
+        filled, added = fill_enclosed(self._layers[name], barrier=barrier)
         if added == 0:
             QMessageBox.information(
                 self, "Nothing enclosed",

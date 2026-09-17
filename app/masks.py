@@ -299,7 +299,24 @@ def entry_in_window(entry: dict, x0: int, y0: int,
     return out
 
 
-def fill_enclosed(mask: np.ndarray) -> "tuple[np.ndarray, int]":
+def _flood(seed: np.ndarray, ground: np.ndarray) -> np.ndarray:
+    """Grow ``seed`` 4-connected through ``ground`` until it stops."""
+    region = seed & ground
+    while True:
+        grown = region.copy()
+        grown[1:, :] |= region[:-1, :]
+        grown[:-1, :] |= region[1:, :]
+        grown[:, 1:] |= region[:, :-1]
+        grown[:, :-1] |= region[:, 1:]
+        grown &= ground
+        if np.array_equal(grown, region):
+            return region
+        region = grown
+
+
+def fill_enclosed(mask: np.ndarray,
+                  barrier: "np.ndarray | None" = None
+                  ) -> "tuple[np.ndarray, int]":
     """Fill every region the mask fully encloses; returns (filled, added).
 
     The complement is flooded inward from the window border; whatever open
@@ -309,28 +326,38 @@ def fill_enclosed(mask: np.ndarray) -> "tuple[np.ndarray, int]":
     unchanged, which is exactly the "refuse to fill an unclosed hull"
     behaviour the editor wants.
 
+    ``barrier`` is other masks' pixels acting as walls (the editor passes
+    them when overlap is not allowed): the flood cannot cross them, so a
+    shadow drawn up to the hull is closed by the hull's edge, and the
+    fill never writes into them - the hull keeps its pixels. With walls in
+    play a hole is filled only if it touches THIS mask: a hull drawn as an
+    outline and never filled has an interior just as enclosed by the
+    combined walls, and that interior is the hull's, not the shadow's.
+    With no barrier every enclosed hole touches the mask by definition,
+    so the rule changes nothing.
+
     The flood is 4-connected, which makes the OUTLINE effectively
     8-connected: a hand-drawn one-pixel stroke whose pixels only touch
     diagonally still counts as closed.
     """
     mask = np.asarray(mask, dtype=bool)
-    open_ground = ~mask
-    outside = np.zeros_like(mask)
-    outside[0, :] = open_ground[0, :]
-    outside[-1, :] = open_ground[-1, :]
-    outside[:, 0] |= open_ground[:, 0]
-    outside[:, -1] |= open_ground[:, -1]
-    while True:
-        grown = outside.copy()
-        grown[1:, :] |= outside[:-1, :]
-        grown[:-1, :] |= outside[1:, :]
-        grown[:, 1:] |= outside[:, :-1]
-        grown[:, :-1] |= outside[:, 1:]
-        grown &= open_ground
-        if np.array_equal(grown, outside):
-            break
-        outside = grown
+    solid = mask
+    if barrier is not None:
+        solid = mask | np.asarray(barrier, dtype=bool)
+    open_ground = ~solid
+    edge = np.zeros_like(mask)
+    edge[0, :] = edge[-1, :] = True
+    edge[:, 0] = edge[:, -1] = True
+    outside = _flood(edge, open_ground)
     holes = open_ground & ~outside
+    if barrier is not None and holes.any():
+        # Keep only the holes that border this mask's own pixels.
+        touching = np.zeros_like(mask)
+        touching[1:, :] |= mask[:-1, :]
+        touching[:-1, :] |= mask[1:, :]
+        touching[:, 1:] |= mask[:, :-1]
+        touching[:, :-1] |= mask[:, 1:]
+        holes = _flood(touching & holes, holes)
     added = int(holes.sum())
     if added == 0:
         return mask, 0
