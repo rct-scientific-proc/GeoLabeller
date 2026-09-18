@@ -2105,6 +2105,7 @@ class MainWindow(QMainWindow):
             editor = self._snippet_editor = SnippetEditor()
             editor.masks_changed.connect(self._on_masks_changed)
             editor.orientation_changed.connect(self._on_orientation_changed)
+            editor.confidence_changed.connect(self._on_confidence_changed)
             editor.mask_names_changed.connect(self._on_mask_names_changed)
             editor.save_requested.connect(self._save_project)
         self._snippet_editor.set_mask_names(self._mask_name_presets())

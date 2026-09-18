@@ -72,9 +72,11 @@ class SnippetStrip(QObject):
     # masks" is legible without hiding anything to find it out.
     FILTER_ALL, FILTER_NEEDS, FILTER_DONE = 0, 1, 2
 
-    def __init__(self, worklist: Worklist, parent=None):
+    def __init__(self, worklist: "Worklist | None", parent=None):
+        """``worklist`` may be None: a host with several gives them all
+        at once through set_worklists."""
         super().__init__(parent)
-        self._worklists = [worklist]
+        self._worklists = [] if worklist is None else [worklist]
         self.entries: list = []
         self.items_by_label: dict = {}          # label_id -> list item
         self.entries_by_label: dict = {}        # label_id -> entry
@@ -91,7 +93,9 @@ class SnippetStrip(QObject):
         # the editor to work through, and its count falling is how they
         # see the work being done.
         self.filter_combo = QComboBox()
-        self.filter_combo.addItems(["", "", ""])      # text set with counts
+        # One entry for All, then a needs/done pair per worklist; the text
+        # is set with the counts.
+        self.filter_combo.addItems([""] * (1 + 2 * len(self._worklists)))
         self.filter_combo.setCurrentIndex(self.FILTER_ALL)
         self.filter_combo.setToolTip(
             "Which snippets the strip lists. A snippet you have just\n"

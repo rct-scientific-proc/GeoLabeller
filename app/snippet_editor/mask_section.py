@@ -40,8 +40,9 @@ from ..masks import (entry_in_window, fill_enclosed, mask_statistics,
                      merged_entry)
 from ..snippets import (read_label_snippet, read_label_window_raw,
                         snippet_frame)
+from .section import Section
 from .single_view import (DEFAULT_BRUSH_PX, MASK_COLORS,
-                          MASK_SNIPPET_SIZE, MaskPaintCanvas,
+                          MASK_SNIPPET_SIZE, TOOL_PAINT, MaskPaintCanvas,
                           apply_display_adjust)
 from .strip import SnippetStrip, Worklist
 
@@ -828,3 +829,33 @@ class MaskEditor(QWidget):
             lines.append(f"B{band}: obj {om:.1f}\N{PLUS-MINUS SIGN}{os_:.1f}"
                          f"  bg {bm:.1f}\N{PLUS-MINUS SIGN}{bs:.1f}")
         self.stats_label.setText("\n".join(lines))
+
+
+class MaskSection(Section):
+    """The Snippet Editor's Masks section (see section.py).
+
+    Its panel is the mask editor's own - list, name, add, delete, fill,
+    overlap, statistics - and it owns the Paint tool. Switched off, the
+    canvas shows no layers and takes no strokes. In the Grid view it waits:
+    masks are painted on the snippet in hand, which the grid does not show.
+    """
+
+    key = "masks"
+    title = "Masks"
+    tool = (TOOL_PAINT, "Paint masks",
+            "Left-drag paints the active mask, right-drag erases.")
+
+    def __init__(self, editor: MaskEditor, parent=None):
+        super().__init__(MASK_WORKLIST, editor.mask_panel, parent)
+        self._editor = editor
+        editor.masks_changed.connect(
+            lambda label_id, _masks: self.entry_changed.emit(label_id))
+
+    def set_shown(self, shown):
+        super().set_shown(shown)
+        self._editor.canvas.set_layers_shown(shown)
+
+    def view_changed(self, single):
+        self.panel.setEnabled(single)
+        return ("" if single else "Masks are painted in the Single view - "
+                                  "double-click a snippet to open it there.")

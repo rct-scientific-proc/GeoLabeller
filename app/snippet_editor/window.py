@@ -3,26 +3,27 @@
 Holds the pieces of this package around ONE snippet list and ONE Show
 filter:
 
-  * Single view - one snippet at a time, zoomable: the mask section
-    (mask_section.MaskEditor, hosted), with two tools - Paint masks, and
-    Orient, which draws the orientation on the enlarged snippet and shows
-    it as an arrow;
-  * Grid view - a page of snippets at once: the orientation section's grid
-    (orientation_section.OrientationEditor, hosted), laying out exactly
-    what the list shows, in the list's order. Double-click a snippet there
-    to open it in the Single view.
+  * Single view - one snippet at a time, zoomable (the mask editor,
+    hosted), with the tools the sections own: Orient and Paint masks;
+  * Grid view - a page of snippets at once (the orientation grid, hosted),
+    laying out exactly what the list shows, in the list's order.
+    Double-click a snippet there to open it in the Single view.
 
 On the right, a column of SECTIONS - one per thing recorded about a
-snippet, Orientation and Masks now, more to come - each under a header
-that switches it on and off. Switching one off takes all of it away: its
-panel, its pair on the Show filter ("Needs orientation", "Needs masks",
-...), its overlay on the snippets and its tool. The save bar at the
-bottom says where the work stands, as the mask editor's did.
+snippet - each under a header that switches it on and off. Switching one
+off takes all of it away: its panel, its pair on the Show filter, its
+overlay on the snippets, its tool and its keys. The save bar at the bottom
+says where the work stands.
 
-The window talks to the rest of the app in the same terms the two editors
-did - set_labels / set_mask_names / set_save_state in, masks_changed /
-orientation_changed / mask_names_changed / save_requested out - so the
-main window can hold it exactly as it held them.
+The window names its sections only where it builds them and where their
+values leave for the main window; everything else loops over them
+(section.py has the interface). The next value the ML team asks for is a
+new module, one line in that list, and its outward signal.
+
+It talks to the rest of the app in the same terms the old editors did -
+set_labels / set_mask_names / set_save_state in; masks_changed /
+orientation_changed / confidence_changed / mask_names_changed /
+save_requested out.
 """
 from PyQt5.QtCore import QEvent, QSettings, Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QKeySequence
@@ -31,17 +32,18 @@ from PyQt5.QtWidgets import (QButtonGroup, QCheckBox, QHBoxLayout, QLabel,
                              QStackedWidget, QVBoxLayout, QWidget)
 
 from ..debug_log import debug
-from .mask_section import MASK_WORKLIST, MaskEditor
-from .orientation_section import (DERIVED_COLOR, MANUAL_COLOR,
-                                  ORIENTATION_WORKLIST, OrientationEditor,
-                                  OrientationPanel)
+from .confidence_section import ConfidenceSection
+from .mask_section import MaskEditor, MaskSection
+from .orientation_section import OrientationEditor, OrientationSection
 from .single_view import TOOL_ORIENT, TOOL_PAINT
 from .strip import SnippetStrip
 
 _SETTINGS = ("GeoLabeller", "GeoLabeller")
 _VIEW_KEY = "snippet_editor/view"
 _SPLITTER_KEY = "snippet_editor/splitter"
-_SECTIONS_KEY = "snippet_editor/sections"     # the sections switched ON
+# The sections switched OFF - so a section added in a later release starts
+# on for someone whose settings predate it.
+_SECTIONS_OFF_KEY = "snippet_editor/sections_off"
 _TOOL_KEY = "snippet_editor/tool"
 
 
@@ -94,10 +96,10 @@ class SectionFrame(QWidget):
 class SnippetEditor(QWidget):
     """One window for everything recorded per snippet."""
 
-    # The same traffic the two editors carried, so the main window can
-    # hold this exactly as it held them.
+    # Out to the main window.
     masks_changed = pyqtSignal(int, list)
     orientation_changed = pyqtSignal(int, object, object, bool)
+    confidence_changed = pyqtSignal(int, int)
     mask_names_changed = pyqtSignal(list)
     save_requested = pyqtSignal()
 
@@ -106,11 +108,20 @@ class SnippetEditor(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent, Qt.Window)
         self.setWindowTitle("Snippet Editor")
-        self.strip = SnippetStrip(ORIENTATION_WORKLIST, self)
-        self.strip.set_worklists([ORIENTATION_WORKLIST, MASK_WORKLIST])
+        # The two views, around one list - which starts with no worklist;
+        # the sections supply theirs once they exist.
+        self.strip = SnippetStrip(None, self)
         self.masks = MaskEditor(self, window=False, strip=self.strip)
         self.grid = OrientationEditor(self, window=False, strip=self.strip)
-        self.orientation_panel = OrientationPanel(self.grid.propagate_check)
+        # The sections, in the order they are offered - in the column, on
+        # the Show filter, and for tools on the Single view. The only place
+        # the window names them.
+        sections = (OrientationSection(self.grid, self.masks, self),
+                    MaskSection(self.masks, self),
+                    ConfidenceSection(self))
+        self.section_objects = {section.key: section for section in sections}
+        self.orientation_panel = self.section_objects["orientation"].panel
+        self.strip.set_worklists([section.worklist for section in sections])
         self._setup_ui()
         self._wire()
         self._restore_settings()
@@ -129,8 +140,8 @@ class SnippetEditor(QWidget):
         toolbar.addWidget(QLabel("View:"))
         self.single_button = QPushButton("Single")
         self.single_button.setToolTip(
-            "One snippet at a time, zoomable - for painting masks.\n"
-            "Space / Ctrl+Space step through the list.")
+            "One snippet at a time, zoomable - for masks, orientation and\n"
+            "rating. Space / Ctrl+Space step through the list.")
         self.grid_button = QPushButton("Grid")
         self.grid_button.setToolTip(
             "A page of snippets at once - for orienting them quickly.\n"
@@ -141,31 +152,30 @@ class SnippetEditor(QWidget):
             button.setCheckable(True)
             self._view_buttons.addButton(button, index)
             toolbar.addWidget(button)
-
         layout.addLayout(toolbar)
 
-        # The Single view's tools, at the front of that view's own row
-        # (beside Snippet and Brush) - not on the toolbar above, which
-        # they pushed past a 1366-pixel screen. Placed by the window, so
-        # the mask panel still knows nothing of orientation. Each tool
-        # belongs to a section and goes when that section is switched off.
+        # The Single view's tools, one per section that owns one, at the
+        # front of that view's own row (beside Snippet and Brush) - the
+        # toolbar above has no room for them on a 1366-pixel screen.
         tool_row = self.masks.tool_row
         tool_row.insertWidget(0, QLabel("Tool:"))
-        self.paint_button = QPushButton("Paint masks")
-        self.paint_button.setToolTip(
-            "Left-drag paints the active mask, right-drag erases.")
-        self.orient_button = QPushButton("Orient")
-        self.orient_button.setToolTip(
-            "Drag from the object's tail to its nose to set its\n"
-            "orientation; right-click clears it.")
         self._tool_buttons = QButtonGroup(self)
-        self._tools = {TOOL_PAINT: self.paint_button,
-                       TOOL_ORIENT: self.orient_button}
-        for position, button in enumerate(self._tools.values(), start=1):
+        self._tools = {}                 # tool id -> button
+        self._tool_owner = {}            # tool id -> section key
+        for section in self.section_objects.values():
+            if section.tool is None:
+                continue
+            tool_id, text, tip = section.tool
+            button = QPushButton(text)
+            button.setToolTip(tip)
             button.setCheckable(True)
             self._tool_buttons.addButton(button)
-            tool_row.insertWidget(position, button)
+            tool_row.insertWidget(len(self._tools) + 1, button)
+            self._tools[tool_id] = button
+            self._tool_owner[tool_id] = section.key
         tool_row.insertSpacing(len(self._tools) + 1, 16)
+        self.paint_button = self._tools.get(TOOL_PAINT)
+        self.orient_button = self._tools.get(TOOL_ORIENT)
 
         # The list, then whichever view is showing. The Grid view is a list
         # of its own, so it takes the list's pane when it is up.
@@ -176,15 +186,9 @@ class SnippetEditor(QWidget):
         self.views.addWidget(self.grid)           # GRID
         self.body_splitter.addWidget(self.views)
 
-        # The sections, in the order they are offered. Each is a key, the
-        # frame showing it, and what it gives the Show filter.
-        self.sections = {
-            "orientation": SectionFrame("Orientation",
-                                        self.orientation_panel),
-            "masks": SectionFrame("Masks", self.masks.mask_panel),
-        }
-        self._worklists = {"orientation": ORIENTATION_WORKLIST,
-                           "masks": MASK_WORKLIST}
+        # The column of sections.
+        self.sections = {key: SectionFrame(section.title, section.panel)
+                         for key, section in self.section_objects.items()}
         column = QWidget()
         column_box = QVBoxLayout(column)
         for frame in self.sections.values():
@@ -210,8 +214,8 @@ class SnippetEditor(QWidget):
         footer.addWidget(self.save_status, 1)
         self.save_button = QPushButton("Save Project")
         self.save_button.setToolTip(
-            "Write the project - orientations and masks included - to its "
-            "file (Ctrl+S).")
+            "Write the project - everything recorded here included - to "
+            "its file (Ctrl+S).")
         footer.addWidget(self.save_button)
         layout.addLayout(footer)
         # The one Ctrl+S in this window - the hosted mask panel does not
@@ -222,21 +226,22 @@ class SnippetEditor(QWidget):
     def _wire(self):
         self._view_buttons.idClicked.connect(self.set_view)
         self.save_button.clicked.connect(self.save_requested.emit)
+        for tool_id, button in self._tools.items():
+            button.clicked.connect(
+                lambda _checked=False, t=tool_id: self.set_tool(t))
+        # Out to the main window.
         self.masks.masks_changed.connect(self.masks_changed)
         self.masks.mask_names_changed.connect(self.mask_names_changed)
-        self.grid.orientation_changed.connect(self._on_orientation_changed)
+        self.grid.orientation_changed.connect(self.orientation_changed)
+        self.section_objects["confidence"].confidence_changed.connect(
+            self.confidence_changed)
+        # Between the sections.
         self.grid.open_requested.connect(self._open_in_single_view)
-        self.strip.entry_picked.connect(self.orientation_panel.show_entry)
-        self.orientation_panel.clear_requested.connect(self.grid._on_clear)
-        self.paint_button.clicked.connect(lambda: self.set_tool(TOOL_PAINT))
-        self.orient_button.clicked.connect(
-            lambda: self.set_tool(TOOL_ORIENT))
-        canvas = self.masks.canvas
-        canvas.vector_drawn.connect(self._on_canvas_line)
-        canvas.orientation_clear_requested.connect(self._on_canvas_clear)
-        # After the mask panel has put a snippet on the canvas - and knows
-        # its frame - so the arrow lands on the right pixel.
-        self.masks.snippet_shown.connect(self._update_arrow)
+        # After the Single view has put a snippet on its canvas - and knows
+        # its crop - so a section drawing there lands on the right pixel.
+        self.masks.snippet_shown.connect(self._show_entry)
+        for section in self.section_objects.values():
+            section.entry_changed.connect(self._on_entry_changed)
         for frame in self.sections.values():
             frame.toggled.connect(self._apply_sections)
         # Space steps the list wherever the keyboard is in the window.
@@ -245,7 +250,7 @@ class SnippetEditor(QWidget):
     # -- data in ------------------------------------------------------------
 
     def set_labels(self, entries: list):
-        """Every label as the entry dicts the two editors took."""
+        """Every label, as the entry dicts the main window builds."""
         self.strip.set_labels(entries)
 
     def set_mask_names(self, names: list):
@@ -271,12 +276,13 @@ class SnippetEditor(QWidget):
         self._view_buttons.button(view).setChecked(True)
         single = view == self.SINGLE
         self.strip.panel.setVisible(single)
-        # Masks are painted in the Single view. In the Grid the panel's
-        # buttons would act on a snippet that is not on screen, so it waits.
-        self.masks.mask_panel.setEnabled(single)
-        self.sections["masks"].set_note(
-            "" if single else "Masks are painted in the Single view - "
-                              "double-click a snippet to open it there.")
+        for key, section in self.section_objects.items():
+            self.sections[key].set_note(section.view_changed(single))
+
+    def _open_in_single_view(self, label_id: int):
+        """A grid cell was double-clicked: look at it closer."""
+        if self.strip.select(label_id):
+            self.set_view(self.SINGLE)
 
     # -- sections -----------------------------------------------------------
 
@@ -286,17 +292,30 @@ class SnippetEditor(QWidget):
     def _apply_sections(self, *_args):
         """Give each section all of itself, or none of it."""
         on = self.sections_on()
-        self.strip.set_worklists([self._worklists[key] for key in on])
-        self.grid.set_orientation_shown("orientation" in on)
-        self.masks.canvas.set_layers_shown("masks" in on)
-        # Each tool goes with its section; if the one in hand went, take
-        # up the other.
-        self.paint_button.setEnabled("masks" in on)
-        self.orient_button.setEnabled("orientation" in on)
+        self.strip.set_worklists([self.section_objects[key].worklist
+                                  for key in on])
+        for key, section in self.section_objects.items():
+            section.set_shown(key in on)
+        # Each tool goes with its section; if the one in hand went, take up
+        # the first that is left.
+        for tool_id, button in self._tools.items():
+            button.setEnabled(self._tool_owner[tool_id] in on)
         if not self._tools[self.tool()].isEnabled():
-            self.set_tool(TOOL_ORIENT if self.tool() == TOOL_PAINT
-                          else TOOL_PAINT)
-        self._update_arrow()
+            for tool_id, button in self._tools.items():
+                if button.isEnabled():
+                    self.set_tool(tool_id)
+                    break
+
+    def _show_entry(self, entry):
+        for section in self.section_objects.values():
+            section.show_entry(entry)
+
+    def _on_entry_changed(self, label_id: int):
+        """A section edited a label: recount the list, let every section
+        redisplay it."""
+        self.strip.refresh(label_id)
+        for section in self.section_objects.values():
+            section.refresh(label_id)
 
     # -- tools --------------------------------------------------------------
 
@@ -304,67 +323,21 @@ class SnippetEditor(QWidget):
         return self.masks.canvas.tool()
 
     def set_tool(self, tool: str):
-        """TOOL_PAINT or TOOL_ORIENT, for the Single view's canvas."""
+        """A tool id from a section's ``tool``, for the Single view."""
         self.masks.canvas.set_tool(tool)
         self._tools[tool].setChecked(True)
-
-    def _on_canvas_line(self, sx, sy, ex, ey):
-        """An orientation drawn on the Single view, in snippet pixels:
-        add the view's own crop origin and commit it exactly as a grid
-        drawing would be."""
-        entry = self.masks._current
-        if entry is None:
-            return
-        x0, y0, _w, _h = self.masks._frame
-        self.grid.orient_from_source_line(entry["label_id"], x0 + sx,
-                                          y0 + sy, x0 + ex, y0 + ey)
-
-    def _on_canvas_clear(self):
-        entry = self.masks._current
-        if entry is not None:
-            self.grid._on_clear(entry["label_id"])
-
-    def _update_arrow(self, *_args):
-        """Show the Single view's snippet's orientation - through the
-        label's own pixel, which a clamped crop moves off centre."""
-        canvas = self.masks.canvas
-        entry = self.masks._current
-        rad = None if entry is None else entry.get("orientation_px_rad")
-        if rad is None or not self.sections["orientation"].is_on():
-            canvas.set_arrow(None, MANUAL_COLOR, None)
-            return
-        x0, y0, _w, _h = self.masks._frame
-        colour = (DERIVED_COLOR if entry.get("orientation_derived")
-                  else MANUAL_COLOR)
-        canvas.set_arrow(rad, colour, (entry["pixel_x"] - x0,
-                                       entry["pixel_y"] - y0))
-
-    def _open_in_single_view(self, label_id: int):
-        """A grid cell was double-clicked: look at it closer."""
-        if self.strip.select(label_id):
-            self.set_view(self.SINGLE)
-
-    # -- traffic ------------------------------------------------------------
-
-    def _on_orientation_changed(self, label_id, rad, deg, derived):
-        # The grid edited the strip's own entry dict; recount and
-        # recaption it, then pass the change on.
-        self.strip.refresh(label_id)
-        current = self.strip.current_entry()
-        if current is not None and current["label_id"] == label_id:
-            self.orientation_panel.show_entry(current)
-        shown = self.masks._current
-        if shown is not None and shown["label_id"] == label_id:
-            self._update_arrow()
-        self.orientation_changed.emit(label_id, rad, deg, derived)
 
     # -- keys ---------------------------------------------------------------
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Space and self.view() == self.SINGLE:
-            self.strip.cycle(
-                -1 if event.modifiers() & Qt.ControlModifier else 1)
-            return
+        if self.view() == self.SINGLE:
+            if event.key() == Qt.Key_Space:
+                self.strip.cycle(
+                    -1 if event.modifiers() & Qt.ControlModifier else 1)
+                return
+            for key in self.sections_on():
+                if self.section_objects[key].key_pressed(event.key()):
+                    return
         super().keyPressEvent(event)
 
     def eventFilter(self, obj, event):
@@ -397,26 +370,26 @@ class SnippetEditor(QWidget):
             # Wide enough for "vessel . survey_04_r006_c112.tif" beside its
             # thumbnail; the old 210 cut captions off mid-name.
             self.body_splitter.setSizes([260, 780, 260])
-        stored = settings.value(_SECTIONS_KEY)
-        if stored is not None:
-            wanted = [key for key in str(stored).split(",") if key]
-            for key, frame in self.sections.items():
-                frame.header.blockSignals(True)
-                frame.set_on(key in wanted)
-                frame.header.blockSignals(False)
-                frame.content.setVisible(frame.is_on())
+        off = {key for key in str(settings.value(_SECTIONS_OFF_KEY, ""))
+               .split(",") if key}
+        for key, frame in self.sections.items():
+            frame.header.blockSignals(True)
+            frame.set_on(key not in off)
+            frame.header.blockSignals(False)
+            frame.content.setVisible(frame.is_on())
         tool = settings.value(_TOOL_KEY, TOOL_PAINT)
         self.set_tool(tool if tool in self._tools else TOOL_PAINT)
         self._apply_sections()
 
     def save_settings(self):
-        """The view and pane widths - this window's and the mask panel's,
-        which gets no close event of its own while hosted."""
+        """The view, panes, sections and tool - and the mask panel's, which
+        gets no close event of its own while hosted."""
         try:
             settings = QSettings(*_SETTINGS)
             settings.setValue(_VIEW_KEY, self.view())
             settings.setValue(_SPLITTER_KEY, self.body_splitter.saveState())
-            settings.setValue(_SECTIONS_KEY, ",".join(self.sections_on()))
+            settings.setValue(_SECTIONS_OFF_KEY, ",".join(
+                key for key in self.sections if key not in self.sections_on()))
             settings.setValue(_TOOL_KEY, self.tool())
         except Exception as exc:                  # noqa: BLE001
             debug(f"snippet editor settings not saved: "

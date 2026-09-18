@@ -33,6 +33,8 @@ from ..debug_log import debug
 from ..orientation_math import (
     pixel_angle_from_heading, principal_angle_rad, true_heading_deg)
 from ..snippets import SnippetLoader, snippet_frame
+from .section import Section
+from .single_view import TOOL_ORIENT
 from .strip import SnippetStrip, Worklist
 
 SNIPPET_SIZE = 224      # source pixels per cell, shown 1:1
@@ -626,3 +628,78 @@ class OrientationPanel(QWidget):
     def _on_clear_clicked(self):
         if self._label_id is not None:
             self.clear_requested.emit(self._label_id)
+
+
+class OrientationSection(Section):
+    """The Snippet Editor's Orientation section (see section.py).
+
+    Its panel reads out the snippet in hand. It owns the Orient tool on the
+    Single view - a line drawn there goes through the grid's
+    orient_from_source_line with the Single view's own crop origin, so it
+    commits exactly what the same line drawn on the grid would - and the
+    arrow showing the orientation there, through the label's own pixel.
+    Switched off: no arrows or drawing in the grid, no arrow on the canvas.
+    """
+
+    key = "orientation"
+    title = "Orientation"
+    tool = (TOOL_ORIENT, "Orient",
+            "Drag from the object's tail to its nose to set its\n"
+            "orientation; right-click clears it.")
+
+    def __init__(self, grid: OrientationEditor, single, parent=None):
+        """``single`` is the Single view's mask editor: its canvas, its
+        crop (_frame) and the snippet it shows."""
+        super().__init__(ORIENTATION_WORKLIST,
+                         OrientationPanel(grid.propagate_check), parent)
+        self._grid = grid
+        self._single = single
+        self._entry = None
+        self.panel.clear_requested.connect(grid._on_clear)
+        canvas = single.canvas
+        canvas.vector_drawn.connect(self._on_canvas_line)
+        canvas.orientation_clear_requested.connect(self._on_canvas_clear)
+        grid.orientation_changed.connect(
+            lambda label_id, *_rest: self.entry_changed.emit(label_id))
+
+    def show_entry(self, entry):
+        self._entry = entry
+        self.panel.show_entry(entry)
+        self._update_arrow()
+
+    def refresh(self, label_id):
+        if self._entry is not None and self._entry["label_id"] == label_id:
+            self.show_entry(self._entry)
+
+    def set_shown(self, shown):
+        super().set_shown(shown)
+        self._grid.set_orientation_shown(shown)
+        self._update_arrow()
+
+    def _on_canvas_line(self, sx, sy, ex, ey):
+        """A line drawn with the Orient tool, in snippet pixels: add the
+        Single view's own crop origin, commit it as the grid would."""
+        if self._entry is None:
+            return
+        x0, y0, _w, _h = self._single._frame
+        self._grid.orient_from_source_line(self._entry["label_id"],
+                                           x0 + sx, y0 + sy, x0 + ex, y0 + ey)
+
+    def _on_canvas_clear(self):
+        if self._entry is not None:
+            self._grid._on_clear(self._entry["label_id"])
+
+    def _update_arrow(self):
+        """The orientation on the Single view - through the label's own
+        pixel, which a clamped crop moves off the snippet's middle."""
+        canvas = self._single.canvas
+        entry = self._entry
+        rad = None if entry is None else entry.get("orientation_px_rad")
+        if rad is None or not self.shown:
+            canvas.set_arrow(None, MANUAL_COLOR, None)
+            return
+        x0, y0, _w, _h = self._single._frame
+        colour = (DERIVED_COLOR if entry.get("orientation_derived")
+                  else MANUAL_COLOR)
+        canvas.set_arrow(rad, colour, (entry["pixel_x"] - x0,
+                                       entry["pixel_y"] - y0))
