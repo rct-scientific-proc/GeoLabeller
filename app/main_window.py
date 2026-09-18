@@ -323,6 +323,15 @@ class MainWindow(QMainWindow):
         # Space was pressed on the final image. The run stays - Ctrl+Space
         # must still go back - but C (or V) now means "start again".
         self._cycle_at_end = False
+        # The image the cycle itself last switched on. A cycle shows one
+        # image at a time, and that has to hold across the join between
+        # one cycle and the next too: finishing a group now stays on its
+        # final image, so without this the next cycle - another group, or
+        # the same one again - started with the old image still showing.
+        # Kept through a detour on purpose (the detour may be FOR that
+        # image); forgotten only by being hidden. Layer ids are never
+        # reused, so a stale one can only miss, never hit another layer.
+        self._cycle_shown: str | None = None
 
         # Last "Go to Coordinates" entry, re-filled next time it opens.
         self._goto_defaults: dict = {}
@@ -1176,6 +1185,19 @@ class MainWindow(QMainWindow):
             f"{prefix}: Layer {position}/{count} - Space=next, "
             "Ctrl+Space=prev", 0)
 
+    def _cycle_show(self, layer_id: str):
+        """Show ``layer_id`` as the cycle's image, hiding the one before.
+
+        Only the image the cycle itself switched on is hidden - layers the
+        user turned on by hand are theirs to keep.
+        """
+        previous = self._cycle_shown
+        if previous is not None and previous != layer_id:
+            self.layer_panel.uncheck_layers([previous])
+        self.layer_panel.check_layers([layer_id])
+        self._cycle_shown = layer_id
+        self._cycle_zoom_to(layer_id)
+
     def _cycle_zoom_to(self, layer_id: str):
         """Zoom to a cycled layer."""
         # A measurement belongs to the image it was taken on; leaving that
@@ -1235,8 +1257,7 @@ class MainWindow(QMainWindow):
         self._cycle_index = (resumed if resumed is not None
                              else len(self._cycle_layers) - 1)
         layer_id = self._cycle_layers[self._cycle_index]
-        self.layer_panel.check_layers([layer_id])
-        self._cycle_zoom_to(layer_id)
+        self._cycle_show(layer_id)
         position, count = self._cycle_position()
         debug(f"cycle {'resume' if resumed is not None else 'start'}: group "
               f"'{group_name}' - {count} images; "
@@ -1264,8 +1285,7 @@ class MainWindow(QMainWindow):
         self._cycle_index = (resumed if resumed is not None
                              else len(self._cycle_layers) - 1)
         layer_id = self._cycle_layers[self._cycle_index]
-        self.layer_panel.check_layers([layer_id])
-        self._cycle_zoom_to(layer_id)
+        self._cycle_show(layer_id)
         position, count = self._cycle_position()
         debug(f"view cycle {'resume' if resumed is not None else 'start'}: "
               f"{count} images in view; "
@@ -1347,17 +1367,11 @@ class MainWindow(QMainWindow):
             self.canvas.setFocus()
             return
 
-        # Toggle off current layer
-        current_layer_id = self._cycle_layers[self._cycle_index]
-        self.layer_panel.uncheck_layers([current_layer_id])
-
-        # Move to previous index (going backwards through the list)
+        # Move to previous index (going backwards through the list), hiding
+        # the current image and showing the next.
         self._cycle_index -= 1
-
-        # Turn on and zoom to next layer
         next_layer_id = self._cycle_layers[self._cycle_index]
-        self.layer_panel.check_layers([next_layer_id])
-        self._cycle_zoom_to(next_layer_id)
+        self._cycle_show(next_layer_id)
         position, count = self._cycle_position()
         debug(f"cycle next: {self._layer_name(next_layer_id)} "
               f"[{position}/{count}, {count - position} remaining]")
@@ -1387,17 +1401,11 @@ class MainWindow(QMainWindow):
         # stray C is once again a stray C.
         self._cycle_at_end = False
 
-        # Toggle off current layer
-        current_layer_id = self._cycle_layers[self._cycle_index]
-        self.layer_panel.uncheck_layers([current_layer_id])
-
-        # Move to next index (going forwards through the list = backwards in cycle)
+        # Move to next index (going forwards through the list = backwards in
+        # cycle), hiding the current image and showing the previous one.
         self._cycle_index += 1
-
-        # Turn on and zoom to previous layer
         prev_layer_id = self._cycle_layers[self._cycle_index]
-        self.layer_panel.check_layers([prev_layer_id])
-        self._cycle_zoom_to(prev_layer_id)
+        self._cycle_show(prev_layer_id)
         position, count = self._cycle_position()
         debug(f"cycle prev: {self._layer_name(prev_layer_id)} "
               f"[{position}/{count}, {count - position} remaining]")
