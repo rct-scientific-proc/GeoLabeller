@@ -469,18 +469,33 @@ class OrientationEditor(QWidget):
     # -- committing ---------------------------------------------------------
 
     def _on_vector_drawn(self, label_id, sx, sy, ex, ey):
+        """A line drawn on a grid cell, in that cell's snippet pixels."""
         entry = self._entry(label_id)
         if entry is None:
             return
-        affine, crs, src_w, src_h = self._geo_info(entry["image_path"])
+        _affine, _crs, src_w, src_h = self._geo_info(entry["image_path"])
         if src_w and src_h:
             x0, y0, _w, _h = snippet_frame(
                 entry["pixel_x"], entry["pixel_y"], SNIPPET_SIZE,
                 src_w, src_h)
         else:
             x0 = y0 = 0     # unreadable file: pixel angle still valid
-        col_s, row_s = x0 + sx, y0 + sy
-        col_e, row_e = x0 + ex, y0 + ey
+        self.orient_from_source_line(label_id, x0 + sx, y0 + sy,
+                                     x0 + ex, y0 + ey)
+
+    def orient_from_source_line(self, label_id, col_s, row_s, col_e, row_e):
+        """Commit an orientation drawn tail -> nose in SOURCE pixels.
+
+        The one way in for a drawn orientation, whichever view it was
+        drawn in: a grid cell adds its crop's origin (above); the Snippet
+        Editor's Single view adds its own - its snippet size is the user's
+        to set - so the same line on the image always commits the same
+        angle, heading and propagation.
+        """
+        entry = self._entry(label_id)
+        if entry is None:
+            return
+        affine, crs, _w, _h = self._geo_info(entry["image_path"])
         rad = principal_angle_rad(col_s, row_s, col_e, row_e)
         if rad is None:
             return
@@ -489,7 +504,9 @@ class OrientationEditor(QWidget):
         entry["orientation_deg"] = deg
         # Drawing by hand always wins: even over a propagated (violet) one.
         entry["orientation_derived"] = False
-        self._cells[label_id].set_angle(rad, derived=False)
+        cell = self._cells.get(label_id)    # may be off the page in view
+        if cell is not None:
+            cell.set_angle(rad, derived=False)
         self._set_caption(entry)
         self.orientation_changed.emit(label_id, rad, deg, False)
         self._propagate_heading(entry, deg)
@@ -575,8 +592,9 @@ class OrientationPanel(QWidget):
         self.clear_button.clicked.connect(self._on_clear_clicked)
         layout.addWidget(self.clear_button)
         layout.addWidget(propagate_check)
-        hint = QLabel("Draw from the object's tail to its nose on a snippet "
-                      "in the Grid view; right-click there clears it.")
+        hint = QLabel("Draw from the object's tail to its nose - on a "
+                      "snippet in the Grid view, or with the Orient tool "
+                      "in the Single view. Right-click clears it.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: palette(mid);")
         layout.addWidget(hint)

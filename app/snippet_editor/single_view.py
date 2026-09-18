@@ -1,17 +1,22 @@
 """The single-snippet view: one snippet, zoomable, with paintable layers.
 
 Part of the Snippet Editor package (see app/snippet_editor/__init__.py).
-Today it is the mask editor's paint surface; in the Snippet Editor it is
-the Single view, where each section draws its overlay - masks as coloured
-layers now, the orientation arrow to come.
+It is the mask editor's paint surface, and the Snippet Editor's Single
+view, where each section draws its overlay: masks as coloured layers, and
+an arrow for the orientation. Two tools: Paint (left-drag paints the
+active mask, right-drag erases) and Orient (left-drag reports a line,
+right-click asks for it to be cleared) - what a line MEANS is the host's
+business; this reports it in snippet pixels.
 
 Deliberately independent of the rest of the app: it needs numpy and Qt and
 nothing else, so it can be read, tested and reused on its own.
 """
 import numpy as np
 
-from PyQt5.QtCore import QLineF, QPoint, QSize, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+import math
+
+from PyQt5.QtCore import QLineF, QPoint, QPointF, QSize, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import QScrollArea, QWidget
 
 MASK_SNIPPET_SIZE = 224     # default source pixels painted on
@@ -19,6 +24,13 @@ MAX_DISPLAY_PX = 448        # starting-view cap; the user zooms from there
 DEFAULT_BRUSH_PX = 12       # brush diameter in SOURCE pixels
 MIN_ZOOM = 0.25             # far enough out to survey a huge snippet
 MAX_ZOOM = 32.0             # far enough in for single-pixel brushwork
+
+TOOL_PAINT = "paint"        # left-drag paints, right-drag erases
+TOOL_ORIENT = "orient"      # left-drag reports a line, right-click clears
+# Shorter than this on screen is a click, not a direction - the same
+# threshold the orientation grid uses, where screen and source are 1:1.
+MIN_LINE_PX = 6
+LINE_PREVIEW_COLOR = QColor(0, 220, 255)
 
 
 def display_scale(size_px: int) -> int:
@@ -66,6 +78,11 @@ class MaskPaintCanvas(QWidget):
     """The snippet, upscaled for painting, with paintable mask overlays."""
 
     stroke_finished = pyqtSignal()
+    # Orient tool: a line from (sx, sy) to (ex, ey) in SNIPPET pixels -
+    # floats, since a zoomed view resolves finer than a pixel.
+    vector_drawn = pyqtSignal(float, float, float, float)
+    # Orient tool: right-click - clear this snippet's orientation.
+    orientation_clear_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -96,6 +113,13 @@ class MaskPaintCanvas(QWidget):
         # Kept apart from _read_only, which means "this image cannot be
         # read" and carries its own cursor and message.
         self._layers_shown = True
+        self._tool = TOOL_PAINT
+        # The orientation arrow, drawn back from a stored angle: (radians,
+        # colour, centre in snippet pixels) or None. The colour is the
+        # caller's - drawn or propagated is not this widget's business.
+        self._arrow = None
+        self._line_start: "QPointF | None" = None   # an Orient drag
+        self._line_now: "QPointF | None" = None
         # Brush preview: the cell under the cursor plus the outline edges of
         # the exact pixel set a stamp there would paint.
         self._hover_cell = None
@@ -159,6 +183,27 @@ class MaskPaintCanvas(QWidget):
                 wall |= layer
             self._blocked = wall
         return self._blocked
+
+    def tool(self) -> str:
+        return self._tool
+
+    def set_tool(self, tool: str):
+        """TOOL_PAINT or TOOL_ORIENT."""
+        self._tool = tool
+        self._line_start = self._line_now = None
+        self.update()
+
+    def arrow(self) -> "tuple | None":
+        return self._arrow
+
+    def set_arrow(self, angle_rad: "float | None", color: QColor,
+                  centre: "tuple | None"):
+        """Show an orientation arrow through ``centre`` (snippet pixels),
+        or none when ``angle_rad`` is None. The angle is the stored
+        convention's: counter-clockwise from +x with y UP."""
+        self._arrow = (None if angle_rad is None or centre is None
+                       else (angle_rad, QColor(color), tuple(centre)))
+        self.update()
 
     def layers_shown(self) -> bool:
         return self._layers_shown
@@ -304,8 +349,36 @@ class MaskPaintCanvas(QWidget):
             for name in self._order:
                 if name in self._layers:
                     painter.drawImage(target, self._overlay_image(name))
-            self._draw_brush_preview(painter)
+            if self._tool == TOOL_PAINT:
+                self._draw_brush_preview(painter)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        if self._line_start is not None and self._line_now is not None:
+            self._draw_arrow(painter, self._line_start, self._line_now,
+                             LINE_PREVIEW_COLOR)
+        elif self._arrow is not None:
+            rad, color, (cx, cy) = self._arrow
+            # A fixed length on screen, through the centre; the minus
+            # because the convention's y grows up and the screen's down.
+            half = 0.35 * min(self._w, self._h) * self._scale
+            x, y = cx * self._scale, cy * self._scale
+            dx, dy = math.cos(rad) * half, -math.sin(rad) * half
+            self._draw_arrow(painter, QPointF(x - dx, y - dy),
+                             QPointF(x + dx, y + dy), color)
         painter.end()
+
+    @staticmethod
+    def _draw_arrow(painter, start: QPointF, end: QPointF, color: QColor):
+        """A shaft and a filled head, as the orientation grid draws them."""
+        painter.setPen(QPen(color, 2))
+        painter.drawLine(start, end)
+        angle = math.atan2(end.y() - start.y(), end.x() - start.x())
+        head = 10.0
+        left = QPointF(end.x() - head * math.cos(angle - 0.5),
+                       end.y() - head * math.sin(angle - 0.5))
+        right = QPointF(end.x() - head * math.cos(angle + 0.5),
+                        end.y() - head * math.sin(angle + 0.5))
+        painter.setBrush(color)
+        painter.drawPolygon(QPolygonF([end, left, right]))
 
     def _draw_brush_preview(self, painter):
         """Wireframe of the exact pixels the next stamp would paint.
@@ -377,6 +450,12 @@ class MaskPaintCanvas(QWidget):
             self._pan_last = event.globalPos()
             self.setCursor(Qt.ClosedHandCursor)
             return
+        if self._tool == TOOL_ORIENT:
+            if event.button() == Qt.LeftButton:
+                self._line_start = self._line_now = QPointF(event.pos())
+            elif event.button() == Qt.RightButton:
+                self.orientation_clear_requested.emit()
+            return
         if (self._read_only or not self._layers_shown
                 or self._active is None
                 or self._active not in self._layers):
@@ -404,6 +483,10 @@ class MaskPaintCanvas(QWidget):
                 vbar.setValue(vbar.value() - delta.y())
             self._pan_last = event.globalPos()
             return
+        if self._line_start is not None:
+            self._line_now = QPointF(event.pos())
+            self.update()
+            return
         if self._painting:
             self._stroke_to(event.pos())
         else:
@@ -418,6 +501,16 @@ class MaskPaintCanvas(QWidget):
                 and event.button() in (Qt.MiddleButton, Qt.LeftButton)):
             self._pan_last = None
             self.setCursor(Qt.CrossCursor)
+            return
+        if self._line_start is not None and event.button() == Qt.LeftButton:
+            start, end = self._line_start, QPointF(event.pos())
+            self._line_start = self._line_now = None
+            self.update()
+            if math.hypot(end.x() - start.x(),
+                          end.y() - start.y()) >= MIN_LINE_PX:
+                self.vector_drawn.emit(
+                    start.x() / self._scale, start.y() / self._scale,
+                    end.x() / self._scale, end.y() / self._scale)
             return
         if self._painting and event.button() in (Qt.LeftButton,
                                                  Qt.RightButton):

@@ -80,6 +80,9 @@ class MaskEditor(QWidget):
     save_requested = pyqtSignal()
     # The project's mask-name presets, after a typed name joined them.
     mask_names_changed = pyqtSignal(list)
+    # A snippet was put on the canvas (or None) - after its frame is known,
+    # so a host drawing on the canvas can place things in it.
+    snippet_shown = pyqtSignal(object)
 
     # The strip lives in snippet_editor/strip.py now; these are its
     # constants under the names this window's callers already use.
@@ -492,6 +495,7 @@ class MaskEditor(QWidget):
             self.canvas.set_layers({}, [], None)
             self._refresh_mask_list()
             self._refresh_stats()
+            self.snippet_shown.emit(None)
             return
         raw = read_label_window_raw(entry["image_path"], entry["pixel_x"],
                                     entry["pixel_y"], size)
@@ -543,6 +547,7 @@ class MaskEditor(QWidget):
         self._set_editable(not self._unreadable)
         self._refresh_mask_list(select=active)
         self._refresh_stats()
+        self.snippet_shown.emit(entry)
 
     def _adjusted_display(self) -> "np.ndarray | None":
         """The current snippet's pixels with the view settings applied."""

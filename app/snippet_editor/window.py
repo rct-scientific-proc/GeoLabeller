@@ -4,7 +4,9 @@ Holds the pieces of this package around ONE snippet list and ONE Show
 filter:
 
   * Single view - one snippet at a time, zoomable: the mask section
-    (mask_section.MaskEditor, hosted);
+    (mask_section.MaskEditor, hosted), with two tools - Paint masks, and
+    Orient, which draws the orientation on the enlarged snippet and shows
+    it as an arrow;
   * Grid view - a page of snippets at once: the orientation section's grid
     (orientation_section.OrientationEditor, hosted), laying out exactly
     what the list shows, in the list's order. Double-click a snippet there
@@ -30,14 +32,17 @@ from PyQt5.QtWidgets import (QButtonGroup, QCheckBox, QHBoxLayout, QLabel,
 
 from ..debug_log import debug
 from .mask_section import MASK_WORKLIST, MaskEditor
-from .orientation_section import (ORIENTATION_WORKLIST, OrientationEditor,
+from .orientation_section import (DERIVED_COLOR, MANUAL_COLOR,
+                                  ORIENTATION_WORKLIST, OrientationEditor,
                                   OrientationPanel)
+from .single_view import TOOL_ORIENT, TOOL_PAINT
 from .strip import SnippetStrip
 
 _SETTINGS = ("GeoLabeller", "GeoLabeller")
 _VIEW_KEY = "snippet_editor/view"
 _SPLITTER_KEY = "snippet_editor/splitter"
 _SECTIONS_KEY = "snippet_editor/sections"     # the sections switched ON
+_TOOL_KEY = "snippet_editor/tool"
 
 
 class SectionFrame(QWidget):
@@ -136,7 +141,31 @@ class SnippetEditor(QWidget):
             button.setCheckable(True)
             self._view_buttons.addButton(button, index)
             toolbar.addWidget(button)
+
         layout.addLayout(toolbar)
+
+        # The Single view's tools, at the front of that view's own row
+        # (beside Snippet and Brush) - not on the toolbar above, which
+        # they pushed past a 1366-pixel screen. Placed by the window, so
+        # the mask panel still knows nothing of orientation. Each tool
+        # belongs to a section and goes when that section is switched off.
+        tool_row = self.masks.tool_row
+        tool_row.insertWidget(0, QLabel("Tool:"))
+        self.paint_button = QPushButton("Paint masks")
+        self.paint_button.setToolTip(
+            "Left-drag paints the active mask, right-drag erases.")
+        self.orient_button = QPushButton("Orient")
+        self.orient_button.setToolTip(
+            "Drag from the object's tail to its nose to set its\n"
+            "orientation; right-click clears it.")
+        self._tool_buttons = QButtonGroup(self)
+        self._tools = {TOOL_PAINT: self.paint_button,
+                       TOOL_ORIENT: self.orient_button}
+        for position, button in enumerate(self._tools.values(), start=1):
+            button.setCheckable(True)
+            self._tool_buttons.addButton(button)
+            tool_row.insertWidget(position, button)
+        tool_row.insertSpacing(len(self._tools) + 1, 16)
 
         # The list, then whichever view is showing. The Grid view is a list
         # of its own, so it takes the list's pane when it is up.
@@ -199,6 +228,15 @@ class SnippetEditor(QWidget):
         self.grid.open_requested.connect(self._open_in_single_view)
         self.strip.entry_picked.connect(self.orientation_panel.show_entry)
         self.orientation_panel.clear_requested.connect(self.grid._on_clear)
+        self.paint_button.clicked.connect(lambda: self.set_tool(TOOL_PAINT))
+        self.orient_button.clicked.connect(
+            lambda: self.set_tool(TOOL_ORIENT))
+        canvas = self.masks.canvas
+        canvas.vector_drawn.connect(self._on_canvas_line)
+        canvas.orientation_clear_requested.connect(self._on_canvas_clear)
+        # After the mask panel has put a snippet on the canvas - and knows
+        # its frame - so the arrow lands on the right pixel.
+        self.masks.snippet_shown.connect(self._update_arrow)
         for frame in self.sections.values():
             frame.toggled.connect(self._apply_sections)
         # Space steps the list wherever the keyboard is in the window.
@@ -251,6 +289,55 @@ class SnippetEditor(QWidget):
         self.strip.set_worklists([self._worklists[key] for key in on])
         self.grid.set_orientation_shown("orientation" in on)
         self.masks.canvas.set_layers_shown("masks" in on)
+        # Each tool goes with its section; if the one in hand went, take
+        # up the other.
+        self.paint_button.setEnabled("masks" in on)
+        self.orient_button.setEnabled("orientation" in on)
+        if not self._tools[self.tool()].isEnabled():
+            self.set_tool(TOOL_ORIENT if self.tool() == TOOL_PAINT
+                          else TOOL_PAINT)
+        self._update_arrow()
+
+    # -- tools --------------------------------------------------------------
+
+    def tool(self) -> str:
+        return self.masks.canvas.tool()
+
+    def set_tool(self, tool: str):
+        """TOOL_PAINT or TOOL_ORIENT, for the Single view's canvas."""
+        self.masks.canvas.set_tool(tool)
+        self._tools[tool].setChecked(True)
+
+    def _on_canvas_line(self, sx, sy, ex, ey):
+        """An orientation drawn on the Single view, in snippet pixels:
+        add the view's own crop origin and commit it exactly as a grid
+        drawing would be."""
+        entry = self.masks._current
+        if entry is None:
+            return
+        x0, y0, _w, _h = self.masks._frame
+        self.grid.orient_from_source_line(entry["label_id"], x0 + sx,
+                                          y0 + sy, x0 + ex, y0 + ey)
+
+    def _on_canvas_clear(self):
+        entry = self.masks._current
+        if entry is not None:
+            self.grid._on_clear(entry["label_id"])
+
+    def _update_arrow(self, *_args):
+        """Show the Single view's snippet's orientation - through the
+        label's own pixel, which a clamped crop moves off centre."""
+        canvas = self.masks.canvas
+        entry = self.masks._current
+        rad = None if entry is None else entry.get("orientation_px_rad")
+        if rad is None or not self.sections["orientation"].is_on():
+            canvas.set_arrow(None, MANUAL_COLOR, None)
+            return
+        x0, y0, _w, _h = self.masks._frame
+        colour = (DERIVED_COLOR if entry.get("orientation_derived")
+                  else MANUAL_COLOR)
+        canvas.set_arrow(rad, colour, (entry["pixel_x"] - x0,
+                                       entry["pixel_y"] - y0))
 
     def _open_in_single_view(self, label_id: int):
         """A grid cell was double-clicked: look at it closer."""
@@ -266,6 +353,9 @@ class SnippetEditor(QWidget):
         current = self.strip.current_entry()
         if current is not None and current["label_id"] == label_id:
             self.orientation_panel.show_entry(current)
+        shown = self.masks._current
+        if shown is not None and shown["label_id"] == label_id:
+            self._update_arrow()
         self.orientation_changed.emit(label_id, rad, deg, derived)
 
     # -- keys ---------------------------------------------------------------
@@ -315,6 +405,8 @@ class SnippetEditor(QWidget):
                 frame.set_on(key in wanted)
                 frame.header.blockSignals(False)
                 frame.content.setVisible(frame.is_on())
+        tool = settings.value(_TOOL_KEY, TOOL_PAINT)
+        self.set_tool(tool if tool in self._tools else TOOL_PAINT)
         self._apply_sections()
 
     def save_settings(self):
@@ -325,6 +417,7 @@ class SnippetEditor(QWidget):
             settings.setValue(_VIEW_KEY, self.view())
             settings.setValue(_SPLITTER_KEY, self.body_splitter.saveState())
             settings.setValue(_SECTIONS_KEY, ",".join(self.sections_on()))
+            settings.setValue(_TOOL_KEY, self.tool())
         except Exception as exc:                  # noqa: BLE001
             debug(f"snippet editor settings not saved: "
                   f"{type(exc).__name__}: {exc}")
