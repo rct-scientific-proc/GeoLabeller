@@ -8,13 +8,19 @@ the main window and apart from the non-GUI logic the exporters share
 main GUI; tests/test_snippet_editor_embed.py holds that.
 
     window.py                the Snippet Editor window: one list, the
-                             Single and Grid views, the save bar
+                             Single and Grid views, the column of
+                             sections, the save bar
+    section.py               the Section interface every section speaks
     strip.py                 the snippet list: class and Show filters,
                              counts, stepping - shared by every section
-    single_view.py           one snippet, zoomable, with paintable layers
-    mask_section.py          the mask editor (MaskEditor)
+    single_view.py           one snippet, zoomable, with paintable layers,
+                             an arrow overlay and the Paint/Orient tools
     orientation_section.py   the orientation editor and its grid
-                             (OrientationEditor)
+                             (OrientationEditor), and OrientationSection
+    mask_section.py          the mask editor (MaskEditor), and MaskSection
+    confidence_section.py    ConfidenceSection - the 1-5 rating; the
+                             smallest complete section, to copy for the
+                             next per-snippet value
 
 Both editors are still their own windows today (Labels > Mask Editor,
 Labels > Orientation Editor) and can also be built as plain panels around
