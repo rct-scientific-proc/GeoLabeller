@@ -20,10 +20,9 @@ values leave for the main window; everything else loops over them
 (section.py has the interface). The next value the ML team asks for is a
 new module, one line in that list, and its outward signal.
 
-It talks to the rest of the app in the same terms the old editors did -
-set_labels / set_mask_names / set_save_state in; masks_changed /
-orientation_changed / confidence_changed / mask_names_changed /
-save_requested out.
+It talks to the rest of the app through set_labels / set_mask_names /
+set_save_state in, and masks_changed / orientation_changed /
+confidence_changed / mask_names_changed / save_requested out.
 """
 from PyQt5.QtCore import QEvent, QSettings, Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QKeySequence
@@ -111,8 +110,8 @@ class SnippetEditor(QWidget):
         # The two views, around one list - which starts with no worklist;
         # the sections supply theirs once they exist.
         self.strip = SnippetStrip(None, self)
-        self.masks = MaskEditor(self, window=False, strip=self.strip)
-        self.grid = OrientationEditor(self, window=False, strip=self.strip)
+        self.masks = MaskEditor(self.strip, self)
+        self.grid = OrientationEditor(self.strip, self)
         # The sections, in the order they are offered - in the column, on
         # the Show filter, and for tools on the Single view. The only place
         # the window names them.

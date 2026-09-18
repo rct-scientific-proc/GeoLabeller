@@ -1,11 +1,12 @@
 """The orientation section: draw a heading across each snippet of a class.
 
-Part of the Snippet Editor package (see app/snippet_editor/__init__.py).
-Built as its own window today (Labels > Orientation Editor) or, with
-window=False, as a plain panel another window can hold.
+Part of the Snippet Editor package (see app/snippet_editor/__init__.py):
+OrientationEditor is the window's Grid view, and OrientationSection the
+Orientation section of its column. (Through 1.x the grid was a window of
+its own, Labels > Orientation Editor.)
 
-A grid of un-warped snippets for one class at a
-time. Dragging start->end across a snippet is the object's orientation - a
+A grid of un-warped snippets - whatever the strip lists, in the strip's
+order. Dragging start->end across a snippet is the object's orientation - a
 car's nose, a ship's bow - and yields both stored angles at once: the
 unit-circle pixel angle and, for georeferenced imagery, the true-north
 heading (see orientation_math for the exact conventions). Right-click
@@ -26,7 +27,7 @@ import rasterio
 from PyQt5.QtCore import QPointF, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import (
-    QCheckBox, QComboBox, QGridLayout, QHBoxLayout, QLabel, QPushButton,
+    QCheckBox, QGridLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QVBoxLayout, QWidget)
 
 from ..debug_log import debug
@@ -213,7 +214,8 @@ class OrientationCell(QWidget):
 
 
 class OrientationEditor(QWidget):
-    """Grid of one class's snippets, each accepting a drawn orientation."""
+    """The Grid view: the strip's snippets a page at a time, each taking a
+    drawn orientation."""
 
     # (label_id, orientation_px_rad or None, orientation_deg or None,
     #  derived) - derived is True for orientations propagated from a linked
@@ -222,15 +224,8 @@ class OrientationEditor(QWidget):
     # A cell was double-clicked: (label_id).
     open_requested = pyqtSignal(int)
 
-    def __init__(self, parent=None, window: bool = True,
-                 strip: "SnippetStrip | None" = None):
-        # A window of its own by default (Labels > Orientation Editor);
-        # window=False builds it as a plain panel for another window to
-        # hold - the Snippet Editor's Grid view.
-        super().__init__(parent, Qt.Window if window else Qt.Widget)
-        if window:
-            self.setWindowTitle("Orientation Editor")
-            self.setMinimumSize(GRID_COLUMNS * (SNIPPET_SIZE + 24) + 60, 600)
+    def __init__(self, strip: SnippetStrip, parent=None):
+        super().__init__(parent)
         self._loader = SnippetLoader(self)
         self._loader.ready.connect(self._on_snippet_ready)
         self._entries: list = []
@@ -239,27 +234,16 @@ class OrientationEditor(QWidget):
         self._cells: dict[int, OrientationCell] = {}
         self._captions: dict[int, QLabel] = {}
         self._geo_cache: dict[str, tuple] = {}   # path -> (affine, crs, w, h)
-        # HOSTED - a shared strip passed in - the grid lays out whatever the
-        # strip lists, in the strip's order: its class choice ("All
-        # classes" included) and its Show filter replace this grid's own
-        # class picker and Unoriented-only box, which are then left out.
-        self._strip = strip
+        # The host's strip: the grid lays out whatever it lists, in its
+        # order - its class choice ("All classes" included) and its Show
+        # filter decide what that is.
+        self.strip = strip
         self._orientation_shown = True
         self._setup_ui()
-        if strip is not None:
-            strip.rebuilt.connect(self._on_strip_rebuilt)
+        strip.rebuilt.connect(self._on_strip_rebuilt)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
-        controls = QHBoxLayout()
-        self.class_combo = QComboBox()
-        # A different class is a different set of labels: start at its
-        # first page rather than wherever the last class was.
-        self.class_combo.currentIndexChanged.connect(
-            self._on_filter_changed)
-        if self._strip is None:
-            controls.addWidget(QLabel("Class:"))
-            controls.addWidget(self.class_combo, 1)
 
         # Draw once, orient the whole linked group: the heading measured
         # here is re-derived into each linked label's own image (violet =
@@ -271,11 +255,8 @@ class OrientationEditor(QWidget):
             "give them the drawn TRUE-NORTH heading too - each one's pixel\n"
             "angle is derived through its own image's georeferencing.\n"
             "Propagated orientations show violet until drawn over.")
-        if self._strip is None:
-            # Hosted, the toggle is the host's to place - the Snippet
-            # Editor puts it in its Orientation section.
-            controls.addWidget(self.propagate_check)
-        layout.addLayout(controls)
+        # Not laid out here: the host places it, in its Orientation
+        # section.
 
         hint = QLabel(
             "Drag across a snippet from the object's tail to its nose to "
@@ -292,13 +273,6 @@ class OrientationEditor(QWidget):
         layout.addWidget(self._scroll)
 
         pager = QHBoxLayout()
-        self.unoriented_check = QCheckBox("Unoriented only")
-        self.unoriented_check.setToolTip(
-            "Show only labels that have no orientation yet - what a review\n"
-            "pass is looking for.")
-        self.unoriented_check.toggled.connect(self._on_filter_changed)
-        if self._strip is None:
-            pager.addWidget(self.unoriented_check)
         pager.addStretch(1)
         self.prev_button = QPushButton("< Previous")
         self.prev_button.clicked.connect(lambda: self._step_page(-1))
@@ -313,26 +287,9 @@ class OrientationEditor(QWidget):
     # -- data in ------------------------------------------------------------
 
     def set_labels(self, entries: list):
-        """Same entry dicts the snippet sidebar takes; grid follows class."""
-        if self._strip is not None:
-            self._strip.set_labels(entries)     # rebuilt -> the grid
-            return
-        self._entries = list(entries)
-        self._entries_by_id = {e["label_id"]: e for e in self._entries}
-        classes = sorted({e["class_name"] for e in self._entries})
-        current = self.class_combo.currentText()
-        self.class_combo.blockSignals(True)
-        self.class_combo.clear()
-        self.class_combo.addItems(classes)
-        if current in classes:
-            self.class_combo.setCurrentText(current)
-        self.class_combo.blockSignals(False)
-        self._rebuild()
-
-    def _on_filter_changed(self, _checked=False):
-        """The filter changes which labels exist, so start from page one."""
-        self._page = 0
-        self._rebuild()
+        """Same entry dicts the snippet sidebar takes, handed to the strip;
+        the grid follows its rebuilt signal."""
+        self.strip.set_labels(entries)
 
     def _step_page(self, delta: int):
         pages = max(1, self._page_count())
@@ -342,22 +299,16 @@ class OrientationEditor(QWidget):
     def _on_strip_rebuilt(self, chosen_anew: bool):
         """The shared strip changed what it lists. A new choice (class,
         filter) starts at page one; new labels keep the page."""
-        self._entries = self._strip.entries
+        self._entries = self.strip.entries
         self._entries_by_id = {e["label_id"]: e for e in self._entries}
         if chosen_anew:
             self._page = 0
         self._rebuild()
 
     def _shown_entries(self) -> list:
-        """The labels this class (and filter) covers, in a stable order."""
-        if self._strip is not None:
-            return self._strip.listed_entries()
-        wanted = self.class_combo.currentText()
-        shown = [e for e in self._entries if e["class_name"] == wanted]
-        if self.unoriented_check.isChecked():
-            shown = [e for e in shown
-                     if e.get("orientation_px_rad") is None]
-        return shown
+        """What the strip lists - its class and Show filter - in its
+        order."""
+        return self.strip.listed_entries()
 
     def _page_count(self) -> int:
         return max(1, -(-len(self._shown_entries()) // PAGE_SIZE))
@@ -422,8 +373,7 @@ class OrientationEditor(QWidget):
         if caption is None:
             return
         parts = [entry["image_name"]]
-        if (self._strip is not None and self._strip.class_combo.currentText()
-                == SnippetStrip.ALL_CLASSES):
+        if self.strip.class_combo.currentText() == SnippetStrip.ALL_CLASSES:
             parts = [f"{entry['class_name']} \N{MIDDLE DOT} "
                      f"{entry['image_name']}"]
         rad = entry.get("orientation_px_rad")

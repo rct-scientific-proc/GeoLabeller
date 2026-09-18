@@ -1,17 +1,18 @@
 """The mask section: paint named binary masks onto label snippets.
 
-Part of the Snippet Editor package (see app/snippet_editor/__init__.py).
-Built as its own window today (Labels > Mask Editor) or, with window=False,
-as a plain panel another window can hold. Pick a class, pick a snippet from
-the strip, add a named mask, and paint: left-drag paints, right-drag
-erases, the brush size is adjustable, and several masks can coexist on one
-snippet - each an independent binary layer with its own overlay colour,
-kept from overlapping one another unless Allow Overlap is on.
+Part of the Snippet Editor package (see app/snippet_editor/__init__.py):
+MaskEditor is the window's Single view, and MaskSection the Masks section
+of its column. Pick a snippet from the strip, add a named mask, and paint:
+left-drag paints, right-drag erases, the brush size is adjustable, and
+several masks can coexist on one snippet - each an independent binary
+layer with its own overlay colour, kept from overlapping one another
+unless Allow Overlap is on.
 
 The paint surface itself is single_view.MaskPaintCanvas; the snippet list
-is strip.SnippetStrip. This module is what makes them a mask editor: the
-mask list, add/delete/fill, the overlap toggle, the statistics, and
-committing every stroke to the label.
+is strip.SnippetStrip, which the window owns and places. This module is
+what makes them a mask editor: the mask list, add/delete/fill, the overlap
+toggle, the statistics, and committing every stroke to the label.
+(Through 1.x this was a window of its own, Labels > Mask Editor.)
 
 Masks are stored on the label as FULL-IMAGE run-length encodings (format
 4.0): the painted window is spliced into the stored runs arithmetically,
@@ -29,11 +30,11 @@ values, never from the display stretch.
 import numpy as np
 
 from PyQt5.QtCore import QEvent, QSettings, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QIcon, QKeySequence, QPixmap
+from PyQt5.QtGui import QColor, QIcon, QPixmap
 from PyQt5.QtWidgets import (
     QComboBox, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QShortcut,
-    QSlider, QSpinBox, QSplitter, QVBoxLayout, QWidget)
+    QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QSlider,
+    QSpinBox, QVBoxLayout, QWidget)
 
 from ..debug_log import debug
 from ..masks import (entry_in_window, fill_enclosed, mask_statistics,
@@ -61,54 +62,33 @@ MASK_WORKLIST = Worklist(
     nothing_left="All of these snippets have a mask. Nothing left to do.",
     none_done="No snippet here has a mask yet.")
 
-# Where the editor remembers how the user last dragged its panes.
+# Where Allow Overlap is remembered. The key keeps the name it had when
+# this was the Mask Editor window, so the choice carried over to 2.0.0.
 _SETTINGS = ("GeoLabeller", "GeoLabeller")
-_SPLITTER_KEY = "mask_editor/splitter"
-# Hosted in the Snippet Editor it has two panes, not three, so its widths
-# are remembered apart from the stand-alone window's.
-_HOSTED_SPLITTER_KEY = "snippet_editor/single_splitter"
 _OVERLAP_KEY = "mask_editor/allow_overlap"
 
 
 class MaskEditor(QWidget):
-    """Window for painting named binary masks on a class's snippets."""
+    """The Single view: paint named binary masks on the strip's snippets.
+
+    A panel around the host's strip. Its mask panel (``mask_panel``) is
+    not laid out here: it is the Masks section in the host's column.
+    """
 
     # (label_id, [mask entries]) - the label's full replacement mask list.
     masks_changed = pyqtSignal(int, list)
-    # "Save the project now" - this is a window of its own, so the main
-    # window's Ctrl+S never reaches it, and painters could not tell whether
-    # their work was anywhere but in memory.
-    save_requested = pyqtSignal()
     # The project's mask-name presets, after a typed name joined them.
     mask_names_changed = pyqtSignal(list)
     # A snippet was put on the canvas (or None) - after its frame is known,
     # so a host drawing on the canvas can place things in it.
     snippet_shown = pyqtSignal(object)
 
-    # The strip lives in snippet_editor/strip.py now; these are its
-    # constants under the names this window's callers already use.
-    _ID_ROLE = SnippetStrip.ID_ROLE
-    ALL_CLASSES = SnippetStrip.ALL_CLASSES
-    FILTER_ALL = SnippetStrip.FILTER_ALL
-    FILTER_NEEDS = SnippetStrip.FILTER_NEEDS
-    FILTER_MASKED = SnippetStrip.FILTER_DONE
-
-    def __init__(self, parent=None, window: bool = True,
-                 strip: "SnippetStrip | None" = None):
-        # A window of its own by default (Labels > Mask Editor);
-        # window=False builds it as a plain panel for another window to
-        # hold - the Snippet Editor.
-        super().__init__(parent, Qt.Window if window else Qt.Widget)
-        if window:
-            self.setWindowTitle("Mask Editor")
-        # The snippet list, its filters and their counts (strip.py). On its
-        # own this editor makes one, places it, and says what "done" means.
-        # HOSTED - a shared strip passed in - the host places the strip and
-        # its filters and owns the save bar and Ctrl+S, and this is just
-        # the paint canvas and the mask panel beside it.
-        self._hosted = strip is not None
-        self.strip = strip if strip is not None else \
-            SnippetStrip(MASK_WORKLIST, self)
+    def __init__(self, strip: SnippetStrip, parent=None):
+        super().__init__(parent)
+        # The snippet list, its filters and their counts (strip.py) - the
+        # host's: it places them, and owns the save bar and Ctrl+S. This is
+        # the paint canvas and the mask panel for the host's column.
+        self.strip = strip
         self._mask_names: list = []              # the project's presets
         self._current: "dict | None" = None      # selected entry
         self._frame = (0, 0, MASK_SNIPPET_SIZE, MASK_SNIPPET_SIZE)
@@ -133,13 +113,6 @@ class MaskEditor(QWidget):
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         controls = self.tool_row = QHBoxLayout()
-        self.class_combo = self.strip.class_combo
-        self.filter_combo = self.strip.filter_combo
-        if not self._hosted:
-            controls.addWidget(QLabel("Class:"))
-            controls.addWidget(self.class_combo, 1)
-            controls.addWidget(QLabel("Show:"))
-            controls.addWidget(self.filter_combo)
         controls.addWidget(QLabel("Snippet:"))
         self.size_spin = QSpinBox()
         self.size_spin.setRange(16, 2048)
@@ -163,11 +136,9 @@ class MaskEditor(QWidget):
         self.brush_spin.setSuffix(" px")
         self.brush_spin.setToolTip("Brush diameter in source pixels.")
         controls.addWidget(self.brush_spin)
-        if self._hosted:
-            # On its own, the class picker on this row soaks up the spare
-            # width; hosted, that picker is on the window's toolbar, and
-            # without this the two number boxes would stretch to fill it.
-            controls.addStretch(1)
+        # Nothing on this row wants the spare width (the class picker is on
+        # the window's toolbar); without this the number boxes take it.
+        controls.addStretch(1)
         layout.addLayout(controls)
 
         # Display-only brightness and contrast: sonar and low-light aerial
@@ -218,20 +189,6 @@ class MaskEditor(QWidget):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        # Three panes the user can drag. They used to be fixed widths, so
-        # a caption like "vessel . survey_04_r006_c112.tif [3 masks]" was
-        # cut off with no way to widen it - and no way to give the paint
-        # canvas the room either.
-        self.body_splitter = QSplitter(Qt.Horizontal)
-
-        # Snippet strip: which label is being painted.
-        self.strip_panel = self.strip.panel
-        self.snippet_list = self.strip.list_widget
-        self.strip_label = self.strip.message_label
-        if not self._hosted:
-            self.snippet_list.installEventFilter(self)
-            self.body_splitter.addWidget(self.strip_panel)
-
         # The paint surface, scrollable so any zoom level fits on screen.
         self.canvas = MaskPaintCanvas()
         self.canvas.stroke_finished.connect(self._on_stroke_finished)
@@ -241,10 +198,9 @@ class MaskEditor(QWidget):
         self.canvas_scroll.setWidgetResizable(False)
         self.canvas_scroll.setAlignment(Qt.AlignCenter)
         self.canvas_scroll.setMinimumSize(360, 360)
-        self.body_splitter.addWidget(self.canvas_scroll)
+        layout.addWidget(self.canvas_scroll, 1)
 
-        # Mask management + statistics, in a pane of its own so the
-        # splitter has something to size.
+        # Mask management + statistics: the host's Masks section.
         self.mask_panel = QWidget()
         self.mask_panel.setMinimumWidth(150)
         side = QVBoxLayout(self.mask_panel)
@@ -272,6 +228,16 @@ class MaskEditor(QWidget):
         self.mask_name_combo.currentIndexChanged.connect(
             self._on_active_mask_name_picked)
         side.addWidget(self.mask_name_combo)
+        # Why Add Mask did nothing, when it did nothing - under the name it
+        # is about, not in a box that stops the run of snippets. It goes as
+        # soon as the name is touched.
+        self.name_note = QLabel("")
+        self.name_note.setWordWrap(True)
+        self.name_note.setStyleSheet("color: #b26a00;")
+        self.name_note.hide()
+        self.mask_name_combo.editTextChanged.connect(
+            lambda _text: self._set_name_note(""))
+        side.addWidget(self.name_note)
 
         buttons = QHBoxLayout()
         self.add_button = QPushButton("Add Mask")
@@ -315,38 +281,6 @@ class MaskEditor(QWidget):
         self.stats_label.setWordWrap(True)
         side.addWidget(self.stats_label)
         side.addStretch(1)
-        if not self._hosted:
-            # Hosted, the panel is the Masks section of the host's column.
-            self.body_splitter.addWidget(self.mask_panel)
-
-        # Only the paint area grows when the window does; the lists keep
-        # whatever the user dragged them to.
-        for index in range(self.body_splitter.count()):
-            self.body_splitter.setStretchFactor(
-                index, 1 if self.body_splitter.widget(index)
-                is self.canvas_scroll else 0)
-        self.body_splitter.setChildrenCollapsible(False)
-        self._restore_splitter()
-        layout.addWidget(self.body_splitter, 1)
-
-        # Where the work stands. Strokes commit to the project as they
-        # happen, but "committed" is not "on disk", and saying so plainly
-        # is the whole point of this line.
-        footer = QHBoxLayout()
-        self.save_status = QLabel("")
-        self.save_status.setWordWrap(True)
-        footer.addWidget(self.save_status, 1)
-        self.save_button = QPushButton("Save Project")
-        self.save_button.setToolTip(
-            "Write the project - masks included - to its file (Ctrl+S).")
-        self.save_button.clicked.connect(self.save_requested.emit)
-        footer.addWidget(self.save_button)
-        if not self._hosted:
-            # Hosted, the window has the save bar and the one Ctrl+S: two
-            # claims of the same chord make Qt fire neither.
-            layout.addLayout(footer)
-            QShortcut(QKeySequence.Save, self,
-                      activated=self.save_requested.emit)
 
     @staticmethod
     def _remembered_overlap() -> bool:
@@ -360,103 +294,21 @@ class MaskEditor(QWidget):
     def allow_overlap(self) -> bool:
         return self.overlap_button.isChecked()
 
-    def _splitter_key(self) -> str:
-        return _HOSTED_SPLITTER_KEY if self._hosted else _SPLITTER_KEY
-
-    def _restore_splitter(self):
-        """Reopen at the widths this user last dragged them to."""
-        saved = QSettings(*_SETTINGS).value(self._splitter_key())
-        if saved is not None:
-            try:
-                if self.body_splitter.restoreState(saved):
-                    return
-            except TypeError:
-                # Something else wrote this key, or it was hand-edited.
-                pass
-        self.body_splitter.setSizes([620, 220] if self._hosted
-                                    else [210, 620, 220])
-
     def save_settings(self):
-        """Remember the pane widths and Allow Overlap for next time.
-
-        Called on close when this is a window. Embedded as a panel it gets
-        no close event of its own, so the window holding it calls this.
-        """
+        """Remember Allow Overlap for next time. A panel gets no close
+        event of its own, so the window holding it calls this."""
         try:
-            settings = QSettings(*_SETTINGS)
-            settings.setValue(self._splitter_key(),
-                              self.body_splitter.saveState())
-            settings.setValue(_OVERLAP_KEY, self.allow_overlap())
+            QSettings(*_SETTINGS).setValue(_OVERLAP_KEY,
+                                           self.allow_overlap())
         except Exception as exc:                  # noqa: BLE001
             debug(f"mask editor settings not saved: "
                   f"{type(exc).__name__}: {exc}")
-
-    def closeEvent(self, event):
-        """Remember the pane widths on the way out."""
-        self.save_settings()
-        super().closeEvent(event)
-
-    def set_save_state(self, text: str, saved: bool):
-        """Show whether what has been painted is on disk yet."""
-        self.save_status.setText(text)
-        self.save_status.setStyleSheet(
-            "color: #2e7d32;" if saved else "color: #b26a00;")
-        self.save_button.setEnabled(not saved)
-
-    def save_status_text(self) -> str:
-        """The status line's current text (for tests and diagnostics)."""
-        return self.save_status.text()
 
     # -- data in ------------------------------------------------------------
 
     def set_labels(self, entries: list):
         """Same entry dicts as the other snippet views (masks included)."""
         self.strip.set_labels(entries)
-
-    # -- the strip, moved to snippet_editor/strip.py ------------------------
-    # Transitional: these keep this window's existing callers and tests
-    # working unchanged while the strip lives in its own module. They go
-    # when the window is retired in favour of the Snippet Editor.
-
-    @property
-    def _entries(self) -> list:
-        return self.strip.entries
-
-    @property
-    def _items_by_label(self) -> dict:
-        return self.strip.items_by_label
-
-    @property
-    def _entries_by_label(self) -> dict:
-        return self.strip.entries_by_label
-
-    @property
-    def _loader(self):
-        return self.strip.loader
-
-    def filter_mode(self) -> int:
-        return self.strip.filter_mode()
-
-    def set_filter_mode(self, mode: int):
-        self.strip.set_filter_mode(mode)
-
-    def strip_message(self) -> str:
-        return self.strip.message()
-
-    def _entry(self, label_id) -> "dict | None":
-        return self.strip.entry(label_id)
-
-    def _rebuild_list(self):
-        self.strip.rebuild()
-
-    def _cycle_snippet(self, delta: int):
-        self.strip.cycle(delta)
-
-    def _on_masks_applied(self):
-        self.strip.refresh_current()
-
-    def _on_snippet_ready(self, label_id, arr):
-        self.strip._on_snippet_ready(label_id, arr)
 
     # -- snippet cycling ----------------------------------------------------
 
@@ -470,7 +322,8 @@ class MaskEditor(QWidget):
         super().keyPressEvent(event)
 
     def eventFilter(self, obj, event):
-        """Steal Space from the list widgets so cycling works everywhere."""
+        """Steal Space from the mask list so stepping works from there
+        too (a list widget would take it as a click)."""
         if (event.type() == QEvent.KeyPress
                 and event.key() == Qt.Key_Space):
             self.strip.cycle(
@@ -703,8 +556,9 @@ class MaskEditor(QWidget):
             return
         name = self.active_mask_name()
         if not name:
-            self.set_save_state("Type or pick a mask name first.", False)
+            self._set_name_note("Type or pick a mask name first.")
             return
+        self._set_name_note("")
         if name in self._layers:
             # Already here: select it rather than refusing. The button
             # means "paint this mask", and an error box in the middle of
@@ -720,6 +574,10 @@ class MaskEditor(QWidget):
         self.canvas.set_layers(self._layers, self._order, name)
         self._refresh_mask_list(select=name)
         self._emit_masks()
+
+    def _set_name_note(self, text: str):
+        self.name_note.setText(text)
+        self.name_note.setVisible(bool(text))
 
     def _on_delete_mask(self):
         name = self._active_name()
