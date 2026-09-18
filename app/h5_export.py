@@ -46,6 +46,7 @@ from PyQt5.QtWidgets import (
 )
 
 from .debug_log import debug
+from .labels import valid_confidence
 
 HARD_NEGATIVE = "hard_negative"
 
@@ -136,6 +137,29 @@ _META_CHUNK = 4096
 # Aligned per-sample string columns, written only when a run has values for
 # them. See _H5DatasetWriter._flush_string_column.
 _STRING_COLUMNS = ("locations", "object_ids")
+# Aligned per-sample NUMERIC columns, in groups created together on demand -
+# the first time a sample has a value for the group - with rows written
+# before that backfilled with the group's "unset" fill. An export with
+# nothing to say writes no such dataset, so it stays byte-identical and
+# files written before the columns existed still take appends. See
+# H5DatasetWriter._flush_numeric_group.
+#
+#   confidence     1-5, the labeller's rating; 0 = unrated, and every hard
+#                  negative (the ML team's convention)
+#   orientation    the label's pixel angle and true-north heading, NaN
+#                  where there is none - 0 is an angle, so it cannot mean
+#                  "none" - and whether it was propagated from a linked
+#                  label. The pixel angle holds in the crop as stored: a
+#                  crop is a plain window of the source raster, which only
+#                  translates it.
+_NUMERIC_GROUPS = {
+    "confidence": (("confidence", "uint8", 0),),
+    "orientation": (("orientation_px_rad", "float32", float("nan")),
+                    ("orientation_deg", "float32", float("nan")),
+                    ("orientation_derived", "bool", False)),
+}
+_NUMERIC_COLUMNS = tuple(name for group in _NUMERIC_GROUPS.values()
+                         for name, _dtype, _fill in group)
 # Label rows read at a time when re-indexing an existing file's classes; 1M
 # uint16 is a couple of MB, so even a huge dataset migrates in bounded memory.
 _SCAN_BLOCK = 1 << 20
@@ -353,6 +377,9 @@ class H5DatasetWriter:
         #   object_ids  which linked object a sample is a view of ("" for a
         #               hard negative, which is a view of nothing)
         self._str_bufs = {name: [] for name in _STRING_COLUMNS}
+        # Aligned per-sample numeric columns, likewise on demand - see
+        # _NUMERIC_GROUPS.
+        self._num_bufs = {name: [] for name in _NUMERIC_COLUMNS}
         # Set when appending to a file whose class list has since changed.
         self.added_classes, self.dropped_classes = [], []
 
@@ -366,6 +393,9 @@ class H5DatasetWriter:
         else:
             self._create()
         self._has_str = {name: name in self._f for name in _STRING_COLUMNS}
+        self._has_group = {
+            group: any(name in self._f for name, _d, _f in columns)
+            for group, columns in _NUMERIC_GROUPS.items()}
         # Most recently used, so an append made with different settings becomes
         # the default next time round.
         if overlap is not None:
@@ -430,8 +460,8 @@ class H5DatasetWriter:
     def _validate_alignment(self):
         """Refuse to append to a file whose aligned columns disagree.
 
-        images / labels / gt / split / locations / object_ids are read by
-        row index - sample i is images[i] with class labels[i] - so they
+        images / labels / gt / split / locations / object_ids / confidence
+        / orientation_* are read by row index - sample i is images[i] with class labels[i] - so they
         only mean anything while they are the same length. A flush writes
         them one after another and is not atomic: an I/O failure partway
         (a full disk) can resize images and stop before labels, and _n is
@@ -445,7 +475,8 @@ class H5DatasetWriter:
         """
         f = self._f
         rows = f["images"].shape[0]
-        for name in ("labels", "gt", "split") + _STRING_COLUMNS:
+        for name in (("labels", "gt", "split") + _STRING_COLUMNS
+                     + _NUMERIC_COLUMNS):
             if name not in f:
                 continue
             if f[name].shape[0] != rows:
@@ -519,7 +550,8 @@ class H5DatasetWriter:
         return found
 
     def add(self, image_hwc, label_index, gt, split_value,
-            location: str = "", object_id: str = "") -> int:
+            location: str = "", object_id: str = "", confidence: int = 0,
+            orientation: "tuple | None" = None) -> int:
         """Buffer one sample; flushes when a batch has accumulated.
 
         Returns the sample's global row index, so masks (and any future
@@ -531,6 +563,10 @@ class H5DatasetWriter:
         can group the views of one object, hold all of them out of a split
         together, and tell whether a file already contains an object before
         appending it again. Empty for a hard negative.
+
+        ``confidence`` is the label's 1-5 rating, 0 when unrated (and for a
+        hard negative). ``orientation`` is ``(px_rad, deg, derived)`` with
+        None for what is unknown, or None when there is no orientation.
         """
         self._img_buf.append(image_hwc)
         self._lbl_buf.append(label_index)
@@ -538,6 +574,15 @@ class H5DatasetWriter:
         self._split_buf.append(split_value)
         self._str_bufs["locations"].append(str(location or ""))
         self._str_bufs["object_ids"].append(str(object_id or ""))
+        self._num_bufs["confidence"].append(valid_confidence(confidence))
+        px_rad, deg, derived = orientation or (None, None, False)
+        nan = float("nan")
+        self._num_bufs["orientation_px_rad"].append(
+            nan if px_rad is None else float(px_rad))
+        self._num_bufs["orientation_deg"].append(
+            nan if deg is None or px_rad is None else float(deg))
+        self._num_bufs["orientation_derived"].append(
+            bool(derived) and px_rad is not None)
         self._img_bytes += getattr(image_hwc, "nbytes", 0)
         row = self._n + len(self._img_buf) - 1
         if (len(self._img_buf) >= _FLUSH_BATCH
@@ -609,10 +654,14 @@ class H5DatasetWriter:
             f[name][self._n:end] = np.asarray(buf, dtype=dt)
         for name in _STRING_COLUMNS:
             self._flush_string_column(name, end)
+        for group in _NUMERIC_GROUPS:
+            self._flush_numeric_group(group, end)
         self._n = end
         self._img_buf.clear(); self._lbl_buf.clear()
         self._gt_buf.clear(); self._split_buf.clear()
         for buf in self._str_bufs.values():
+            buf.clear()
+        for buf in self._num_bufs.values():
             buf.clear()
         self._img_bytes = 0
 
@@ -636,6 +685,36 @@ class H5DatasetWriter:
             f[name].resize(end, axis=0)
             f[name][self._n:end] = buf
 
+    def _flush_numeric_group(self, group: str, end: int):
+        """Write one group of aligned numeric columns, creating it the first
+        time a sample in it has a value.
+
+        Created sized to the rows already written, filled with the group's
+        "unset" value, so every row stays aligned with ``images`` and rows
+        from before read as unrated / no orientation. A group with nothing
+        to say writes no dataset at all.
+        """
+        columns = _NUMERIC_GROUPS[group]
+        f = self._f
+        if not self._has_group[group]:
+            first, _dtype, fill = columns[0]
+            values = self._num_bufs[first]
+            if isinstance(fill, float) and np.isnan(fill):
+                wanted = any(not np.isnan(v) for v in values)
+            else:
+                wanted = any(v != fill for v in values)
+            if not wanted:
+                return
+            self._has_group[group] = True
+        for name, dtype, fill in columns:
+            if name not in f:
+                f.create_dataset(name, shape=(self._n,), maxshape=(None,),
+                                 dtype=dtype, chunks=(_META_CHUNK,),
+                                 fillvalue=fill)
+            f[name].resize(end, axis=0)
+            f[name][self._n:end] = np.asarray(self._num_bufs[name],
+                                              dtype=dtype)
+
     def close(self) -> int:
         """Flush, close the file and return the total sample count."""
         try:
@@ -647,7 +726,8 @@ class H5DatasetWriter:
         return total
 
 
-def _positive_windows(pts, img_width, img_height, width, height, offset):
+def _positive_windows(pts, img_width, img_height, width, height, offset,
+                      owners: "dict | None" = None):
     """The example crops for every label: ``{(x0, y0): (class_index, object_id)}``.
 
     Each label yields a crop centred on it plus eight more shifted by
@@ -666,32 +746,36 @@ def _positive_windows(pts, img_width, img_height, width, height, offset):
     for whichever label sits nearest its centre - and that label's object id
     goes with it, so the crop names the object it is actually framed on.
 
-    ``pts`` are ``(x, y, class_index, object_id)``.
+    ``pts`` are ``(x, y, class_index, object_id)``. Pass a dict as
+    ``owners`` to have it filled with ``{(x0, y0): index into pts}`` - which
+    label each crop is framed on, so the export can write that label's
+    confidence and orientation with it (the same label its object id
+    comes from).
     """
     windows: dict[tuple[int, int], tuple[int, str, float]] = {}
     max_x, max_y = img_width - width, img_height - height
     if max_x < 0 or max_y < 0:
         return {}
 
-    def offer(x0, y0, x, y, class_index, object_id):
+    def offer(x0, y0, x, y, class_index, object_id, index):
         """Record a crop, keeping whichever label sits nearest its centre."""
         x0 = min(max(x0, 0), max_x)
         y0 = min(max(y0, 0), max_y)
         away = max(abs(x - (x0 + width / 2.0)), abs(y - (y0 + height / 2.0)))
         held = windows.get((x0, y0))
         if held is None or away < held[2]:
-            windows[(x0, y0)] = (class_index, object_id, away)
+            windows[(x0, y0)] = (class_index, object_id, away, index)
 
     # Pass 1: the exactly-centred crop for every label, using the same centring
     # rule as the sub-image GeoTIFF export. Dicts keep insertion order, so these
     # are written to the dataset before any shifted copy - the first snippet of
     # each label is the one framed exactly like its sub-image.
     bases = []
-    for x, y, class_index, object_id in pts:
+    for index, (x, y, class_index, object_id) in enumerate(pts):
         base_x, base_y = centered_window(
             x, y, width, height, img_width, img_height)
-        bases.append((base_x, base_y, x, y, class_index, object_id))
-        offer(base_x, base_y, x, y, class_index, object_id)
+        bases.append((base_x, base_y, x, y, class_index, object_id, index))
+        offer(base_x, base_y, x, y, class_index, object_id, index)
         # Where the label lands inside its centred crop. Anything other than
         # (width//2, height//2) means the crop was shifted off an image edge -
         # log it so a real off-centre export can be traced to its label.
@@ -702,14 +786,16 @@ def _positive_windows(pts, img_width, img_height, width, height, offset):
 
     # Pass 2: the eight offsets, measured from each label's centred crop.
     if offset > 0:
-        for base_x, base_y, x, y, class_index, object_id in bases:
+        for base_x, base_y, x, y, class_index, object_id, index in bases:
             for dy in (-offset, 0, offset):
                 for dx in (-offset, 0, offset):
                     if dx == 0 and dy == 0:
                         continue  # already placed in pass 1
                     offer(base_x + dx, base_y + dy, x, y, class_index,
-                          object_id)
+                          object_id, index)
 
+    if owners is not None:
+        owners.update({pos: held[3] for pos, held in windows.items()})
     return {pos: (held[0], held[1]) for pos, held in windows.items()}
 
 
@@ -808,12 +894,13 @@ def export_image(writer, path, labels, height, width, overlap, channels,
     step_y = max(1, int(round(height * (1.0 - overlap))))
 
     # Label pixel positions + resolved class indices (drop unknown classes).
-    pts = []
+    pts, pt_labels = [], []
     for lab in labels:
         ci = class_to_index.get(lab.class_name)
         if ci is not None:
             pts.append((float(lab.pixel_x), float(lab.pixel_y), ci,
                         str(getattr(lab, "object_id", "") or "")))
+            pt_labels.append(lab)
 
     # Every painted mask on this image, in source-pixel anchoring. Each
     # example crop gets every mask that intersects it (re-anchored by pure
@@ -839,8 +926,9 @@ def export_image(writer, path, labels, height, width, overlap, channels,
             return _window_pixels(src, win, channels, nodata, scaling=scaling)
 
         offset = max(0, int(positive_offset))
+        owners: dict = {}
         positives = _positive_windows(
-            pts, src.width, src.height, width, height, offset)
+            pts, src.width, src.height, width, height, offset, owners=owners)
 
         for (x0, y0), (class_index, object_id) in positives.items():
             if cancel_check and cancel_check():
@@ -848,8 +936,16 @@ def export_image(writer, path, labels, height, width, overlap, channels,
             arr = window_pixels(Window(x0, y0, width, height))
             if arr is None:
                 continue  # entirely nodata
-            row = writer.add(arr, class_index, True, split_value,
-                             location=location, object_id=object_id)
+            # The label this crop is framed on - its object id's label -
+            # supplies the rating and orientation written with it.
+            owner = pt_labels[owners[(x0, y0)]]
+            row = writer.add(
+                arr, class_index, True, split_value, location=location,
+                object_id=object_id,
+                confidence=getattr(owner, "confidence", 0),
+                orientation=(getattr(owner, "orientation_px_rad", None),
+                             getattr(owner, "orientation_deg", None),
+                             getattr(owner, "orientation_derived", False)))
             for entry in mask_entries:
                 layer = entry_in_window(entry, x0, y0, width, height)
                 if layer.any():
