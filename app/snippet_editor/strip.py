@@ -139,9 +139,10 @@ class SnippetStrip(QObject):
         self._rebuild(chosen_anew=False)
 
     @property
-    def worklist(self) -> Worklist:
-        """The first worklist (the only one, in a single-section host)."""
-        return self._worklists[0]
+    def worklist(self) -> "Worklist | None":
+        """The first worklist (the only one, in a single-section host);
+        None when every section is switched off."""
+        return self._worklists[0] if self._worklists else None
 
     @property
     def worklists(self) -> list:

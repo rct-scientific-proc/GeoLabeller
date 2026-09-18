@@ -311,7 +311,9 @@ class MaskEditor(QWidget):
         self.stats_label.setWordWrap(True)
         side.addWidget(self.stats_label)
         side.addStretch(1)
-        self.body_splitter.addWidget(self.mask_panel)
+        if not self._hosted:
+            # Hosted, the panel is the Masks section of the host's column.
+            self.body_splitter.addWidget(self.mask_panel)
 
         # Only the paint area grows when the window does; the lists keep
         # whatever the user dragged them to.

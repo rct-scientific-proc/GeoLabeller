@@ -88,6 +88,9 @@ class OrientationCell(QWidget):
         self._derived = False                   # propagated, not drawn
         self._drag_start: QPointF | None = None
         self._drag_now: QPointF | None = None
+        # The Orientation section switched off: no arrow, no border, no
+        # drawing - but a double-click still opens the snippet.
+        self._orientation_shown = True
         self.setFixedSize(size, size)
         self.setCursor(Qt.CrossCursor)
 
@@ -109,6 +112,15 @@ class OrientationCell(QWidget):
         self._derived = derived and angle_rad is not None
         self.update()
 
+    def orientation_shown(self) -> bool:
+        return self._orientation_shown
+
+    def set_orientation_shown(self, shown: bool):
+        self._orientation_shown = bool(shown)
+        self._drag_start = self._drag_now = None
+        self.setCursor(Qt.CrossCursor if shown else Qt.ArrowCursor)
+        self.update()
+
     def _committed_color(self) -> QColor:
         return DERIVED_COLOR if self._derived else MANUAL_COLOR
 
@@ -120,6 +132,9 @@ class OrientationCell(QWidget):
         if self._pixmap is not None:
             painter.drawPixmap(0, 0, self._pixmap)
         painter.setRenderHint(QPainter.Antialiasing, True)
+        if not self._orientation_shown:
+            painter.end()
+            return
         if self._drag_start is not None and self._drag_now is not None:
             self._draw_arrow(painter, self._drag_start, self._drag_now,
                              QColor(0, 220, 255))
@@ -160,6 +175,8 @@ class OrientationCell(QWidget):
     # -- interaction --------------------------------------------------------
 
     def mousePressEvent(self, event):
+        if not self._orientation_shown:
+            return
         if event.button() == Qt.LeftButton:
             self._drag_start = QPointF(event.pos())
             self._drag_now = self._drag_start
@@ -225,6 +242,7 @@ class OrientationEditor(QWidget):
         # classes" included) and its Show filter replace this grid's own
         # class picker and Unoriented-only box, which are then left out.
         self._strip = strip
+        self._orientation_shown = True
         self._setup_ui()
         if strip is not None:
             strip.rebuilt.connect(self._on_strip_rebuilt)
@@ -251,7 +269,10 @@ class OrientationEditor(QWidget):
             "give them the drawn TRUE-NORTH heading too - each one's pixel\n"
             "angle is derived through its own image's georeferencing.\n"
             "Propagated orientations show violet until drawn over.")
-        controls.addWidget(self.propagate_check)
+        if self._strip is None:
+            # Hosted, the toggle is the host's to place - the Snippet
+            # Editor puts it in its Orientation section.
+            controls.addWidget(self.propagate_check)
         layout.addLayout(controls)
 
         hint = QLabel(
@@ -366,6 +387,7 @@ class OrientationEditor(QWidget):
             cell.open_requested.connect(self.open_requested)
             cell.set_angle(entry.get("orientation_px_rad"),
                            derived=bool(entry.get("orientation_derived")))
+            cell.set_orientation_shown(self._orientation_shown)
             caption = QLabel()
             caption.setAlignment(Qt.AlignHCenter)
             box = QVBoxLayout()
@@ -382,6 +404,14 @@ class OrientationEditor(QWidget):
                                  entry["pixel_x"], entry["pixel_y"],
                                  SNIPPET_SIZE)
 
+    def set_orientation_shown(self, shown: bool):
+        """Show arrows and take drawings - or neither (the section is off)."""
+        self._orientation_shown = bool(shown)
+        for cell in self._cells.values():
+            cell.set_orientation_shown(shown)
+        for entry in self._entries:
+            self._set_caption(entry)
+
     def _entry(self, label_id: int) -> dict | None:
         return getattr(self, "_entries_by_id", {}).get(label_id)
 
@@ -396,8 +426,13 @@ class OrientationEditor(QWidget):
                      f"{entry['image_name']}"]
         rad = entry.get("orientation_px_rad")
         deg = entry.get("orientation_deg")
+        if not self._orientation_shown:
+            rad = deg = None
         if rad is not None:
-            parts.append(f"{rad:+.3f} rad")
+            # + 0.0 turns the -0.0 a due-right drag produces into 0.0: the
+            # screen's y axis is flipped into the convention's, and "-0.000
+            # rad" for a horizontal arrow reads as a mistake.
+            parts.append(f"{rad + 0.0:+.3f} rad")
         if deg is not None:
             parts.append(f"{deg:.1f}\N{DEGREE SIGN} true")
         if rad is not None and entry.get("orientation_derived"):
@@ -505,6 +540,71 @@ class OrientationEditor(QWidget):
         entry["orientation_px_rad"] = None
         entry["orientation_deg"] = None
         entry["orientation_derived"] = False
-        self._cells[label_id].set_angle(None)
+        # Not indexed: the Snippet Editor's Clear button reaches snippets
+        # that are not on the page in view.
+        cell = self._cells.get(label_id)
+        if cell is not None:
+            cell.set_angle(None)
         self._set_caption(entry)
         self.orientation_changed.emit(label_id, None, None, False)
+
+
+class OrientationPanel(QWidget):
+    """The Orientation section's panel in the Snippet Editor.
+
+    What the snippet in hand's orientation is - its pixel angle and true
+    heading, and whether it was drawn or propagated from a linked label -
+    with Clear, and the "apply heading to linked labels" toggle the grid's
+    drawing obeys (the grid's own, placed here by the host).
+    """
+
+    clear_requested = pyqtSignal(int)          # label_id
+
+    def __init__(self, propagate_check: QCheckBox, parent=None):
+        super().__init__(parent)
+        self._label_id = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._readout = QLabel("")
+        self._readout.setWordWrap(True)
+        layout.addWidget(self._readout)
+        self.clear_button = QPushButton("Clear")
+        self.clear_button.setToolTip(
+            "Remove this snippet's orientation (right-click on it in the\n"
+            "grid does the same).")
+        self.clear_button.clicked.connect(self._on_clear_clicked)
+        layout.addWidget(self.clear_button)
+        layout.addWidget(propagate_check)
+        hint = QLabel("Draw from the object's tail to its nose on a snippet "
+                      "in the Grid view; right-click there clears it.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: palette(mid);")
+        layout.addWidget(hint)
+        self.show_entry(None)
+
+    def show_entry(self, entry: "dict | None"):
+        """Read out ``entry``'s orientation (None: no snippet in hand)."""
+        self._label_id = None if entry is None else entry["label_id"]
+        rad = None if entry is None else entry.get("orientation_px_rad")
+        self.clear_button.setEnabled(rad is not None)
+        if entry is None:
+            self._readout.setText("No snippet selected.")
+            return
+        if rad is None:
+            self._readout.setText("No orientation yet.")
+            return
+        deg = entry.get("orientation_deg")
+        parts = [f"{rad + 0.0:+.3f} rad"]       # no "-0.000" (see caption)
+        parts.append(f"{deg:.1f}\N{DEGREE SIGN} true" if deg is not None
+                     else "no georeferencing: pixel angle only")
+        text = "   ".join(parts)
+        if entry.get("orientation_derived"):
+            text += "\nPropagated from a linked label's heading."
+        self._readout.setText(text)
+
+    def readout_text(self) -> str:
+        return self._readout.text()
+
+    def _on_clear_clicked(self):
+        if self._label_id is not None:
+            self.clear_requested.emit(self._label_id)

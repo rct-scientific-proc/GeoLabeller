@@ -92,6 +92,10 @@ class MaskPaintCanvas(QWidget):
         # image size is unknown too) no idea where in the source the strokes
         # would land - so the canvas refuses them outright.
         self._read_only = False
+        # The Masks section switched off: no layers drawn, no strokes taken.
+        # Kept apart from _read_only, which means "this image cannot be
+        # read" and carries its own cursor and message.
+        self._layers_shown = True
         # Brush preview: the cell under the cursor plus the outline edges of
         # the exact pixel set a stamp there would paint.
         self._hover_cell = None
@@ -155,6 +159,14 @@ class MaskPaintCanvas(QWidget):
                 wall |= layer
             self._blocked = wall
         return self._blocked
+
+    def layers_shown(self) -> bool:
+        return self._layers_shown
+
+    def set_layers_shown(self, shown: bool):
+        """Draw the mask layers and take strokes - or neither."""
+        self._layers_shown = bool(shown)
+        self.update()
 
     def set_read_only(self, read_only: bool):
         """Show the masks but accept no strokes."""
@@ -288,10 +300,11 @@ class MaskPaintCanvas(QWidget):
         target = self.rect()
         if self._pixmap is not None:
             painter.drawPixmap(target, self._pixmap)
-        for name in self._order:
-            if name in self._layers:
-                painter.drawImage(target, self._overlay_image(name))
-        self._draw_brush_preview(painter)
+        if self._layers_shown:
+            for name in self._order:
+                if name in self._layers:
+                    painter.drawImage(target, self._overlay_image(name))
+            self._draw_brush_preview(painter)
         painter.end()
 
     def _draw_brush_preview(self, painter):
@@ -364,7 +377,8 @@ class MaskPaintCanvas(QWidget):
             self._pan_last = event.globalPos()
             self.setCursor(Qt.ClosedHandCursor)
             return
-        if (self._read_only or self._active is None
+        if (self._read_only or not self._layers_shown
+                or self._active is None
                 or self._active not in self._layers):
             return
         if event.button() == Qt.LeftButton:
