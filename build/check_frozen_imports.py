@@ -23,7 +23,9 @@ ROOT = Path(__file__).resolve().parent.parent
 SETUP_PY = ROOT / "build" / "setup.py"
 # Everything that ends up in the frozen application. Tests are not packaged, so
 # what they import has no bearing on what the executable needs.
-SOURCES = [ROOT / "main.py", *sorted((ROOT / "app").glob("*.py"))]
+# Recursive: app/ has sub-packages now (app/snippet_editor/), and a module
+# they import is shipped - or left out - exactly like one app/*.py imports.
+SOURCES = [ROOT / "main.py", *sorted((ROOT / "app").rglob("*.py"))]
 
 
 def excluded_modules() -> set[str]:
