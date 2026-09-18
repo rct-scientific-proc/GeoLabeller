@@ -143,7 +143,7 @@ class DescriptionEditorDialog(QDialog):
 
 
 class MaskNameEditorDialog(QDialog):
-    """Edit the project's mask-name presets (the mask editor's picker).
+    """Edit the project's mask-name presets (the Snippet Editor's picker).
 
     Like descriptions, editing this list touches no existing data: a mask
     already painted keeps the name it was painted with. It only decides
@@ -159,7 +159,7 @@ class MaskNameEditorDialog(QDialog):
 
         layout = QVBoxLayout(self)
         instructions = QLabel(
-            "Enter mask names, one per line. The mask editor offers these "
+            "Enter mask names, one per line. The Snippet Editor offers these "
             "when a mask is added, and a name typed there joins the list.\n\n"
             "Renaming or removing a line never changes a mask already "
             "painted - it only changes what is offered next."

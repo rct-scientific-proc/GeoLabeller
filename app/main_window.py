@@ -54,7 +54,7 @@ from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
 from .relocate import (RelocateImagesDialog, missing_images,
                        silently_resolve)
-from .snippet_editor import MaskEditor, OrientationEditor, SnippetEditor
+from .snippet_editor import SnippetEditor
 from .snippet_panel import SnippetPanel
 from .resources import icd_path
 from .version import app_title
@@ -382,13 +382,12 @@ class MainWindow(QMainWindow):
         self._h5_worker: H5ExportWorker | None = None
         self._h5_dialog = None
         self._h5_total = 0
+        # The one window for everything recorded per snippet - masks,
+        # orientation, confidence (2.0.0; it replaced the separate Mask
+        # and Orientation Editor windows). Created on first open.
+        self._snippet_editor = None
         # Last-used export settings, so a re-export doesn't start from scratch.
         # An existing target file's own settings still take precedence.
-        # The orientation editor window, created on first open.
-        self._orientation_editor = None
-        self._mask_editor = None
-        # The one window for orientations and masks together (2.0.0).
-        self._snippet_editor = None
         self._h5_last_options: dict = {}
 
 
@@ -443,8 +442,8 @@ class MainWindow(QMainWindow):
     def _mark_unsaved(self):
         """Show that something has changed since the last save.
 
-        Only the live signs - the title's asterisk and the editor windows'
-        status lines - follow this. Whether closing asks is decided by
+        Only the live signs - the title's asterisk and the Snippet
+        Editor's status line - follow this. Whether closing asks is decided by
         _has_unsaved_changes, which does not rely on being told.
         """
         self.setWindowModified(True)
@@ -452,13 +451,9 @@ class MainWindow(QMainWindow):
 
     def _push_save_state(self, stored: bool = False,
                          label_id: "int | None" = None):
-        """Tell the editor windows that have a save line where the work
-        stands - the mask editor and the Snippet Editor."""
-        editors = [editor for editor in (getattr(self, "_mask_editor", None),
-                                         getattr(self, "_snippet_editor",
-                                                 None))
-                   if editor is not None]
-        if not editors:
+        """Tell the Snippet Editor, if it is open, where the work stands."""
+        editor = getattr(self, "_snippet_editor", None)
+        if editor is None:
             return
         name = self._project_path.name if self._project_path else None
         if self.isWindowModified():
@@ -474,8 +469,7 @@ class MainWindow(QMainWindow):
                            f"{datetime.now():%H:%M:%S}.", True)
         else:
             text, saved = "Nothing to save yet.", True
-        for editor in editors:
-            editor.set_save_state(text, saved=saved)
+        editor.set_save_state(text, saved=saved)
 
     def _ask_save_changes(self, action: str) -> str:
         """Ask whether to save first: "save", "discard" or "cancel".
@@ -751,7 +745,7 @@ class MainWindow(QMainWindow):
 
         edit_mask_names_action = QAction("Edit &Mask Names...", self)
         edit_mask_names_action.setStatusTip(
-            "Preset mask names offered by the mask editor when a mask "
+            "Preset mask names offered by the Snippet Editor when a mask "
             "is added")
         edit_mask_names_action.triggered.connect(self._edit_mask_names)
         labels_menu.addAction(edit_mask_names_action)
@@ -762,20 +756,6 @@ class MainWindow(QMainWindow):
             "everything recorded per snippet")
         snippet_action.triggered.connect(self._open_snippet_editor)
         labels_menu.addAction(snippet_action)
-
-        orientation_action = QAction("&Orientation Editor...", self)
-        orientation_action.setStatusTip(
-            "Draw each label's orientation across a grid of its class's "
-            "snippets")
-        orientation_action.triggered.connect(self._open_orientation_editor)
-        labels_menu.addAction(orientation_action)
-
-        mask_action = QAction("&Mask Editor...", self)
-        mask_action.setStatusTip(
-            "Paint named binary masks on label snippets to compare object "
-            "pixels against the background")
-        mask_action.triggered.connect(self._open_mask_editor)
-        labels_menu.addAction(mask_action)
 
         labels_menu.addSeparator()
 
@@ -1506,14 +1486,12 @@ class MainWindow(QMainWindow):
             self._push_mask_names()
 
     def _push_mask_names(self):
-        """Give every open editor that offers mask names the current list."""
-        presets = self._mask_name_presets()
-        for editor in (self._mask_editor, self._snippet_editor):
-            if editor is not None:
-                editor.set_mask_names(presets)
+        """Give the Snippet Editor, if open, the current preset list."""
+        if self._snippet_editor is not None:
+            self._snippet_editor.set_mask_names(self._mask_name_presets())
 
     def _on_mask_names_changed(self, names):
-        """A name typed in the mask editor joined the project's presets."""
+        """A name typed in the Snippet Editor joined the project's presets."""
         self.project.mask_names = list(names)
         self._mark_unsaved()
 
@@ -2006,11 +1984,11 @@ class MainWindow(QMainWindow):
                     "orientation_deg": label.orientation_deg,
                     "orientation_derived": label.orientation_derived,
                     "confidence": label.confidence,
-                    # Copies: the mask editor mutates its entries freely and
+                    # Copies: the Snippet Editor mutates its entries and
                     # commits through masks_changed, never by aliasing.
                     "masks": [dict(m) for m in label.masks],
                     # Full image dimensions when the project knows them -
-                    # what the mask editor anchors full-image RLEs against
+                    # what the Snippet Editor anchors full-image RLEs against
                     # without re-reading the file header.
                     "image_size": (
                         (image.original_width, image.original_height)
@@ -2057,50 +2035,25 @@ class MainWindow(QMainWindow):
         self._schedule_refresh("labeled", "snippets")
 
     def _reseat_open_editors(self):
-        """Re-seat the orientation and mask editors on the CURRENT project.
+        """Re-seat the Snippet Editor on the CURRENT project.
 
-        Both are long-lived windows holding their own snapshot of label
-        entries, and both commit by bare label id. Left alone across a
-        project switch or a Clear All Labels, the next stroke or drawn
-        heading is applied to whatever label now carries that id - in a
-        different project - or dropped silently. Re-seating them (with an
-        empty list when there is nothing to show) keeps the window that is
-        open honest about what it is editing.
+        It is a long-lived window holding its own snapshot of label entries,
+        and it commits by bare label id. Left alone across a project switch
+        or a Clear All Labels, the next stroke, drawn heading or rating is
+        applied to whatever label now carries that id - in a different
+        project - or dropped silently. Re-seating it (with an empty list
+        when there is nothing to show) keeps it honest about what it is
+        editing.
         """
-        entries = self._label_entries()
         # The presets belong to the project too, so they are re-seated with
         # the labels rather than left showing the old project's.
         self._push_mask_names()
-        for editor in (self._orientation_editor, self._mask_editor,
-                       self._snippet_editor):
-            if editor is not None:
-                editor.set_labels(entries)
+        if self._snippet_editor is not None:
+            self._snippet_editor.set_labels(self._label_entries())
         self._refresh_snippet_panel()
-
-    def _close_clashing_editors(self, *editors, opening: str):
-        """Close these editor windows if open, and say why.
-
-        The Snippet Editor and the old Mask / Orientation Editor windows
-        must never be open together: each keeps its own copy of the labels,
-        and a mask edit sends the label's ENTIRE mask list, so two windows
-        painting the same label would each overwrite the other's masks.
-        Every edit is committed as it is made, so closing loses nothing.
-        (The old two may share the screen - they edit different things.)
-        """
-        closed = [editor.windowTitle() for editor in editors
-                  if editor is not None and editor.isVisible()
-                  and editor.close()]
-        if closed:
-            self.statusBar.showMessage(
-                f"Closed the {' and '.join(closed)} - the {opening} edits "
-                "the same labels, and two windows at once would overwrite "
-                "each other's work. Nothing was lost.", 8000)
 
     def _open_snippet_editor(self):
         """Open (or refresh) the Snippet Editor window."""
-        self._close_clashing_editors(self._mask_editor,
-                                     self._orientation_editor,
-                                     opening="Snippet Editor")
         if self._snippet_editor is None:
             editor = self._snippet_editor = SnippetEditor()
             editor.masks_changed.connect(self._on_masks_changed)
@@ -2114,36 +2067,6 @@ class MainWindow(QMainWindow):
         self._snippet_editor.show()
         self._snippet_editor.raise_()
         self._snippet_editor.activateWindow()
-
-    def _open_orientation_editor(self):
-        """Open (or refresh) the orientation editor window."""
-        self._close_clashing_editors(self._snippet_editor,
-                                     opening="Orientation Editor")
-        if self._orientation_editor is None:
-            self._orientation_editor = OrientationEditor()
-            self._orientation_editor.orientation_changed.connect(
-                self._on_orientation_changed)
-        self._orientation_editor.set_labels(self._label_entries())
-        self._orientation_editor.show()
-        self._orientation_editor.raise_()
-        self._orientation_editor.activateWindow()
-
-    def _open_mask_editor(self):
-        """Open (or refresh) the snippet mask editor window."""
-        self._close_clashing_editors(self._snippet_editor,
-                                     opening="Mask Editor")
-        if self._mask_editor is None:
-            self._mask_editor = MaskEditor()
-            self._mask_editor.masks_changed.connect(self._on_masks_changed)
-            self._mask_editor.save_requested.connect(self._save_project)
-            self._mask_editor.mask_names_changed.connect(
-                self._on_mask_names_changed)
-        self._mask_editor.set_mask_names(self._mask_name_presets())
-        self._mask_editor.set_labels(self._label_entries())
-        self._push_save_state()
-        self._mask_editor.show()
-        self._mask_editor.raise_()
-        self._mask_editor.activateWindow()
 
     def _on_masks_changed(self, label_id, masks):
         """Store a label's full replacement mask list.
@@ -4800,13 +4723,11 @@ class MainWindow(QMainWindow):
         if not self._confirm_unsaved_changes("close"):
             event.ignore()
             return
-        # The editors are windows of their own and would otherwise outlive
-        # this one, editing a project nobody can save.
-        for editor in (getattr(self, "_mask_editor", None),
-                       getattr(self, "_orientation_editor", None),
-                       getattr(self, "_snippet_editor", None)):
-            if editor is not None:
-                editor.close()
+        # The Snippet Editor is a window of its own and would otherwise
+        # outlive this one, editing a project nobody can save.
+        editor = getattr(self, "_snippet_editor", None)
+        if editor is not None:
+            editor.close()
 
         # Clean up crash detection and recovery
         self._clean_exit()
