@@ -52,10 +52,9 @@ from .h5_export import (EXAMPLES_ALL, EXAMPLES_OBJECT,
                         estimate_export)
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
-from .mask_editor import MaskEditor
-from .orientation import OrientationEditor
 from .relocate import (RelocateImagesDialog, missing_images,
                        silently_resolve)
+from .snippet_editor import MaskEditor, OrientationEditor
 from .snippet_panel import SnippetPanel
 from .resources import icd_path
 from .version import app_title

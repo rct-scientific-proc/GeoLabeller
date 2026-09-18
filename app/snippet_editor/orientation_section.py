@@ -1,6 +1,10 @@
-"""The orientation editor: draw a heading across each snippet of a class.
+"""The orientation section: draw a heading across each snippet of a class.
 
-A separate window showing a grid of un-warped snippets for one class at a
+Part of the Snippet Editor package (see app/snippet_editor/__init__.py).
+Built as its own window today (Labels > Orientation Editor) or, with
+window=False, as a plain panel another window can hold.
+
+A grid of un-warped snippets for one class at a
 time. Dragging start->end across a snippet is the object's orientation - a
 car's nose, a ship's bow - and yields both stored angles at once: the
 unit-circle pixel angle and, for georeferenced imagery, the true-north
@@ -25,10 +29,10 @@ from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QGridLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QVBoxLayout, QWidget)
 
-from .debug_log import debug
-from .orientation_math import (
+from ..debug_log import debug
+from ..orientation_math import (
     pixel_angle_from_heading, principal_angle_rad, true_heading_deg)
-from .snippets import SnippetLoader, snippet_frame
+from ..snippets import SnippetLoader, snippet_frame
 
 SNIPPET_SIZE = 224      # source pixels per cell, shown 1:1
 GRID_COLUMNS = 3
@@ -170,10 +174,14 @@ class OrientationEditor(QWidget):
     # label's heading rather than drawn on this snippet.
     orientation_changed = pyqtSignal(int, object, object, bool)
 
-    def __init__(self, parent=None):
-        super().__init__(parent, Qt.Window)
-        self.setWindowTitle("Orientation Editor")
-        self.setMinimumSize(GRID_COLUMNS * (SNIPPET_SIZE + 24) + 60, 600)
+    def __init__(self, parent=None, window: bool = True):
+        # A window of its own by default (Labels > Orientation Editor);
+        # window=False builds it as a plain panel for another window to
+        # hold - the Snippet Editor's Grid view.
+        super().__init__(parent, Qt.Window if window else Qt.Widget)
+        if window:
+            self.setWindowTitle("Orientation Editor")
+            self.setMinimumSize(GRID_COLUMNS * (SNIPPET_SIZE + 24) + 60, 600)
         self._loader = SnippetLoader(self)
         self._loader.ready.connect(self._on_snippet_ready)
         self._entries: list = []
