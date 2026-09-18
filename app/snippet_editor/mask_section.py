@@ -63,6 +63,9 @@ MASK_WORKLIST = Worklist(
 # Where the editor remembers how the user last dragged its panes.
 _SETTINGS = ("GeoLabeller", "GeoLabeller")
 _SPLITTER_KEY = "mask_editor/splitter"
+# Hosted in the Snippet Editor it has two panes, not three, so its widths
+# are remembered apart from the stand-alone window's.
+_HOSTED_SPLITTER_KEY = "snippet_editor/single_splitter"
 _OVERLAP_KEY = "mask_editor/allow_overlap"
 
 
@@ -86,17 +89,22 @@ class MaskEditor(QWidget):
     FILTER_NEEDS = SnippetStrip.FILTER_NEEDS
     FILTER_MASKED = SnippetStrip.FILTER_DONE
 
-    def __init__(self, parent=None, window: bool = True):
+    def __init__(self, parent=None, window: bool = True,
+                 strip: "SnippetStrip | None" = None):
         # A window of its own by default (Labels > Mask Editor);
         # window=False builds it as a plain panel for another window to
         # hold - the Snippet Editor.
         super().__init__(parent, Qt.Window if window else Qt.Widget)
         if window:
             self.setWindowTitle("Mask Editor")
-        # The snippet list, its filters and their counts: shared with the
-        # coming Snippet Editor (app/snippet_editor/strip.py). This window
-        # only places its widgets and says what "done" means.
-        self.strip = SnippetStrip(MASK_WORKLIST, self)
+        # The snippet list, its filters and their counts (strip.py). On its
+        # own this editor makes one, places it, and says what "done" means.
+        # HOSTED - a shared strip passed in - the host places the strip and
+        # its filters and owns the save bar and Ctrl+S, and this is just
+        # the paint canvas and the mask panel beside it.
+        self._hosted = strip is not None
+        self.strip = strip if strip is not None else \
+            SnippetStrip(MASK_WORKLIST, self)
         self._mask_names: list = []              # the project's presets
         self._current: "dict | None" = None      # selected entry
         self._frame = (0, 0, MASK_SNIPPET_SIZE, MASK_SNIPPET_SIZE)
@@ -121,12 +129,13 @@ class MaskEditor(QWidget):
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         controls = self.tool_row = QHBoxLayout()
-        controls.addWidget(QLabel("Class:"))
         self.class_combo = self.strip.class_combo
-        controls.addWidget(self.class_combo, 1)
-        controls.addWidget(QLabel("Show:"))
         self.filter_combo = self.strip.filter_combo
-        controls.addWidget(self.filter_combo)
+        if not self._hosted:
+            controls.addWidget(QLabel("Class:"))
+            controls.addWidget(self.class_combo, 1)
+            controls.addWidget(QLabel("Show:"))
+            controls.addWidget(self.filter_combo)
         controls.addWidget(QLabel("Snippet:"))
         self.size_spin = QSpinBox()
         self.size_spin.setRange(16, 2048)
@@ -150,6 +159,11 @@ class MaskEditor(QWidget):
         self.brush_spin.setSuffix(" px")
         self.brush_spin.setToolTip("Brush diameter in source pixels.")
         controls.addWidget(self.brush_spin)
+        if self._hosted:
+            # On its own, the class picker on this row soaks up the spare
+            # width; hosted, that picker is on the window's toolbar, and
+            # without this the two number boxes would stretch to fill it.
+            controls.addStretch(1)
         layout.addLayout(controls)
 
         # Display-only brightness and contrast: sonar and low-light aerial
@@ -210,8 +224,9 @@ class MaskEditor(QWidget):
         self.strip_panel = self.strip.panel
         self.snippet_list = self.strip.list_widget
         self.strip_label = self.strip.message_label
-        self.snippet_list.installEventFilter(self)
-        self.body_splitter.addWidget(self.strip_panel)
+        if not self._hosted:
+            self.snippet_list.installEventFilter(self)
+            self.body_splitter.addWidget(self.strip_panel)
 
         # The paint surface, scrollable so any zoom level fits on screen.
         self.canvas = MaskPaintCanvas()
@@ -298,11 +313,12 @@ class MaskEditor(QWidget):
         side.addStretch(1)
         self.body_splitter.addWidget(self.mask_panel)
 
-        # Only the paint area grows when the window does; the two lists
-        # keep whatever the user dragged them to.
-        self.body_splitter.setStretchFactor(0, 0)
-        self.body_splitter.setStretchFactor(1, 1)
-        self.body_splitter.setStretchFactor(2, 0)
+        # Only the paint area grows when the window does; the lists keep
+        # whatever the user dragged them to.
+        for index in range(self.body_splitter.count()):
+            self.body_splitter.setStretchFactor(
+                index, 1 if self.body_splitter.widget(index)
+                is self.canvas_scroll else 0)
         self.body_splitter.setChildrenCollapsible(False)
         self._restore_splitter()
         layout.addWidget(self.body_splitter, 1)
@@ -319,9 +335,12 @@ class MaskEditor(QWidget):
             "Write the project - masks included - to its file (Ctrl+S).")
         self.save_button.clicked.connect(self.save_requested.emit)
         footer.addWidget(self.save_button)
-        layout.addLayout(footer)
-        QShortcut(QKeySequence.Save, self,
-                  activated=self.save_requested.emit)
+        if not self._hosted:
+            # Hosted, the window has the save bar and the one Ctrl+S: two
+            # claims of the same chord make Qt fire neither.
+            layout.addLayout(footer)
+            QShortcut(QKeySequence.Save, self,
+                      activated=self.save_requested.emit)
 
     @staticmethod
     def _remembered_overlap() -> bool:
@@ -335,9 +354,12 @@ class MaskEditor(QWidget):
     def allow_overlap(self) -> bool:
         return self.overlap_button.isChecked()
 
+    def _splitter_key(self) -> str:
+        return _HOSTED_SPLITTER_KEY if self._hosted else _SPLITTER_KEY
+
     def _restore_splitter(self):
         """Reopen at the widths this user last dragged them to."""
-        saved = QSettings(*_SETTINGS).value(_SPLITTER_KEY)
+        saved = QSettings(*_SETTINGS).value(self._splitter_key())
         if saved is not None:
             try:
                 if self.body_splitter.restoreState(saved):
@@ -345,7 +367,8 @@ class MaskEditor(QWidget):
             except TypeError:
                 # Something else wrote this key, or it was hand-edited.
                 pass
-        self.body_splitter.setSizes([210, 620, 220])
+        self.body_splitter.setSizes([620, 220] if self._hosted
+                                    else [210, 620, 220])
 
     def save_settings(self):
         """Remember the pane widths and Allow Overlap for next time.
@@ -355,7 +378,8 @@ class MaskEditor(QWidget):
         """
         try:
             settings = QSettings(*_SETTINGS)
-            settings.setValue(_SPLITTER_KEY, self.body_splitter.saveState())
+            settings.setValue(self._splitter_key(),
+                              self.body_splitter.saveState())
             settings.setValue(_OVERLAP_KEY, self.allow_overlap())
         except Exception as exc:                  # noqa: BLE001
             debug(f"mask editor settings not saved: "

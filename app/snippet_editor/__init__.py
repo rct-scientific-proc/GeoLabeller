@@ -7,6 +7,8 @@ the main window and apart from the non-GUI logic the exporters share
 (masks.py, orientation_math.py, snippets.py). Nothing here imports the
 main GUI; tests/test_snippet_editor_embed.py holds that.
 
+    window.py                the Snippet Editor window: one list, the
+                             Single and Grid views, the save bar
     strip.py                 the snippet list: class and Show filters,
                              counts, stepping - shared by every section
     single_view.py           one snippet, zoomable, with paintable layers
@@ -15,13 +17,15 @@ main GUI; tests/test_snippet_editor_embed.py holds that.
                              (OrientationEditor)
 
 Both editors are still their own windows today (Labels > Mask Editor,
-Labels > Orientation Editor) and can also be built with window=False as
-plain panels, which is how the Snippet Editor will hold them. The package
+Labels > Orientation Editor) and can also be built as plain panels around
+a shared strip, which is how the Snippet Editor holds them. The package
 is being filled in piece by piece, each piece shipping on its own with
 the existing windows still working; see the 2.0.0 plan for the order.
 """
 from .mask_section import MaskEditor
 from .orientation_section import OrientationEditor
 from .strip import SnippetStrip, Worklist
+from .window import SnippetEditor
 
-__all__ = ["MaskEditor", "OrientationEditor", "SnippetStrip", "Worklist"]
+__all__ = ["MaskEditor", "OrientationEditor", "SnippetEditor",
+           "SnippetStrip", "Worklist"]
