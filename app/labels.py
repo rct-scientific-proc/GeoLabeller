@@ -126,6 +126,26 @@ def geodesic_distance(lat1: float, lon1: float,
     return abs(distance)
 
 
+# How sure the labeller is of a label, for the ML team: which snippets to
+# train on, and which matter less to get exactly right. A whole number from
+# CONFIDENCE_MIN (lowest) to CONFIDENCE_MAX (highest); CONFIDENCE_UNSET for
+# a label nobody has rated - in the model, and in the H5 export.
+CONFIDENCE_UNSET = 0
+CONFIDENCE_MIN, CONFIDENCE_MAX = 1, 5
+
+
+def valid_confidence(value) -> int:
+    """``value`` if it is a rating (a whole number 1-5), else unset (0).
+
+    Strict on purpose. A 6, a 2.5, "3" or True found in a file is not a
+    rating anyone gave, and the ML team would train on whatever this
+    returns - so anything that is not plainly a rating reads as unset.
+    """
+    if type(value) is int and CONFIDENCE_MIN <= value <= CONFIDENCE_MAX:
+        return value
+    return CONFIDENCE_UNSET
+
+
 @dataclass
 class PointLabel:
     """A single point label annotation."""
@@ -182,6 +202,12 @@ class PointLabel:
     # the user draws over it. Lets consumers (and the editor's colouring)
     # tell measured orientations from inherited ones.
     orientation_derived: bool = False
+
+    # The labeller's confidence in this label, 1 (lowest) to 5 (highest), or
+    # CONFIDENCE_UNSET (0) until someone rates it - set in the Snippet
+    # Editor. Per label, like the orientation: each view of a linked object
+    # is rated on its own snippet. See valid_confidence.
+    confidence: int = CONFIDENCE_UNSET
 
     # Named binary masks painted on this label's snippet in the mask editor.
     # Each entry is a dict {name, x0, y0, width, height, rle}. As of format
@@ -244,6 +270,10 @@ class PointLabel:
             d["orientation_deg"] = self.orientation_deg
         if self.orientation_derived:
             d["orientation_derived"] = True
+        # Written only when rated (format 4.5), like the description, so a
+        # project that never rates anything serialises exactly as before.
+        if self.confidence != CONFIDENCE_UNSET:
+            d["confidence"] = self.confidence
         if self.masks:
             d["masks"] = self.masks
         return d
@@ -288,6 +318,7 @@ class PointLabel:
             orientation_px_rad=data.get("orientation_px_rad"),
             orientation_deg=data.get("orientation_deg"),
             orientation_derived=bool(data.get("orientation_derived", False)),
+            confidence=valid_confidence(data.get("confidence")),
             masks=cls._normalized_masks(data.get("masks", []),
                                         image_width, image_height)
         )
@@ -1110,7 +1141,7 @@ class LabelProject:
         return {
             # Single-digit minors only ("4.0" came after "3.9", never
             # "3.10"): the ICD pins readers to STRING comparison.
-            "version": "4.4",
+            "version": "4.5",
             # Copied, not referenced: the recovery snapshot is handed to a
             # background writer and the user carries on editing meanwhile.
             # The image and waypoint entries are freshly built dictionaries,

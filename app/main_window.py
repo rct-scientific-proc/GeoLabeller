@@ -39,8 +39,8 @@ from .class_editor import (ClassEditorDialog, DescriptionEditorDialog,
                            MaskNameEditorDialog)
 from .goto_location import (GoToLocationDialog, WaypointDialog,
                             format_lat_lon)
-from .labels import (LabelProject, combine_projects, geodesic_distance,
-                     mask_names_in_use)
+from .labels import (CONFIDENCE_UNSET, LabelProject, combine_projects,
+                     geodesic_distance, mask_names_in_use, valid_confidence)
 from .layer_panel import CombinedLayerPanel
 from .optimize_export import (OptimizeExportDialog, OptimizeWorker,
                               plan_output_paths)
@@ -2005,6 +2005,7 @@ class MainWindow(QMainWindow):
                     "orientation_px_rad": label.orientation_px_rad,
                     "orientation_deg": label.orientation_deg,
                     "orientation_derived": label.orientation_derived,
+                    "confidence": label.confidence,
                     # Copies: the mask editor mutates its entries freely and
                     # commits through masks_changed, never by aliasing.
                     "masks": [dict(m) for m in label.masks],
@@ -2179,6 +2180,19 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage(
                 f"Label #{label_id} oriented: {px_rad:+.3f} rad{heading}"
                 f"{source}", 4000)
+
+    def _on_confidence_changed(self, label_id, value):
+        """Store a rating (1-5) the Snippet Editor reports; 0 clears it."""
+        _, label = self.project.get_label_by_id(label_id)
+        if label is None:
+            return
+        if value != CONFIDENCE_UNSET and valid_confidence(value) != value:
+            return          # not a rating; leave what is stored alone
+        label.confidence = value
+        self._mark_unsaved()
+        self.statusBar.showMessage(
+            f"Confidence cleared for label #{label_id}" if not value
+            else f"Label #{label_id} rated {value} of 5", 3000)
 
     def _go_to_coordinates(self):
         """Move the view to a latitude/longitude the user types in."""
