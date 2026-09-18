@@ -54,6 +54,7 @@ from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
 from .mask_editor import MaskEditor
 from .orientation import OrientationEditor
+from .gt_import import apply_import, confirm_import, plan_import
 from .relocate import (RelocateImagesDialog, missing_images,
                        silently_resolve)
 from .snippet_panel import SnippetPanel
@@ -720,6 +721,15 @@ class MainWindow(QMainWindow):
         combine_action = QAction("&Combine Projects...", self)
         combine_action.triggered.connect(self._combine_projects)
         file_menu.addAction(combine_action)
+
+        # Import Ground Truth - another machine's labels, matched onto the
+        # images loaded here by filename
+        import_gt_action = QAction("&Import Ground Truth...", self)
+        import_gt_action.setStatusTip(
+            "Add the labels from a GT file made on another computer, "
+            "matched to the images loaded here by filename")
+        import_gt_action.triggered.connect(self._import_ground_truth)
+        file_menu.addAction(import_gt_action)
 
         file_menu.addSeparator()
 
@@ -2944,6 +2954,72 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
             QMessageBox.critical(
                 self, "Error", f"Failed to combine projects: {e}")
+
+    def _import_ground_truth(self):
+        """Add the labels from another machine's GT file to this project.
+
+        The GT names its images by paths on the machine that wrote it; here
+        they are matched to the images already loaded, by filename, checked
+        against the size and CRS it recorded (app/gt_import.py has the
+        rules). A preview shows what will and will not come in, and nothing
+        changes until the user chooses Import.
+        """
+        title = "Import Ground Truth"
+        if not self.project.images:
+            QMessageBox.information(
+                self, title,
+                "No images are loaded yet. Load the imagery the ground truth "
+                "was made on first (File > Add Directory...), then import "
+                "it: its labels are matched to the loaded images by "
+                "filename.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, title, "",
+            "Ground Truth or Project (*.json *.geolabel);;All Files (*)")
+        if not path:
+            return
+        try:
+            gt = LabelProject.load(path)
+        except Exception as exc:                  # noqa: BLE001
+            debug(f"GT import could not read {path}: "
+                  f"{type(exc).__name__}: {exc}")
+            QMessageBox.warning(
+                self, title,
+                f"Could not read {Path(path).name} as a ground truth or "
+                f"project file.\n\n{type(exc).__name__}: {exc}")
+            return
+        if gt.label_count == 0:
+            QMessageBox.information(
+                self, title, f"{Path(path).name} has no labels to import.")
+            return
+
+        plan = plan_import(self.project, gt)
+        if not self._confirm_gt_import(plan, Path(path).name):
+            return
+        result = apply_import(self.project, plan)
+
+        self._update_class_combo()
+        self._update_description_combo()
+        self._refresh_label_markers()
+        self._refresh_hard_negative_panel()
+        self._reseat_open_editors()
+        self._mark_unsaved()
+        self._recovery_soon_timer.start()
+
+        message = (f"Imported {result.labels_added} label"
+                   f"{'' if result.labels_added == 1 else 's'} onto "
+                   f"{result.images} image"
+                   f"{'' if result.images == 1 else 's'} from "
+                   f"{Path(path).name}")
+        if result.duplicates:
+            message += f"; {result.duplicates} already here"
+        if result.left_out:
+            message += f"; {result.left_out} left out (images not loaded)"
+        self.statusBar.showMessage(message, 8000)
+
+    def _confirm_gt_import(self, plan, source_name: str) -> bool:
+        """The preview; a method of its own so tests can answer it."""
+        return confirm_import(plan, source_name, self.project, self)
 
     def _export_ground_truth(self):
         """Export ground truth labels to a JSON file."""
