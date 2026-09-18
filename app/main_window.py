@@ -320,6 +320,9 @@ class MainWindow(QMainWindow):
         # (layers, index) kept while the user steps out of a cycle mode, so
         # the cycle resumes instead of restarting. See _suspend_cycle.
         self._cycle_parked: tuple[list[str], int] | None = None
+        # Space was pressed on the final image. The run stays - Ctrl+Space
+        # must still go back - but C (or V) now means "start again".
+        self._cycle_at_end = False
 
         # Last "Go to Coordinates" entry, re-filled next time it opens.
         self._goto_defaults: dict = {}
@@ -1059,7 +1062,11 @@ class MainWindow(QMainWindow):
             # clears the way for was never reached. Restart when there is
             # something new to start; stay put mid-run.
             if self._repeat_starts_a_new_cycle(mode):
+                from_the_top = self._cycle_at_end
                 self._suspend_cycle()
+                if from_the_top:
+                    # Starting over - not resuming the end just reached.
+                    self._cycle_parked = None
                 if mode == CanvasMode.CYCLE:
                     self._start_cycle_mode()
                 else:
@@ -1106,7 +1113,8 @@ class MainWindow(QMainWindow):
         """
         if mode not in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
             return False
-        if not self._cycle_layers or self._cycle_index < 0:
+        if (not self._cycle_layers or self._cycle_index < 0
+                or self._cycle_at_end):
             return True
         if mode == CanvasMode.CYCLE:
             selected = self.layer_panel.get_all_layers_in_selected_group()
@@ -1128,6 +1136,7 @@ class MainWindow(QMainWindow):
             self._cycle_parked = (list(self._cycle_layers), self._cycle_index)
         self._cycle_layers = []
         self._cycle_index = -1
+        self._cycle_at_end = False
         self.group_label.setText("")
 
     def _parked_cycle_index(self, layers: list[str]) -> int | None:
@@ -1143,6 +1152,29 @@ class MainWindow(QMainWindow):
         if parked_layers != layers or not 0 <= parked_index < len(layers):
             return None
         return parked_index
+
+    def _cycle_position(self) -> tuple[int, int]:
+        """(position, count) of the image showing, counting UP from 1.
+
+        The queue is walked from its end to its start (the bottom of the
+        group in the tree first), so the index counts down; the counter
+        used to as well - 300/300 on the first image, 1/300 on the last -
+        which made "end of group, 1 of 300" read backwards.
+        """
+        count = len(self._cycle_layers)
+        return count - self._cycle_index, count
+
+    def _cycle_scope(self) -> tuple[str, str]:
+        """What is being cycled, and the key that starts it again."""
+        if self.canvas._mode == CanvasMode.VIEW_CYCLE:
+            return "view cycle", "V"
+        return "group", "C"
+
+    def _show_cycle_status(self, prefix: str = "Cycle mode"):
+        position, count = self._cycle_position()
+        self.statusBar.showMessage(
+            f"{prefix}: Layer {position}/{count} - Space=next, "
+            "Ctrl+Space=prev", 0)
 
     def _cycle_zoom_to(self, layer_id: str):
         """Zoom to a cycled layer."""
@@ -1199,20 +1231,18 @@ class MainWindow(QMainWindow):
 
         # Pick up where a detour left off, else start at the last layer.
         resumed = self._parked_cycle_index(self._cycle_layers)
+        self._cycle_at_end = False
         self._cycle_index = (resumed if resumed is not None
                              else len(self._cycle_layers) - 1)
         layer_id = self._cycle_layers[self._cycle_index]
         self.layer_panel.check_layers([layer_id])
         self._cycle_zoom_to(layer_id)
-        count = len(self._cycle_layers)
+        position, count = self._cycle_position()
         debug(f"cycle {'resume' if resumed is not None else 'start'}: group "
               f"'{group_name}' - {count} images; "
-              f"at {self._layer_name(layer_id)} [{self._cycle_index + 1}/{count}]")
-        self.statusBar.showMessage(
-            f"Cycle {'resumed' if resumed is not None else 'mode'}: Layer "
-            f"{self._cycle_index + 1}/{count} - Space=next, Ctrl+Space=prev",
-            0  # No timeout
-        )
+              f"at {self._layer_name(layer_id)} [{position}/{count}]")
+        self._show_cycle_status(
+            "Cycle resumed" if resumed is not None else "Cycle mode")
 
         # Give canvas keyboard focus so Space key works immediately
         self.canvas.setFocus()
@@ -1230,20 +1260,18 @@ class MainWindow(QMainWindow):
 
         # Pick up where a detour left off, else start at the last layer.
         resumed = self._parked_cycle_index(self._cycle_layers)
+        self._cycle_at_end = False
         self._cycle_index = (resumed if resumed is not None
                              else len(self._cycle_layers) - 1)
         layer_id = self._cycle_layers[self._cycle_index]
         self.layer_panel.check_layers([layer_id])
         self._cycle_zoom_to(layer_id)
-        count = len(self._cycle_layers)
+        position, count = self._cycle_position()
         debug(f"view cycle {'resume' if resumed is not None else 'start'}: "
               f"{count} images in view; "
-              f"at {self._layer_name(layer_id)} [{self._cycle_index + 1}/{count}]")
-        self.statusBar.showMessage(
-            f"View Cycle{' resumed' if resumed is not None else ''}: Layer "
-            f"{self._cycle_index + 1}/{count} - Space=next, Ctrl+Space=prev",
-            0  # No timeout
-        )
+              f"at {self._layer_name(layer_id)} [{position}/{count}]")
+        self._show_cycle_status(
+            "View Cycle resumed" if resumed is not None else "View Cycle")
 
         # Give canvas keyboard focus so Space key works immediately
         self.canvas.setFocus()
@@ -1301,6 +1329,24 @@ class MainWindow(QMainWindow):
 
         self._cycle_direction = -1
 
+        if self._cycle_index == 0:
+            # On the final image. Stay on it, and say so. Running past the
+            # end used to hide this image, throw the queue away and post
+            # "Cycle complete" to the status bar - after which Ctrl+Space
+            # had nothing to go back through, and the message was easy to
+            # miss.
+            self._cycle_at_end = True
+            scope, restart_key = self._cycle_scope()
+            count = len(self._cycle_layers)
+            debug(f"cycle at end: {count}/{count}")
+            self.canvas.show_notice(
+                f"End of {scope} \N{EM DASH} {count} of {count}")
+            self.statusBar.showMessage(
+                f"End of {scope}: Layer {count}/{count} - Ctrl+Space=prev, "
+                f"{restart_key}=start again", 0)
+            self.canvas.setFocus()
+            return
+
         # Toggle off current layer
         current_layer_id = self._cycle_layers[self._cycle_index]
         self.layer_panel.uncheck_layers([current_layer_id])
@@ -1308,32 +1354,14 @@ class MainWindow(QMainWindow):
         # Move to previous index (going backwards through the list)
         self._cycle_index -= 1
 
-        if self._cycle_index < 0:
-            # Reached the beginning, cycle complete
-            debug("cycle complete: all images processed")
-            self.statusBar.showMessage(
-                "Cycle complete - all layers processed", 3000)
-            self._cycle_layers = []
-            self._cycle_index = -1
-            # Nothing left to come back to, so the next C starts a fresh run.
-            self._cycle_parked = None
-            self.group_label.setText("")
-            return
-
         # Turn on and zoom to next layer
         next_layer_id = self._cycle_layers[self._cycle_index]
         self.layer_panel.check_layers([next_layer_id])
         self._cycle_zoom_to(next_layer_id)
-        count = len(self._cycle_layers)
+        position, count = self._cycle_position()
         debug(f"cycle next: {self._layer_name(next_layer_id)} "
-              f"[{self._cycle_index + 1}/{count}, {self._cycle_index} remaining]")
-        self.statusBar.showMessage(
-            f"Cycle mode: Layer {
-                self._cycle_index + 1}/{
-                len(
-                    self._cycle_layers)} - Space=next, Ctrl+Space=prev",
-            0
-        )
+              f"[{position}/{count}, {count - position} remaining]")
+        self._show_cycle_status()
 
         # Refocus canvas so Space key continues to work
         self.canvas.setFocus()
@@ -1346,10 +1374,18 @@ class MainWindow(QMainWindow):
 
         self._cycle_direction = 1
 
-        # Check if we're already at the last layer (can't go back further)
+        # Already on the first image: stay, and say so.
         if self._cycle_index >= len(self._cycle_layers) - 1:
-            self.statusBar.showMessage("Already at the first layer in cycle", 3000)
+            scope, _key = self._cycle_scope()
+            count = len(self._cycle_layers)
+            self.canvas.show_notice(
+                f"Start of {scope} \N{EM DASH} 1 of {count}")
+            self.canvas.setFocus()
             return
+
+        # Stepping back off the final image: no longer at the end, so a
+        # stray C is once again a stray C.
+        self._cycle_at_end = False
 
         # Toggle off current layer
         current_layer_id = self._cycle_layers[self._cycle_index]
@@ -1362,16 +1398,10 @@ class MainWindow(QMainWindow):
         prev_layer_id = self._cycle_layers[self._cycle_index]
         self.layer_panel.check_layers([prev_layer_id])
         self._cycle_zoom_to(prev_layer_id)
-        count = len(self._cycle_layers)
+        position, count = self._cycle_position()
         debug(f"cycle prev: {self._layer_name(prev_layer_id)} "
-              f"[{self._cycle_index + 1}/{count}, {self._cycle_index} remaining]")
-        self.statusBar.showMessage(
-            f"Cycle mode: Layer {
-                self._cycle_index + 1}/{
-                len(
-                    self._cycle_layers)} - Space=next, Ctrl+Space=prev",
-            0
-        )
+              f"[{position}/{count}, {count - position} remaining]")
+        self._show_cycle_status()
 
         # Refocus canvas so keys continue to work
         self.canvas.setFocus()

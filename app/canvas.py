@@ -11,7 +11,7 @@ from collections import deque
 from PyQt5 import sip
 from PyQt5.QtCore import (Qt, pyqtSignal, QRect, QRectF, QLineF, QPointF,
                           QSize, QTimer, QThread, QObject, QThreadPool,
-                          QRunnable)
+                          QRunnable, QPropertyAnimation)
 
 from PyQt5.QtGui import (
     QImage,
@@ -28,7 +28,8 @@ from PyQt5.QtGui import (
 from PyQt5.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
     QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem, QGraphicsTextItem,
-    QGraphicsPathItem, QGraphicsRectItem, QMenu, QRubberBand, QWidget
+    QGraphicsPathItem, QGraphicsRectItem, QMenu, QRubberBand, QWidget,
+    QLabel, QGraphicsOpacityEffect
 )
 from affine import Affine
 from pyproj import Transformer
@@ -1953,6 +1954,67 @@ class _LevelLoadRunnable(QRunnable):
         _emit_safely(signal, *args)
 
 
+class CanvasNotice(QLabel):
+    """A short message over the canvas that goes away by itself.
+
+    For things worth seeing but not worth stopping for - the end of a cycle,
+    say. The status bar was too easy to miss for those; a dialog would stop
+    the user mid-stride and take the focus Space needs. So: a label over the
+    top of the view that takes no focus, lets every click through, and fades
+    after a few seconds. Showing it again while it is up restarts the clock,
+    rather than stacking a second one on top.
+    """
+
+    SHOW_MS = 2500
+    FADE_MS = 300
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet(
+            "background: rgba(24, 24, 28, 210); color: white;"
+            "border-radius: 6px; padding: 6px 14px; font-weight: 600;")
+        self._opacity = QGraphicsOpacityEffect(self)
+        self._opacity.setOpacity(1.0)
+        self.setGraphicsEffect(self._opacity)
+        self._fade = QPropertyAnimation(self._opacity, b"opacity", self)
+        self._fade.setDuration(self.FADE_MS)
+        self._fade.setStartValue(1.0)
+        self._fade.setEndValue(0.0)
+        self._fade.finished.connect(self.hide)
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.setInterval(self.SHOW_MS)
+        self.hide_timer.timeout.connect(self._fade.start)
+        self.hide()
+
+    def flash(self, text: str):
+        """Show ``text`` now, fully opaque, for another SHOW_MS."""
+        # stop() does not emit finished(), so a fade already under way
+        # cannot hide the fresh message.
+        self._fade.stop()
+        self._opacity.setOpacity(1.0)
+        self.setText(text)
+        self.adjustSize()
+        self.reposition()
+        self.show()
+        self.raise_()
+        self.hide_timer.start()
+
+    def reposition(self):
+        """Centre along the top of the view."""
+        parent = self.parentWidget()
+        if parent is not None:
+            self.move(max(0, (parent.width() - self.width()) // 2), 16)
+
+    def is_showing(self) -> bool:
+        """Up, as far as the notice itself is concerned - whether or not
+        its window happens to be on screen."""
+        return not self.isHidden()
+
 class MapCanvas(QGraphicsView):
     """Canvas widget for displaying geospatial raster layers with tiling."""
 
@@ -2179,6 +2241,8 @@ class MapCanvas(QGraphicsView):
         # the highlight can be undone.
         self._chain_link_active = False
         self._chain_link_anchor: int | None = None
+        # The short-message overlay, made on first use (show_notice).
+        self._notice: "CanvasNotice | None" = None
         # Box-link mode: entered from a label's context menu ("Link by
         # Box"). The user drags a desktop-style box; on release every label
         # inside is linked to the ANCHOR label the menu was opened on, then
@@ -4232,9 +4296,20 @@ class MapCanvas(QGraphicsView):
         self._refresh_scene_rect()
         self._schedule_tile_update()
 
+    def show_notice(self, text: str):
+        """A short, non-blocking message over the view (see CanvasNotice)."""
+        if self._notice is None:
+            self._notice = CanvasNotice(self)
+        self._notice.flash(text)
+
+    def notice(self) -> "CanvasNotice | None":
+        return self._notice
+
     def resizeEvent(self, event):
         """Called when view is resized."""
         super().resizeEvent(event)
+        if self._notice is not None and self._notice.is_showing():
+            self._notice.reposition()
         self._refresh_scene_rect()
         self._schedule_tile_update()
 
