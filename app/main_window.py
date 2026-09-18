@@ -1053,6 +1053,17 @@ class MainWindow(QMainWindow):
             # at image 150 of 300 jumped to 300 and lost the position the
             # park/resume machinery exists to protect.
             self._sync_mode_actions(mode)
+            # ...but ignoring EVERY repeat was too much: finish a group,
+            # select the next, press C, and nothing happened - the canvas
+            # was still in Cycle mode, so the fresh run the completion path
+            # clears the way for was never reached. Restart when there is
+            # something new to start; stay put mid-run.
+            if self._repeat_starts_a_new_cycle(mode):
+                self._suspend_cycle()
+                if mode == CanvasMode.CYCLE:
+                    self._start_cycle_mode()
+                else:
+                    self._start_view_cycle_mode()
             return
         was_waterfall = self.canvas._waterfall_active
         self.canvas.set_mode(mode)
@@ -1079,6 +1090,29 @@ class MainWindow(QMainWindow):
             self._start_waterfall_mode()
         else:
             self._suspend_cycle()
+
+    def _repeat_starts_a_new_cycle(self, mode: CanvasMode) -> bool:
+        """Whether pressing a cycle mode's key while in it means "go".
+
+        Yes when the last run finished (nothing is being cycled), and - for
+        Cycle - when a different group is selected: that is asking for
+        that group. No mid-run otherwise, which is what keeps a stray key
+        from throwing away the user's place.
+
+        View Cycle never switches mid-run. Its queue is whatever is in
+        view, and the view follows the cycle, so the layers in view differ
+        on nearly every step - "the queue changed" would be true of almost
+        every press.
+        """
+        if mode not in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
+            return False
+        if not self._cycle_layers or self._cycle_index < 0:
+            return True
+        if mode == CanvasMode.CYCLE:
+            selected = self.layer_panel.get_all_layers_in_selected_group()
+            # No group selected is not a request for a different one.
+            return bool(selected) and selected != self._cycle_layers
+        return False
 
     def _suspend_cycle(self):
         """Park the cycle on leaving it, so a detour can be resumed.
