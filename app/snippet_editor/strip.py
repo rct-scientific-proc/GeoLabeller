@@ -5,10 +5,13 @@ live counts, a line explaining an empty list, and stepping for Space /
 Ctrl+Space. Moved out of the mask editor so every section of the Snippet
 Editor can share it.
 
-What "done" means for the Show filter is the host's to say, as a Worklist:
-"has a mask" for the mask editor today, "has an orientation" or "has a
-confidence" as those sections arrive. The strip knows nothing about any of
-them - it imports the snippet service and nothing else in the app.
+What "done" means for the Show filter is the host's to say, as one or more
+Worklists: "has a mask" for the mask editor, "has an orientation" and "has
+a mask" side by side in the Snippet Editor, "has a confidence" when that
+section arrives. Each gets its own pair on the filter ("Needs masks",
+"Masked") with live counts, and its own badge on the captions. The strip
+knows nothing about any of them - it imports the snippet service and
+nothing else in the app.
 
 It owns its widgets but not their placement: the two filters go on the
 host's toolbar, the list pane into the host's splitter. So the strip can
@@ -51,21 +54,27 @@ class SnippetStrip(QObject):
     """The list of snippets being worked through, and its filters."""
 
     # The entry dict now selected (the strip's own object - hosts edit it
-    # in place and call refresh_current), or None for an empty list.
+    # in place and call refresh), or None for an empty list.
     entry_picked = pyqtSignal(object)
+    # The list was rebuilt. True when what it lists was CHOSEN anew (class,
+    # filter, worklists) - a grid beside it starts from its first page -
+    # and False when the same choice was refilled with new labels, where
+    # a grid keeps its place.
+    rebuilt = pyqtSignal(bool)
 
     ID_ROLE = Qt.UserRole
     ALL_CLASSES = "All classes"
 
-    # Show filter, in combo order. It opens on All, and deliberately:
-    # reopening a finished class onto an empty strip reads as lost work.
-    # The counts sit on the filter, so "212 still need masks" is legible
-    # without hiding anything to find it out.
+    # Show filter, in combo order: All, then a needs/done pair per
+    # worklist - so these name the first worklist's pair. It opens on All,
+    # and deliberately: reopening a finished class onto an empty strip
+    # reads as lost work. The counts sit on the filter, so "212 still need
+    # masks" is legible without hiding anything to find it out.
     FILTER_ALL, FILTER_NEEDS, FILTER_DONE = 0, 1, 2
 
     def __init__(self, worklist: Worklist, parent=None):
         super().__init__(parent)
-        self._worklist = worklist
+        self._worklists = [worklist]
         self.entries: list = []
         self.items_by_label: dict = {}          # label_id -> list item
         self.entries_by_label: dict = {}        # label_id -> entry
@@ -127,16 +136,49 @@ class SnippetStrip(QObject):
         if current in wanted:
             self.class_combo.setCurrentText(current)
         self.class_combo.blockSignals(False)
-        self.rebuild()
+        self._rebuild(chosen_anew=False)
 
     @property
     def worklist(self) -> Worklist:
-        return self._worklist
+        """The first worklist (the only one, in a single-section host)."""
+        return self._worklists[0]
+
+    @property
+    def worklists(self) -> list:
+        return list(self._worklists)
 
     def set_worklist(self, worklist: Worklist):
-        """Change what "done" means - the filter setting itself is kept."""
-        self._worklist = worklist
-        self.rebuild()
+        """Replace the single worklist - the filter's position is kept.
+
+        A one-section host changing what "done" means: Needs stays Needs,
+        now in the new worklist's sense.
+        """
+        mode = min(self.filter_mode(), self.FILTER_DONE)
+        self._worklists = [worklist]
+        self._reset_filter(max(mode, self.FILTER_ALL))
+
+    def set_worklists(self, worklists: list):
+        """Offer a needs/done pair on the filter for each of these.
+
+        A choice that still exists afterwards stays chosen ("Needs masks"
+        survives Orientation being switched off); one that does not falls
+        back to All rather than silently becoming something else.
+        """
+        chosen = self._chosen()
+        self._worklists = list(worklists)
+        mode = self.FILTER_ALL
+        if chosen is not None and chosen[0] in self._worklists:
+            mode = 1 + 2 * self._worklists.index(chosen[0]) + int(chosen[1])
+        self._reset_filter(mode)
+
+    def _reset_filter(self, mode: int):
+        """One needs/done pair per worklist, ``mode`` chosen, then refill."""
+        self.filter_combo.blockSignals(True)
+        self.filter_combo.clear()
+        self.filter_combo.addItems([""] * (1 + 2 * len(self._worklists)))
+        self.filter_combo.setCurrentIndex(mode)
+        self.filter_combo.blockSignals(False)
+        self._rebuild(chosen_anew=True)
 
     # -- queries ------------------------------------------------------------
 
@@ -157,16 +199,41 @@ class SnippetStrip(QObject):
     def current_entry(self) -> "dict | None":
         return self.entries_by_label.get(self._current_id)
 
+    def listed_entries(self) -> list:
+        """The entries the list shows, in its order - what a grid beside
+        the list lays out."""
+        return [self.entries_by_label[self.list_widget.item(row)
+                                      .data(self.ID_ROLE)]
+                for row in range(self.list_widget.count())]
+
+    def select(self, label_id) -> bool:
+        """Put a listed snippet in hand; False if it is not listed."""
+        item = self.items_by_label.get(label_id)
+        if item is None:
+            return False
+        self.list_widget.setCurrentItem(item)
+        return True
+
     def in_class(self, entry: dict) -> bool:
         wanted = self.class_combo.currentText()
         return wanted == self.ALL_CLASSES or entry["class_name"] == wanted
 
-    def matches(self, entry: dict) -> bool:
+    def _chosen(self) -> "tuple[Worklist, bool] | None":
+        """(worklist, wants-done) for the filter's choice; None for All."""
         mode = self.filter_mode()
-        if mode == self.FILTER_ALL:
+        if mode <= self.FILTER_ALL:
+            return None
+        index, done = divmod(mode - 1, 2)
+        if index >= len(self._worklists):
+            return None
+        return self._worklists[index], bool(done)
+
+    def matches(self, entry: dict) -> bool:
+        chosen = self._chosen()
+        if chosen is None:
             return True
-        return bool(self._worklist.is_done(entry)) == \
-            (mode == self.FILTER_DONE)
+        worklist, wants_done = chosen
+        return bool(worklist.is_done(entry)) == wants_done
 
     # -- stepping -----------------------------------------------------------
 
@@ -180,25 +247,36 @@ class SnippetStrip(QObject):
 
     # -- after the host edits the current entry -----------------------------
 
-    def refresh_current(self):
-        """The current entry changed: recaption and recount, no rebuild.
+    def refresh(self, label_id=None):
+        """An entry changed (the current one by default): recaption it and
+        recount, without a rebuild.
 
         A rebuild here would take a just-finished snippet off a Needs list
         while it is still being worked on; it is retired when the user
-        moves off it instead (see _retire).
+        moves off it instead (see _retire). A grid edits snippets that are
+        not the current one, hence the label_id.
         """
-        item = self.list_widget.currentItem()
-        entry = self.current_entry()
+        if label_id is None:
+            label_id = self._current_id
+        item = self.items_by_label.get(label_id)
+        entry = self.entries_by_label.get(label_id)
         if item is not None and entry is not None:
             item.setText(self._caption(entry))
         self._update_counts()
 
+    def refresh_current(self):
+        self.refresh()
+
     # -- building -----------------------------------------------------------
 
     def rebuild(self):
-        # No optional arguments: class_combo.currentIndexChanged is
-        # connected straight to this slot, and PyQt hands a Python
-        # callable as many signal arguments as its signature will take.
+        """Refill the list for the current choice of class and filter."""
+        # No arguments: class_combo.currentIndexChanged is connected
+        # straight to this slot, and PyQt hands a Python callable as many
+        # signal arguments as its signature will take.
+        self._rebuild(chosen_anew=True)
+
+    def _rebuild(self, chosen_anew: bool):
         self.loader.cancel_all()
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
@@ -228,22 +306,24 @@ class SnippetStrip(QObject):
             self._current_id = None
             self.entry_picked.emit(None)
         self._update_message()
+        self.rebuilt.emit(chosen_anew)
 
     def _caption(self, entry: dict) -> str:
         caption = entry["image_name"]
         if self.class_combo.currentText() == self.ALL_CLASSES:
             caption = f"{entry['class_name']}  \N{MIDDLE DOT}  {caption}"
-        return caption + self._worklist.badge(entry)
+        return caption + "".join(w.badge(entry) for w in self._worklists)
 
     def _update_counts(self):
         """Live counts on the filter, for the class in view - the number
         left to do falls as the work is done, where the user chose what
         to look at."""
         in_class = [e for e in self.entries if self.in_class(e)]
-        done = sum(1 for e in in_class if self._worklist.is_done(e))
-        labels = (f"All ({len(in_class)})",
-                  f"{self._worklist.needs} ({len(in_class) - done})",
-                  f"{self._worklist.done} ({done})")
+        labels = [f"All ({len(in_class)})"]
+        for worklist in self._worklists:
+            done = sum(1 for e in in_class if worklist.is_done(e))
+            labels += [f"{worklist.needs} ({len(in_class) - done})",
+                       f"{worklist.done} ({done})"]
         self.filter_combo.blockSignals(True)
         for index, text in enumerate(labels):
             self.filter_combo.setItemText(index, text)
@@ -254,12 +334,13 @@ class SnippetStrip(QObject):
             self.message_label.setText("")
             self.message_label.setVisible(False)
             return
-        if self.filter_mode() == self.FILTER_NEEDS:
-            text = self._worklist.nothing_left
-        elif self.filter_mode() == self.FILTER_DONE:
-            text = self._worklist.none_done
-        else:
+        chosen = self._chosen()
+        if chosen is None:
             text = "No snippets in this class."
+        elif chosen[1]:
+            text = chosen[0].none_done
+        else:
+            text = chosen[0].nothing_left
         self.message_label.setText(text)
         self.message_label.setVisible(True)
 
