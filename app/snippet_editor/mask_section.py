@@ -195,7 +195,8 @@ class MaskEditor(QWidget):
         hint = QLabel("Left-drag paints the active mask, right-drag erases; "
                       "wheel zooms (to the cursor), Shift+drag pans. "
                       "Space / Ctrl+Space step through the snippets. "
-                      "Masks may overlap; each is its own layer.")
+                      "Each mask is its own layer; masks do not overlap "
+                      "unless Allow Overlap is on.")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
