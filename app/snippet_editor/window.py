@@ -26,9 +26,11 @@ confidence_changed / mask_names_changed / save_requested out.
 """
 from PyQt5.QtCore import QEvent, QSettings, Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QKeySequence
-from PyQt5.QtWidgets import (QButtonGroup, QCheckBox, QHBoxLayout, QLabel,
-                             QPushButton, QScrollArea, QShortcut, QSplitter,
-                             QStackedWidget, QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QAbstractSpinBox, QApplication, QButtonGroup,
+                             QCheckBox, QComboBox, QHBoxLayout, QLabel,
+                             QLineEdit, QPlainTextEdit, QPushButton,
+                             QScrollArea, QShortcut, QSplitter,
+                             QStackedWidget, QTextEdit, QVBoxLayout, QWidget)
 
 from ..debug_log import debug
 from .confidence_section import ConfidenceSection
@@ -244,7 +246,7 @@ class SnippetEditor(QWidget):
         for frame in self.sections.values():
             frame.toggled.connect(self._apply_sections)
         # Space steps the list wherever the keyboard is in the window.
-        self.strip.list_widget.installEventFilter(self)
+        QApplication.instance().installEventFilter(self)
 
     # -- data in ------------------------------------------------------------
 
@@ -329,24 +331,54 @@ class SnippetEditor(QWidget):
     # -- keys ---------------------------------------------------------------
 
     def keyPressEvent(self, event):
-        if self.view() == self.SINGLE:
-            if event.key() == Qt.Key_Space:
-                self.strip.cycle(
-                    -1 if event.modifiers() & Qt.ControlModifier else 1)
-                return
-            for key in self.sections_on():
-                if self.section_objects[key].key_pressed(event.key()):
-                    return
-        super().keyPressEvent(event)
+        if not self._take_key(event):
+            super().keyPressEvent(event)
 
     def eventFilter(self, obj, event):
-        """Steal Space from the list, so stepping works from there too."""
-        if (event.type() == QEvent.KeyPress
-                and event.key() == Qt.Key_Space):
+        """Claim this window's keys before the focused widget eats them.
+
+        Qt hands a key to whichever widget holds focus, so which keys
+        worked depended on the last thing clicked: Add Mask kept the focus
+        and Space pressed it again, the snippet list took 1-5 as
+        type-ahead, and the paint canvas takes no focus at all, so
+        clicking the snippet being painted never helped. Reported from the
+        field as being stuck in the paintbrush (2026-09-20).
+
+        A filter on the application sees every key first; this answers for
+        the ones aimed at this window.
+        """
+        if (event.type() == QEvent.KeyPress and self._owns(obj)
+                and self._take_key(event)):
+            return True
+        return super().eventFilter(obj, event)
+
+    def _owns(self, obj) -> bool:
+        """Is this event on its way to something in this window?"""
+        return isinstance(obj, QWidget) and (obj is self
+                                             or self.isAncestorOf(obj))
+
+    def _take_key(self, event) -> bool:
+        """Step the list, or hand the key to a section that wants it."""
+        if self.view() != self.SINGLE:
+            return False
+        focus = QApplication.focusWidget()
+        # A mask name is typed, and may hold spaces and digits ("bow
+        # wave"), so a text field keeps every key it is given.
+        if isinstance(focus, (QLineEdit, QTextEdit, QPlainTextEdit)) or (
+                isinstance(focus, QComboBox) and focus.isEditable()):
+            return False
+        if event.key() == Qt.Key_Space:
             self.strip.cycle(
                 -1 if event.modifiers() & Qt.ControlModifier else 1)
             return True
-        return super().eventFilter(obj, event)
+        # Digits in a number box are the value being typed; Space above is
+        # claimed there, since a number box has no use for one.
+        if isinstance(focus, QAbstractSpinBox):
+            return False
+        for key in self.sections_on():
+            if self.section_objects[key].key_pressed(event.key()):
+                return True
+        return False
 
     # -- settings -----------------------------------------------------------
 
