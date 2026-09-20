@@ -1506,17 +1506,26 @@ class MainWindow(QMainWindow):
         self._mark_unsaved()
 
     def _select_description(self, number: int):
-        """Shift+1-9 / Shift+0: activate preset ``number`` (0 = none)."""
-        if number == 0:
-            self.description_combo.setCurrentIndex(0)
-            self.statusBar.showMessage("Description: none", 2000)
-            return True
-        if number <= len(self.project.descriptions):
-            self.description_combo.setCurrentIndex(number)   # 0 is "(none)"
-            self.statusBar.showMessage(
-                f"Description: {self.description_combo.currentText()}", 2000)
-            return True
-        return False
+        """Shift+1-9 / Shift+0: activate preset ``number`` (0 = none).
+
+        The preset already in hand switches itself off: pressing its own
+        key again goes back to none. Reaching across the number row for
+        Shift+0 meant letting go of the mouse, which is what labellers
+        actually complained about (2026-09-20); 1-6 and back is now all
+        left-hand work.
+        """
+        if number and number > len(self.project.descriptions):
+            return False
+        if number == self.description_combo.currentIndex():
+            number = 0                      # the same one again: turn it off
+        self.description_combo.setCurrentIndex(number)   # 0 is "(none)"
+        # Over the imagery, where the eyes are - the status bar is not read
+        # while labelling. It fades on its own (CanvasNotice).
+        text = ("Description: none" if number == 0 else
+                f"Description: {self.description_combo.currentText()}")
+        self.statusBar.showMessage(text, 2000)
+        self.canvas.show_notice(text)
+        return True
 
     # With Shift held, the number row reports the SHIFTED symbol as the key
     # on most layouts (Shift+1 arrives as Key_Exclam on US keyboards), so

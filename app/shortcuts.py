@@ -50,7 +50,7 @@ SHORTCUT_SECTIONS = [
         ("Right-click + drag", "Pan the view"),
         ("Ctrl+Left-click label", "Label options (Cycle modes)"),
         ("1-9", "Quick-switch to class 1-9"),
-        ("Shift+1-9", "Quick-switch description preset 1-9"),
+        ("Shift+1-9", "Description preset 1-9; again for none"),
         ("Shift+0", "No description (new labels get none)"),
         ("Escape", "Cancel link mode"),
     ]),
