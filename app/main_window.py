@@ -52,6 +52,7 @@ from .h5_export import (EXAMPLES_ALL, EXAMPLES_OBJECT,
                         estimate_export)
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
+from . import recent
 from .gt_import import apply_import, confirm_import, plan_import
 from .relocate import (RelocateImagesDialog, missing_images,
                        silently_resolve)
@@ -680,6 +681,11 @@ class MainWindow(QMainWindow):
         open_project_action.setShortcut("Ctrl+Shift+P")
         open_project_action.triggered.connect(self._open_project)
         file_menu.addAction(open_project_action)
+
+        # Open Recent - filled in as it drops down, so it is right
+        # whatever has been opened or saved since the window was built.
+        self.recent_menu = file_menu.addMenu("Open &Recent")
+        self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
 
         # Save Project
         save_project_action = QAction("&Save Project", self)
@@ -2477,51 +2483,107 @@ class MainWindow(QMainWindow):
         self.statusBar.showMessage("New project created", 3000)
 
     def _open_project(self):
-        """Open a project file."""
+        """Open a project file the user picks."""
         if not self._confirm_unsaved_changes("open another project"):
             return
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Open Project",
-            "",
+            recent.last_dir(recent.PROJECT),
             "GeoLabeller Project (*.geolabel);;All Files (*)"
         )
         if file_path:
-            try:
-                # Before clearing anything: a loader still running would
-                # keep feeding the tree the user is about to replace.
-                self._supersede_async_loading()
-                self.canvas.clear_label_markers()
-                self.canvas.clear_layers()
-                self.layer_panel.clear()
+            recent.remember_dir(recent.PROJECT, file_path)
+            self._load_project_file(file_path)
 
-                self.project = LabelProject.load(file_path)
-                self._project_path = Path(file_path)
-                # What is on disk. Anything the load goes on to change -
-                # imagery relocated beside the project, metadata backfilled
-                # into an older file - is a real change, worth saving.
-                self._set_saved_baseline()
+    def _fill_recent_menu(self):
+        """Rebuild File > Open Recent from what has been opened lately."""
+        self.recent_menu.clear()
+        paths = recent.projects()
+        if not paths:
+            nothing = self.recent_menu.addAction("No recent projects")
+            nothing.setEnabled(False)
+            return
+        for number, path in enumerate(paths, start=1):
+            # &1..&9 pick an entry by number; the ampersand would
+            # otherwise eat a literal & in somebody's folder name.
+            label = Path(path).name.replace("&", "&&")
+            action = self.recent_menu.addAction(
+                f"&{number}  {label}" if number < 10 else f"   {label}")
+            action.setData(path)
+            action.setStatusTip(path)
+            action.setToolTip(path)
+            action.triggered.connect(
+                lambda _checked=False, chosen=path:
+                    self._open_recent_project(chosen))
+        self.recent_menu.addSeparator()
+        self.recent_menu.addAction("Clear List",
+                                   self._clear_recent_projects)
 
-                # Show progress for loading images
-                num_images = len(self.project.images)
-                if num_images > 0:
-                    self._show_progress(num_images, "Loading project")
-                    # Start async project loading
-                    self._start_project_image_loading()
-                else:
-                    self._update_class_combo()
-                    self._refresh_label_markers()
-                    self._refresh_waypoints()
-                    self._refresh_hard_negative_panel()
-                    self._apply_title(
-                        f"{app_title()} - {self._project_path.name}")
-                    self.statusBar.showMessage(
-                        f"Opened project with {
-                            self.project.label_count} labels", 3000)
-            except Exception as e:
-                traceback.print_exc()
-                QMessageBox.critical(
-                    self, "Error", f"Failed to open project: {e}")
+    def _remember_recent_project(self, path):
+        """A project was opened or saved: put it at the top of the list."""
+        recent.remember_project(str(path))
+
+    def _open_recent_project(self, path: str):
+        """Open a project from the Open Recent menu."""
+        if not self._confirm_unsaved_changes("open another project"):
+            return
+        if not os.path.exists(path):
+            # Moved, renamed, or on a share that is not mounted today.
+            recent.forget_project(path)
+            QMessageBox.warning(
+                self, "Open Recent",
+                f"{Path(path).name} is no longer at:\n{path}\n\n"
+                "It has been taken off the recent list.")
+            return
+        recent.remember_dir(recent.PROJECT, path)
+        self._load_project_file(path)
+
+    def _clear_recent_projects(self):
+        recent.clear_projects()
+
+    def _load_project_file(self, file_path):
+        """Open the project at ``file_path``, whoever chose it.
+
+        File > Open Recent comes through here too, so a project opened
+        from the menu is opened exactly as one picked in the dialog.
+        """
+        try:
+            # Before clearing anything: a loader still running would
+            # keep feeding the tree the user is about to replace.
+            self._supersede_async_loading()
+            self.canvas.clear_label_markers()
+            self.canvas.clear_layers()
+            self.layer_panel.clear()
+
+            self.project = LabelProject.load(file_path)
+            self._project_path = Path(file_path)
+            self._remember_recent_project(file_path)
+            # What is on disk. Anything the load goes on to change -
+            # imagery relocated beside the project, metadata backfilled
+            # into an older file - is a real change, worth saving.
+            self._set_saved_baseline()
+
+            # Show progress for loading images
+            num_images = len(self.project.images)
+            if num_images > 0:
+                self._show_progress(num_images, "Loading project")
+                # Start async project loading
+                self._start_project_image_loading()
+            else:
+                self._update_class_combo()
+                self._refresh_label_markers()
+                self._refresh_waypoints()
+                self._refresh_hard_negative_panel()
+                self._apply_title(
+                    f"{app_title()} - {self._project_path.name}")
+                self.statusBar.showMessage(
+                    f"Opened project with {
+                        self.project.label_count} labels", 3000)
+        except Exception as e:
+            traceback.print_exc()
+            QMessageBox.critical(
+                self, "Error", f"Failed to open project: {e}")
 
     def _start_project_image_loading(self):
         """Start async loading of project images."""
@@ -2870,10 +2932,11 @@ class MainWindow(QMainWindow):
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Project",
-            "",
+            recent.last_dir(recent.PROJECT),
             "GeoLabeller Project (*.geolabel)"
         )
         if file_path:
+            recent.remember_dir(recent.PROJECT, file_path)
             if not file_path.endswith('.geolabel'):
                 file_path += '.geolabel'
             self._do_save(Path(file_path))
@@ -2883,6 +2946,7 @@ class MainWindow(QMainWindow):
         try:
             data = self.project.save(path)
             self._project_path = path
+            self._remember_recent_project(path)
             self._set_saved_baseline(data=data)
             self._apply_title(f"{app_title()} - {path.name}")
             self.statusBar.showMessage(
@@ -2900,7 +2964,7 @@ class MainWindow(QMainWindow):
         file1, _ = QFileDialog.getOpenFileName(
             self,
             "Select First Project to Combine",
-            "",
+            recent.last_dir(recent.PROJECT),
             "GeoLabeller Project (*.geolabel);;All Files (*)"
         )
         if not file1:
@@ -2910,7 +2974,7 @@ class MainWindow(QMainWindow):
         file2, _ = QFileDialog.getOpenFileName(
             self,
             "Select Second Project to Combine",
-            "",
+            recent.last_dir(recent.PROJECT),
             "GeoLabeller Project (*.geolabel);;All Files (*)"
         )
         if not file2:
@@ -2920,11 +2984,12 @@ class MainWindow(QMainWindow):
         output_file, _ = QFileDialog.getSaveFileName(
             self,
             "Save Combined Project As",
-            "",
+            recent.last_dir(recent.PROJECT),
             "GeoLabeller Project (*.geolabel)"
         )
         if not output_file:
             return
+        recent.remember_dir(recent.PROJECT, output_file)
 
         if not output_file.endswith('.geolabel'):
             output_file += '.geolabel'
@@ -2979,10 +3044,11 @@ class MainWindow(QMainWindow):
                 "filename.")
             return
         path, _ = QFileDialog.getOpenFileName(
-            self, title, "",
+            self, title, recent.last_dir(recent.PROJECT),
             "Ground Truth or Project (*.json *.geolabel);;All Files (*)")
         if not path:
             return
+        recent.remember_dir(recent.PROJECT, path)
         try:
             gt = LabelProject.load(path)
         except Exception as exc:                  # noqa: BLE001
@@ -3035,10 +3101,11 @@ class MainWindow(QMainWindow):
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Export Ground Truth",
-            "",
+            recent.last_dir(recent.EXPORT),
             "JSON Files (*.json)"
         )
         if file_path:
+            recent.remember_dir(recent.EXPORT, file_path)
             if not file_path.endswith('.json'):
                 file_path += '.json'
             try:
@@ -3060,11 +3127,12 @@ class MainWindow(QMainWindow):
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Export Ground Truth (Labeled Only)",
-            "",
+            recent.last_dir(recent.EXPORT),
             "JSON Files (*.json)"
         )
         if not file_path:
             return
+        recent.remember_dir(recent.EXPORT, file_path)
         if not file_path.endswith('.json'):
             file_path += '.json'
 
@@ -3538,11 +3606,12 @@ class MainWindow(QMainWindow):
         output_dir = QFileDialog.getExistingDirectory(
             self,
             "Select Output Directory for Sub-images",
-            "",
+            recent.last_dir(recent.EXPORT),
             QFileDialog.ShowDirsOnly
         )
         if not output_dir:
             return
+        recent.remember_dir(recent.EXPORT, output_dir)
 
         output_path = Path(output_dir)
 
@@ -3712,9 +3781,11 @@ class MainWindow(QMainWindow):
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Add Image",
-            "",
+            recent.last_dir(recent.IMAGERY),
             file_filter
         )
+        if file_paths:
+            recent.remember_dir(recent.IMAGERY, file_paths[0])
 
         skipped = 0
         for file_path in file_paths:
@@ -3772,12 +3843,13 @@ class MainWindow(QMainWindow):
         dir_path = QFileDialog.getExistingDirectory(
             self,
             "Select Directory with Images",
-            "",
+            recent.last_dir(recent.IMAGERY),
             QFileDialog.ShowDirsOnly
         )
 
         if not dir_path:
             return
+        recent.remember_dir(recent.IMAGERY, dir_path)
 
         # Find all supported files recursively
         root_path = Path(dir_path)
