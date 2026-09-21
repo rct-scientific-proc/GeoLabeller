@@ -3983,8 +3983,16 @@ class MapCanvas(QGraphicsView):
             return layer._src_transform, layer._src_crs
         return None, None
 
-    def zoom_to_layer(self, layer_id: str):
-        """Zoom the view to fit a specific layer's bounds."""
+    def zoom_to_layer(self, layer_id: str, immediate: bool = False):
+        """Zoom the view to fit a specific layer's bounds.
+
+        ``immediate`` runs the tile update now rather than on the throttle
+        (see _schedule_tile_update). The throttle exists to coalesce motion
+        - a wheel, a pan, a glide - and a cycle step is not motion: it is
+        one event whose image is usually already in memory, and the 50 ms
+        wait was most of what a step cost (measured ~65 ms from key to
+        picture, ~15 without it).
+        """
         if layer_id not in self._layers:
             return
 
@@ -4003,7 +4011,15 @@ class MapCanvas(QGraphicsView):
         # from a metre-scale wheel zoom) or covering the image (after a
         # whole-project view). Cycle mode reaches here on every step.
         self.update_label_markers_scale()
-        self._schedule_tile_update()
+        if immediate:
+            # After the fit above, never before it: a cycle step switches
+            # its image on BEFORE zooming, and an update judged at the
+            # previous image's zoom loads a level the step then discards
+            # (which is why set_layer_visibility defers).
+            self._tile_update_timer.stop()
+            self._update_visible_tiles()
+        else:
+            self._schedule_tile_update()
 
     def zoom_to_point(self, lon: float, lat: float, size_meters: float = 10.0):
         """Zoom the view to center on a point with a given GROUND extent.

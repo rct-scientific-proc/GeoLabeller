@@ -1211,7 +1211,9 @@ class MainWindow(QMainWindow):
         # A measurement belongs to the image it was taken on; leaving that
         # image behind should not leave the line hanging over the next one.
         self.canvas.clear_ruler()
-        self.canvas.zoom_to_layer(layer_id)
+        # At once: a step is one event, not motion to be coalesced, and its
+        # image is normally in memory already (the prefetch below).
+        self.canvas.zoom_to_layer(layer_id, immediate=True)
         self._prefetch_cycle_neighbours()
 
     def _prefetch_cycle_neighbours(self):
