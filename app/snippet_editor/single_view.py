@@ -27,6 +27,12 @@ MAX_ZOOM = 32.0             # far enough in for single-pixel brushwork
 
 TOOL_PAINT = "paint"        # left-drag paints, right-drag erases
 TOOL_ORIENT = "orient"      # left-drag reports a line, right-click clears
+TOOL_MEASURE = "measure"    # the same gesture, for a length or a width
+
+# The tools that draw a line rather than paint.
+_LINE_TOOLS = (TOOL_ORIENT, TOOL_MEASURE)
+# Measured lines wear the cyan the map's measured labels do.
+MEASURE_COLOR = QColor(0, 200, 255)
 # Shorter than this on screen is a click, not a direction - the same
 # threshold the orientation grid uses, where screen and source are 1:1.
 MIN_LINE_PX = 6
@@ -83,6 +89,11 @@ class MaskPaintCanvas(QWidget):
     vector_drawn = pyqtSignal(float, float, float, float)
     # Orient tool: right-click - clear this snippet's orientation.
     orientation_clear_requested = pyqtSignal()
+    # Measure tool: the same line, while it is dragged and once it is
+    # let go; and right-click - clear this snippet's size.
+    measure_moved = pyqtSignal(float, float, float, float)
+    measure_drawn = pyqtSignal(float, float, float, float)
+    measure_clear_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -118,6 +129,7 @@ class MaskPaintCanvas(QWidget):
         # colour, centre in snippet pixels) or None. The colour is the
         # caller's - drawn or propagated is not this widget's business.
         self._arrow = None
+        self._measure_lines: list = []               # see set_measure_lines
         self._line_start: "QPointF | None" = None   # an Orient drag
         self._line_now: "QPointF | None" = None
         # Brush preview: the cell under the cursor plus the outline edges of
@@ -187,8 +199,17 @@ class MaskPaintCanvas(QWidget):
     def tool(self) -> str:
         return self._tool
 
+    def measure_lines(self) -> list:
+        return list(self._measure_lines)
+
+    def set_measure_lines(self, lines):
+        """Lines already measured on this snippet, to draw over it:
+        ``[(sx, sy, ex, ey, caption), ...]`` in snippet pixels."""
+        self._measure_lines = [tuple(line) for line in (lines or [])]
+        self.update()
+
     def set_tool(self, tool: str):
-        """TOOL_PAINT or TOOL_ORIENT."""
+        """TOOL_PAINT, TOOL_ORIENT or TOOL_MEASURE."""
         self._tool = tool
         self._line_start = self._line_now = None
         self.update()
@@ -352,7 +373,15 @@ class MaskPaintCanvas(QWidget):
             if self._tool == TOOL_PAINT:
                 self._draw_brush_preview(painter)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        if self._line_start is not None and self._line_now is not None:
+        for sx, sy, ex, ey, caption in self._measure_lines:
+            self._draw_measure(
+                painter, QPointF(sx * self._scale, sy * self._scale),
+                QPointF(ex * self._scale, ey * self._scale), caption)
+        dragging = (self._line_start is not None
+                    and self._line_now is not None)
+        if dragging and self._tool == TOOL_MEASURE:
+            self._draw_measure(painter, self._line_start, self._line_now, "")
+        elif dragging:
             self._draw_arrow(painter, self._line_start, self._line_now,
                              LINE_PREVIEW_COLOR)
         elif self._arrow is not None:
@@ -365,6 +394,28 @@ class MaskPaintCanvas(QWidget):
             self._draw_arrow(painter, QPointF(x - dx, y - dy),
                              QPointF(x + dx, y + dy), color)
         painter.end()
+
+    @staticmethod
+    def _draw_measure(painter, start: QPointF, end: QPointF, caption: str):
+        """A measured line: no head - a length has no direction - with a
+        tick at each end and what it measures beside it."""
+        painter.setPen(QPen(MEASURE_COLOR, 2))
+        painter.drawLine(start, end)
+        length = math.hypot(end.x() - start.x(), end.y() - start.y())
+        if length > 0:
+            nx = -(end.y() - start.y()) / length * 5
+            ny = (end.x() - start.x()) / length * 5
+            for point in (start, end):
+                painter.drawLine(QPointF(point.x() - nx, point.y() - ny),
+                                 QPointF(point.x() + nx, point.y() + ny))
+        if caption and length > 0:
+            # Just past the far end, not at the middle: a length and a
+            # width usually cross there, and two captions on one spot
+            # read as neither.
+            ux = (end.x() - start.x()) / length
+            uy = (end.y() - start.y()) / length
+            painter.drawText(QPointF(end.x() + ux * 8 + 2,
+                                     end.y() + uy * 8 + 4), caption)
 
     @staticmethod
     def _draw_arrow(painter, start: QPointF, end: QPointF, color: QColor):
@@ -441,6 +492,10 @@ class MaskPaintCanvas(QWidget):
         self._overlay_cache.pop(self._active, None)
         self.update()
 
+    def _line_in_snippet_pixels(self, start: QPointF, end: QPointF):
+        return (start.x() / self._scale, start.y() / self._scale,
+                end.x() / self._scale, end.y() / self._scale)
+
     def mousePressEvent(self, event):
         # Shift+left-drag pans the zoomed view (middle-drag still works for
         # those with the habit); plain left/right stay paint/erase.
@@ -450,11 +505,13 @@ class MaskPaintCanvas(QWidget):
             self._pan_last = event.globalPos()
             self.setCursor(Qt.ClosedHandCursor)
             return
-        if self._tool == TOOL_ORIENT:
+        if self._tool in _LINE_TOOLS:
             if event.button() == Qt.LeftButton:
                 self._line_start = self._line_now = QPointF(event.pos())
             elif event.button() == Qt.RightButton:
-                self.orientation_clear_requested.emit()
+                (self.measure_clear_requested
+                 if self._tool == TOOL_MEASURE
+                 else self.orientation_clear_requested).emit()
             return
         if (self._read_only or not self._layers_shown
                 or self._active is None
@@ -485,6 +542,9 @@ class MaskPaintCanvas(QWidget):
             return
         if self._line_start is not None:
             self._line_now = QPointF(event.pos())
+            if self._tool == TOOL_MEASURE:
+                self.measure_moved.emit(*self._line_in_snippet_pixels(
+                    self._line_start, self._line_now))
             self.update()
             return
         if self._painting:
@@ -508,9 +568,9 @@ class MaskPaintCanvas(QWidget):
             self.update()
             if math.hypot(end.x() - start.x(),
                           end.y() - start.y()) >= MIN_LINE_PX:
-                self.vector_drawn.emit(
-                    start.x() / self._scale, start.y() / self._scale,
-                    end.x() / self._scale, end.y() / self._scale)
+                (self.measure_drawn if self._tool == TOOL_MEASURE
+                 else self.vector_drawn).emit(
+                    *self._line_in_snippet_pixels(start, end))
             return
         if self._painting and event.button() in (Qt.LeftButton,
                                                  Qt.RightButton):

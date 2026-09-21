@@ -22,7 +22,8 @@ new module, one line in that list, and its outward signal.
 
 It talks to the rest of the app through set_labels / set_mask_names /
 set_save_state in, and masks_changed / orientation_changed /
-confidence_changed / mask_names_changed / save_requested out.
+size_changed / confidence_changed / mask_names_changed / save_requested
+out.
 """
 from PyQt5.QtCore import QEvent, QSettings, Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QKeySequence
@@ -34,6 +35,7 @@ from PyQt5.QtWidgets import (QAbstractSpinBox, QApplication, QButtonGroup,
 
 from ..debug_log import debug
 from .confidence_section import ConfidenceSection
+from .size_section import SizeSection
 from .mask_section import MaskEditor, MaskSection
 from .orientation_section import OrientationEditor, OrientationSection
 from .single_view import TOOL_ORIENT, TOOL_PAINT
@@ -101,6 +103,8 @@ class SnippetEditor(QWidget):
     masks_changed = pyqtSignal(int, list)
     orientation_changed = pyqtSignal(int, object, object, bool)
     confidence_changed = pyqtSignal(int, int)
+    # (label_id, length_m or None, width_m or None)
+    size_changed = pyqtSignal(int, object, object)
     mask_names_changed = pyqtSignal(list)
     save_requested = pyqtSignal()
 
@@ -119,6 +123,7 @@ class SnippetEditor(QWidget):
         # the window names them.
         sections = (OrientationSection(self.grid, self.masks, self),
                     MaskSection(self.masks, self),
+                    SizeSection(self.masks, self.grid._geo_info, self),
                     ConfidenceSection(self))
         self.section_objects = {section.key: section for section in sections}
         self.orientation_panel = self.section_objects["orientation"].panel
@@ -236,6 +241,7 @@ class SnippetEditor(QWidget):
         self.grid.orientation_changed.connect(self.orientation_changed)
         self.section_objects["confidence"].confidence_changed.connect(
             self.confidence_changed)
+        self.section_objects["size"].size_changed.connect(self.size_changed)
         # Between the sections.
         self.grid.open_requested.connect(self._open_in_single_view)
         # After the Single view has put a snippet on its canvas - and knows

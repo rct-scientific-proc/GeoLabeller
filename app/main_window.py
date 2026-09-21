@@ -57,6 +57,7 @@ from .gt_import import apply_import, confirm_import, plan_import
 from .relocate import (RelocateImagesDialog, missing_images,
                        silently_resolve)
 from .snippet_editor import SnippetEditor
+from .snippet_editor.size_section import shares_with_linked, size_text
 from .snippet_panel import SnippetPanel
 from .resources import icd_path
 from .version import app_title
@@ -276,7 +277,6 @@ class MainWindow(QMainWindow):
 
         # Options (in-memory, default off): when on, measuring one label's
         # length/width propagates to all labels linked to it (same object_id).
-        self._wire_meas_to_linked = False
 
         # Async loading state (initialized here to avoid AttributeError)
         self._async_root_path = None
@@ -846,18 +846,6 @@ class MainWindow(QMainWindow):
         export_h5_action = QAction("&HDF5 Dataset...", self)
         export_h5_action.triggered.connect(self._export_h5)
         export_menu.addAction(export_h5_action)
-
-        # Options menu
-        options_menu = menubar.addMenu("&Options")
-
-        # Wire measurements to linked objects: propagate a label's measured
-        # length/width to all labels sharing its object_id.
-        self._wire_meas_action = QAction(
-            "Wire meas. to linked objects", self)
-        self._wire_meas_action.setCheckable(True)
-        self._wire_meas_action.setChecked(self._wire_meas_to_linked)
-        self._wire_meas_action.toggled.connect(self._on_wire_meas_toggled)
-        options_menu.addAction(self._wire_meas_action)
 
         # Help menu
         help_menu = menubar.addMenu("&Help")
@@ -1683,7 +1671,7 @@ class MainWindow(QMainWindow):
         Returns the number of labels updated (0 if wiring is off, nobody in the
         group has a measurement, or the group is already consistent).
         """
-        if not self._wire_meas_to_linked:
+        if not shares_with_linked():
             return 0
 
         linked = self.project.get_linked_labels(label_id1)
@@ -1852,12 +1840,29 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar.clearMessage()
 
-    def _on_wire_meas_toggled(self, checked: bool):
-        """Toggle propagation of measurements to linked objects."""
-        self._wire_meas_to_linked = checked
-        state = "on" if checked else "off"
+    def _on_size_changed(self, label_id: int, length_m, width_m):
+        """Store a length and width the Snippet Editor measured.
+
+        One label at a time: sharing a size with the labels of the same
+        object is the editor's to decide (its "Apply size to linked
+        labels"), and it reports each label it gave one to.
+        """
+        _, label = self.project.get_label_by_id(label_id)
+        if label is None:
+            return
+        label.length_m, label.width_m = length_m, width_m
+        self._mark_unsaved()
+        self._recovery_soon_timer.start()
+        # The marker may not exist if its image is not loaded; it is
+        # adorned when it is.
+        self.canvas.set_label_measured(
+            label_id, length_m is not None or width_m is not None,
+            length_m, width_m)
+        self._label_row_changed(label_id)
         self.statusBar.showMessage(
-            f"Wire measurements to linked objects: {state}", 3000)
+            f"Label #{label_id}: size cleared"
+            if length_m is None and width_m is None else
+            f"Label #{label_id}: " + size_text(length_m, width_m), 3000)
 
     def _on_label_measured(self, label_id: int, length_m, width_m):
         """Store measured length/width (metres) on a label.
@@ -1878,7 +1883,7 @@ class MainWindow(QMainWindow):
         # linked object group. get_linked_labels returns [] for an unlinked
         # label and otherwise includes the source label itself.
         targets = [label]
-        if self._wire_meas_to_linked:
+        if shares_with_linked():
             linked = self.project.get_linked_labels(label_id)
             if linked:
                 targets = [lbl for _, lbl in linked]
@@ -2013,6 +2018,8 @@ class MainWindow(QMainWindow):
                     "orientation_deg": label.orientation_deg,
                     "orientation_derived": label.orientation_derived,
                     "confidence": label.confidence,
+                    "length_m": label.length_m,
+                    "width_m": label.width_m,
                     # Copies: the Snippet Editor mutates its entries and
                     # commits through masks_changed, never by aliasing.
                     "masks": [dict(m) for m in label.masks],
@@ -2088,6 +2095,7 @@ class MainWindow(QMainWindow):
             editor.masks_changed.connect(self._on_masks_changed)
             editor.orientation_changed.connect(self._on_orientation_changed)
             editor.confidence_changed.connect(self._on_confidence_changed)
+            editor.size_changed.connect(self._on_size_changed)
             editor.mask_names_changed.connect(self._on_mask_names_changed)
             editor.save_requested.connect(self._save_project)
         self._snippet_editor.set_mask_names(self._mask_name_presets())

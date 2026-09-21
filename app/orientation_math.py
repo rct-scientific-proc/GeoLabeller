@@ -17,6 +17,11 @@ The user drags start -> end across a snippet; that vector yields:
   heading TRUE north rather than grid north, projection convergence and all.
   None when the image has no georeferencing.
 
+- ground_length_m: how long the same line is on the ground, in metres on
+  the WGS84 ellipsoid - the Snippet Editor's Size section measures a
+  label's length and width with it. The same two steps as the heading,
+  and the same geodesic solve, so it agrees with the canvas's Ruler.
+
 Snippet coordinates are source-pixel coordinates (snippets are un-warped and
 axis-aligned crops), so callers only add the crop's top-left offset.
 """
@@ -93,3 +98,25 @@ def true_heading_deg(col_start: float, row_start: float,
     if dist == 0.0:
         return None      # sub-pixel vector collapsed to one ground point
     return azimuth % 360.0
+
+
+def ground_length_m(col_start: float, row_start: float,
+                    col_end: float, row_end: float,
+                    affine, crs) -> float | None:
+    """Ground length of the start->end line, metres on the ellipsoid.
+
+    None when the image has no georeferencing - pixels alone have no
+    metres to give - or the line has no length.
+    """
+    if affine is None or crs is None:
+        return None
+    if col_start == col_end and row_start == row_end:
+        return None
+    x1, y1 = affine * (col_start, row_start)
+    x2, y2 = affine * (col_end, row_end)
+    transformer = Transformer.from_crs(crs, WGS84, always_xy=True)
+    lon1, lat1 = transformer.transform(x1, y1)
+    lon2, lat2 = transformer.transform(x2, y2)
+    _azimuth, _back, dist = _GEOD.inv(lon1, lat1, lon2, lat2)
+    dist = abs(dist)
+    return dist if dist > 0.0 else None

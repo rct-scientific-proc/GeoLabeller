@@ -19,6 +19,8 @@ main GUI; tests/test_snippet_editor_embed.py holds that.
                              OrientationSection
     mask_section.py          the Single view's mask painting
                              (MaskEditor), and MaskSection
+    size_section.py          SizeSection - a label's length and width,
+                             measured on its snippet (the Measure tool)
     confidence_section.py    ConfidenceSection - the 1-5 rating; the
                              smallest complete section, to copy for the
                              next per-snippet value
