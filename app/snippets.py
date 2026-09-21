@@ -20,11 +20,11 @@ from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
-import rasterio
 from rasterio.windows import Window
 
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QThread, pyqtSignal
 
+from . import gdal_config
 from .debug_log import debug
 
 
@@ -252,7 +252,7 @@ def read_label_window_raw(image_path: str, pixel_x: float, pixel_y: float,
     cannot say which of them mean "nothing here" - see nodata_mask.
     """
     try:
-        with rasterio.open(image_path) as src:
+        with gdal_config.opened(image_path) as src:
             x0, y0, w, h = snippet_frame(pixel_x, pixel_y, size_px,
                                          src.width, src.height)
             data = src.read(window=Window(x0, y0, w, h))
@@ -273,7 +273,7 @@ def read_label_snippet(image_path: str, pixel_x: float, pixel_y: float,
     entirely nodata or the file cannot be read.
     """
     try:
-        with rasterio.open(image_path) as src:
+        with gdal_config.opened(image_path) as src:
             scaling = cached_band_scaling(src)
             x0, y0, w, h = snippet_frame(pixel_x, pixel_y, size_px,
                                          src.width, src.height)

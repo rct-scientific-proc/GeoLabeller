@@ -52,7 +52,7 @@ from .h5_export import (EXAMPLES_ALL, EXAMPLES_OBJECT,
                         estimate_export)
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
-from . import recent
+from . import gdal_config, recent
 from .gt_import import apply_import, confirm_import, plan_import
 from .relocate import (RelocateImagesDialog, missing_images,
                        silently_resolve)
@@ -180,9 +180,7 @@ RECOVERY_SOON_MS = 5000
 # files, external overviews/statistics, projection and mask files. When a
 # directory scan sees NONE of these, the header-reading loader can tell
 # GDAL to skip that per-open listing, which costs almost half of an open.
-_SIDECAR_SUFFIXES = (
-    ".ovr", ".aux.xml", ".aux", ".rrd", ".msk", ".tab", ".prj",
-    ".tfw", ".tifw", ".tiffw", ".wld", ".jgw", ".pgw", ".j2w")
+_SIDECAR_SUFFIXES = gdal_config.SIDECAR_SUFFIXES
 
 
 def scan_directory_images(root_path: Path) -> "tuple[list, bool]":
@@ -197,12 +195,16 @@ def scan_directory_images(root_path: Path) -> "tuple[list, bool]":
     image_files = []
     has_sidecars = False
     for dirpath, _dirnames, filenames in os.walk(root_path):
+        here = False
         for name in filenames:
             lower = name.lower()
             if lower.endswith((".tif", ".tiff")):
                 image_files.append(Path(dirpath) / name)
             elif lower.endswith(_SIDECAR_SUFFIXES):
-                has_sidecars = True
+                has_sidecars = here = True
+        # Every later open in this folder - level loads, detail tiles,
+        # snippets - can then skip GDAL's listing without listing it again.
+        gdal_config.note_directory(dirpath, here)
     return sorted(set(image_files)), has_sidecars
 
 # How many images either side of the current one a cycle mode reads ahead.

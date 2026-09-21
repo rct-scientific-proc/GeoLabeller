@@ -468,7 +468,7 @@ class TiledLayer:
         - Showing the layer in the tree
         - Zoom-to-layer calculations
         """
-        with rasterio.open(self.file_path) as src:
+        with gdal_config.opened(self.file_path) as src:
             # Store original image info
             self._src_crs = src.crs
             self._src_transform = src.transform
@@ -742,7 +742,7 @@ class TiledLayer:
                 pixels are read from the matching pyramid level via a decimated
                 ``out_shape`` so the full image is never decoded when zoomed out.
         """
-        with rasterio.open(self.file_path) as src:
+        with gdal_config.opened(self.file_path) as src:
             # Store original image info for coordinate transforms
             self._src_crs = src.crs
             self._src_transform = src.transform
@@ -944,7 +944,7 @@ class TiledLayer:
 
         Bounds are set later by the canvas layout manager via set_pixel_bounds().
         """
-        with rasterio.open(self.file_path) as src:
+        with gdal_config.opened(self.file_path) as src:
             self._src_width = src.width
             self._src_height = src.height
             # Capture georeferencing if present so a clicked pixel can still be
@@ -978,7 +978,7 @@ class TiledLayer:
         # Preserve bounds if already assigned by set_pixel_bounds()
         saved_bounds = self.bounds
 
-        with rasterio.open(self.file_path) as src:
+        with gdal_config.opened(self.file_path) as src:
             self._src_width = src.width
             self._src_height = src.height
             # Keep any georeferencing so pixel -> lat/lon works in waterfall mode.
@@ -1809,7 +1809,7 @@ class _TileLoadRunnable(QRunnable):
             if self._cancelled:
                 self._fail()
                 return
-            with rasterio.open(self._file_path) as src:
+            with gdal_config.opened(self._file_path) as src:
                 rgba = read_tile(src, self._dst_crs, self._level,
                                  self._tx, self._ty, grid=self._grid)
             if self._cancelled:
