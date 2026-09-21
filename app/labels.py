@@ -181,8 +181,8 @@ class PointLabel:
     # Deliberately per-label, not per-object: linking labels makes them the
     # same object seen in different images, and what is worth writing down is
     # usually what differs between those views. Nothing copies this across an
-    # object group - see MainWindow._on_label_measured, which does copy the
-    # measurements when the user asks it to.
+    # object group - unlike a size, which the Snippet Editor's Size section
+    # does copy across one when the user asks it to.
     description: str = ""
 
     # The object's orientation, drawn by the user in the orientation editor.

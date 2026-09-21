@@ -171,12 +171,6 @@ STEP_CYCLE_MODES = (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE)
 LABELING_MODES = (CanvasMode.LABEL,) + CYCLE_MODES
 
 
-class MeasureStage(Enum):
-    """Which measurement line the user is currently drawing."""
-    LENGTH = auto()   # First line drawn -> label.length_m
-    WIDTH = auto()    # Second line drawn -> label.width_m
-
-
 _crosshair = None
 
 
@@ -2083,14 +2077,6 @@ class MapCanvas(QGraphicsView):
     # Lets the main window sync the toolbar toggle and the status bar.
     chain_link_changed = pyqtSignal(bool, str)
 
-    # Signal emitted when a label's length/width has been measured:
-    # (label_id, length_m, width_m). Values are floats in metres; `object`
-    # payloads allow None (e.g. when clearing measurements later).
-    label_measured = pyqtSignal(int, object, object)
-
-    # Signal emitted when measure mode state changes: (is_active, message)
-    measure_mode_changed = pyqtSignal(bool, str)
-
     # Status text when the waterfall glide speed is stepped with +/-.
     waterfall_speed_changed = pyqtSignal(str)
 
@@ -2124,11 +2110,6 @@ class MapCanvas(QGraphicsView):
 
     # Signal emitted when Ctrl+Space is pressed in cycle mode (go backwards)
     cycle_prev_requested = pyqtSignal()
-
-    # Minimum on-screen separation (view pixels) between the two clicks of a
-    # measurement line; shorter lines are treated as an accidental click and
-    # ignored so a stray double-click never records a bogus sub-metre value.
-    _MIN_MEASURE_PIXELS = 4
 
     # How far (view pixels) the right button must move before a right-press in a
     # labeling mode counts as a pan-drag rather than a click. Below this, the
@@ -2255,23 +2236,6 @@ class MapCanvas(QGraphicsView):
         self._box_link_origin = None        # QPoint while dragging, else None
         self._chain_members: set[int] = set()
         self._chain_highlighted: list = []
-
-        # Measure mode state (drawing length/width lines on a label). Needs
-        # source georeferencing for metres; see _enter_measure_mode.
-        self._measure_active = False
-        self._measure_label_id: int | None = None
-        # The measured label's layer: _line_distance_m maps through its
-        # source pixels when the image is displayed raw (waterfall stack).
-        self._measure_layer: "TiledLayer | None" = None
-        self._measure_stage = MeasureStage.LENGTH
-        self._measure_start = None  # QPointF: first click of the current line
-        self._measure_start_view = None  # first click in view coords (for min-drag)
-        self._measure_temp_line: QGraphicsLineItem | None = None  # rubber band
-        self._measure_committed_line: QGraphicsLineItem | None = None  # finished length line
-        self._measure_length_m: float | None = None  # result of the length line
-        # Last mouse position over the viewport (view coords), used so the
-        # 'M' shortcut can find the label under the cursor.
-        self._last_mouse_view_pos = None
 
         # Ruler mode state (drag to measure ground distance).
         self._ruler_dragging = False
@@ -4167,37 +4131,20 @@ class MapCanvas(QGraphicsView):
     def _shift_raw_scene_overlays(self, dx: float, dy: float):
         """Carry the raw-scene overlays across a floating-origin move.
 
-        The ruler and measure items are deliberately NOT parented to
-        _origin_group - they want cosmetic pens and they outlive the
-        gesture that drew them - so everything in raw scene coordinates
-        has to be shifted by hand when the origin moves, or it ends up
-        drawn over unrelated ground.
-
-        The stored START POINTS go with the items. A line in progress is
-        anchored by _measure_start, and measuring the second click
-        against a start left behind in the old frame recorded a length
-        wrong by the whole origin delta - metres to hundreds of km -
-        straight onto the label and into the export, with nothing on
-        screen to suggest it. Reachable any time a go-to lands between
-        the two clicks of a line: a double-click in the labelled panel,
-        a waypoint, Zoom to Layer.
+        The ruler's items are deliberately NOT parented to _origin_group -
+        they want cosmetic pens and they outlive the gesture that drew
+        them - so everything in raw scene coordinates has to be shifted by
+        hand when the origin moves, or it ends up drawn over unrelated
+        ground. The stored START POINT goes with the items: a line
+        measured against a start left behind in the old frame is wrong by
+        the whole origin delta.
         """
-        for item in (self._ruler_line, self._ruler_text,
-                     self._measure_temp_line, self._measure_committed_line):
+        for item in (self._ruler_line, self._ruler_text):
             if item is not None:
                 item.moveBy(-dx, -dy)
-        if self._measure_start is not None:
-            self._measure_start = QPointF(self._measure_start.x() - dx,
-                                          self._measure_start.y() - dy)
         if self._ruler_start is not None:
             self._ruler_start = QPointF(self._ruler_start.x() - dx,
                                         self._ruler_start.y() - dy)
-        # The first click's VIEW position means nothing once the view has
-        # jumped somewhere else, so the too-short-line check is skipped for
-        # this pair rather than run against a stale point. A degenerate line
-        # is still rejected by the zero-length check in _handle_measure_click.
-        if (dx or dy) and self._measure_start_view is not None:
-            self._measure_start_view = None
 
     def _reset_origin_group(self, world_pt: QPointF):
         """Set the floating origin to `world_pt` without preserving the view.
@@ -4242,8 +4189,8 @@ class MapCanvas(QGraphicsView):
     def _maybe_rebase_origin(self, scale: float):
         """Rebase the floating origin onto the view if the view centre's scene
         coordinate has wandered far enough that `coord * scale` risks overflow.
-        Skipped mid measure/ruler drag (their items live in raw scene coords)."""
-        if self._measure_active or self._ruler_dragging:
+        Skipped mid ruler drag (its items live in raw scene coords)."""
+        if self._ruler_dragging:
             return
         vc = self.mapToScene(self.viewport().rect().center())
         if max(abs(vc.x()), abs(vc.y())) * scale > self._REBASE_DEVICE_THRESHOLD:
@@ -4372,15 +4319,6 @@ class MapCanvas(QGraphicsView):
 
     def mousePressEvent(self, event):
         """Handle mouse press for labeling."""
-        # Measure mode intercepts clicks regardless of the underlying mode:
-        # left click draws a line vertex, right click cancels.
-        if self._measure_active:
-            if event.button() == Qt.LeftButton:
-                self._handle_measure_click(event.pos())
-            elif event.button() == Qt.RightButton:
-                self._exit_measure_mode()
-            return
-
         # Box-link mode intercepts clicks the same way: left press starts
         # (or restarts) the box, right click cancels the mode.
         if self._box_link_anchor is not None:
@@ -4530,10 +4468,6 @@ class MapCanvas(QGraphicsView):
             if band_rect.width() >= 5 and band_rect.height() >= 5:
                 self._apply_box_link(band_rect)
             return
-        # Measure mode consumes clicks in mousePressEvent; swallow the matching
-        # release so it can't reach pan/cycle release handling.
-        if self._measure_active:
-            return
         # Finish a Shift+drag measurement started from another mode, before that
         # mode's own release handling can act on the same click.
         if self._ruler_dragging and event.button() == Qt.LeftButton:
@@ -4564,18 +4498,12 @@ class MapCanvas(QGraphicsView):
 
     def mouseMoveEvent(self, event):
         """Track mouse position and emit lat/lon coordinates."""
-        self._last_mouse_view_pos = event.pos()
 
         # Box-link selection: stretch the box to the cursor.
         if (self._box_link_origin is not None
                 and self._box_link_band is not None):
             self._box_link_band.setGeometry(
                 QRect(self._box_link_origin, event.pos()).normalized())
-
-        # Measure mode: stretch the rubber-band line to the cursor. Fall through
-        # so the coordinate readout still updates.
-        if self._measure_active and self._measure_start is not None:
-            self._update_measure_preview(event.pos())
 
         # Update the measurement line + readout while dragging, whether the
         # ruler was reached by its mode or by Shift+drag.
@@ -4673,19 +4601,6 @@ class MapCanvas(QGraphicsView):
         if (event.key() == Qt.Key_Escape
                 and self._box_link_anchor is not None):
             self._exit_box_link_mode("Box link cancelled")
-        elif event.key() == Qt.Key_Escape and self._measure_active:
-            self._exit_measure_mode()
-        elif event.key() == Qt.Key_M and not self._measure_active:
-            # Start measuring the label under the cursor.
-            pos = self._last_mouse_view_pos
-            label_id = None
-            if pos is not None:
-                label_id, _ = self._get_label_at_position(pos)
-            if label_id is not None:
-                self._enter_measure_mode(label_id, pos)
-            else:
-                self.measure_mode_changed.emit(
-                    False, "Hover over a label, then press M to measure")
         elif event.key() == Qt.Key_Escape and self._link_mode_active:
             self._exit_link_mode()
         elif event.key() == Qt.Key_N and self._chain_link_active:
@@ -5206,19 +5121,10 @@ class MapCanvas(QGraphicsView):
             link_action = menu.addAction("Link with...")
             box_link_action = menu.addAction("Link by Box...")
 
-            # Measure length/width - only meaningful for georeferenced images
-            measure_action = menu.addAction("Measure Length / Width")
-
             # Check if label is linked (data slot 1 stores True if linked to
             # others)
             ellipse, _ = self._label_items.get(label_id, (None, None))
             is_linked = ellipse and ellipse.data(1)
-
-            # Clear measurements - only if this label has been measured
-            # (data slot 4 stores True when length/width are set).
-            clear_measure_action = None
-            if ellipse and ellipse.data(4):
-                clear_measure_action = menu.addAction("Clear Measurements")
 
             # Unlink option (only if label is linked to others). The old
             # "Show Linked" action is gone: linked groups now carry an
@@ -5252,12 +5158,6 @@ class MapCanvas(QGraphicsView):
                 self._enter_link_mode(label_id)
             elif action == box_link_action:
                 self.enter_box_link_mode(label_id)
-            elif action == measure_action:
-                self._enter_measure_mode(label_id, view_pos)
-            elif clear_measure_action is not None and action == clear_measure_action:
-                # Clearing is routed through the same signal; main_window
-                # resets length_m/width_m and calls set_label_measured(False).
-                self.label_measured.emit(label_id, None, None)
             elif action == export_object_action:
                 self.export_object_requested.emit(label_id)
             elif action == describe_action:
@@ -5481,11 +5381,9 @@ class MapCanvas(QGraphicsView):
             return
         if active:
             # Chain mode takes over the mouse: end the single-pair link mode
-            # and any measurement first.
+            # first.
             if self._link_mode_active:
                 self._exit_link_mode()
-            if self._measure_active:
-                self._exit_measure_mode()
             self._chain_link_active = True
             self._chain_link_anchor = None
             self._chain_members = set()
@@ -5546,11 +5444,9 @@ class MapCanvas(QGraphicsView):
         every label inside it to this anchor's object (one shot); right
         click or Esc cancels.
         """
-        # Take the mouse over from the other linking/measuring overlays.
+        # Take the mouse over from the other linking overlays.
         if self._link_mode_active:
             self._exit_link_mode()
-        if self._measure_active:
-            self._exit_measure_mode()
         if self._chain_link_active:
             self.set_chain_link_mode(False)
         self._box_link_anchor = label_id
@@ -5638,208 +5534,25 @@ class MapCanvas(QGraphicsView):
         self._chain_highlighted = []
 
     # ------------------------------------------------------------------
-    # Measure mode: draw two lines on a label to record length + width (m)
+    # Ruler: drag a line, read a ground distance. It touches no label - a
+    # label's length and width are measured on its snippet, in the Snippet
+    # Editor's Size section.
     # ------------------------------------------------------------------
-
-    def _measure_target_layer(self, label_id: int,
-                              view_pos=None) -> TiledLayer | None:
-        """The layer whose georeferencing scales this measurement.
-
-        Normally the label's own image, found through the path stored on
-        its marker. In the WATERFALL that is not enough: a label is drawn
-        on every other stacked image it falls inside (the projections), and
-        a measurement started on one of those is drawn across THAT image's
-        pixels while the label belongs to another. Using the label's own
-        layer then scales the answer by the ratio of the two images'
-        ground resolutions - a 1.0 m/px and a 0.25 m/px pair turned one
-        drawn line into 127.72 m or 510.87 m depending only on which layer
-        the code asked. The strips are disjoint, so the image under the
-        cursor is unambiguous and is the one being measured.
-
-        Outside the waterfall, layers overlap geographically and the
-        label's own image remains the right answer (see _enter_measure_mode
-        on why both endpoints share one grid).
-        """
-        if self._waterfall_active and view_pos is not None:
-            easting, northing = self._scene_to_web(self.mapToScene(view_pos))
-            under_cursor = self._layer_id_at(easting, northing)
-            if under_cursor is not None:
-                return self._layers.get(under_cursor)
-        if label_id not in self._label_items:
-            return None
-        ellipse, _ = self._label_items[label_id]
-        image_path = ellipse.data(0)  # image_path stored in slot 0 at creation
-        layer_id = self._path_to_layer.get(image_path) if image_path else None
-        return self._layers.get(layer_id) if layer_id else None
-
-    def _enter_measure_mode(self, label_id: int, view_pos=None):
-        """Begin drawing length/width measurement lines for a label.
-
-        ``view_pos`` is where the user asked to measure. In the waterfall it
-        decides which stacked image the line is scaled by - see
-        _measure_target_layer.
-
-        Measurement needs source georeferencing to give metres. That is the
-        layer's own CRS when displayed geographically, and the RETAINED
-        source CRS/geotransform when the image is displayed as raw pixels in
-        the waterfall stack - the drawn line is mapped back through source
-        pixels to the ground there, so measuring keeps working mid-waterfall.
-        Only a plain raster with no georeferencing at all is refused.
-        """
-        layer = self._measure_target_layer(label_id, view_pos)
-        if layer is None or (not layer.geo and (
-                layer._src_crs is None or layer._src_transform is None)):
-            self.measure_mode_changed.emit(
-                False, "Measurements need a georeferenced image")
-            return
-
-        # Cancel any in-progress link mode before taking over the mouse.
-        if self._link_mode_active:
-            self._exit_link_mode()
-
-        self._measure_active = True
-        self._measure_layer = layer
-        self._measure_label_id = label_id
-        self._measure_stage = MeasureStage.LENGTH
-        self._measure_start = None
-        self._measure_length_m = None
-        self.setCursor(_crosshair_cursor())
-        self.measure_mode_changed.emit(
-            True, "Measure LENGTH: click start, then end (Esc to cancel)")
-
-    def _handle_measure_click(self, view_pos):
-        """Handle a left click while in measure mode (line start, then end)."""
-        scene_pos = self.mapToScene(view_pos)
-
-        if self._measure_start is None:
-            # First click of this line: anchor it and start the rubber band.
-            self._measure_start = scene_pos
-            self._measure_start_view = view_pos
-            self._ensure_measure_temp_line()
-            return
-
-        # Reject an accidental click too close to the start (in screen pixels),
-        # which would otherwise record a bogus near-zero line.
-        if self._measure_start_view is not None:
-            dx = view_pos.x() - self._measure_start_view.x()
-            dy = view_pos.y() - self._measure_start_view.y()
-            if (dx * dx + dy * dy) ** 0.5 < self._MIN_MEASURE_PIXELS:
-                return
-
-        # Second click: finalise the current line.
-        dist_m = self._line_distance_m(self._measure_start, scene_pos)
-        if dist_m is None or dist_m <= 0:
-            # Degenerate (zero-length) line - ignore and let the user retry.
-            return
-
-        if self._measure_stage == MeasureStage.LENGTH:
-            self._measure_length_m = dist_m
-            self._promote_temp_to_committed(scene_pos)
-            self._measure_stage = MeasureStage.WIDTH
-            self._measure_start = None
-            self._measure_start_view = None
-            self.measure_mode_changed.emit(
-                True, "Measure WIDTH: click start, then end (Esc to cancel)")
-        else:
-            width_m = dist_m
-            length_m = self._measure_length_m
-            label_id = self._measure_label_id
-            self._exit_measure_mode()
-            if label_id is not None:
-                self.label_measured.emit(label_id, length_m, width_m)
-
-    def _update_measure_preview(self, view_pos):
-        """Stretch the rubber-band line to the cursor and show a live readout."""
-        if self._measure_temp_line is None or self._measure_start is None:
-            return
-        scene_pos = self.mapToScene(view_pos)
-        self._measure_temp_line.setLine(QLineF(self._measure_start, scene_pos))
-
-        dist_m = self._line_distance_m(self._measure_start, scene_pos)
-        stage = ("LENGTH" if self._measure_stage == MeasureStage.LENGTH
-                 else "WIDTH")
-        if dist_m is not None:
-            self.measure_mode_changed.emit(
-                True, f"Measure {stage}: {dist_m:.2f} m "
-                      "(click to set, Esc to cancel)")
-
-    def _ensure_measure_temp_line(self):
-        """Create the rubber-band line item for the line being drawn."""
-        if self._measure_temp_line is not None:
-            return
-        pen = QPen(QColor(0, 200, 255), 0)
-        pen.setCosmetic(True)  # constant ~1px width regardless of zoom
-        line = QGraphicsLineItem(
-            QLineF(self._measure_start, self._measure_start))
-        line.setPen(pen)
-        line.setZValue(self._get_label_z_base() + 2)
-        self._scene.addItem(line)
-        self._measure_temp_line = line
-
-    def _promote_temp_to_committed(self, end_scene_pos):
-        """Freeze the finished length line on screen (dimmed) while width is drawn."""
-        if self._measure_temp_line is None:
-            return
-        self._measure_temp_line.setLine(
-            QLineF(self._measure_start, end_scene_pos))
-        pen = QPen(QColor(0, 200, 255, 120), 0)
-        pen.setCosmetic(True)
-        self._measure_temp_line.setPen(pen)
-        self._measure_committed_line = self._measure_temp_line
-        self._measure_temp_line = None
 
     def _line_distance_m(self, start_scene, end_scene) -> float | None:
         """Geodesic length in metres of a line between two scene points.
 
-        Geographic display: scene coordinates are Web Mercator metres (scene
-        Y = -northing); both endpoints go to WGS84 and are measured on the
+        Scene coordinates are the scene projection's metres (scene Y =
+        -northing); both endpoints go to WGS84 and are measured on the
         WGS84 ellipsoid, so the result is true ground distance rather than
-        the latitude-inflated planar Web Mercator distance.
-
-        Raw display (the waterfall stack): scene offsets are source PIXELS
-        times PIXEL_ZONE_SCALE, so each endpoint is mapped to a source pixel
-        and through the retained source geotransform/CRS to WGS84 first. Both
-        endpoints use the measured label's own layer, so a cursor straying
-        just off the image edge extrapolates along the same grid instead of
-        producing garbage.
+        the latitude-inflated planar distance. (The pixel zone has no
+        ground scale; _ruler_measure reports pixels there instead.)
         """
         e1, n1 = self._scene_to_web(start_scene)
         e2, n2 = self._scene_to_web(end_scene)
-        layer = self._measure_layer
-        if layer is not None and not layer.geo:
-            ll1 = layer.pixel_to_latlon(*layer.scene_to_pixel(e1, n1))
-            ll2 = layer.pixel_to_latlon(*layer.scene_to_pixel(e2, n2))
-            if ll1 is None or ll2 is None:
-                return None
-            return geodesic_distance(ll1[1], ll1[0], ll2[1], ll2[0])
         lon1, lat1 = self._web_mercator_to_wgs84(e1, n1)
         lon2, lat2 = self._web_mercator_to_wgs84(e2, n2)
         return geodesic_distance(lat1, lon1, lat2, lon2)
-
-    def _exit_measure_mode(self):
-        """Leave measure mode, removing any in-progress/committed line items."""
-        for item in (self._measure_temp_line, self._measure_committed_line):
-            if item is not None:
-                self._scene.removeItem(item)
-        self._measure_temp_line = None
-        self._measure_committed_line = None
-        self._measure_start_view = None
-        self._measure_active = False
-        self._measure_label_id = None
-        self._measure_layer = None
-        self._measure_start = None
-        self._measure_stage = MeasureStage.LENGTH
-        self._measure_length_m = None
-
-        # Restore the cursor for the underlying interaction mode.
-        if self._mode in LABELING_MODES:
-            self.setCursor(_crosshair_cursor())
-        elif self._mode == CanvasMode.PAN:
-            self.setCursor(Qt.OpenHandCursor)
-        else:
-            self.setCursor(Qt.ArrowCursor)
-
-        self.measure_mode_changed.emit(False, "")
 
     def _ruler_begin(self, view_pos):
         """Start a ruler measurement at the given view position."""
@@ -6084,10 +5797,10 @@ class MapCanvas(QGraphicsView):
                            width_m: float | None = None):
         """Adorn a label marker to reflect whether it has length/width set.
 
-        Measured labels get a cyan outline (matching the measure lines) and the
-        dimensions appended to their text; clearing restores the class colour
-        and base text. The measured flag is stored in data slot 4 so the
-        context menu can offer "Clear Measurements".
+        Measured labels get a cyan outline (the Snippet Editor's measure
+        lines wear the same) and the dimensions appended to their text;
+        clearing restores the class colour and base text. The size itself
+        is measured in the Snippet Editor's Size section.
         """
         if label_id not in self._label_items:
             return

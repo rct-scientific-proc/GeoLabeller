@@ -622,8 +622,6 @@ class MainWindow(QMainWindow):
         self.canvas.link_mode_changed.connect(self._on_link_mode_changed)
         self.canvas.label_rejected.connect(
             lambda message: self.statusBar.showMessage(message, 4000))
-        self.canvas.label_measured.connect(self._on_label_measured)
-        self.canvas.measure_mode_changed.connect(self._on_measure_mode_changed)
         self.canvas.ruler_changed.connect(self._on_ruler_changed)
         self.canvas.hide_layers_outside_view.connect(
             self.layer_panel.uncheck_layers)
@@ -1752,7 +1750,7 @@ class MainWindow(QMainWindow):
         seen in different images, and what is worth describing is usually what
         differs between those views. This is why it is not applied across the
         object group the way "Wire meas. to linked objects" applies
-        measurements - see _on_label_measured.
+        measurements - see _on_size_changed.
         """
         _, label = self.project.get_label_by_id(label_id)
         if label is None:
@@ -1863,60 +1861,6 @@ class MainWindow(QMainWindow):
             f"Label #{label_id}: size cleared"
             if length_m is None and width_m is None else
             f"Label #{label_id}: " + size_text(length_m, width_m), 3000)
-
-    def _on_label_measured(self, label_id: int, length_m, width_m):
-        """Store measured length/width (metres) on a label.
-
-        Values are picked up automatically by the periodic recovery autosave
-        and by normal project save/export (PointLabel.to_dict serialises
-        length_m / width_m). ``None`` values clear the respective dimension.
-
-        When the "Wire meas. to linked objects" option is on and this label is
-        linked (shares an object_id with others), the same values are applied
-        to every label in that object group.
-        """
-        _, label = self.project.get_label_by_id(label_id)
-        if label is None:
-            return
-
-        # Decide which labels receive the values: just this one, or the whole
-        # linked object group. get_linked_labels returns [] for an unlinked
-        # label and otherwise includes the source label itself.
-        targets = [label]
-        if shares_with_linked():
-            linked = self.project.get_linked_labels(label_id)
-            if linked:
-                targets = [lbl for _, lbl in linked]
-
-        has_measurement = length_m is not None or width_m is not None
-        self._mark_unsaved()
-        for lbl in targets:
-            lbl.length_m = length_m
-            lbl.width_m = width_m
-            # Marker may not exist if its image isn't loaded; set_label_measured
-            # is a no-op then, and the load path re-adorns it later.
-            self.canvas.set_label_measured(
-                lbl.id, has_measurement, length_m, width_m)
-        for lbl in targets:
-            self._label_row_changed(lbl.id)
-
-        n = len(targets)
-        linked_note = f" ({n} linked labels)" if n > 1 else ""
-        if length_m is None and width_m is None:
-            self.statusBar.showMessage(f"Cleared measurements{linked_note}", 3000)
-        else:
-            self.statusBar.showMessage(
-                f"Measured: length {length_m:.2f} m, width {width_m:.2f} m"
-                f"{linked_note}", 4000)
-
-    def _on_measure_mode_changed(self, is_active: bool, message: str):
-        """Handle measure mode state changes (live status-bar prompt)."""
-        if is_active:
-            self.statusBar.showMessage(message, 0)  # 0 = no timeout
-        elif message:
-            self.statusBar.showMessage(message, 3000)
-        else:
-            self.statusBar.clearMessage()
 
     def _on_ruler_changed(self, is_active: bool, message: str):
         """Show the live ruler distance in the status bar."""
