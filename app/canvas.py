@@ -40,6 +40,7 @@ from .labels import geodesic_distance
 from .debug_log import debug
 from .labels import ImagePaths, canonical_path
 from .snippets import apply_band_stretch, cached_band_scaling, nodata_mask
+from . import gdal_config
 from .tile_reader import (TILE_SIZE as DETAIL_TILE_SIZE, level_grid_for,
                           read_tile, tile_bounds, tile_span, tiles_for_bounds)
 
@@ -847,7 +848,8 @@ class TiledLayer:
                     dst_crs=dst_crs,
                     resampling=Resampling.bilinear,
                     src_nodata=np.nan,
-                    dst_nodata=np.nan
+                    dst_nodata=np.nan,
+                    num_threads=gdal_config.WARP_THREADS
                 )
             # ~4 bytes/px of source float32 with no further use; at the
             # 150 MP budget that is ~600 MB held across the whole of the
@@ -901,7 +903,8 @@ class TiledLayer:
                             dst_crs=dst_crs,
                             resampling=Resampling.bilinear,
                             src_nodata=0,
-                            dst_nodata=0
+                            dst_nodata=0,
+                            num_threads=gdal_config.WARP_THREADS
                         )
                     bands_uint8.append(dst_band)
 

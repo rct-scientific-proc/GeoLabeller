@@ -31,6 +31,7 @@ from rasterio.warp import (Resampling, calculate_default_transform, reproject,
                            transform_bounds)
 from rasterio.windows import Window
 
+from . import gdal_config
 from .snippets import apply_band_stretch, cached_band_scaling
 
 # Tile edge in destination pixels. Matches the canvas's own TILE_SIZE.
@@ -244,6 +245,9 @@ def read_tile(src, dst_crs, level: int, tx: int, ty: int,
         "dst_crs": dst_crs,
         "resampling": Resampling.bilinear,
         "tolerance": WARP_TOLERANCE,
+        # The exact transformer above is what makes a tile cost what it
+        # does; threads take a viewport of them from 1.3 s to 0.5 s.
+        "num_threads": gdal_config.WARP_THREADS,
     }
 
     # The same per-file display stretch the coarse tiles and snippets use,
