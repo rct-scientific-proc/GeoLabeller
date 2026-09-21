@@ -29,13 +29,14 @@ values, never from the display stretch.
 """
 import numpy as np
 
-from PyQt5.QtCore import QEvent, QSettings, Qt, pyqtSignal
+from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QPixmap
 from PyQt5.QtWidgets import (
     QComboBox, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QSlider,
     QSpinBox, QVBoxLayout, QWidget)
 
+from ..settings_scope import settings
 from ..debug_log import debug
 from ..masks import (entry_in_window, fill_enclosed, mask_statistics,
                      merged_entry)
@@ -64,7 +65,6 @@ MASK_WORKLIST = Worklist(
 
 # Where Allow Overlap is remembered. The key keeps the name it had when
 # this was the Mask Editor window, so the choice carried over to 2.0.0.
-_SETTINGS = ("GeoLabeller", "GeoLabeller")
 _OVERLAP_KEY = "mask_editor/allow_overlap"
 
 
@@ -285,7 +285,7 @@ class MaskEditor(QWidget):
     @staticmethod
     def _remembered_overlap() -> bool:
         """Last session's Allow Overlap; off when never set."""
-        value = QSettings(*_SETTINGS).value(_OVERLAP_KEY)
+        value = settings().value(_OVERLAP_KEY)
         if isinstance(value, bool):
             return value
         # QSettings hands back a string on some backends.
@@ -298,7 +298,7 @@ class MaskEditor(QWidget):
         """Remember Allow Overlap for next time. A panel gets no close
         event of its own, so the window holding it calls this."""
         try:
-            QSettings(*_SETTINGS).setValue(_OVERLAP_KEY,
+            settings().setValue(_OVERLAP_KEY,
                                            self.allow_overlap())
         except Exception as exc:                  # noqa: BLE001
             debug(f"mask editor settings not saved: "

@@ -20,11 +20,10 @@ Windows so is C:/WORK/A.GEOLABEL).
 """
 import os
 
-from PyQt5.QtCore import QSettings
 
+from .settings_scope import settings
 from .labels import canonical_path
 
-SETTINGS = ("GeoLabeller", "GeoLabeller")
 
 # The kinds of dialog, each with a folder of its own.
 IMAGERY = "imagery"      # Add Directory, Add GeoTIFF, hunting for images
@@ -56,7 +55,7 @@ def promoted(paths: list, path: str, limit: int = LIMIT) -> list:
 
 def last_dir(kind: str) -> str:
     """Where this kind of dialog was last used, or "" the first time."""
-    value = QSettings(*SETTINGS).value(_DIR_KEY.format(kind), "")
+    value = settings().value(_DIR_KEY.format(kind), "")
     folder = str(value) if value else ""
     return folder if folder and os.path.isdir(folder) else ""
 
@@ -67,20 +66,19 @@ def remember_dir(kind: str, path: str) -> None:
         return
     folder = path if os.path.isdir(path) else os.path.dirname(path)
     if folder:
-        QSettings(*SETTINGS).setValue(_DIR_KEY.format(kind),
-                                      canonical_path(folder))
+        settings().setValue(_DIR_KEY.format(kind), canonical_path(folder))
 
 
 def projects() -> list:
     """The recently opened projects, newest first."""
-    value = QSettings(*SETTINGS).value(_PROJECTS_KEY, [])
+    value = settings().value(_PROJECTS_KEY, [])
     if isinstance(value, str):          # one entry comes back bare
         value = [value] if value else []
     return [str(path) for path in (value or [])]
 
 
 def _store(paths: list) -> list:
-    QSettings(*SETTINGS).setValue(_PROJECTS_KEY, list(paths))
+    settings().setValue(_PROJECTS_KEY, list(paths))
     return list(paths)
 
 

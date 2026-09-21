@@ -29,10 +29,11 @@ asymmetric, and nothing guarantees its heading runs along its length.
 Only the numbers are stored. The lines themselves are remembered for the
 session, so coming back to a snippet shows what was measured and where.
 """
-from PyQt5.QtCore import QSettings, Qt, pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (QButtonGroup, QCheckBox, QLabel, QPushButton,
                              QRadioButton, QVBoxLayout, QWidget)
 
+from ..settings_scope import settings
 from ..orientation_math import ground_length_m
 from .section import Section
 from .single_view import TOOL_MEASURE
@@ -40,7 +41,6 @@ from .strip import Worklist
 
 LENGTH, WIDTH = "length", "width"
 _FIELD = {LENGTH: "length_m", WIDTH: "width_m"}
-_SETTINGS = ("GeoLabeller", "GeoLabeller")
 _LINKED_KEY = "snippet_editor/size_linked"
 _NO_METRES = ("This image has no georeferencing, so there are no metres "
               "to measure.")
@@ -78,7 +78,7 @@ def shares_with_linked() -> bool:
     Off unless somebody asked for it, as the Options toggle it replaced
     was. The main window asks too, when two labels are linked.
     """
-    value = QSettings(*_SETTINGS).value(_LINKED_KEY)
+    value = settings().value(_LINKED_KEY)
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in ("true", "1")
@@ -121,7 +121,7 @@ class SizePanel(QWidget):
             "its best view once. Off: each view is measured on its own.")
         self.linked_check.setChecked(shares_with_linked())
         self.linked_check.toggled.connect(
-            lambda on: QSettings(*_SETTINGS).setValue(_LINKED_KEY, bool(on)))
+            lambda on: settings().setValue(_LINKED_KEY, bool(on)))
         layout.addWidget(self.linked_check)
 
         self.clear_button = QPushButton("Clear")

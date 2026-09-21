@@ -25,7 +25,7 @@ set_save_state in, and masks_changed / orientation_changed /
 size_changed / confidence_changed / mask_names_changed / save_requested
 out.
 """
-from PyQt5.QtCore import QEvent, QSettings, Qt, pyqtSignal
+from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QKeySequence
 from PyQt5.QtWidgets import (QAbstractSpinBox, QApplication, QButtonGroup,
                              QCheckBox, QComboBox, QHBoxLayout, QLabel,
@@ -33,6 +33,7 @@ from PyQt5.QtWidgets import (QAbstractSpinBox, QApplication, QButtonGroup,
                              QScrollArea, QShortcut, QSplitter,
                              QStackedWidget, QTextEdit, QVBoxLayout, QWidget)
 
+from ..settings_scope import settings as app_settings
 from ..debug_log import debug
 from .confidence_section import ConfidenceSection
 from .size_section import SizeSection
@@ -41,7 +42,6 @@ from .orientation_section import OrientationEditor, OrientationSection
 from .single_view import TOOL_ORIENT, TOOL_PAINT
 from .strip import SnippetStrip
 
-_SETTINGS = ("GeoLabeller", "GeoLabeller")
 _VIEW_KEY = "snippet_editor/view"
 _SPLITTER_KEY = "snippet_editor/splitter"
 # The sections switched OFF - so a section added in a later release starts
@@ -389,7 +389,7 @@ class SnippetEditor(QWidget):
     # -- settings -----------------------------------------------------------
 
     def _restore_settings(self):
-        settings = QSettings(*_SETTINGS)
+        settings = app_settings()
         try:
             view = int(settings.value(_VIEW_KEY, self.SINGLE))
         except (TypeError, ValueError):
@@ -422,7 +422,7 @@ class SnippetEditor(QWidget):
         """The view, panes, sections and tool - and the mask panel's, which
         gets no close event of its own while hosted."""
         try:
-            settings = QSettings(*_SETTINGS)
+            settings = app_settings()
             settings.setValue(_VIEW_KEY, self.view())
             settings.setValue(_SPLITTER_KEY, self.body_splitter.saveState())
             settings.setValue(_SECTIONS_OFF_KEY, ",".join(
