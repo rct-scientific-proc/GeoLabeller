@@ -321,9 +321,32 @@ class MainWindow(QMainWindow):
         self._cycle_direction = -1
         # Current position in cycle (-1 means not started)
         self._cycle_index: int = -1
-        # (layers, index) kept while the user steps out of a cycle mode, so
-        # the cycle resumes instead of restarting. See _suspend_cycle.
-        self._cycle_parked: tuple[list[str], int] | None = None
+        # Per cycle mode, the (layers, index) kept while the user steps out
+        # of it, so the cycle resumes instead of restarting. See
+        # _suspend_cycle. One slot for both modes meant C, V, C lost the
+        # C place.
+        self._cycle_parked: dict[CanvasMode, tuple[list[str], int]] = {}
+        # The run's mode, and the whole selected group behind it (a View
+        # Cycle queue is the part of the group that was on screen), so a
+        # repeat press can tell "another group" from "the view moved".
+        self._cycle_mode: CanvasMode | None = None
+        self._cycle_group: list[str] = []
+        # The images the cycle switched on itself - the only ones it may
+        # hide again. An image the user had on before the cycle reached it
+        # stays on: a checked group used to lose its images one by one.
+        self._cycle_turned_on: set[str] = set()
+        # Where the view was when a View Cycle reached its end. V there
+        # runs the queue again while the view has not moved, and takes
+        # what is on screen once it has.
+        self._cycle_end_view: tuple | None = None
+        # An image removed mid-run: the run moves on once the panel has
+        # finished removing - one settle for a whole group, not a zoom
+        # per image.
+        self._cycle_current_removed = False
+        self._cycle_settle_timer = QTimer(self)
+        self._cycle_settle_timer.setSingleShot(True)
+        self._cycle_settle_timer.timeout.connect(
+            self._settle_cycle_after_removal)
         # Space was pressed on the final image. The run stays - Ctrl+Space
         # must still go back - but C (or V) now means "start again".
         self._cycle_at_end = False
@@ -584,6 +607,7 @@ class MainWindow(QMainWindow):
         self.layer_panel.reveal_label_requested.connect(self._reveal_label)
         self.snippet_panel.reveal_requested.connect(self._reveal_label)
         self.layer_panel.layer_removed.connect(self.canvas.remove_layer)
+        self.layer_panel.layer_removed.connect(self._forget_cycled_layer)
         # The batch signal carries the file paths (the canvas has already
         # dropped its layers by then): delete the images and their labels
         # from the PROJECT and refresh everything that listed them.
@@ -1070,10 +1094,13 @@ class MainWindow(QMainWindow):
             # something new to start; stay put mid-run.
             if self._repeat_starts_a_new_cycle(mode):
                 from_the_top = self._cycle_at_end
+                if from_the_top and self._view_cycle_runs_again():
+                    self._restart_from_the_top()
+                    return
                 self._suspend_cycle()
                 if from_the_top:
                     # Starting over - not resuming the end just reached.
-                    self._cycle_parked = None
+                    self._cycle_parked.pop(mode, None)
                 if mode == CanvasMode.CYCLE:
                     self._start_cycle_mode()
                 else:
@@ -1082,6 +1109,10 @@ class MainWindow(QMainWindow):
         was_waterfall = self.canvas._waterfall_active
         self.canvas.set_mode(mode)
         self._sync_mode_actions(mode)
+        # Leaving a cycle parks it, whatever comes next - another cycle
+        # mode included. Only a detour through a non-cycle mode used to
+        # park, so C straight to V and back lost the C place.
+        self._suspend_cycle()
 
         # Leaving waterfall: restore the normal layout and re-place labels,
         # then take the view to the geography of the image the user was on in
@@ -1102,8 +1133,6 @@ class MainWindow(QMainWindow):
             self._start_view_cycle_mode()
         elif mode == CanvasMode.WATERFALL:
             self._start_waterfall_mode()
-        else:
-            self._suspend_cycle()
 
     def _repeat_starts_a_new_cycle(self, mode: CanvasMode) -> bool:
         """Whether pressing a cycle mode's key while in it means "go".
@@ -1113,21 +1142,19 @@ class MainWindow(QMainWindow):
         that group. No mid-run otherwise, which is what keeps a stray key
         from throwing away the user's place.
 
-        View Cycle never switches mid-run. Its queue is whatever is in
-        view, and the view follows the cycle, so the layers in view differ
-        on nearly every step - "the queue changed" would be true of almost
-        every press.
+        Both compare the SELECTED GROUP, not the queue: a View Cycle
+        queue is the part of the group that was on screen, and the view
+        follows the cycle, so the layers on screen differ on nearly every
+        step - "the queue changed" would be true of almost every press.
         """
         if mode not in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
             return False
         if (not self._cycle_layers or self._cycle_index < 0
                 or self._cycle_at_end):
             return True
-        if mode == CanvasMode.CYCLE:
-            selected = self.layer_panel.get_all_layers_in_selected_group()
-            # No group selected is not a request for a different one.
-            return bool(selected) and selected != self._cycle_layers
-        return False
+        selected = self.layer_panel.get_all_layers_in_selected_group()
+        # No group selected is not a request for a different one.
+        return bool(selected) and selected != self._cycle_group
 
     def _suspend_cycle(self):
         """Park the cycle on leaving it, so a detour can be resumed.
@@ -1139,23 +1166,36 @@ class MainWindow(QMainWindow):
         """
         # Warmed neighbours are only worth their memory inside the cycle.
         self.canvas.clear_warmed_layers()
-        if self._cycle_layers and self._cycle_index >= 0:
-            self._cycle_parked = (list(self._cycle_layers), self._cycle_index)
+        mode = self._cycle_mode
+        if self._cycle_layers and self._cycle_index >= 0 and mode is not None:
+            # Each mode parks its own run. A finished View Cycle is not
+            # parked: coming back to it means the next area, not the end
+            # of the last one. (Cycle resumes at its end; C there starts
+            # the group over anyway.)
+            if not (mode == CanvasMode.VIEW_CYCLE and self._cycle_at_end):
+                self._cycle_parked[mode] = (list(self._cycle_layers),
+                                            self._cycle_index)
         self._cycle_layers = []
+        self._cycle_group = []
+        self._cycle_mode = None
         self._cycle_index = -1
         self._cycle_at_end = False
+        self._cycle_end_view = None
         self.group_label.setText("")
 
     def _parked_cycle_index(self, layers: list[str]) -> int | None:
         """Where to resume in ``layers``, or None to start the cycle fresh.
 
-        Only resumes into the identical queue: change the group, or load or
-        remove a layer, and the parked position no longer refers to the same
-        run, so the cycle starts over.
+        Only resumes into the identical queue: change the group, or load a
+        layer into it, and the parked position no longer refers to the
+        same run, so the cycle starts over. (A removed layer drops out of
+        the parked queue instead - _forget_cycled_layer.) The park is
+        taken: it lives from one leave to the next start.
         """
-        if not self._cycle_parked:
+        parked = self._cycle_parked.pop(CanvasMode.CYCLE, None)
+        if parked is None:
             return None
-        parked_layers, parked_index = self._cycle_parked
+        parked_layers, parked_index = parked
         if parked_layers != layers or not 0 <= parked_index < len(layers):
             return None
         return parked_index
@@ -1177,7 +1217,11 @@ class MainWindow(QMainWindow):
             return "view cycle", "V"
         return "group", "C"
 
-    def _show_cycle_status(self, prefix: str = "Cycle mode"):
+    def _show_cycle_status(self, prefix: str | None = None):
+        if prefix is None:
+            prefix = ("View Cycle"
+                      if self._cycle_mode == CanvasMode.VIEW_CYCLE
+                      else "Cycle mode")
         position, count = self._cycle_position()
         self.statusBar.showMessage(
             f"{prefix}: Layer {position}/{count} - Space=next, "
@@ -1186,12 +1230,24 @@ class MainWindow(QMainWindow):
     def _cycle_show(self, layer_id: str):
         """Show ``layer_id`` as the cycle's image, hiding the one before.
 
-        Only the image the cycle itself switched on is hidden - layers the
-        user turned on by hand are theirs to keep.
+        Only an image the cycle itself switched on is hidden - one the
+        user had on already is theirs to keep, on this step and on every
+        later one. (Hiding "the one before" regardless meant a checked
+        group lost its images one by one as the cycle visited them.)
         """
+        layer = self.canvas.get_layer(layer_id)
+        if layer is None:
+            # Gone without the panel saying so (a relocation dropped it):
+            # out of the queue, and on to the next.
+            self._forget_cycled_layer(layer_id)
+            return
         previous = self._cycle_shown
-        if previous is not None and previous != layer_id:
+        if (previous is not None and previous != layer_id
+                and previous in self._cycle_turned_on):
             self.layer_panel.uncheck_layers([previous])
+            self._cycle_turned_on.discard(previous)
+        if not layer.visible:
+            self._cycle_turned_on.add(layer_id)
         self.layer_panel.check_layers([layer_id])
         self._cycle_shown = layer_id
         self._cycle_zoom_to(layer_id)
@@ -1250,6 +1306,8 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage("No layers in selected group", 3000)
             self._cycle_index = -1
             return
+        self._cycle_group = list(self._cycle_layers)
+        self._cycle_mode = CanvasMode.CYCLE
 
         # Pick up where a detour left off, else start at the last layer.
         resumed = self._parked_cycle_index(self._cycle_layers)
@@ -1269,32 +1327,171 @@ class MainWindow(QMainWindow):
         self.canvas.setFocus()
 
     def _start_view_cycle_mode(self):
-        """Initialize view cycle mode with layers visible in the current canvas view."""
-        self._cycle_layers = self.canvas.get_layers_in_view()
-        if not self._cycle_layers:
-            self.statusBar.showMessage("No layers in current view", 3000)
-            self._cycle_index = -1
-            self.group_label.setText("View Cycle")
-            return
+        """Cycle the selected group's images that intersect the view.
 
+        Not every layer on screen: that queued other groups' tiles and
+        hidden ones, in load order, and zoomed to one image it was the
+        handful overlapping the margins - "6/6" for a group of 100. The
+        group is the tree's selected group (an image stands for its own),
+        the order the tree's, and the status names both counts.
+        """
         self.group_label.setText("View Cycle")
-
-        # Pick up where a detour left off, else start at the last layer.
-        resumed = self._parked_cycle_index(self._cycle_layers)
+        group = self.layer_panel.get_all_layers_in_selected_group()
+        group_name = self.layer_panel.get_selected_group_name()
+        if not group:
+            self.statusBar.showMessage(
+                "View Cycle needs a group: select one in the layer panel "
+                "(or one of its images) and press V again", 5000)
+            self._cycle_index = -1
+            return
+        on_screen = set(self.canvas.get_layers_in_view())
+        resumed = self._resume_view_cycle(group, on_screen)
+        if resumed is not None:
+            self._cycle_layers, self._cycle_index = resumed
+        else:
+            self._cycle_layers = [lid for lid in group if lid in on_screen]
+            self._cycle_index = len(self._cycle_layers) - 1
+        if not self._cycle_layers:
+            self.statusBar.showMessage(
+                f"No images of '{group_name}' on screen: zoom or pan to "
+                "them and press V again", 5000)
+            self._cycle_index = -1
+            return
+        self._cycle_group = list(group)
+        self._cycle_mode = CanvasMode.VIEW_CYCLE
         self._cycle_at_end = False
-        self._cycle_index = (resumed if resumed is not None
-                             else len(self._cycle_layers) - 1)
+        self._cycle_end_view = None
+        self.group_label.setText(
+            f"View Cycle: {group_name} - {len(self._cycle_layers)} of "
+            f"{len(group)} on screen")
         layer_id = self._cycle_layers[self._cycle_index]
         self._cycle_show(layer_id)
         position, count = self._cycle_position()
         debug(f"view cycle {'resume' if resumed is not None else 'start'}: "
-              f"{count} images in view; "
+              f"'{group_name}' - {count} of {len(group)} on screen; "
               f"at {self._layer_name(layer_id)} [{position}/{count}]")
         self._show_cycle_status(
             "View Cycle resumed" if resumed is not None else "View Cycle")
 
         # Give canvas keyboard focus so Space key works immediately
         self.canvas.setFocus()
+
+    def _resume_view_cycle(self, group: list[str],
+                           on_screen: set) -> "tuple[list[str], int] | None":
+        """The parked View Cycle to pick up, as (queue, index), or None.
+
+        A detour - the ruler, a label, a nudge of the view - comes back to
+        the image it left, as long as that image is still on screen and
+        the group is the same. Pan away to another area, or pick another
+        group, and V means a new run there. (Requiring the fresh on-screen
+        list to EQUAL the parked queue, as Cycle does with its group,
+        never matched: the view had followed the cycle, so every detour
+        ended the run.) The park is taken either way.
+        """
+        parked = self._cycle_parked.pop(CanvasMode.VIEW_CYCLE, None)
+        if parked is None:
+            return None
+        queue, index = parked
+        if not queue or not 0 <= index < len(queue):
+            return None
+        if not set(queue) <= set(group) or queue[index] not in on_screen:
+            return None
+        return list(queue), index
+
+    def _view_cycle_runs_again(self) -> bool:
+        """V at the end of a View Cycle: the same run over, or a new one?
+
+        The same, while the view has not moved since the end was reached
+        and the group is the same: "V=start again" means these images
+        again, not the few tiles around the last one. Once the user has
+        panned or zoomed (the wheel and right-drag work inside the mode),
+        V takes the group's images now on screen.
+        """
+        if (self._cycle_mode != CanvasMode.VIEW_CYCLE
+                or not self._cycle_at_end or self._cycle_end_view is None):
+            return False
+        then, now = self._cycle_end_view, self.canvas._get_view_bounds()
+        span = max(then[2] - then[0], then[3] - then[1], 1e-9)
+        if any(abs(a - b) > span * 0.01 for a, b in zip(now, then)):
+            return False
+        selected = self.layer_panel.get_all_layers_in_selected_group()
+        return not selected or selected == self._cycle_group
+
+    def _restart_from_the_top(self):
+        """Run the current queue again from its first image."""
+        self._cycle_at_end = False
+        self._cycle_end_view = None
+        self._cycle_index = len(self._cycle_layers) - 1
+        layer_id = self._cycle_layers[self._cycle_index]
+        self._cycle_show(layer_id)
+        position, count = self._cycle_position()
+        debug(f"view cycle again: {count} images; "
+              f"at {self._layer_name(layer_id)} [{position}/{count}]")
+        self._show_cycle_status()
+        self.canvas.setFocus()
+
+    def _forget_cycled_layer(self, layer_id: str):
+        """A layer is gone from the canvas: take it out of every cycle.
+
+        It used to stay in the queue, and a step onto it hid the image
+        before, showed nothing, and counted on. The live run and the parked
+        runs both drop it, the position moving with the images that
+        remain. If it was the image showing, the run moves on to the next
+        once the panel has finished removing (_settle_cycle_after_removal).
+        """
+        self._cycle_turned_on.discard(layer_id)
+        if self._cycle_shown == layer_id:
+            self._cycle_shown = None
+        for mode, (queue, index) in list(self._cycle_parked.items()):
+            if layer_id in queue:
+                queue, index, _gone = self._without(queue, index, layer_id)
+                if queue:
+                    self._cycle_parked[mode] = (queue, index)
+                else:
+                    del self._cycle_parked[mode]
+        if layer_id in self._cycle_group:
+            self._cycle_group.remove(layer_id)
+        if layer_id in self._cycle_layers:
+            was_final = self._cycle_layers[0] == layer_id
+            self._cycle_layers, self._cycle_index, gone = self._without(
+                self._cycle_layers, self._cycle_index, layer_id)
+            if gone:
+                self._cycle_current_removed = True
+                # The final image gone: the run ends on the one before it.
+                self._cycle_at_end = was_final and bool(self._cycle_layers)
+                self._cycle_settle_timer.start(0)
+
+    @staticmethod
+    def _without(queue: list, index: int, layer_id: str) -> tuple:
+        """``queue`` less ``layer_id``, and ``index`` moved to keep its
+        image - or, when that is the image removed, moved to the next the
+        run would have shown (the one before it when it was the last).
+
+        Returns (queue, index, current_was_removed).
+        """
+        position = queue.index(layer_id)
+        queue = [lid for lid in queue if lid != layer_id]
+        if not queue:
+            return queue, -1, position == index
+        if position < index:
+            return queue, index - 1, False
+        if position > index:
+            return queue, index, False
+        return queue, max(0, index - 1), True
+
+    def _settle_cycle_after_removal(self):
+        """The panel is done removing: show the image the run is on now."""
+        if not self._cycle_current_removed:
+            return
+        self._cycle_current_removed = False
+        if not self._cycle_layers:
+            self._cycle_index = -1
+            self._cycle_at_end = False
+            self.statusBar.showMessage(
+                "Cycle ended: its images were removed", 5000)
+            return
+        self._cycle_show(self._cycle_layers[self._cycle_index])
+        self._show_cycle_status()
 
     def _start_waterfall_mode(self):
         """Stack the selected bottom-level group's images vertically.
@@ -1355,12 +1552,18 @@ class MainWindow(QMainWindow):
             # "Cycle complete" to the status bar - after which Ctrl+Space
             # had nothing to go back through, and the message was easy to
             # miss.
+            if not self._cycle_at_end:
+                # Where the view is at the end: V here runs the queue
+                # again unless the view moves first (_view_cycle_runs_again).
+                self._cycle_end_view = self.canvas._get_view_bounds()
             self._cycle_at_end = True
             scope, restart_key = self._cycle_scope()
             count = len(self._cycle_layers)
+            on_screen = (" on screen"
+                         if self._cycle_mode == CanvasMode.VIEW_CYCLE else "")
             debug(f"cycle at end: {count}/{count}")
             self.canvas.show_notice(
-                f"End of {scope} \N{EM DASH} {count} of {count}")
+                f"End of {scope} \N{EM DASH} {count} of {count}{on_screen}")
             self.statusBar.showMessage(
                 f"End of {scope}: Layer {count}/{count} - Ctrl+Space=prev, "
                 f"{restart_key}=start again", 0)
@@ -2489,8 +2692,13 @@ class MainWindow(QMainWindow):
 
         # Clear cycle mode state
         self._cycle_layers.clear()
+        self._cycle_group.clear()
         self._cycle_index = -1
-        self._cycle_parked = None
+        self._cycle_mode = None
+        self._cycle_at_end = False
+        self._cycle_parked.clear()
+        self._cycle_turned_on.clear()
+        self._cycle_shown = None
 
         # Clear canvas and UI
         self.canvas.clear_label_markers()

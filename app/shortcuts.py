@@ -40,7 +40,7 @@ SHORTCUT_SECTIONS = [
         ("P", "Pan mode"),
         ("L", "Label mode"),
         ("C", "Cycle mode (group-based)"),
-        ("V", "View Cycle (layers in view)"),
+        ("V", "View Cycle (the selected group's images on screen)"),
         ("W", "Waterfall mode (stack group vertically)"),
         ("R", "Ruler mode"),
     ]),
@@ -61,7 +61,7 @@ SHORTCUT_SECTIONS = [
         ("Escape", "Exit chain-link (links are kept)"),
     ]),
     ("Cycle Modes (Cycle / View Cycle)", [
-        ("Space", "Next layer (unchecks current)"),
+        ("Space", "Next image (hides the one the cycle showed)"),
         ("Ctrl+Space", "Go back to previous layer"),
         ("Left-click", "Place label"),
         ("Right-click label", "Label options (remove, link, describe)"),
