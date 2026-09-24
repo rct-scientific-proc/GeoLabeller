@@ -32,6 +32,7 @@ from rasterio.warp import (Resampling, calculate_default_transform, reproject,
 from rasterio.windows import Window
 
 from . import gdal_config
+from .display_settings import DEFAULT as DEFAULT_DISPLAY
 from .snippets import apply_band_stretch, cached_band_scaling
 
 # Tile edge in destination pixels. Matches the canvas's own TILE_SIZE.
@@ -209,13 +210,15 @@ def _source_window(src, dst_crs, bounds, level: int):
 
 
 def read_tile(src, dst_crs, level: int, tx: int, ty: int,
-              tile_size: int = TILE_SIZE, grid=None):
+              tile_size: int = TILE_SIZE, grid=None, display=None):
     """Reproject a single tile, reading only the source window it needs.
 
     Returns an ``(h, w, 4)`` uint8 RGBA array - alpha 0 where the tile has no
     source data - or ``None`` when the tile is outside the image or fully
     empty. ``grid`` may carry a precomputed :func:`level_grid` result, since
-    every tile of a level shares it.
+    every tile of a level shares it. ``display`` (DisplaySettings)
+    chooses the bands drawn as red, green and blue; its adjustments are
+    applied later, where the tile becomes a pixmap.
 
     The band handling mirrors the whole-image loader: band 1 goes through
     float32 so nodata (and the blank wedges reprojection leaves at the edges)
@@ -254,14 +257,15 @@ def read_tile(src, dst_crs, level: int, tx: int, ty: int,
     # so detail refinement never shifts the imagery's contrast (and float
     # or 16-bit data doesn't clip to black).
     scaling = cached_band_scaling(src)
+    chosen = (display or DEFAULT_DISPLAY).source_bands(src.count)
 
-    # Band 1 in float32: NaN marks both source nodata and the areas the
-    # reprojection never writes, which become the alpha channel.
-    band1 = src.read(1, window=window,
+    # The first band in float32: NaN marks both source nodata and the areas
+    # the reprojection never writes, which become the alpha channel.
+    band1 = src.read(chosen[0], window=window,
                      out_shape=(read_h, read_w)).astype(np.float32)
     if src.nodata is not None:
         band1[band1 == src.nodata] = np.nan
-    band1 = apply_band_stretch(band1, scaling, 0)
+    band1 = apply_band_stretch(band1, scaling, chosen[0] - 1)
     dst_band1 = np.full((out_h, out_w), np.nan, dtype=np.float32)
     reproject(source=band1, destination=dst_band1,
               src_nodata=np.nan, dst_nodata=np.nan, **common)
@@ -275,22 +279,24 @@ def read_tile(src, dst_crs, level: int, tx: int, ty: int,
                             ).astype(np.uint8)
     del dst_band1
 
-    if src.count >= 3:
-        for index, channel in ((2, 1), (3, 2)):
-            band = src.read(index, window=window, out_shape=(read_h, read_w))
-            nodata_at = (band == src.nodata) \
-                if src.nodata is not None else None
-            band = apply_band_stretch(band, scaling, index - 1)
-            band = np.clip(band, 0, 255).astype(np.uint8)
-            if nodata_at is not None:
-                band[nodata_at] = 0
-            dst_band = np.zeros((out_h, out_w), dtype=np.uint8)
-            reproject(source=band, destination=dst_band,
-                      src_nodata=0, dst_nodata=0, **common)
-            rgba[:, :, channel] = dst_band
-    else:
-        rgba[:, :, 1] = rgba[:, :, 0]
-        rgba[:, :, 2] = rgba[:, :, 0]
+    done = {chosen[0]: 0}          # band -> the channel already holding it
+    for channel in (1, 2):
+        index = chosen[channel]
+        if index in done:
+            rgba[:, :, channel] = rgba[:, :, done[index]]
+            continue
+        band = src.read(index, window=window, out_shape=(read_h, read_w))
+        nodata_at = (band == src.nodata) \
+            if src.nodata is not None else None
+        band = apply_band_stretch(band, scaling, index - 1)
+        band = np.clip(band, 0, 255).astype(np.uint8)
+        if nodata_at is not None:
+            band[nodata_at] = 0
+        dst_band = np.zeros((out_h, out_w), dtype=np.uint8)
+        reproject(source=band, destination=dst_band,
+                  src_nodata=0, dst_nodata=0, **common)
+        rgba[:, :, channel] = dst_band
+        done[index] = channel
 
     rgba[:, :, 3] = np.where(nodata_mask, 0, 255).astype(np.uint8)
     return rgba

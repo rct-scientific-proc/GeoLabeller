@@ -40,6 +40,8 @@ from .labels import geodesic_distance
 from .debug_log import debug
 from .labels import ImagePaths, canonical_path
 from .snippets import apply_band_stretch, cached_band_scaling, nodata_mask
+from . import display_settings
+from .display_settings import apply_lut
 from . import gdal_config
 from .tile_reader import (TILE_SIZE as DETAIL_TILE_SIZE, level_grid_for,
                           read_tile, tile_bounds, tile_span, tiles_for_bounds)
@@ -135,6 +137,18 @@ def _as_uint8(band, scaling=None, band_index=0):
         # platform does.
         band = np.nan_to_num(band, nan=0.0, posinf=255.0, neginf=0.0)
     return np.clip(band, 0, 255).astype(np.uint8)
+
+def _rgba_pixmap(rgba: np.ndarray) -> QPixmap:
+    """A pixmap from a contiguous (H, W, 4) uint8 array.
+
+    fromImage deep-copies into the pixmap, so the array only has to
+    outlive this call.
+    """
+    height, width = rgba.shape[:2]
+    image = QImage(rgba.data, width, height, 4 * width,
+                   QImage.Format_RGBA8888)
+    return QPixmap.fromImage(image)
+
 
 # Waterfall mode: a bottom-level group's images are stacked vertically in the
 # pixel zone (raw pixels, no reprojection) so the view can glide through them
@@ -233,6 +247,12 @@ class TiledLayer:
         self._dst_crs = dst_crs if dst_crs is not None else WEB_MERCATOR
         self.name = Path(file_path).stem  # File name without extension
         self.group_path = ""  # Group hierarchy (e.g., "folder/subfolder")
+        # How this layer is drawn (Display Settings): which bands, and the
+        # per-channel lookup table. A background load's throwaway layer
+        # gets the live layer's through the metadata, so it reads the same
+        # bands.
+        self.display = ((metadata or {}).get("display")
+                        or display_settings.DEFAULT)
         self.visible = True
         self.bounds = None  # (west, south, east, north) in Web Mercator or pixel coords
         self.tiles: dict[tuple[int, int], QGraphicsPixmapItem] = {}
@@ -376,6 +396,7 @@ class TiledLayer:
         return {
             "file_path": self.file_path,
             "group_path": self.group_path,
+            "display": self.display,
             "bounds": self.bounds,
             "width": self._full_width,
             "height": self._full_height,
@@ -823,10 +844,15 @@ class TiledLayer:
 
             # Band 1: reproject as float32 to detect nodata
             self._checkpoint(cancel_check)
-            src_band1 = src.read(1, out_shape=(rd_h, rd_w)).astype(np.float32)
+            # The bands drawn as red, green and blue (Display Settings);
+            # by default the file's first three, or its only one.
+            chosen = self.display.source_bands(src.count)
+            first = chosen[0]
+            src_band1 = src.read(first, out_shape=(rd_h, rd_w)).astype(
+                np.float32)
             if src.nodata is not None:
                 src_band1[src_band1 == src.nodata] = np.nan
-            src_band1 = apply_band_stretch(src_band1, band_scaling, 0)
+            src_band1 = apply_band_stretch(src_band1, band_scaling, first - 1)
 
             self._checkpoint(cancel_check)
             if same_grid:
@@ -865,11 +891,10 @@ class TiledLayer:
             del dst_band1  # Free memory
 
             # Reproject remaining bands directly as uint8 (faster)
-            if src.count >= 3:
-                # RGB image - reproject bands 2 and 3 as uint8
-                bands_uint8 = [band1_uint8]
-                for i in range(2, min(src.count + 1, 4)
-                               ):  # bands 2, 3 (and skip 4 if exists)
+            planes = {first: band1_uint8}
+            extra = [b for b in dict.fromkeys(chosen) if b != first]
+            if extra:
+                for i in extra:
                     self._checkpoint(cancel_check)
                     src_band = src.read(i, out_shape=(rd_h, rd_w))
                     # Nodata positions noted BEFORE the stretch (which maps
@@ -900,12 +925,9 @@ class TiledLayer:
                             dst_nodata=0,
                             num_threads=gdal_config.WARP_THREADS
                         )
-                    bands_uint8.append(dst_band)
+                    planes[i] = dst_band
 
-                r, g, b = bands_uint8[0], bands_uint8[1], bands_uint8[2]
-            else:
-                # Grayscale - use band 1 for all RGB channels
-                r = g = b = band1_uint8
+            r, g, b = (planes[c] for c in chosen)
 
             # Build RGBA array
             rgba_full = np.zeros((height, width, 4), dtype=np.uint8)
@@ -997,7 +1019,9 @@ class TiledLayer:
 
             band_scaling = cached_band_scaling(src)
             self._checkpoint(cancel_check)
-            band1 = src.read(1, out_shape=(height, width))
+            chosen = self.display.source_bands(src.count)
+            first = chosen[0]
+            band1 = src.read(first, out_shape=(height, width))
             # Nodata read from the RAW band, before the stretch maps it to
             # some ordinary-looking value. The geo path and the detail
             # tiles have always turned nodata into transparency; this one
@@ -1005,18 +1029,16 @@ class TiledLayer:
             # so a swath exterior that is invisible on the map showed up as
             # a black block in waterfall.
             empty = nodata_mask(band1, src.nodata)
-            r = _as_uint8(band1, band_scaling, 0)
-            if src.count >= 3:
-                # astype on an already-uint8 read is a full-frame copy for
-                # nothing; nearly all supported imagery is uint8.
-                self._checkpoint(cancel_check)
-                g = _as_uint8(src.read(2, out_shape=(height, width)),
-                              band_scaling, 1)
-                self._checkpoint(cancel_check)
-                b = _as_uint8(src.read(3, out_shape=(height, width)),
-                              band_scaling, 2)
-            else:
-                g = b = r
+            # _as_uint8 skips the copy for an already-uint8 read; nearly
+            # all supported imagery is uint8.
+            planes = {first: _as_uint8(band1, band_scaling, first - 1)}
+            for index in dict.fromkeys(chosen):
+                if index not in planes:
+                    self._checkpoint(cancel_check)
+                    planes[index] = _as_uint8(
+                        src.read(index, out_shape=(height, width)),
+                        band_scaling, index - 1)
+            r, g, b = (planes[c] for c in chosen)
 
             rgba = np.zeros((height, width, 4), dtype=np.uint8)
             rgba[:, :, 0] = r
@@ -1160,6 +1182,15 @@ class TiledLayer:
         # format, so the numpy buffer only needs to outlive that single call
         # (self._rgba_data does).
         tile_view = self._rgba_data[px_top:px_bottom, px_left:px_right]
+        lut = self.display.lut()
+        if lut is not None:
+            # Display Settings' brightness, contrast and gamma: applied
+            # here, to the tile being drawn, so a slider redraws the tiles
+            # without reading the file again.
+            adjusted = apply_lut(tile_view, lut)
+            image = QImage(adjusted.data, width, height, 4 * width,
+                           QImage.Format_RGBA8888)
+            return QPixmap.fromImage(image)
         bytes_per_line = self._rgba_data.strides[0]
         ptr = sip.voidptr(tile_view.ctypes.data)
         image = QImage(
@@ -1769,7 +1800,7 @@ class _TileLoadRunnable(QRunnable):
 
     def __init__(self, layer_id: str, file_path: str, level: int,
                  tx: int, ty: int, signals: "_TileLoadSignals", grid=None,
-                 dst_crs=None):
+                 dst_crs=None, display=None):
         """Store the tile identity and the signal group to report through.
 
         ``grid`` is the layer's cached level grid; every tile of a level
@@ -1786,6 +1817,7 @@ class _TileLoadRunnable(QRunnable):
         self._signals = signals
         self._grid = grid
         self._dst_crs = dst_crs if dst_crs is not None else WEB_MERCATOR
+        self._display = display
         self._cancelled = False
 
     def cancel(self):
@@ -1805,7 +1837,8 @@ class _TileLoadRunnable(QRunnable):
                 return
             with gdal_config.opened(self._file_path) as src:
                 rgba = read_tile(src, self._dst_crs, self._level,
-                                 self._tx, self._ty, grid=self._grid)
+                                 self._tx, self._ty, grid=self._grid,
+                                 display=self._display)
             if self._cancelled:
                 self._fail()
                 return
@@ -2434,6 +2467,11 @@ class MapCanvas(QGraphicsView):
             layer = TiledLayer(file_path, lazy=lazy, metadata=metadata,
                                dst_crs=self.scene_crs)
             layer.visible = visible
+            display = self._resolve_display(layer)
+            if display.band_choice() != layer.display.band_choice() \
+                    and layer.is_fully_loaded():
+                layer.free_data()   # loaded eagerly with the default bands
+            layer.display = display
 
             layer_id = f"layer_{self._next_id}"
             self._next_id += 1
@@ -2495,6 +2533,11 @@ class MapCanvas(QGraphicsView):
                                metadata=metadata, dst_crs=self.scene_crs)
             layer.visible = visible
             layer.group_path = group_path
+            display = self._resolve_display(layer)
+            if display.band_choice() != layer.display.band_choice() \
+                    and layer.is_fully_loaded():
+                layer.free_data()   # loaded eagerly with the default bands
+            layer.display = display
 
             # Assign pixel zone position based on group
             origin_x = self._get_pixel_zone_column(group_path, layer._width)
@@ -3185,7 +3228,8 @@ class MapCanvas(QGraphicsView):
 
         runnable = _TileLoadRunnable(
             layer_id, layer.file_path, level, tx, ty, signals,
-            grid=layer.detail_grid(level), dst_crs=self.scene_crs)
+            grid=layer.detail_grid(level), dst_crs=self.scene_crs,
+            display=layer.display)
         self._pending_tiles[(layer_id, level, tx, ty)] = runnable
         self._tile_pool.start(runnable)
 
@@ -3228,13 +3272,13 @@ class MapCanvas(QGraphicsView):
         if x1 <= x0 or y1 <= y0:
             return
 
+        item = QGraphicsPixmapItem(
+            _rgba_pixmap(apply_lut(rgba, layer.display.lut())),
+            self._origin_group)
+        # The tile as read, kept with its item so a Display Settings slider
+        # can redraw it without reading it again; it goes when the item does.
+        item.raw_rgba = rgba
         height, width = rgba.shape[:2]
-        image = QImage(rgba.data, width, height, 4 * width,
-                       QImage.Format_RGBA8888)
-        # fromImage already deep-copies into the pixmap, and `rgba` outlives
-        # this call - the extra image.copy() doubled every tile's memcpy.
-        item = QGraphicsPixmapItem(QPixmap.fromImage(image),
-                                   self._origin_group)
         west, south, east, north = tile_bounds(
             grid_transform, x0, y0, x1, y1)
         transform = QTransform()
@@ -3885,6 +3929,66 @@ class MapCanvas(QGraphicsView):
         """Set the group path for a layer."""
         if layer_id in self._layers:
             self._layers[layer_id].group_path = group_path
+            # Another group may draw it differently.
+            self.set_layer_display(
+                layer_id, self._resolve_display(self._layers[layer_id]))
+
+    # ------------------------------------------------------------------
+    # Display Settings: which bands a layer draws, and how
+    # ------------------------------------------------------------------
+
+    def set_display_resolver(self, resolver):
+        """Install ``resolver(file_path, group_path) -> DisplaySettings``.
+
+        The main window answers from the project's per-group settings.
+        Without one every layer draws the default way.
+        """
+        self._display_resolver = resolver
+
+    def _resolve_display(self, layer) -> "display_settings.DisplaySettings":
+        resolver = getattr(self, "_display_resolver", None)
+        if resolver is None:
+            return display_settings.DEFAULT
+        try:
+            found = resolver(layer.file_path, layer.group_path)
+        except Exception as exc:  # noqa: BLE001 - never fail a draw on it
+            debug(f"display resolve failed: {type(exc).__name__}: {exc}")
+            return display_settings.DEFAULT
+        return found or display_settings.DEFAULT
+
+    def refresh_display(self):
+        """Re-ask every layer's settings, after they changed somewhere."""
+        for layer_id, layer in list(self._layers.items()):
+            self.set_layer_display(layer_id, self._resolve_display(layer))
+
+    def set_layer_display(self, layer_id: str, settings) -> None:
+        """Draw one layer through ``settings``.
+
+        Other bands mean the pixels held are the wrong ones: they are
+        dropped and read again the next time the view wants them. Only the
+        adjustments changing is a redraw of the tiles already on screen,
+        from what is in memory - no file access, so a slider can drive it.
+        """
+        layer = self._layers.get(layer_id)
+        if layer is None or settings is None or layer.display == settings:
+            return
+        old, layer.display = layer.display, settings
+        if old.band_choice() != settings.band_choice():
+            self.free_layer_data(layer_id)
+            self._schedule_tile_update()
+            return
+        self._redraw_layer_pixels(layer)
+
+    def _redraw_layer_pixels(self, layer) -> None:
+        for idx, item in layer.tiles.items():
+            pixmap = layer.create_tile_pixmap(*idx)
+            if pixmap is not None:
+                item.setPixmap(pixmap)
+        lut = layer.display.lut()
+        for item in layer.detail_tiles.values():
+            raw = getattr(item, "raw_rgba", None)
+            if raw is not None:
+                item.setPixmap(_rgba_pixmap(apply_lut(raw, lut)))
 
     def is_path_loaded(self, file_path: str) -> bool:
         """Check if a file path is already loaded as a layer."""

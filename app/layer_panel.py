@@ -71,6 +71,9 @@ class LayerPanel(QWidget):
     # actually finds them.
     group_location_edit_requested = pyqtSignal(str, list)
 
+    # Right-click a group > Display Settings...: the PROJECT group path.
+    group_display_requested = pyqtSignal(str)
+
     # Batch progress signals for group toggle operations
     batch_visibility_started = pyqtSignal(int)  # total items to process
     batch_visibility_progress = pyqtSignal(int)  # current progress
@@ -643,6 +646,16 @@ class LayerPanel(QWidget):
                 location_action.triggered.connect(
                     lambda: self._request_group_location(item))
 
+                display_paths = self._project_group_paths([item])
+                if display_paths:
+                    display_action = menu.addAction("Display Settings...")
+                    display_action.setToolTip(
+                        "Choose the bands this group is drawn with, and "
+                        "their brightness, contrast and gamma")
+                    display_action.triggered.connect(
+                        lambda _=False, p=display_paths[0]:
+                            self.group_display_requested.emit(p))
+
                 menu.addSeparator()
                 preload_action = menu.addAction("Preload Group")
                 preload_action.triggered.connect(
@@ -1088,6 +1101,21 @@ class LayerPanel(QWidget):
             if group_item.child(i).data(0, Qt.UserRole + 1) == "group":
                 return False
         return True
+
+    def selected_project_group_path(self) -> str:
+        """The project group of the selection: the selected group, or the
+        group of the selected image. "" when there is none (nothing
+        selected, an ungrouped image, or the Non-Georeferenced root)."""
+        selected = self.tree.selectedItems()
+        if not selected:
+            return ""
+        item = selected[0]
+        if item.data(0, Qt.UserRole + 1) == "layer":
+            item = item.parent()
+        if item is None:
+            return ""
+        paths = self._project_group_paths([item])
+        return paths[0] if paths else ""
 
     def get_selected_group_name(self) -> str:
         """Get the name of the currently selected group.
@@ -2001,6 +2029,8 @@ class CombinedLayerPanel(QWidget):
 
     # Group location tag (right-click a group > Set Location...)
     group_location_edit_requested = pyqtSignal(str, list)
+    # Right-click a group > Display Settings...
+    group_display_requested = pyqtSignal(str)
 
     # Batch progress signals
     batch_visibility_started = pyqtSignal(int)  # total items
@@ -2086,6 +2116,8 @@ class CombinedLayerPanel(QWidget):
             self.group_free_requested)
         self.main_panel.group_location_edit_requested.connect(
             self.group_location_edit_requested)
+        self.main_panel.group_display_requested.connect(
+            self.group_display_requested)
 
         # Forward signals from labeled panel
         self.labeled_panel.layer_visibility_changed.connect(
@@ -2236,6 +2268,10 @@ class CombinedLayerPanel(QWidget):
     def get_selected_group_name(self) -> str:
         """Get the name of the currently selected group."""
         return self.main_panel.get_selected_group_name()
+
+    def selected_project_group_path(self) -> str:
+        """The project group of the selection (see the main panel's)."""
+        return self.main_panel.selected_project_group_path()
 
     def selected_group_is_bottom_level(self) -> "bool | None":
         """Check whether the selected group contains no nested sub-groups."""

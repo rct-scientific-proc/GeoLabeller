@@ -53,13 +53,15 @@ from .h5_export import (EXAMPLES_ALL, EXAMPLES_OBJECT,
                         estimate_export)
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
-from . import gdal_config, recent, waypoint_io
+from . import display_settings, gdal_config, recent, waypoint_io
+from .display_dialog import DisplaySettingsDialog
 from .gt_import import apply_import, confirm_import, plan_import
 from .relocate import (RelocateImagesDialog, missing_images,
                        silently_resolve)
 from .snippet_editor import SnippetEditor
 from .snippet_editor.size_section import shares_with_linked, size_text
 from .snippet_panel import SnippetPanel
+from .snippets import cached_band_scaling
 from .resources import icd_path
 from .version import app_title, app_version
 
@@ -608,6 +610,13 @@ class MainWindow(QMainWindow):
         self.snippet_panel.reveal_requested.connect(self._reveal_label)
         self.layer_panel.layer_removed.connect(self.canvas.remove_layer)
         self.layer_panel.layer_removed.connect(self._forget_cycled_layer)
+        # Display Settings: the canvas and every snippet read ask the
+        # project which settings draw an image.
+        self._display_dialog = None
+        self.canvas.set_display_resolver(self._display_for_layer)
+        display_settings.set_resolver(self._display_for_image)
+        self.layer_panel.group_display_requested.connect(
+            self._open_display_settings)
         # The batch signal carries the file paths (the canvas has already
         # dropped its layers by then): delete the images and their labels
         # from the PROJECT and refresh everything that listed them.
@@ -830,6 +839,17 @@ class MainWindow(QMainWindow):
             "Save a named latitude/longitude to return to later")
         add_waypoint_action.triggered.connect(self._add_waypoint_by_coordinates)
         view_menu.addAction(add_waypoint_action)
+
+        # How the selected group's imagery is drawn: bands, and brightness,
+        # contrast and gamma per channel. Also on a group's right-click.
+        display_action = QAction("&Display Settings...", self)
+        display_action.setShortcut("Ctrl+D")
+        display_action.setStatusTip(
+            "Choose the bands the selected group is drawn with, and their "
+            "brightness, contrast and gamma")
+        display_action.triggered.connect(
+            lambda: self._open_display_settings())
+        view_menu.addAction(display_action)
 
         snippet_action = QAction("&Snippet Panel", self)
         snippet_action.setCheckable(True)
@@ -2253,6 +2273,148 @@ class MainWindow(QMainWindow):
             self._snippet_editor.set_labels(self._label_entries())
         self._refresh_snippet_panel()
 
+    # ------------------------------------------------------------------
+    # Display Settings: how each group's imagery is drawn
+    # ------------------------------------------------------------------
+
+    def _image_group(self, file_path: str, fallback: str = "") -> str:
+        """The project group an image is filed under."""
+        image = self.project.images.get(file_path)
+        if image is not None:
+            return image.group or ""
+        if fallback.startswith("Non-Georeferenced/"):
+            fallback = fallback[len("Non-Georeferenced/"):]
+        return "" if fallback == "Non-Georeferenced" else fallback
+
+    def _display_for_layer(self, file_path: str, canvas_group: str):
+        """The canvas's question: which settings draw this layer."""
+        return display_settings.resolve(
+            self.project.display_settings,
+            self._image_group(file_path, canvas_group))
+
+    def _display_for_image(self, file_path: str):
+        """A snippet read's question, from a worker thread: plain dict
+        lookups on the project, nothing that changes it."""
+        return display_settings.resolve(
+            self.project.display_settings, self._image_group(file_path))
+
+    def _group_reference(self, group_path: str):
+        """One of the group's images, for its band count and histograms:
+        a loaded layer's file if there is one, else any the project files
+        under the group."""
+        def in_group(group):
+            return group == group_path or group.startswith(group_path + "/")
+        for info in self.canvas.get_layer_infos():
+            path = info.get("file_path")
+            if path and in_group(self._image_group(path,
+                                                   info.get("group_path")
+                                                   or "")):
+                return path
+        for path, image in self.project.images.items():
+            if in_group(image.group or ""):
+                return path
+        return None
+
+    def _open_display_settings(self, group_path: "str | None" = None):
+        """View > Display Settings..., or a group's right-click menu."""
+        if group_path is None:
+            group_path = self.layer_panel.selected_project_group_path()
+        if not group_path:
+            QMessageBox.information(
+                self, "Display Settings",
+                "Select a group in the layer panel (or one of its "
+                "images) first. Display settings belong to a group.")
+            return
+        self._close_display_dialog()
+        reference = self._group_reference(group_path)
+        band_count = 3
+        if reference is not None:
+            try:
+                with gdal_config.opened(reference) as src:
+                    band_count = src.count
+            except Exception as exc:  # noqa: BLE001 - still editable
+                debug(f"display settings: cannot read {reference}: {exc}")
+                reference = None
+
+        def histogram_for(band):
+            if reference is None:
+                return None
+            with gdal_config.opened(reference) as src:
+                return display_settings.band_histogram(
+                    src, band, cached_band_scaling(src))
+
+        own = self.project.display_settings.get(group_path)
+        dialog = DisplaySettingsDialog(
+            group_path, display_settings.resolve(
+                self.project.display_settings, group_path),
+            band_count, histogram_for, self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        dialog.changed.connect(
+            lambda s, g=group_path: self._set_group_display(g, s))
+        dialog.accepted.connect(
+            lambda d=dialog, g=group_path: self._finish_display_dialog(d, g))
+        dialog.rejected.connect(
+            lambda g=group_path, o=own: self._restore_group_display(g, o))
+        self._display_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+
+    def _finish_display_dialog(self, dialog, group_path: str):
+        dialog.flush()
+        self._set_group_display(group_path, dialog.settings())
+        self._display_dialog = None
+
+    def _restore_group_display(self, group_path: str, own):
+        """Cancel: put back the group's own settings (or none)."""
+        dialog = self._display_dialog
+        if dialog is not None:
+            dialog._emit_timer.stop()
+        self._display_dialog = None
+        changed = self.project.display_settings.get(group_path) != own
+        if own is None:
+            self.project.display_settings.pop(group_path, None)
+        else:
+            self.project.display_settings[group_path] = own
+        if changed:
+            self._after_display_change()
+
+    def _close_display_dialog(self):
+        """The project is being replaced: the window edited the old one."""
+        dialog, self._display_dialog = self._display_dialog, None
+        if dialog is not None:
+            dialog._emit_timer.stop()
+            for signal in (dialog.changed, dialog.accepted, dialog.rejected):
+                try:
+                    signal.disconnect()
+                except TypeError:
+                    pass
+            dialog.close()
+
+    def _set_group_display(self, group_path: str, settings):
+        """Give a group these settings (dropping its own entry when they
+        are simply what it would inherit), and redraw what shows it."""
+        others = {k: v for k, v in self.project.display_settings.items()
+                  if k != group_path}
+        inherited = display_settings.resolve(others, group_path)
+        before = self.project.display_settings.get(group_path)
+        after = None if settings == inherited else settings
+        if before == after:
+            return
+        if after is None:
+            del self.project.display_settings[group_path]
+        else:
+            self.project.display_settings[group_path] = after
+        self._mark_unsaved()
+        self._after_display_change()
+
+    def _after_display_change(self):
+        self.canvas.refresh_display()
+        if self.snippet_panel.isVisible():
+            self.snippet_panel._rebuild()
+        if self._snippet_editor is not None \
+                and self._snippet_editor.isVisible():
+            self._snippet_editor.redraw_snippets()
+
     def _open_snippet_editor(self):
         """Open (or refresh) the Snippet Editor window."""
         if self._snippet_editor is None:
@@ -2710,6 +2872,13 @@ class MainWindow(QMainWindow):
         group was "removed". The rows the tree did have follow in
         _on_layers_removed, which also refreshes.
         """
+        dropped = [key for key in self.project.display_settings
+                   if any(key == g or key.startswith(g + "/")
+                          for g in group_paths)]
+        for key in dropped:
+            del self.project.display_settings[key]
+        if dropped:
+            self._mark_unsaved()
         images = self._images_to_remove([], group_paths)
         if not images:
             return
@@ -2784,6 +2953,7 @@ class MainWindow(QMainWindow):
         self._hide_progress()
 
         # Clear project state
+        self._close_display_dialog()
         self.project = LabelProject()
         self._project_path = None
         self._set_saved_baseline()
@@ -2883,6 +3053,7 @@ class MainWindow(QMainWindow):
             self.canvas.clear_layers()
             self.layer_panel.clear()
 
+            self._close_display_dialog()
             self.project = LabelProject.load(file_path)
             self._project_path = Path(file_path)
             self._remember_recent_project(file_path)

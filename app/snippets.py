@@ -24,7 +24,7 @@ from rasterio.windows import Window
 
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QThread, pyqtSignal
 
-from . import gdal_config
+from . import display_settings, gdal_config
 from .debug_log import debug
 
 
@@ -64,7 +64,10 @@ def _band_scaling(src):
     """
     if np.dtype(src.dtypes[0]) == np.uint8:
         return None
-    bands = min(src.count, 3)
+    # Every band, not only the first three: Display Settings can draw any
+    # band, and one without a stretch would clip to black. The first
+    # three come out exactly as before - each band's window is its own.
+    bands = min(src.count, 64)
     out_h = min(src.height, 1024)
     out_w = min(src.width, 1024)
     sample = src.read(indexes=list(range(1, bands + 1)),
@@ -273,10 +276,16 @@ def read_label_snippet(image_path: str, pixel_x: float, pixel_y: float,
     entirely nodata or the file cannot be read.
     """
     try:
+        display = display_settings.for_image(image_path)
         with gdal_config.opened(image_path) as src:
             scaling = cached_band_scaling(src)
             x0, y0, w, h = snippet_frame(pixel_x, pixel_y, size_px,
                                          src.width, src.height)
+            if not display.is_default():
+                # Drawn the way the group's Display Settings draw it on
+                # the canvas. Exports never come through here.
+                return display_settings.display_rgb(
+                    src, Window(x0, y0, w, h), src.nodata, scaling, display)
             return _window_pixels(src, Window(x0, y0, w, h), 3,
                                   src.nodata, scaling=scaling)
     except Exception as exc:  # noqa: BLE001 - a bad file costs one thumbnail
@@ -362,8 +371,10 @@ class SnippetLoader(QObject):
     def request(self, key, image_path: str, pixel_x: float, pixel_y: float,
                 size_px: int):
         """Ask for one snippet; `ready` fires with the newest request's data."""
+        # The display settings are part of what a snippet looks like, so
+        # a change of them is a cache miss rather than a stale picture.
         content = (image_path, int(round(pixel_x)), int(round(pixel_y)),
-                   int(size_px))
+                   int(size_px), display_settings.for_image(image_path))
         cached = self._cache.get(content)
         if cached is not None:
             self._cache.move_to_end(content)

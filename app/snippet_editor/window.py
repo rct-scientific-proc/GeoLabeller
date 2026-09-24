@@ -263,6 +263,11 @@ class SnippetEditor(QWidget):
     def set_mask_names(self, names: list):
         self.masks.set_mask_names(names)
 
+    def redraw_snippets(self):
+        """Display Settings changed: read every snippet again, keeping the
+        class, the filter and the snippet in hand."""
+        self.strip._rebuild(chosen_anew=False)
+
     def set_save_state(self, text: str, saved: bool):
         """Show whether what has been done is on disk yet."""
         self.save_status.setText(text)

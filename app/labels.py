@@ -12,6 +12,7 @@ from pyproj import Geod, Transformer
 from rasterio.crs import CRS
 
 from .debug_log import debug
+from .display_settings import settings_from_project_data
 
 # WGS84 CRS (EPSG:4326)
 WGS84 = CRS.from_epsg(4326)
@@ -753,6 +754,10 @@ class LabelProject:
     # Named geographic bookmarks, in the order they were added
     waypoints: list[Waypoint] = field(default_factory=list)
 
+    # Display Settings per project group path (format 4.6): only groups
+    # that set their own; sub-groups inherit (display_settings.resolve).
+    display_settings: dict = field(default_factory=dict)
+
     # Auto-increment ID counter for labels
     _next_id: int = 1
 
@@ -1141,7 +1146,7 @@ class LabelProject:
         return {
             # Single-digit minors only ("4.0" came after "3.9", never
             # "3.10"): the ICD pins readers to STRING comparison.
-            "version": "4.5",
+            "version": "4.6",
             # Copied, not referenced: the recovery snapshot is handed to a
             # background writer and the user carries on editing meanwhile.
             # The image and waypoint entries are freshly built dictionaries,
@@ -1157,7 +1162,13 @@ class LabelProject:
                if self.descriptions else {}),
             # Likewise for mask-name presets, added at 4.4.
             **({"mask_names": list(self.mask_names)}
-               if self.mask_names else {})
+               if self.mask_names else {}),
+            # Per-group display settings, added at 4.6: only groups that
+            # set their own, so a project without any is unchanged.
+            **({"display_settings": {
+                group: settings.to_dict()
+                for group, settings in sorted(self.display_settings.items())}}
+               if self.display_settings else {})
         }
 
     def save(self, file_path: str | Path):
@@ -1226,6 +1237,9 @@ class LabelProject:
         project.descriptions = [str(d) for d in data.get("descriptions", [])]
         # Mask-name presets arrived in 4.4, likewise.
         project.mask_names = [str(n) for n in data.get("mask_names", [])]
+        # Display settings arrived in 4.6, likewise.
+        project.display_settings = settings_from_project_data(
+            data.get("display_settings"))
         project._next_id = data.get("_next_id", 1)
 
         # Waypoints arrived in 3.3; older projects simply have none. The id
@@ -1391,6 +1405,10 @@ def combine_projects(project1: "LabelProject",
         list(project1.descriptions) + list(project2.descriptions)))
     combined.mask_names = list(dict.fromkeys(
         list(project1.mask_names) + list(project2.mask_names)))
+    # Display settings: the first project's win; the second fills in
+    # groups the first never set.
+    combined.display_settings = {**project2.display_settings,
+                                 **project1.display_settings}
 
     # Both projects number waypoints from 1, so their ids collide; add
     # them through add_waypoint to renumber, keeping the names.

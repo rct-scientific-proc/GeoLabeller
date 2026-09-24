@@ -20,6 +20,7 @@ from PyQt5.QtWidgets import (
     QComboBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu,
     QSpinBox, QVBoxLayout, QWidget)
 
+from . import display_settings
 from .snippets import SnippetLoader
 
 FILTER_ALL = "All"
@@ -202,7 +203,9 @@ class SnippetPanel(QWidget):
         """Everything about an entry that changes what its tile shows."""
         return (entry["label_id"], self._caption_for(entry),
                 entry["image_path"], int(round(entry["pixel_x"])),
-                int(round(entry["pixel_y"])), size)
+                int(round(entry["pixel_y"])), size,
+                # Display Settings change what a tile looks like too.
+                display_settings.for_image(entry["image_path"]))
 
     def _rebuild(self):
         size = self.size_spin.value()

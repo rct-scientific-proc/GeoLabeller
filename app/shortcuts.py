@@ -34,6 +34,7 @@ SHORTCUT_SECTIONS = [
         ("Right-click", "Context menu"),
         ("Ctrl+G", "Go to a latitude/longitude"),
         ("Ctrl+Shift+W", "Add waypoint by coordinates"),
+        ("Ctrl+D", "Display Settings for the selected group"),
         ("Ctrl+B", "Show/hide the snippet sidebar"),
     ]),
     ("Mode Switching", [
