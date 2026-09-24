@@ -39,8 +39,9 @@ from .class_editor import (ClassEditorDialog, DescriptionEditorDialog,
                            MaskNameEditorDialog)
 from .goto_location import (GoToLocationDialog, WaypointDialog,
                             format_lat_lon)
-from .labels import (CONFIDENCE_UNSET, LabelProject, combine_projects,
-                     geodesic_distance, mask_names_in_use, valid_confidence)
+from .labels import (CONFIDENCE_UNSET, LabelProject, canonical_path,
+                     combine_projects, geodesic_distance, mask_names_in_use,
+                     valid_confidence)
 from .layer_panel import CombinedLayerPanel
 from .optimize_export import (OptimizeExportDialog, OptimizeWorker,
                               plan_output_paths)
@@ -587,6 +588,7 @@ class MainWindow(QMainWindow):
         # dropped its layers by then): delete the images and their labels
         # from the PROJECT and refresh everything that listed them.
         self.layer_panel.layers_removed.connect(self._on_layers_removed)
+        self.layer_panel.groups_removed.connect(self._on_groups_removed)
         # The panel's removal confirmation states what will actually be
         # deleted; only the project knows the counts.
         self.layer_panel.main_panel.removal_describer = \
@@ -2325,29 +2327,95 @@ class MainWindow(QMainWindow):
             self._update_class_combo()
             self._refresh_label_markers()
 
-    def _describe_layer_removal(self, entries: list) -> "str | None":
+    def _describe_layer_removal(self, entries: list,
+                                group_paths: list = ()) -> "str | None":
         """Confirmation text for removing these layers, or None for no prompt.
 
-        ``entries`` is the panel's [(layer_id, file_path), ...]. Removal is
+        ``entries`` is the panel's [(layer_id, file_path), ...] and
+        ``group_paths`` the project groups the gesture covers. Removal is
         a PROJECT deletion, so the prompt must say what really goes: how
-        many images and how many labels. A single image with no labels is
-        the one case removed without asking - nothing of consequence dies.
+        many images and how many labels - counting the images those
+        groups hold that the tree never showed. A single image with no
+        labels is the one case removed without asking - nothing of
+        consequence dies.
         """
-        paths = {path for _layer_id, path in entries}
-        n_labels = sum(len(self.project.images[p].labels)
-                       for p in paths if p in self.project.images)
-        if len(entries) == 1 and n_labels == 0:
+        images = self._images_to_remove(entries, group_paths)
+        n_labels = sum(len(image.labels) for image in images)
+        n_images = max(len(images), len(entries))
+        if n_images <= 1 and n_labels == 0:
             return None
-        message = (f"Remove {len(entries)} image(s) from the project?"
-                   if len(entries) > 1
+        message = (f"Remove {n_images} image(s) from the project?"
+                   if n_images > 1
                    else "Remove this image from the project?")
         if n_labels:
             message += (f"\n\n{n_labels} label(s) on "
-                        f"{'them' if len(entries) > 1 else 'it'} "
+                        f"{'them' if n_images > 1 else 'it'} "
                         "will be deleted.")
         else:
             message += "\n\nNo labels will be deleted."
         return message
+
+    def _project_image_for(self, file_path: str):
+        """The project's entry for a path the tree knew an image by.
+
+        Normally a straight lookup. But the project may spell the same file
+        differently - another machine's project, another drive-letter case
+        - and a lookup that misses used to skip the image silently, leaving
+        it and its labels in the project after "Remove".
+        """
+        image = self.project.images.get(file_path)
+        if image is not None:
+            return image
+        wanted = os.path.normcase(canonical_path(file_path))
+        for key, image in self.project.images.items():
+            if os.path.normcase(key) == wanted:
+                return image
+        return None
+
+    def _images_to_remove(self, entries: list, group_paths=()) -> list:
+        """Every project image a removal gesture covers, once each: the
+        tree's rows, and whatever the removed groups hold besides."""
+        images, seen = [], set()
+        for _layer_id, file_path in entries:
+            image = self._project_image_for(file_path)
+            if image is not None and id(image) not in seen:
+                seen.add(id(image))
+                images.append(image)
+        for group_path in group_paths:
+            for image in self._images_in_group(group_path):
+                if id(image) not in seen:
+                    seen.add(id(image))
+                    images.append(image)
+        return images
+
+    def _remove_images_from_project(self, images: list) -> tuple:
+        """Delete these images and their labels; (images, labels) counts."""
+        removed_labels = 0
+        for image in images:
+            for label in image.labels:
+                self.canvas.remove_label_marker(label.id)
+            removed_labels += len(image.labels)
+            self.project.remove_image(image.path)
+        return len(images), removed_labels
+
+    def _on_groups_removed(self, group_paths: list):
+        """Groups went from the tree: delete what the project files under
+        them that the tree never showed.
+
+        A shared project opened where some of a group's images are not on
+        this machine gives those images no layer and no row (they wait for
+        Locate Missing Images), so the tree's own removal never reached
+        them - and their labels stayed in every save and export after the
+        group was "removed". The rows the tree did have follow in
+        _on_layers_removed, which also refreshes.
+        """
+        images = self._images_to_remove([], group_paths)
+        if not images:
+            return
+        removed_images, removed_labels = \
+            self._remove_images_from_project(images)
+        self._mark_unsaved()
+        self._after_project_removal(removed_images, removed_labels)
 
     def _on_layers_removed(self, entries: list):
         """Complete a panel removal: delete the images from the project.
@@ -2358,19 +2426,16 @@ class MainWindow(QMainWindow):
         "Remove" was view-only - the images and labels survived in the
         project and all came back on the next open.
         """
-        removed_images = removed_labels = 0
-        for _layer_id, file_path in entries:
-            image = self.project.images.get(file_path)
-            if image is None:
-                continue
-            for label in image.labels:
-                self.canvas.remove_label_marker(label.id)
-            removed_labels += len(image.labels)
-            self.project.remove_image(file_path)
-            removed_images += 1
+        removed_images, removed_labels = self._remove_images_from_project(
+            self._images_to_remove(entries))
         if not removed_images:
             return
         self._mark_unsaved()
+        self._after_project_removal(removed_images, removed_labels)
+
+    def _after_project_removal(self, removed_images: int,
+                               removed_labels: int):
+        """Refresh every surface that listed the images just deleted."""
         # Removing an image can leave the OTHER half of a linked pair alone
         # in its object group: without this the survivor keeps the halo that
         # says it is linked, while the panel correctly shows it is not.

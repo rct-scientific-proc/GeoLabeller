@@ -52,6 +52,13 @@ class LayerPanel(QWidget):
     # images (and their labels) from the PROJECT here - "Remove" used to be
     # view-only, and every removed image came back on the next open.
     layers_removed = pyqtSignal(list)
+    # The PROJECT group paths a removal gesture covered, emitted before
+    # layers_removed. A group can hold images the tree never showed - a
+    # shared project's images that are not on this machine get no layer
+    # and no row - and those went on living in the project, labels and
+    # all, after the group was "removed". MainWindow deletes them by
+    # group membership.
+    groups_removed = pyqtSignal(list)
 
     # Group memory management signals: emitted with list of layer_ids
     group_preload_requested = pyqtSignal(list)  # layer_ids to fully load
@@ -759,9 +766,10 @@ class LayerPanel(QWidget):
             unique.append((layer_id, path))
         entries = unique
 
+        group_paths = self._project_group_paths(outermost)
         message = None
-        if self.removal_describer is not None and entries:
-            message = self.removal_describer(entries)
+        if self.removal_describer is not None and (entries or group_paths):
+            message = self.removal_describer(entries, group_paths)
         elif any(item.data(0, Qt.UserRole + 1) == "group"
                  and item.childCount() > 0 for item in outermost):
             message = "This selection contains layers. Remove anyway?"
@@ -779,6 +787,8 @@ class LayerPanel(QWidget):
         self.refresh_group_check_states()
         for layer_id, _path in entries:
             self.layer_removed.emit(layer_id)
+        if group_paths:
+            self.groups_removed.emit(group_paths)
         if entries:
             self.layers_removed.emit(entries)
 
@@ -804,9 +814,10 @@ class LayerPanel(QWidget):
         # Confirm with what will actually be deleted. The describer knows
         # the project (image and label counts); without one, fall back to
         # the old generic group prompt.
+        group_paths = self._project_group_paths([item])
         message = None
-        if self.removal_describer is not None and entries:
-            message = self.removal_describer(entries)
+        if self.removal_describer is not None and (entries or group_paths):
+            message = self.removal_describer(entries, group_paths)
         elif item_type == "group" and item.childCount() > 0:
             message = "This group contains layers. Remove anyway?"
         if message is not None:
@@ -834,8 +845,31 @@ class LayerPanel(QWidget):
         # side (which needs the file paths the canvas no longer has).
         for layer_id, _path in entries:
             self.layer_removed.emit(layer_id)
+        if group_paths:
+            self.groups_removed.emit(group_paths)
         if entries:
             self.layers_removed.emit(entries)
+
+    def _project_group_paths(self, items: list) -> list:
+        """The project group path of each group among ``items``.
+
+        A tree path and a project group differ for non-georeferenced
+        imagery: the tree files it under a "Non-Georeferenced" root, the
+        project under the import path alone. The root itself names no
+        project group.
+        """
+        paths = []
+        for item in items:
+            if item.data(0, Qt.UserRole + 1) != "group":
+                continue
+            above = self._get_group_path(item)
+            full = f"{above}/{item.text(0)}" if above else item.text(0)
+            if full == "Non-Georeferenced":
+                continue
+            if full.startswith("Non-Georeferenced/"):
+                full = full[len("Non-Georeferenced/"):]
+            paths.append(full)
+        return paths
 
     @staticmethod
     def _is_ancestor_of(item: QTreeWidgetItem,
@@ -1956,6 +1990,7 @@ class CombinedLayerPanel(QWidget):
     export_object_requested = pyqtSignal(str)  # object_id
     layer_removed = pyqtSignal(str)
     layers_removed = pyqtSignal(list)  # [(layer_id, file_path), ...]
+    groups_removed = pyqtSignal(list)  # project group paths
 
     # Hard-negative mirror section
     hard_negative_unflag_requested = pyqtSignal(str)  # layer_id
@@ -2034,6 +2069,7 @@ class CombinedLayerPanel(QWidget):
             self.zoom_to_layer_requested)
         self.main_panel.layer_removed.connect(self.layer_removed)
         self.main_panel.layers_removed.connect(self.layers_removed)
+        self.main_panel.groups_removed.connect(self.groups_removed)
 
         # Forward batch progress signals
         self.main_panel.batch_visibility_started.connect(
