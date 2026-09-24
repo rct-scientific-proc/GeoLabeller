@@ -88,6 +88,9 @@ SHORTCUT_SECTIONS = [
         ("Right-click marker", "Go to / Rename / Remove"),
         ("Double-click in panel", "Fly to that waypoint"),
         ("Show on map", "Hide or show every waypoint marker"),
+        ("Export > Waypoints (GPX)...", "Write every waypoint to a GPX file"),
+        ("File > Import Waypoints...",
+         "Add the waypoints in a GPX file or another project"),
     ]),
     ("Layer Panel", [
         ("Checkbox", "Toggle layer/group visibility"),

@@ -53,7 +53,7 @@ from .h5_export import (EXAMPLES_ALL, EXAMPLES_OBJECT,
                         estimate_export)
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
-from . import gdal_config, recent
+from . import gdal_config, recent, waypoint_io
 from .gt_import import apply_import, confirm_import, plan_import
 from .relocate import (RelocateImagesDialog, missing_images,
                        silently_resolve)
@@ -61,7 +61,7 @@ from .snippet_editor import SnippetEditor
 from .snippet_editor.size_section import shares_with_linked, size_text
 from .snippet_panel import SnippetPanel
 from .resources import icd_path
-from .version import app_title
+from .version import app_title, app_version
 
 
 class GroupMemoryWorker(QObject):
@@ -762,6 +762,14 @@ class MainWindow(QMainWindow):
         import_gt_action.triggered.connect(self._import_ground_truth)
         file_menu.addAction(import_gt_action)
 
+        # Import Waypoints - a GPX file, or another project's waypoints
+        # (Import Ground Truth leaves those alone on purpose)
+        import_waypoints_action = QAction("Import &Waypoints...", self)
+        import_waypoints_action.setStatusTip(
+            "Add the waypoints in a GPX file or another GeoLabeller project")
+        import_waypoints_action.triggered.connect(self._import_waypoints)
+        file_menu.addAction(import_waypoints_action)
+
         file_menu.addSeparator()
 
         # Exit action
@@ -858,6 +866,14 @@ class MainWindow(QMainWindow):
         export_subimages_action = QAction("&Sub-images...", self)
         export_subimages_action.triggered.connect(self._export_subimages)
         export_menu.addAction(export_subimages_action)
+
+        # Export Waypoints as GPX - what GPS units, Google Earth, QGIS and
+        # another GeoLabeller all read
+        export_waypoints_action = QAction("&Waypoints (GPX)...", self)
+        export_waypoints_action.setStatusTip(
+            "Write every waypoint to a GPX file for another user or tool")
+        export_waypoints_action.triggered.connect(self._export_waypoints)
+        export_menu.addAction(export_waypoints_action)
 
         export_menu.addSeparator()
 
@@ -2404,6 +2420,88 @@ class MainWindow(QMainWindow):
             self.project.waypoints, format_lat_lon)
         debug(f"waypoint removed: #{waypoint_id} '{name}'")
         self.statusBar.showMessage(f"Removed waypoint '{name}'", 3000)
+
+    def _export_waypoints(self):
+        """Write every waypoint to a GPX file (Export > Waypoints).
+
+        GPX 1.1, because it is what everything else reads - GPS units,
+        Google Earth, QGIS, GDAL - and File > Import Waypoints reads it
+        back on another machine.
+        """
+        if not self.project.waypoints:
+            QMessageBox.information(self, "Export Waypoints",
+                                    "No waypoints to export.")
+            return
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Waypoints", recent.last_dir(recent.EXPORT),
+            "GPX Files (*.gpx)")
+        if not file_path:
+            return
+        recent.remember_dir(recent.EXPORT, file_path)
+        if not file_path.lower().endswith(waypoint_io.EXTENSION):
+            file_path += waypoint_io.EXTENSION
+        try:
+            count = waypoint_io.write_gpx(
+                file_path, self.project.waypoints,
+                creator=f"GeoLabeller {app_version()}")
+        except OSError as e:
+            QMessageBox.critical(self, "Export Waypoints",
+                                 f"Could not write {file_path}:\n{e}")
+            return
+        debug(f"waypoints exported: {count} to {file_path}")
+        self.statusBar.showMessage(
+            f"Exported {count} waypoint(s) to {file_path}", 5000)
+
+    def _import_waypoints(self):
+        """Add the waypoints in a GPX file or another project (File menu).
+
+        Only what is new is added: a waypoint already in the project at
+        that place, under that name (or unnamed in the file), is left as
+        it is - so importing a file twice adds nothing the second time.
+        The confirmation says how many will be added, how many are
+        already here and how many entries could not be read.
+        """
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Import Waypoints", recent.last_dir(recent.PROJECT),
+            "Waypoint files (*.gpx *.geolabel *.json);;GPX files (*.gpx);;"
+            "GeoLabeller projects (*.geolabel *.json);;All files (*)")
+        if not file_path:
+            return
+        recent.remember_dir(recent.PROJECT, file_path)
+        try:
+            read = waypoint_io.read_waypoints(file_path)
+        except waypoint_io.WaypointFileError as e:
+            QMessageBox.critical(self, "Import Waypoints", str(e))
+            return
+        new, already = waypoint_io.plan_import(self.project, read.found)
+        name = os.path.basename(file_path)
+        notes = []
+        if already:
+            notes.append(f"{already} already in this project")
+        if read.skipped:
+            notes.append(f"{read.skipped} "
+                         f"{'entry' if read.skipped == 1 else 'entries'} "
+                         "without a usable position")
+        if not new:
+            what = (f"{name} holds no waypoints." if not read.found
+                    and not read.skipped
+                    else f"Nothing new in {name}: " + ", ".join(notes) + ".")
+            QMessageBox.information(self, "Import Waypoints", what)
+            return
+        message = f"Add {len(new)} waypoint(s) from {name}?"
+        if notes:
+            message += "\n\nLeft out: " + ", ".join(notes) + "."
+        reply = QMessageBox.question(self, "Import Waypoints", message,
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        added = waypoint_io.apply_import(self.project, new)
+        self._mark_unsaved()
+        self._refresh_waypoints()
+        debug(f"waypoints imported: {len(added)} from {file_path} "
+              f"({already} already here, {read.skipped} skipped)")
+        self.statusBar.showMessage(
+            f"Imported {len(added)} waypoint(s) from {name}", 5000)
 
     def _clear_coordinate_marker(self):
         """Remove the go-to crosshair from the map."""
