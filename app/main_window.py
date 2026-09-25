@@ -54,6 +54,7 @@ from .h5_export import (EXAMPLES_ALL, EXAMPLES_OBJECT,
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
 from . import display_settings, gdal_config, recent, waypoint_io
+from .about import AboutDialog
 from .display_dialog import DisplaySettingsDialog
 from .gt_import import apply_import, confirm_import, plan_import
 from .relocate import (RelocateImagesDialog, missing_images,
@@ -923,8 +924,12 @@ class MainWindow(QMainWindow):
         icd_action.triggered.connect(self._show_icd)
         help_menu.addAction(icd_action)
 
-        # About
+        # About: what this build is made of, with a Copy button for a
+        # bug report
         about_action = QAction("&About", self)
+        about_action.setStatusTip(
+            "The version of GeoLabeller, Python and every library it runs "
+            "on, ready to copy into a bug report")
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
 
@@ -5345,21 +5350,8 @@ class MainWindow(QMainWindow):
                 f"{path}")
 
     def _show_about(self):
-        """Show about dialog."""
-        QMessageBox.about(
-            self, "About GeoLabeller",
-            f"<h2>{app_title()}</h2>"
-            "<p>A geospatial image labeling tool for creating ground truth datasets.</p>"
-            "<p>Load GeoTIFF images, place point labels, and export annotations "
-            "for machine learning workflows.</p>"
-            "<p><b>Features:</b></p>"
-            "<ul>"
-            "<li>Multi-layer GeoTIFF support</li>"
-            "<li>Web Mercator reprojection</li>"
-            "<li>Point labeling with custom classes</li>"
-            "<li>Label linking across images</li>"
-            "<li>Ground truth export</li>"
-            "</ul>")
+        """Help > About: the versions window (app/about.py)."""
+        AboutDialog(self).exec_()
 
     def _show_debug_console(self):
         """Open (or focus) the live Debug Console window."""
