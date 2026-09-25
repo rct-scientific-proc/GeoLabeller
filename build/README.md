@@ -7,7 +7,8 @@ repository README); there is no Linux build script.
 
 ## Prerequisites
 
-1. **Python 3.10+** with pip. The release workflow pins 3.12.
+1. **Python 3.10+** with pip. The release workflow pins 3.14, the version
+   the test suite runs on, so the installer ships what was tested.
 2. **The .NET SDK**, for the WiX toolset (installed on first use by the script).
 3. Internet access for pip, or a proxy (see below).
 
