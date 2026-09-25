@@ -72,8 +72,9 @@ WiX UI extension's standard pages:
    Per-user defaults to `%LocalAppData%\Apps\GeoLabeller`, per-machine to
    `C:\Program Files\GeoLabeller`. On an upgrade the default is wherever the
    previous version was installed, so a folder chosen once stays chosen.
-5. **Shortcuts.** Start Menu and Desktop are separate features with
-   tick-boxes, both on by default. Then **Install**.
+5. **Shortcuts.** Two tick-boxes, Start Menu and Desktop, both on by
+   default. Then **Install**. Add/Remove Programs > Change shows the same
+   page with the boxes as installed.
 
 Before 2.3.1 the installer used the stock `WixUI_Advanced` set, which had
 two faults users noticed: an upgrade showed the licence twice (the upgrade

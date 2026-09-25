@@ -23,7 +23,7 @@
       Licence  (accept to go on)
       Scope    (just me / everyone)
       Folder   (the default, or Change...)
-      Features (shortcuts) - Install
+      Shortcuts (two tick-boxes) - Install
 
   It replaced WixUI_Advanced, which had two faults users noticed. Its
   first page offered a one-click Install that skipped every choice, and it
@@ -139,6 +139,19 @@
          the old one is suddenly blocked by a UAC prompt. -->
     <Property Id="WixAppFolder" Value="WixPerUserFolder" />
 
+    <!-- The shortcuts page's two tick-boxes, on to begin with. Secure, so a
+         per-machine install keeps them across its elevation. From
+         Add/Remove Programs > Change they start as the install is: the
+         feature state is known once costing has run. -->
+    <Property Id="INSTALLSTARTMENUSHORTCUT" Value="1" Secure="yes" />
+    <Property Id="INSTALLDESKTOPSHORTCUT" Value="1" Secure="yes" />
+    <SetProperty Id="INSTALLSTARTMENUSHORTCUT" Action="ReadStartMenuShortcutState"
+                 Value="{}" After="CostFinalize" Sequence="ui"
+                 Condition="Installed AND NOT (!StartMenuShortcutFeature = 3)" />
+    <SetProperty Id="INSTALLDESKTOPSHORTCUT" Action="ReadDesktopShortcutState"
+                 Value="{}" After="CostFinalize" Sequence="ui"
+                 Condition="Installed AND NOT (!DesktopShortcutFeature = 3)" />
+
     <!-- Without this the licence page shows the UI extension's placeholder,
          which is Lorem ipsum. build_windows.ps1 generates the RTF from the
          LICENSE file at the repository root so there is only one copy of it. -->
@@ -228,7 +241,6 @@
       <DialogRef Id="DiskCostDlg" />
       <DialogRef Id="ErrorDlg" />
       <DialogRef Id="FatalError" />
-      <DialogRef Id="FeaturesDlg" />
       <DialogRef Id="FilesInUse" />
       <DialogRef Id="InstallDirDlg" />
       <DialogRef Id="InstallScopeDlg" />
@@ -283,6 +295,92 @@ Continuing will replace it with version [ProductVersion]. The existing version i
         </Control>
       </Dialog>
 
+
+      <!--
+        The shortcuts, as two tick-boxes - on to begin with - rather than
+        the stock feature tree, whose drop-down menus ("Will be installed
+        on local hard drive") asked users to think in Windows Installer's
+        terms for a yes-or-no choice. Install adds or removes each shortcut
+        feature from what the box says, then ends the chain. From
+        Add/Remove Programs > Change the same page appears, with the boxes
+        showing what is installed.
+      -->
+      <Dialog Id="ShortcutsDlg" Width="370" Height="270" Title="[ProductName] Setup" TrackDiskSpace="yes">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="210" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Title}Shortcuts" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="Choose the shortcuts to create." />
+
+        <Control Id="StartMenuCheck" Type="CheckBox" X="20" Y="68" Width="330" Height="18"
+                 Property="INSTALLSTARTMENUSHORTCUT" CheckBoxValue="1" Text="&amp;Start Menu shortcut" />
+        <Control Id="StartMenuText" Type="Text" X="37" Y="87" Width="310" Height="14" NoPrefix="yes"
+                 Text="Add GeoLabeller to the Start Menu." />
+        <Control Id="DesktopCheck" Type="CheckBox" X="20" Y="112" Width="330" Height="18"
+                 Property="INSTALLDESKTOPSHORTCUT" CheckBoxValue="1" Text="&amp;Desktop shortcut" />
+        <Control Id="DesktopText" Type="Text" X="37" Y="131" Width="310" Height="14" NoPrefix="yes"
+                 Text="Put a GeoLabeller shortcut on the desktop." />
+
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="156" Y="243" Width="56" Height="17" Text="Back" />
+        <Control Id="Install" Type="PushButton" ElevationShield="yes" X="212" Y="243" Width="80" Height="17"
+                 Hidden="yes" ShowCondition="NOT Installed AND ALLUSERS" DefaultCondition="NOT Installed" Text="&amp;Install">
+          <Publish Event="AddLocal" Value="StartMenuShortcutFeature" Condition="INSTALLSTARTMENUSHORTCUT" Order="1" />
+          <Publish Event="Remove" Value="StartMenuShortcutFeature" Condition="NOT INSTALLSTARTMENUSHORTCUT" Order="2" />
+          <Publish Event="AddLocal" Value="DesktopShortcutFeature" Condition="INSTALLDESKTOPSHORTCUT" Order="3" />
+          <Publish Event="Remove" Value="DesktopShortcutFeature" Condition="NOT INSTALLDESKTOPSHORTCUT" Order="4" />
+          <Publish Event="SpawnWaitDialog" Value="WaitForCostingDlg" Condition="!(wix.WixUICostingPopupOptOut) OR CostingComplete = 1" Order="5" />
+          <Publish Event="EndDialog" Value="Return" Condition="OutOfDiskSpace &lt;&gt; 1" Order="6" />
+          <Publish Event="SpawnDialog" Value="OutOfRbDiskDlg" Condition="OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 0 AND (PROMPTROLLBACKCOST=&quot;P&quot; OR NOT PROMPTROLLBACKCOST)" Order="7" />
+          <Publish Event="EndDialog" Value="Return" Condition="OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 0 AND PROMPTROLLBACKCOST=&quot;D&quot;" Order="8" />
+          <Publish Event="EnableRollback" Value="False" Condition="OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 0 AND PROMPTROLLBACKCOST=&quot;D&quot;" Order="9" />
+          <Publish Event="SpawnDialog" Value="OutOfDiskDlg" Condition="(OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 1) OR (OutOfDiskSpace = 1 AND PROMPTROLLBACKCOST=&quot;F&quot;)" Order="10" />
+        </Control>
+        <Control Id="InstallNoShield" Type="PushButton" ElevationShield="no" X="212" Y="243" Width="80" Height="17"
+                 Hidden="yes" ShowCondition="NOT Installed AND NOT ALLUSERS" DefaultCondition="NOT Installed" Text="&amp;Install">
+          <Publish Event="AddLocal" Value="StartMenuShortcutFeature" Condition="INSTALLSTARTMENUSHORTCUT" Order="1" />
+          <Publish Event="Remove" Value="StartMenuShortcutFeature" Condition="NOT INSTALLSTARTMENUSHORTCUT" Order="2" />
+          <Publish Event="AddLocal" Value="DesktopShortcutFeature" Condition="INSTALLDESKTOPSHORTCUT" Order="3" />
+          <Publish Event="Remove" Value="DesktopShortcutFeature" Condition="NOT INSTALLDESKTOPSHORTCUT" Order="4" />
+          <Publish Event="SpawnWaitDialog" Value="WaitForCostingDlg" Condition="!(wix.WixUICostingPopupOptOut) OR CostingComplete = 1" Order="5" />
+          <Publish Event="EndDialog" Value="Return" Condition="OutOfDiskSpace &lt;&gt; 1" Order="6" />
+          <Publish Event="SpawnDialog" Value="OutOfRbDiskDlg" Condition="OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 0 AND (PROMPTROLLBACKCOST=&quot;P&quot; OR NOT PROMPTROLLBACKCOST)" Order="7" />
+          <Publish Event="EndDialog" Value="Return" Condition="OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 0 AND PROMPTROLLBACKCOST=&quot;D&quot;" Order="8" />
+          <Publish Event="EnableRollback" Value="False" Condition="OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 0 AND PROMPTROLLBACKCOST=&quot;D&quot;" Order="9" />
+          <Publish Event="SpawnDialog" Value="OutOfDiskDlg" Condition="(OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 1) OR (OutOfDiskSpace = 1 AND PROMPTROLLBACKCOST=&quot;F&quot;)" Order="10" />
+        </Control>
+        <Control Id="Change" Type="PushButton" ElevationShield="yes" X="212" Y="243" Width="80" Height="17"
+                 Hidden="yes" ShowCondition="Installed AND ALLUSERS" DefaultCondition="Installed" Text="&amp;Change">
+          <Publish Event="AddLocal" Value="StartMenuShortcutFeature" Condition="INSTALLSTARTMENUSHORTCUT" Order="1" />
+          <Publish Event="Remove" Value="StartMenuShortcutFeature" Condition="NOT INSTALLSTARTMENUSHORTCUT" Order="2" />
+          <Publish Event="AddLocal" Value="DesktopShortcutFeature" Condition="INSTALLDESKTOPSHORTCUT" Order="3" />
+          <Publish Event="Remove" Value="DesktopShortcutFeature" Condition="NOT INSTALLDESKTOPSHORTCUT" Order="4" />
+          <Publish Event="SpawnWaitDialog" Value="WaitForCostingDlg" Condition="!(wix.WixUICostingPopupOptOut) OR CostingComplete = 1" Order="5" />
+          <Publish Event="EndDialog" Value="Return" Condition="OutOfDiskSpace &lt;&gt; 1" Order="6" />
+          <Publish Event="SpawnDialog" Value="OutOfRbDiskDlg" Condition="OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 0 AND (PROMPTROLLBACKCOST=&quot;P&quot; OR NOT PROMPTROLLBACKCOST)" Order="7" />
+          <Publish Event="EndDialog" Value="Return" Condition="OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 0 AND PROMPTROLLBACKCOST=&quot;D&quot;" Order="8" />
+          <Publish Event="EnableRollback" Value="False" Condition="OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 0 AND PROMPTROLLBACKCOST=&quot;D&quot;" Order="9" />
+          <Publish Event="SpawnDialog" Value="OutOfDiskDlg" Condition="(OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 1) OR (OutOfDiskSpace = 1 AND PROMPTROLLBACKCOST=&quot;F&quot;)" Order="10" />
+        </Control>
+        <Control Id="ChangeNoShield" Type="PushButton" ElevationShield="no" X="212" Y="243" Width="80" Height="17"
+                 Hidden="yes" ShowCondition="Installed AND NOT ALLUSERS" DefaultCondition="Installed" Text="&amp;Change">
+          <Publish Event="AddLocal" Value="StartMenuShortcutFeature" Condition="INSTALLSTARTMENUSHORTCUT" Order="1" />
+          <Publish Event="Remove" Value="StartMenuShortcutFeature" Condition="NOT INSTALLSTARTMENUSHORTCUT" Order="2" />
+          <Publish Event="AddLocal" Value="DesktopShortcutFeature" Condition="INSTALLDESKTOPSHORTCUT" Order="3" />
+          <Publish Event="Remove" Value="DesktopShortcutFeature" Condition="NOT INSTALLDESKTOPSHORTCUT" Order="4" />
+          <Publish Event="SpawnWaitDialog" Value="WaitForCostingDlg" Condition="!(wix.WixUICostingPopupOptOut) OR CostingComplete = 1" Order="5" />
+          <Publish Event="EndDialog" Value="Return" Condition="OutOfDiskSpace &lt;&gt; 1" Order="6" />
+          <Publish Event="SpawnDialog" Value="OutOfRbDiskDlg" Condition="OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 0 AND (PROMPTROLLBACKCOST=&quot;P&quot; OR NOT PROMPTROLLBACKCOST)" Order="7" />
+          <Publish Event="EndDialog" Value="Return" Condition="OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 0 AND PROMPTROLLBACKCOST=&quot;D&quot;" Order="8" />
+          <Publish Event="EnableRollback" Value="False" Condition="OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 0 AND PROMPTROLLBACKCOST=&quot;D&quot;" Order="9" />
+          <Publish Event="SpawnDialog" Value="OutOfDiskDlg" Condition="(OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 1) OR (OutOfDiskSpace = 1 AND PROMPTROLLBACKCOST=&quot;F&quot;)" Order="10" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
+          <Publish Event="SpawnDialog" Value="CancelDlg" Condition="1" />
+        </Control>
+      </Dialog>
+
       <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
 
       <!-- Welcome: on to the notice when an older install is present, else
@@ -329,7 +427,7 @@ Continuing will replace it with version [ProductVersion]. The existing version i
                Order="2" Condition="NOT WIXUI_DONTVALIDATEPATH" />
       <Publish Dialog="InstallDirDlg" Control="Next" Event="SpawnDialog" Value="InvalidDirDlg"
                Order="3" Condition="NOT WIXUI_DONTVALIDATEPATH AND WIXUI_INSTALLDIR_VALID&lt;&gt;&quot;1&quot;" />
-      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="FeaturesDlg"
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="ShortcutsDlg"
                Order="4" Condition="WIXUI_DONTVALIDATEPATH OR WIXUI_INSTALLDIR_VALID=&quot;1&quot;" />
       <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1" />
       <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2" />
@@ -338,17 +436,17 @@ Continuing will replace it with version [ProductVersion]. The existing version i
       <Publish Dialog="BrowseDlg" Control="OK" Event="SpawnDialog" Value="InvalidDirDlg"
                Order="4" Condition="NOT WIXUI_DONTVALIDATEPATH AND WIXUI_INSTALLDIR_VALID&lt;&gt;&quot;1&quot;" />
 
-      <!-- Features: the shortcuts, then Install (the button is the page's
-           own). Also where Change from Add/Remove Programs lands. -->
-      <Publish Dialog="FeaturesDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg"
+      <!-- Shortcuts, then Install (the buttons are the page's own). Also
+           where Change from Add/Remove Programs lands. -->
+      <Publish Dialog="ShortcutsDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg"
                Condition="NOT Installed" />
-      <Publish Dialog="FeaturesDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg"
+      <Publish Dialog="ShortcutsDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg"
                Condition="Installed" />
 
       <!-- Maintenance: Change (shortcuts) or Remove. Repair is hidden by
            ARPNOREPAIR above. -->
       <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
-      <Publish Dialog="MaintenanceTypeDlg" Control="ChangeButton" Event="NewDialog" Value="FeaturesDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="ChangeButton" Event="NewDialog" Value="ShortcutsDlg" />
       <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
       <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
       <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
