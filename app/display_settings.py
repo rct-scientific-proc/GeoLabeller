@@ -49,23 +49,34 @@ def _clamp(value, low, high):
 
 @dataclass(frozen=True)
 class ChannelAdjust:
-    """Brightness, contrast and gamma for one displayed channel."""
+    """Brightness, contrast and gamma for one displayed channel, or the
+    channel hidden outright.
+
+    ``hidden`` draws the channel as exactly zero whatever the sliders say
+    (they are kept, so unhiding brings them back). The three sliders at
+    their darkest only get within a few grey levels of that - asked for
+    2026-09-24 as a clean way to drop a channel.
+    """
     brightness: int = 0
     contrast: int = 0
     gamma: float = 1.0
+    hidden: bool = False
 
     def is_identity(self) -> bool:
-        return (self.brightness == 0 and self.contrast == 0
-                and abs(self.gamma - 1.0) < 1e-9)
+        return (not self.hidden and self.brightness == 0
+                and self.contrast == 0 and abs(self.gamma - 1.0) < 1e-9)
 
     def clamped(self) -> "ChannelAdjust":
         return ChannelAdjust(
             int(round(_clamp(self.brightness, *BRIGHTNESS_RANGE))),
             int(round(_clamp(self.contrast, *CONTRAST_RANGE))),
-            round(float(_clamp(self.gamma, *GAMMA_RANGE)), 2))
+            round(float(_clamp(self.gamma, *GAMMA_RANGE)), 2),
+            bool(self.hidden))
 
     def table(self) -> np.ndarray:
         """This channel's 256-entry lookup table (uint8)."""
+        if self.hidden:
+            return np.zeros(256, dtype=np.uint8)
         values = np.arange(256, dtype=np.float64)
         # Brightness first, then contrast around mid-grey: a dim picture
         # is lifted into the middle and then spread, which is what Auto
@@ -81,8 +92,11 @@ class ChannelAdjust:
         return np.round(values * 255.0).astype(np.uint8)
 
     def to_dict(self) -> dict:
-        return {"brightness": self.brightness, "contrast": self.contrast,
+        data = {"brightness": self.brightness, "contrast": self.contrast,
                 "gamma": self.gamma}
+        if self.hidden:
+            data["hidden"] = True
+        return data
 
     @classmethod
     def from_dict(cls, data) -> "ChannelAdjust":
@@ -91,7 +105,8 @@ class ChannelAdjust:
         try:
             return cls(float(data.get("brightness", 0)),
                        float(data.get("contrast", 0)),
-                       float(data.get("gamma", 1.0))).clamped()
+                       float(data.get("gamma", 1.0)),
+                       data.get("hidden") is True).clamped()
         except (TypeError, ValueError):
             return cls()
 
@@ -185,7 +200,9 @@ class DisplaySettings:
         except (TypeError, ValueError):
             bands = None
         if mode == MODE_SINGLE:
-            channels = [channels[0], ChannelAdjust(), ChannelAdjust()]
+            # One channel: hiding it would only blank the image.
+            channels = [replace(channels[0], hidden=False), ChannelAdjust(),
+                        ChannelAdjust()]
             bands = None
         return cls(mode=mode, bands=bands, band=band,
                    channels=tuple(channels))

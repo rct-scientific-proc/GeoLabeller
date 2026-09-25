@@ -15,7 +15,8 @@ import math
 import numpy as np
 from PyQt5.QtCore import QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter, QPainterPath
-from PyQt5.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox, QFormLayout,
+from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
+                             QFormLayout,
                              QGroupBox, QHBoxLayout, QLabel, QPushButton,
                              QSizePolicy, QSlider, QSpinBox, QVBoxLayout,
                              QWidget)
@@ -133,6 +134,12 @@ class ChannelPanel(QGroupBox):
         for box in (self.brightness, self.contrast, self.gamma):
             box.valueChanged.connect(self._on_changed)
 
+        self.hide_check = QCheckBox("Hide this channel")
+        self.hide_check.setToolTip(
+            "Draw this channel as black, exactly - its band leaves the "
+            "picture. The sliders are kept for when it comes back.")
+        self.hide_check.toggled.connect(self._on_hidden)
+
         self.auto_button = QPushButton("Auto")
         self.auto_button.setToolTip(
             "Spread this band's 2-98 percentile range of values over the "
@@ -149,6 +156,7 @@ class ChannelPanel(QGroupBox):
         form.addRow("Contrast", self._row(self.contrast_slider, self.contrast))
         form.addRow("Gamma", self._row(self.gamma_slider, self.gamma))
         buttons = QHBoxLayout()
+        buttons.addWidget(self.hide_check)
         buttons.addStretch(1)
         buttons.addWidget(self.auto_button)
         buttons.addWidget(self.reset_button)
@@ -194,9 +202,31 @@ class ChannelPanel(QGroupBox):
 
     def adjust(self) -> ChannelAdjust:
         return ChannelAdjust(self.brightness.value(), self.contrast.value(),
-                             round(self.gamma.value(), 2))
+                             round(self.gamma.value(), 2),
+                             not self.hide_check.isHidden()
+                             and self.hide_check.isChecked())
+
+    def set_hideable(self, hideable: bool):
+        """Single mode has one channel; hiding it would blank the image."""
+        self.hide_check.setVisible(hideable)
+        if not hideable and self.hide_check.isChecked():
+            self.hide_check.setChecked(False)
+
+    def _on_hidden(self, hidden: bool):
+        for widget in (self.brightness, self.contrast, self.gamma,
+                       self.brightness_slider, self.contrast_slider,
+                       self.gamma_slider, self.auto_button):
+            widget.setEnabled(not hidden)
+        self._on_changed()
 
     def set_adjust(self, adjust: ChannelAdjust, emit: bool = False):
+        self.hide_check.blockSignals(True)
+        self.hide_check.setChecked(bool(adjust.hidden))
+        self.hide_check.blockSignals(False)
+        for widget in (self.brightness, self.contrast, self.gamma,
+                       self.brightness_slider, self.contrast_slider,
+                       self.gamma_slider, self.auto_button):
+            widget.setEnabled(not adjust.hidden)
         boxes = (self.brightness, self.contrast, self.gamma)
         for box in boxes:
             box.blockSignals(True)
@@ -392,6 +422,7 @@ class DisplaySettingsDialog(QDialog):
             GRAY_COLOUR if single else CHANNEL_COLOURS[0])
         for panel in self.panels[1:]:
             panel.setVisible(not single)
+        self.panels[0].set_hideable(not single)
 
     def _channel_bands(self) -> list:
         if self.mode() == MODE_SINGLE:
@@ -415,7 +446,8 @@ class DisplaySettingsDialog(QDialog):
 
     def _auto(self, index: int):
         counts = self.panels[index].counts()
-        if counts is None:
+        # A hidden channel stays hidden: Auto All must not bring it back.
+        if counts is None or self.panels[index].hide_check.isChecked():
             return
         self.panels[index].set_adjust(auto_adjust(counts), emit=True)
 
