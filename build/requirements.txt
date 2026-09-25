@@ -10,4 +10,3 @@ h5py==3.16.0
 # cx_Freeze 7.2+ is required for the MSI options used in setup.py
 # (install_icon, all_users, summary_data, ProgramFiles64Folder handling).
 cx_Freeze>=7.2,<9
-patchelf; sys_platform == "linux"

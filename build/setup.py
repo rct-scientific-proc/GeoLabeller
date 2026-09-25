@@ -2,8 +2,8 @@
 cx_Freeze setup script for GeoLabeller.
 
 Usage:
-    python setup.py build       # Build executable
-    python setup.py bdist_msi   # Build MSI installer (Windows only)
+    python setup.py build       # Build the frozen application (Windows)
+    python setup.py bdist_msi   # cx_Freeze installer; releases use -Wix
 
 Configuration via environment variables (set by build_windows.ps1):
     GEOLABELLER_VERSION       Version string "X.Y.Z" (default 1.0.0)
@@ -240,10 +240,9 @@ bdist_msi_options = {
     "data": msi_data,
 }
 
-# Base for GUI application (hides console on Windows)
-base = None
-if sys.platform == "win32":
-    base = "gui"
+# A GUI application: no console window. Windows is the only build target
+# (Linux users run from a conda or virtual environment instead).
+base = "gui"
 
 # Target executable. Shortcuts are defined via the MSI Shortcut table above
 # (so we can install both Start Menu and Desktop entries), not here.

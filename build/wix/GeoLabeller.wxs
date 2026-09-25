@@ -5,7 +5,8 @@
   cx_Freeze still produces the frozen application (build_exe); this packages
   that output. Its own bdist_msi is not used, because the choices it bakes in
   at build time are the ones the person installing wants to make: whether the
-  install is for everyone or just them, and which shortcuts they get.
+  install is for everyone or just them, where it goes, and which shortcuts
+  they get.
 
   Built by build/build_windows.ps1 -Wix, which passes the version, the folder
   to package and the publisher details in as preprocessor variables:
@@ -14,9 +15,30 @@
         -d Version=1.3.0 -d PayloadDir=..\build\exe.win-amd64-3.12 ^
         -d Manufacturer="RCT Scientific Processing" -d AboutUrl=https://... ^
         -o GeoLabeller-1.3.0-win64.msi GeoLabeller.wxs
+
+  The dialog flow is the package's own (WixUI_GeoLabeller, below), built
+  from the UI extension's standard pages:
+
+      Welcome  (or "an existing install was found")
+      Licence  (accept to go on)
+      Scope    (just me / everyone)
+      Folder   (the default, or Change...)
+      Features (shortcuts) - Install
+
+  It replaced WixUI_Advanced, which had two faults users noticed. Its
+  first page offered a one-click Install that skipped every choice, and it
+  only offered the folder page to a per-machine install: a per-user
+  install - the default, and the only kind a standard user can make -
+  went straight to the features, so there was no way to pick the folder.
+  And the package's upgrade notice was sequenced as a second dialog: its
+  chain ran the EULA and returned, and Windows Installer then went on to
+  the NEXT sequenced dialog - the EULA again. Every upgrade asked twice.
+
+  Now only WelcomeDlg is sequenced (by the extension, as it ships). Every
+  other page is reached with NewDialog inside that one chain, which ends
+  once, at Install. No page can be shown twice by the sequence.
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
 
   <Package
       Name="GeoLabeller"
@@ -103,17 +125,19 @@
     </Feature>
 
     <!--
-      WixUI_Advanced is the dialog set that offers "just me" or "everyone",
-      which is the whole reason for the perUserOrMachine scope above. It needs
-      the install directory to be called APPLICATIONFOLDER and reads these two
-      properties, so they are not optional decoration.
+      What the extension's scope and folder pages read. The install
+      directory has to be APPLICATIONFOLDER, the folder page edits whatever
+      WIXUI_INSTALLDIR names, and InstallScopeDlg shows its radio buttons
+      only when both scopes are declared supported.
     -->
     <Property Id="ApplicationFolderName" Value="GeoLabeller" />
+    <Property Id="WIXUI_INSTALLDIR" Value="APPLICATIONFOLDER" />
+    <WixVariable Id="WixUISupportPerUser" Value="1" />
+    <WixVariable Id="WixUISupportPerMachine" Value="1" />
     <!-- Default the choice to a per-user install: it needs no elevation, which
          is how the cx_Freeze installer behaved, so nobody who could install
          the old one is suddenly blocked by a UAC prompt. -->
     <Property Id="WixAppFolder" Value="WixPerUserFolder" />
-    <ui:WixUI Id="WixUI_Advanced" />
 
     <!-- Without this the licence page shows the UI extension's placeholder,
          which is Lorem ipsum. build_windows.ps1 generates the RTF from the
@@ -121,10 +145,12 @@
     <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtf)" />
 
     <!--
-      Read back the version stamped by whichever build installed last, so the
-      upgrade notice can name it. Installs made by the old cx_Freeze packaging
-      never wrote this, so it is empty for anyone upgrading from 1.3.0 or
-      earlier - the notice has wording for both cases.
+      Read back what the last install wrote (the breadcrumb component in
+      ApplicationFiles): its version, so the upgrade notice can name it, and
+      its folder, so the folder page defaults to where the user put it last
+      time rather than making them find it again on every release.
+      Installs made by the old cx_Freeze packaging never wrote either, so
+      both are empty for anyone upgrading from 1.3.0 or earlier.
     -->
     <!-- RegistrySearch cannot take HKMU the way RegistryValue can, so both
          hives are searched and whichever answered is used. A per-user install
@@ -139,6 +165,16 @@
                       Key="Software\$(var.Manufacturer)\GeoLabeller"
                       Name="Version" Type="raw" />
     </Property>
+    <Property Id="PREVIOUSFOLDERUSER" Secure="yes">
+      <RegistrySearch Id="PreviousFolderUserSearch" Root="HKCU"
+                      Key="Software\$(var.Manufacturer)\GeoLabeller"
+                      Name="InstallDir" Type="raw" />
+    </Property>
+    <Property Id="PREVIOUSFOLDERMACHINE" Secure="yes">
+      <RegistrySearch Id="PreviousFolderMachineSearch" Root="HKLM"
+                      Key="Software\$(var.Manufacturer)\GeoLabeller"
+                      Name="InstallDir" Type="raw" />
+    </Property>
     <SetProperty Id="INSTALLEDVERSION" Action="SetInstalledVersionFromUser"
                  Value="[INSTALLEDVERSIONUSER]" After="AppSearch"
                  Condition="INSTALLEDVERSIONUSER" />
@@ -147,11 +183,73 @@
                  Condition="INSTALLEDVERSIONMACHINE AND NOT INSTALLEDVERSIONUSER" />
 
     <!--
-      Say so before replacing an existing install, rather than silently
-      swapping it out. Continuing upgrades in place; Cancel backs out. There
-      is no third option, by design - see the MajorUpgrade note above.
+      The default folder for each scope, and from them the install folder
+      when nothing else set it (a silent install, or the command line). The
+      same arrangement WixUI_Advanced makes, with two differences: a folder
+      remembered from the last install wins over the stock default, and the
+      per-machine default is the 64-bit Program Files - WixUI_Advanced used
+      [ProgramFilesFolder], which on x64 is "Program Files (x86)".
     -->
-    <UI>
+    <SetProperty Id="WixPerUserFolder" Action="SetPerUserFolderDefault"
+                 Value="[LocalAppDataFolder]Apps\[ApplicationFolderName]"
+                 Before="CostFinalize" Sequence="both"
+                 Condition="NOT PREVIOUSFOLDERUSER" />
+    <SetProperty Id="WixPerUserFolder" Action="SetPerUserFolderRemembered"
+                 Value="[PREVIOUSFOLDERUSER]"
+                 After="SetPerUserFolderDefault" Sequence="both"
+                 Condition="PREVIOUSFOLDERUSER" />
+    <SetProperty Id="WixPerMachineFolder" Action="SetPerMachineFolderDefault"
+                 Value="[ProgramFiles64Folder][ApplicationFolderName]"
+                 After="SetPerUserFolderRemembered" Sequence="both"
+                 Condition="NOT PREVIOUSFOLDERMACHINE" />
+    <SetProperty Id="WixPerMachineFolder" Action="SetPerMachineFolderRemembered"
+                 Value="[PREVIOUSFOLDERMACHINE]"
+                 After="SetPerMachineFolderDefault" Sequence="both"
+                 Condition="PREVIOUSFOLDERMACHINE" />
+    <SetProperty Id="APPLICATIONFOLDER" Action="SetApplicationFolderPerUser"
+                 Value="[WixPerUserFolder]"
+                 After="SetPerMachineFolderRemembered" Sequence="both"
+                 Condition="ACTION=&quot;INSTALL&quot; AND APPLICATIONFOLDER=&quot;&quot; AND (ALLUSERS=&quot;&quot; OR (ALLUSERS=2 AND (NOT Privileged)))" />
+    <SetProperty Id="APPLICATIONFOLDER" Action="SetApplicationFolderPerMachine"
+                 Value="[WixPerMachineFolder]"
+                 After="SetApplicationFolderPerUser" Sequence="both"
+                 Condition="ACTION=&quot;INSTALL&quot; AND APPLICATIONFOLDER=&quot;&quot; AND (ALLUSERS=1 OR (ALLUSERS=2 AND Privileged))" />
+
+    <UI Id="WixUI_GeoLabeller">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+      <TextStyle Id="WixUI_Font_Emphasized" FaceName="Tahoma" Size="8" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+
+      <!-- The extension's pages this flow is made of. WelcomeDlg brings its
+           own sequence row (NOT Installed OR PATCH): the one entry point. -->
+      <DialogRef Id="BrowseDlg" />
+      <DialogRef Id="DiskCostDlg" />
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FeaturesDlg" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="InstallDirDlg" />
+      <DialogRef Id="InstallScopeDlg" />
+      <DialogRef Id="InvalidDirDlg" />
+      <DialogRef Id="LicenseAgreementDlg" />
+      <DialogRef Id="MaintenanceTypeDlg" />
+      <DialogRef Id="MaintenanceWelcomeDlg" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+      <DialogRef Id="VerifyReadyDlg" />
+      <DialogRef Id="WelcomeDlg" />
+
+      <!--
+        Say so before replacing an existing install, rather than silently
+        swapping it out. Upgrade goes on to the licence; Cancel backs out.
+        There is no third option, by design - see the MajorUpgrade note
+        above. Reached from WelcomeDlg's Next, never sequenced on its own.
+      -->
       <Dialog Id="UpgradeNoticeDlg" Width="370" Height="270" Title="[ProductName] Setup">
         <Control Id="Title" Type="Text" X="15" Y="15" Width="340" Height="20"
                  Transparent="yes" NoPrefix="yes"
@@ -171,21 +269,95 @@ Continuing will replace it with version [ProductVersion]. The existing version i
 
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
 
+        <Control Id="Back" Type="PushButton" X="156" Y="243" Width="56" Height="17"
+                 Text="Back">
+          <Publish Event="NewDialog" Value="WelcomeDlg" Condition="1" />
+        </Control>
         <Control Id="Next" Type="PushButton" X="212" Y="243" Width="80" Height="17"
                  Default="yes" Text="Upgrade">
-          <Publish Event="NewDialog" Value="AdvancedWelcomeEulaDlg" Condition="1" />
+          <Publish Event="NewDialog" Value="LicenseAgreementDlg" Condition="1" />
         </Control>
         <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17"
                  Cancel="yes" Text="Cancel">
           <Publish Event="SpawnDialog" Value="CancelDlg" Condition="1" />
         </Control>
       </Dialog>
-    </UI>
 
-    <InstallUISequence>
-      <Show Dialog="UpgradeNoticeDlg" Before="AdvancedWelcomeEulaDlg"
-            Condition="WIX_UPGRADE_DETECTED AND NOT Installed" />
-    </InstallUISequence>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+
+      <!-- Welcome: on to the notice when an older install is present, else
+           the licence. A patch (never shipped, kept for completeness) goes
+           straight to the summary. -->
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="UpgradeNoticeDlg"
+               Condition="NOT Installed AND WIX_UPGRADE_DETECTED" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="LicenseAgreementDlg"
+               Condition="NOT Installed AND NOT WIX_UPGRADE_DETECTED" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg"
+               Condition="Installed AND PATCH" />
+
+      <!-- Licence: shown once, on this path only. -->
+      <Publish Dialog="LicenseAgreementDlg" Control="Print" Event="DoAction" Value="WixUIPrintEula_X64" />
+      <Publish Dialog="LicenseAgreementDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg"
+               Condition="NOT WIX_UPGRADE_DETECTED" />
+      <Publish Dialog="LicenseAgreementDlg" Control="Back" Event="NewDialog" Value="UpgradeNoticeDlg"
+               Condition="WIX_UPGRADE_DETECTED" />
+      <Publish Dialog="LicenseAgreementDlg" Control="Next" Event="NewDialog" Value="InstallScopeDlg"
+               Condition="LicenseAccepted = &quot;1&quot;" />
+
+      <!-- Scope: just me or everyone. A standard user is not shown the choice
+           and gets per-user. Either way the folder page comes next, with the
+           scope's default folder in it. -->
+      <Publish Dialog="InstallScopeDlg" Control="Back" Event="NewDialog" Value="LicenseAgreementDlg" />
+      <Publish Dialog="InstallScopeDlg" Control="Next" Property="WixAppFolder" Value="WixPerUserFolder"
+               Order="1" Condition="NOT Privileged" />
+      <Publish Dialog="InstallScopeDlg" Control="Next" Property="ALLUSERS" Value="{}"
+               Order="2" Condition="WixAppFolder = &quot;WixPerUserFolder&quot;" />
+      <Publish Dialog="InstallScopeDlg" Control="Next" Property="ALLUSERS" Value="1"
+               Order="3" Condition="WixAppFolder = &quot;WixPerMachineFolder&quot;" />
+      <Publish Dialog="InstallScopeDlg" Control="Next" Property="APPLICATIONFOLDER" Value="[WixPerUserFolder]"
+               Order="4" Condition="WixAppFolder = &quot;WixPerUserFolder&quot;" />
+      <Publish Dialog="InstallScopeDlg" Control="Next" Property="APPLICATIONFOLDER" Value="[WixPerMachineFolder]"
+               Order="5" Condition="WixAppFolder = &quot;WixPerMachineFolder&quot;" />
+      <Publish Dialog="InstallScopeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg"
+               Order="6" Condition="1" />
+
+      <!-- Folder: the default for the scope, or Change... to browse. The
+           path is validated before going on. -->
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="InstallScopeDlg" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="DoAction" Value="WixUIValidatePath_X64"
+               Order="2" Condition="NOT WIXUI_DONTVALIDATEPATH" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="SpawnDialog" Value="InvalidDirDlg"
+               Order="3" Condition="NOT WIXUI_DONTVALIDATEPATH AND WIXUI_INSTALLDIR_VALID&lt;&gt;&quot;1&quot;" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="FeaturesDlg"
+               Order="4" Condition="WIXUI_DONTVALIDATEPATH OR WIXUI_INSTALLDIR_VALID=&quot;1&quot;" />
+      <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2" />
+      <Publish Dialog="BrowseDlg" Control="OK" Event="DoAction" Value="WixUIValidatePath_X64"
+               Order="3" Condition="NOT WIXUI_DONTVALIDATEPATH" />
+      <Publish Dialog="BrowseDlg" Control="OK" Event="SpawnDialog" Value="InvalidDirDlg"
+               Order="4" Condition="NOT WIXUI_DONTVALIDATEPATH AND WIXUI_INSTALLDIR_VALID&lt;&gt;&quot;1&quot;" />
+
+      <!-- Features: the shortcuts, then Install (the button is the page's
+           own). Also where Change from Add/Remove Programs lands. -->
+      <Publish Dialog="FeaturesDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg"
+               Condition="NOT Installed" />
+      <Publish Dialog="FeaturesDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg"
+               Condition="Installed" />
+
+      <!-- Maintenance: Change (shortcuts) or Remove. Repair is hidden by
+           ARPNOREPAIR above. -->
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="ChangeButton" Event="NewDialog" Value="FeaturesDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg"
+               Order="2" Condition="Installed AND NOT PATCH" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg"
+               Order="3" Condition="Installed AND PATCH" />
+    </UI>
+    <UIRef Id="WixUI_Common" />
 
   </Package>
 
@@ -202,14 +374,19 @@ Continuing will replace it with version [ProductVersion]. The existing version i
     <ComponentGroup Id="ApplicationFiles" Directory="APPLICATIONFOLDER">
       <Files Include="$(var.PayloadDir)\**" />
 
-      <!-- The breadcrumb the upgrade notice reads next time round. HKMU
-           follows the install scope, so a per-user install writes it under
-           HKCU and a per-machine one under HKLM. -->
+      <!-- The breadcrumbs the next install reads: the version, for the
+           upgrade notice, and the folder, so the folder page defaults to it.
+           HKMU follows the install scope, so a per-user install writes them
+           under HKCU and a per-machine one under HKLM. -->
       <Component Id="VersionBreadcrumb" Guid="D2E5A146-3B78-4C92-A0F5-7E81B4C6D30A">
         <RegistryValue Root="HKMU"
                        Key="Software\$(var.Manufacturer)\GeoLabeller"
                        Name="Version"
                        Type="string" Value="$(var.Version)" KeyPath="yes" />
+        <RegistryValue Root="HKMU"
+                       Key="Software\$(var.Manufacturer)\GeoLabeller"
+                       Name="InstallDir"
+                       Type="string" Value="[APPLICATIONFOLDER]" />
       </Component>
     </ComponentGroup>
   </Fragment>
