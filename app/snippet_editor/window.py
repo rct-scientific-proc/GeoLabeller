@@ -27,7 +27,7 @@ out.
 """
 from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QKeySequence
-from PyQt5.QtWidgets import (QAbstractSpinBox, QApplication, QButtonGroup,
+from PyQt5.QtWidgets import (QGroupBox, QAbstractSpinBox, QApplication, QButtonGroup,
                              QCheckBox, QComboBox, QHBoxLayout, QLabel,
                              QLineEdit, QPlainTextEdit, QPushButton,
                              QScrollArea, QShortcut, QSplitter,
@@ -105,6 +105,9 @@ class SnippetEditor(QWidget):
     orientation_changed = pyqtSignal(int, object, object, bool)
     confidence_changed = pyqtSignal(int, int)
     review_changed = pyqtSignal(int, str)
+    # (label_id, class name): the main window applies it to the label's
+    # whole linked object - the same thing seen in different images.
+    class_changed = pyqtSignal(int, str)
     # (label_id, length_m or None, width_m or None)
     size_changed = pyqtSignal(int, object, object)
     mask_names_changed = pyqtSignal(list)
@@ -199,11 +202,28 @@ class SnippetEditor(QWidget):
         self.views.addWidget(self.grid)           # GRID
         self.body_splitter.addWidget(self.views)
 
-        # The column of sections.
+        # The column of sections, under the snippet's class: a correction
+        # noticed while reviewing is made here, not back on the canvas.
         self.sections = {key: SectionFrame(section.title, section.panel)
                          for key, section in self.section_objects.items()}
         column = QWidget()
         column_box = QVBoxLayout(column)
+        class_box = QGroupBox("Label class")
+        class_layout = QVBoxLayout(class_box)
+        self.label_class_combo = QComboBox()
+        self.label_class_combo.setToolTip(
+            "The class of the snippet in hand, and of every label linked to "
+            "it - they are the same object (Ctrl+1-9 in the Single view).")
+        self.label_class_combo.activated.connect(
+            lambda index: self.change_class(
+                self.label_class_combo.itemText(index)))
+        class_layout.addWidget(self.label_class_combo)
+        class_hint = QLabel("Ctrl+1-9 picks a class by its place in the "
+                            "list. Applies to the whole linked object.")
+        class_hint.setWordWrap(True)
+        class_hint.setStyleSheet("color: palette(mid);")
+        class_layout.addWidget(class_hint)
+        column_box.addWidget(class_box)
         for frame in self.sections.values():
             column_box.addWidget(frame)
         column_box.addStretch(1)
@@ -274,6 +294,41 @@ class SnippetEditor(QWidget):
     def set_mask_names(self, names: list):
         self.masks.set_mask_names(names)
 
+    def set_classes(self, names: list):
+        """The project's classes, in order, for the Label class picker."""
+        self._classes = list(names)
+        self._show_class(self.strip.current_entry())
+
+    def _show_class(self, entry):
+        combo = self.label_class_combo
+        combo.blockSignals(True)
+        combo.clear()
+        classes = list(getattr(self, "_classes", []))
+        current = entry["class_name"] if entry is not None else ""
+        if current and current not in classes:
+            classes.append(current)          # a class since removed
+        combo.addItems(classes)
+        combo.setCurrentText(current)
+        combo.setEnabled(entry is not None and self.view() == self.SINGLE)
+        combo.blockSignals(False)
+
+    def change_class(self, class_name: str):
+        """Give the snippet in hand (and its linked object) ``class_name``.
+
+        When the list is showing one class and this takes the snippet out
+        of it, the editor moves on to the next snippet first, as a review
+        pass would expect, rather than jumping back to the top.
+        """
+        entry = self.strip.current_entry()
+        if entry is None or not class_name or \
+                class_name == entry["class_name"]:
+            return
+        label_id = entry["label_id"]
+        shown = self.strip.class_combo.currentText()
+        if shown != self.strip.ALL_CLASSES and shown != class_name:
+            self.strip.cycle(1)
+        self.class_changed.emit(label_id, class_name)
+
     def redraw_snippets(self):
         """Display Settings changed: read every snippet again, keeping the
         class, the filter and the snippet in hand."""
@@ -299,6 +354,9 @@ class SnippetEditor(QWidget):
         self._view_buttons.button(view).setChecked(True)
         single = view == self.SINGLE
         self.strip.panel.setVisible(single)
+        # A class is changed on the snippet in hand, which only the Single
+        # view has.
+        self._show_class(self.strip.current_entry())
         for key, section in self.section_objects.items():
             self.sections[key].set_note(section.view_changed(single))
 
@@ -330,6 +388,7 @@ class SnippetEditor(QWidget):
                     break
 
     def _show_entry(self, entry):
+        self._show_class(entry)
         for section in self.section_objects.values():
             section.show_entry(entry)
 
@@ -392,6 +451,8 @@ class SnippetEditor(QWidget):
             return True
         if self.view() != self.SINGLE:
             return False
+        if self._take_class_key(event):
+            return True
         if event.key() == Qt.Key_Space:
             self.strip.cycle(
                 -1 if event.modifiers() & Qt.ControlModifier else 1)
@@ -408,6 +469,19 @@ class SnippetEditor(QWidget):
             if self.section_objects[key].key_pressed(event.key()):
                 return True
         return False
+
+    def _take_class_key(self, event) -> bool:
+        """Ctrl+1-9: the class at that place in the list."""
+        mods = event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier
+                                    | Qt.AltModifier)
+        if mods != Qt.ControlModifier or not \
+                Qt.Key_1 <= event.key() <= Qt.Key_9:
+            return False
+        index = event.key() - Qt.Key_1
+        classes = getattr(self, "_classes", [])
+        if index < len(classes):
+            self.change_class(classes[index])
+        return True
 
     def _take_history_key(self, event) -> bool:
         """Ctrl+Z undoes; Ctrl+Y or Ctrl+Shift+Z redoes - in either view."""

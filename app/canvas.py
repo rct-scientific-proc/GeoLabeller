@@ -2085,6 +2085,8 @@ class MapCanvas(QGraphicsView):
     # The shared group name of a label's linked group should be edited:
     # (label_id). Same ownership split as the description.
     label_group_id_requested = pyqtSignal(int)
+    # Right-click a label > Change Class > name: (label_id, class name).
+    label_class_change_requested = pyqtSignal(int, str)
 
     # Signal emitted when user wants to highlight linked labels: (label_id)
 
@@ -5250,6 +5252,12 @@ class MapCanvas(QGraphicsView):
 
             describe_action = menu.addAction("Description...")
             group_id_action = menu.addAction("Group ID...")
+            # The class, for the label and its whole linked object.
+            class_menu = menu.addMenu("Change Class")
+            class_actions = {}
+            for name in getattr(self, "class_names", []):
+                class_actions[class_menu.addAction(name)] = name
+            class_menu.setEnabled(bool(class_actions))
 
             # Toggle layer visibility option
             toggle_layer_action = menu.addAction("Toggle Image Visibility")
@@ -5271,6 +5279,9 @@ class MapCanvas(QGraphicsView):
                 self.label_describe_requested.emit(label_id)
             elif action == group_id_action:
                 self.label_group_id_requested.emit(label_id)
+            elif action in class_actions:
+                self.label_class_change_requested.emit(
+                    label_id, class_actions[action])
             elif action == unlink_action:
                 self.label_unlinked.emit(label_id)
             elif action == toggle_layer_action:

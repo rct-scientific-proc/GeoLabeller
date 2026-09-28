@@ -665,6 +665,8 @@ class MainWindow(QMainWindow):
         self.canvas.label_unlinked.connect(self._on_label_unlinked)
         self.canvas.label_describe_requested.connect(self._describe_label)
         self.canvas.label_group_id_requested.connect(self._edit_group_id)
+        self.canvas.label_class_change_requested.connect(
+            self._on_label_class_changed)
         self.canvas.link_mode_changed.connect(self._on_link_mode_changed)
         self.canvas.label_rejected.connect(
             lambda message: self.statusBar.showMessage(message, 4000))
@@ -1698,6 +1700,11 @@ class MainWindow(QMainWindow):
         elif self.project.classes:
             self.class_combo.setCurrentIndex(0)
 
+        # Where else a class can be chosen for an existing label.
+        self.canvas.class_names = list(self.project.classes)
+        if self._snippet_editor is not None:
+            self._snippet_editor.set_classes(self.project.classes)
+
         # The description picker follows the same project switches (open,
         # new, combine, recovery) - refreshed here so no site can update
         # one picker and forget the other.
@@ -2473,12 +2480,14 @@ class MainWindow(QMainWindow):
             editor.orientation_changed.connect(self._on_orientation_changed)
             editor.confidence_changed.connect(self._on_confidence_changed)
             editor.review_changed.connect(self._on_review_changed)
+            editor.class_changed.connect(self._on_label_class_changed)
             editor.size_changed.connect(self._on_size_changed)
             editor.mask_names_changed.connect(self._on_mask_names_changed)
             editor.save_requested.connect(self._save_project)
             editor.undo_requested.connect(self._undo)
             editor.redo_requested.connect(self._redo)
         self._snippet_editor.set_mask_names(self._mask_name_presets())
+        self._snippet_editor.set_classes(self.project.classes)
         self._snippet_editor.set_labels(self._label_entries())
         self._push_save_state()
         self._snippet_editor.show()
@@ -2526,6 +2535,40 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage(
                 f"Label #{label_id} oriented: {px_rad:+.3f} rad{heading}"
                 f"{source}", 4000)
+
+    def _on_label_class_changed(self, label_id: int, class_name: str):
+        """Give a label - and every label linked to it - another class.
+
+        Linked labels are one object seen in different images, so they
+        share a class; what differs between the views is what a
+        description is for. From the canvas's Change Class menu and the
+        Snippet Editor's Label class picker.
+        """
+        _, label = self.project.get_label_by_id(label_id)
+        if label is None or class_name not in self.project.classes:
+            return
+        ids = self._object_ids_of(label_id)
+        with self._recorded("Change class", labels=ids):
+            for other in ids:
+                _, lab = self.project.get_label_by_id(other)
+                if lab is not None:
+                    lab.class_name = class_name
+        if self._history.undo_name() != "Change class":
+            return                           # it already had that class
+        self._mark_unsaved()
+        for other in ids:
+            self.canvas.remove_label_marker(other)
+            image, lab = self.project.get_label_by_id(other)
+            if lab is not None:
+                self._add_label_marker(image, lab)
+        self._update_ring_colors()
+        self._update_waterfall_projections()
+        self._schedule_refresh("labeled", "snippets")
+        self._reseat_open_editors()
+        n = len(ids)
+        self.statusBar.showMessage(
+            f"Class changed to {class_name}"
+            + (f" on all {n} labels of the object" if n > 1 else ""), 4000)
 
     def _on_review_changed(self, label_id, status):
         """Store a review the Snippet Editor reports ("" clears it)."""

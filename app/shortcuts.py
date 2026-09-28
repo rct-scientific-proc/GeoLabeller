@@ -117,6 +117,7 @@ SHORTCUT_SECTIONS = [
         ("A", "Review: accept, then next (Single view)"),
         ("X", "Review: reject, then next"),
         ("F", "Review: look at again, then next"),
+        ("Ctrl+1-9", "Label class by its place in the list (whole object)"),
         ("Left-drag", "Paint a mask, draw a heading, or measure"),
         ("Right-drag", "Erase the mask (Paint)"),
         ("Right-click", "Clear the heading (Orient) or the size (Measure)"),
