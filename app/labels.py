@@ -147,6 +147,24 @@ def valid_confidence(value) -> int:
     return CONFIDENCE_UNSET
 
 
+# A label's review, from the Snippet Editor's Review section (format 4.7):
+# unreviewed until someone marks it. Rejected labels stay in the project
+# and are left out of the HDF5 and sub-image exports.
+REVIEW_UNREVIEWED = ""
+REVIEW_ACCEPTED = "accepted"
+REVIEW_REJECTED = "rejected"
+REVIEW_RECHECK = "recheck"
+REVIEW_STATES = (REVIEW_UNREVIEWED, REVIEW_ACCEPTED, REVIEW_REJECTED,
+                 REVIEW_RECHECK)
+
+
+def valid_review(value) -> str:
+    """``value`` if it is a review status, else unreviewed - strict, like
+    valid_confidence: a status nobody gave must not exclude a label."""
+    return value if isinstance(value, str) and value in REVIEW_STATES \
+        else REVIEW_UNREVIEWED
+
+
 @dataclass
 class PointLabel:
     """A single point label annotation."""
@@ -209,6 +227,11 @@ class PointLabel:
     # Editor. Per label, like the orientation: each view of a linked object
     # is rated on its own snippet. See valid_confidence.
     confidence: int = CONFIDENCE_UNSET
+
+    # The review status (see valid_review): "" until someone checks it in
+    # the Snippet Editor. A rejected label is kept, drawn dimmed, and left
+    # out of the HDF5 and sub-image exports.
+    review: str = REVIEW_UNREVIEWED
 
     # Named binary masks painted on this label's snippet in the mask editor.
     # Each entry is a dict {name, x0, y0, width, height, rle}. As of format
@@ -275,6 +298,9 @@ class PointLabel:
         # project that never rates anything serialises exactly as before.
         if self.confidence != CONFIDENCE_UNSET:
             d["confidence"] = self.confidence
+        # Likewise the review (format 4.7).
+        if self.review != REVIEW_UNREVIEWED:
+            d["review"] = self.review
         if self.masks:
             d["masks"] = self.masks
         return d
@@ -320,6 +346,7 @@ class PointLabel:
             orientation_deg=data.get("orientation_deg"),
             orientation_derived=bool(data.get("orientation_derived", False)),
             confidence=valid_confidence(data.get("confidence")),
+            review=valid_review(data.get("review")),
             masks=cls._normalized_masks(data.get("masks", []),
                                         image_width, image_height)
         )
@@ -1146,7 +1173,7 @@ class LabelProject:
         return {
             # Single-digit minors only ("4.0" came after "3.9", never
             # "3.10"): the ICD pins readers to STRING comparison.
-            "version": "4.6",
+            "version": "4.7",
             # Copied, not referenced: the recovery snapshot is handed to a
             # background writer and the user carries on editing meanwhile.
             # The image and waypoint entries are freshly built dictionaries,

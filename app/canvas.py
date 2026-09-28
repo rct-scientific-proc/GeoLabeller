@@ -150,6 +150,9 @@ def _rgba_pixmap(rgba: np.ndarray) -> QPixmap:
     return QPixmap.fromImage(image)
 
 
+# A marker rejected in review is drawn at this opacity.
+REJECTED_OPACITY = 0.3
+
 # Waterfall mode: a bottom-level group's images are stacked vertically in the
 # pixel zone (raw pixels, no reprojection) so the view can glide through them
 # like a filmstrip. Vertical gap between stacked images, in scene units.
@@ -5926,6 +5929,14 @@ class MapCanvas(QGraphicsView):
             text.setPlainText(f"{base} ({length_s}×{width_s} m)")
         else:
             text.setPlainText(base)
+
+    def set_label_rejected(self, label_id: int, rejected: bool):
+        """Draw a label rejected in review dimmed, so it stays visible
+        without being mistaken for a good one."""
+        if label_id not in self._label_items:
+            return
+        for item in self._label_items[label_id]:
+            item.setOpacity(REJECTED_OPACITY if rejected else 1.0)
 
     def set_label_description(self, label_id: int, description: str):
         """Record a label's description and refresh the marker's tooltip.

@@ -36,6 +36,7 @@ from PyQt5.QtWidgets import (QAbstractSpinBox, QApplication, QButtonGroup,
 from ..settings_scope import settings as app_settings
 from ..debug_log import debug
 from .confidence_section import ConfidenceSection
+from .review_section import ReviewSection
 from .size_section import SizeSection
 from .mask_section import MaskEditor, MaskSection
 from .orientation_section import OrientationEditor, OrientationSection
@@ -103,6 +104,7 @@ class SnippetEditor(QWidget):
     masks_changed = pyqtSignal(int, list)
     orientation_changed = pyqtSignal(int, object, object, bool)
     confidence_changed = pyqtSignal(int, int)
+    review_changed = pyqtSignal(int, str)
     # (label_id, length_m or None, width_m or None)
     size_changed = pyqtSignal(int, object, object)
     mask_names_changed = pyqtSignal(list)
@@ -128,7 +130,8 @@ class SnippetEditor(QWidget):
         sections = (OrientationSection(self.grid, self.masks, self),
                     MaskSection(self.masks, self),
                     SizeSection(self.masks, self.grid._geo_info, self),
-                    ConfidenceSection(self))
+                    ConfidenceSection(self),
+                    ReviewSection(self))
         self.section_objects = {section.key: section for section in sections}
         self.orientation_panel = self.section_objects["orientation"].panel
         self.strip.set_worklists([section.worklist for section in sections])
@@ -246,6 +249,10 @@ class SnippetEditor(QWidget):
         self.section_objects["confidence"].confidence_changed.connect(
             self.confidence_changed)
         self.section_objects["size"].size_changed.connect(self.size_changed)
+        review = self.section_objects["review"]
+        review.review_changed.connect(self.review_changed)
+        # A key that marks the snippet moves on to the next, when asked.
+        review.advance_requested.connect(lambda: self.strip.cycle(1))
         # Between the sections.
         self.grid.open_requested.connect(self._open_in_single_view)
         # After the Single view has put a snippet on its canvas - and knows
@@ -392,6 +399,10 @@ class SnippetEditor(QWidget):
         # Digits in a number box are the value being typed; Space above is
         # claimed there, since a number box has no use for one.
         if isinstance(focus, QAbstractSpinBox):
+            return False
+        # Sections answer to plain keys: Ctrl+A is not "accept", Ctrl+1 is
+        # not a rating.
+        if event.modifiers() & (Qt.ControlModifier | Qt.AltModifier):
             return False
         for key in self.sections_on():
             if self.section_objects[key].key_pressed(event.key()):

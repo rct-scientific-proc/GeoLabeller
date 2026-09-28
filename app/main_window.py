@@ -40,9 +40,10 @@ from .class_editor import (ClassEditorDialog, DescriptionEditorDialog,
                            MaskNameEditorDialog)
 from .goto_location import (GoToLocationDialog, WaypointDialog,
                             format_lat_lon)
-from .labels import (CONFIDENCE_UNSET, LabelProject, canonical_path,
+from .labels import (CONFIDENCE_UNSET, REVIEW_ACCEPTED, REVIEW_RECHECK,
+                     REVIEW_REJECTED, LabelProject, canonical_path,
                      combine_projects, geodesic_distance, mask_names_in_use,
-                     valid_confidence)
+                     valid_confidence, valid_review)
 from .layer_panel import CombinedLayerPanel
 from .optimize_export import (OptimizeExportDialog, OptimizeWorker,
                               plan_output_paths)
@@ -2251,6 +2252,7 @@ class MainWindow(QMainWindow):
                     "orientation_deg": label.orientation_deg,
                     "orientation_derived": label.orientation_derived,
                     "confidence": label.confidence,
+                    "review": label.review,
                     "length_m": label.length_m,
                     "width_m": label.width_m,
                     # Copies: the Snippet Editor mutates its entries and
@@ -2470,6 +2472,7 @@ class MainWindow(QMainWindow):
             editor.masks_changed.connect(self._on_masks_changed)
             editor.orientation_changed.connect(self._on_orientation_changed)
             editor.confidence_changed.connect(self._on_confidence_changed)
+            editor.review_changed.connect(self._on_review_changed)
             editor.size_changed.connect(self._on_size_changed)
             editor.mask_names_changed.connect(self._on_mask_names_changed)
             editor.save_requested.connect(self._save_project)
@@ -2523,6 +2526,23 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage(
                 f"Label #{label_id} oriented: {px_rad:+.3f} rad{heading}"
                 f"{source}", 4000)
+
+    def _on_review_changed(self, label_id, status):
+        """Store a review the Snippet Editor reports ("" clears it)."""
+        _, label = self.project.get_label_by_id(label_id)
+        if label is None or valid_review(status) != status:
+            return
+        with self._recorded("Review label", labels=[label_id]):
+            label.review = status
+        self._mark_unsaved()
+        self.canvas.set_label_rejected(label_id, status == REVIEW_REJECTED)
+        self._label_row_changed(label_id)
+        self.statusBar.showMessage(
+            f"Label #{label_id} " + {
+                REVIEW_ACCEPTED: "accepted",
+                REVIEW_REJECTED: "rejected - left out of exports",
+                REVIEW_RECHECK: "flagged to look at again",
+            }.get(status, "back to not reviewed"), 3000)
 
     def _on_confidence_changed(self, label_id, value):
         """Store a rating (1-5) the Snippet Editor reports; 0 clears it."""
@@ -2811,6 +2831,8 @@ class MainWindow(QMainWindow):
             self.canvas.set_label_description(label.id, label.description)
         if label.group_id:
             self.canvas.set_label_group_id(label.id, label.group_id)
+        if label.review == REVIEW_REJECTED:
+            self.canvas.set_label_rejected(label.id, True)
 
     # ------------------------------------------------------------------
     # Undo and redo
@@ -3955,7 +3977,16 @@ class MainWindow(QMainWindow):
         if img is None:
             return []
         classes = set(self.project.classes)
-        return [l for l in img.labels if l.class_name in classes]
+        # Rejected in review: kept in the project, not trained on.
+        return [l for l in img.labels if l.class_name in classes
+                and l.review != REVIEW_REJECTED]
+
+    def _rejected_on(self, paths) -> int:
+        """How many labels on these images were rejected in review."""
+        return sum(1 for path in paths
+                   for l in getattr(self.project.images.get(path),
+                                    "labels", ())
+                   if l.review == REVIEW_REJECTED)
 
     def _h5_is_hn_source(self, path: str) -> bool:
         """Is this image flagged as a hard-negative source?"""
@@ -4155,6 +4186,7 @@ class MainWindow(QMainWindow):
             return
 
         self._h5_last_options = dict(options, out_path=out_path)
+        self._h5_rejected = self._rejected_on(img.path for img in images)
         options["classes"] = list(self.project.classes) + [HARD_NEGATIVE]
         self._start_h5_worker(out_path, images, options)
 
@@ -4211,6 +4243,10 @@ class MainWindow(QMainWindow):
         if result.get("excluded"):
             msg += (f"\n\n{result['excluded']:,} window(s) withheld from the "
                     "hard negatives for overlapping an example.")
+        rejected = getattr(self, "_h5_rejected", 0)
+        if rejected:
+            msg += (f"\n\n{rejected:,} label(s) rejected in review were "
+                    "left out.")
         if result.get("split_negatives"):
             counts = result.get("negative_counts") or [0, 0, 0]
             msg += ("\n\nHard negatives split "
@@ -4314,6 +4350,7 @@ class MainWindow(QMainWindow):
 
         exported = 0
         errors = []
+        rejected = 0
 
         for idx, (image_data, label) in enumerate(
                 self.project.get_all_labels()):
@@ -4321,6 +4358,9 @@ class MainWindow(QMainWindow):
                 break
 
             progress.setValue(idx)
+            if label.review == REVIEW_REJECTED:
+                rejected += 1          # kept in the project, not exported
+                continue
 
             image_path = image_data.path
             if not os.path.exists(image_path):
@@ -4452,6 +4492,9 @@ class MainWindow(QMainWindow):
 
         # Show results
         msg = f"Exported {exported} sub-images to {output_dir}"
+        if rejected:
+            msg += (f"\n\n{rejected} label(s) rejected in review were "
+                    "left out.")
         if errors:
             msg += f"\n\n{len(errors)} errors occurred:\n" + \
                 "\n".join(errors[:5])
