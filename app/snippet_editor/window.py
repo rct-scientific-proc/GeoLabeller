@@ -37,6 +37,7 @@ from ..settings_scope import settings as app_settings
 from ..debug_log import debug
 from .confidence_section import ConfidenceSection
 from .review_section import ReviewSection
+from .linked_row import LinkedRow
 from .size_section import SizeSection
 from .mask_section import MaskEditor, MaskSection
 from .orientation_section import OrientationEditor, OrientationSection
@@ -198,7 +199,19 @@ class SnippetEditor(QWidget):
         self.body_splitter = QSplitter(Qt.Horizontal)
         self.body_splitter.addWidget(self.strip.panel)
         self.views = QStackedWidget()
-        self.views.addWidget(self.masks)          # SINGLE
+        # The Single view: the snippet in hand, and under it every snippet
+        # of the object it belongs to (hidden for a label that is alone).
+        self.linked_row = LinkedRow()
+        self.linked_row.set_badges(
+            lambda entry: "".join(w.badge(entry)
+                                  for w in self.strip._worklists))
+        self.linked_row.picked.connect(self.strip.select)
+        single_page = QWidget()
+        single_box = QVBoxLayout(single_page)
+        single_box.setContentsMargins(0, 0, 0, 0)
+        single_box.addWidget(self.masks, 1)
+        single_box.addWidget(self.linked_row)
+        self.views.addWidget(single_page)         # SINGLE
         self.views.addWidget(self.grid)           # GRID
         self.body_splitter.addWidget(self.views)
 
@@ -389,6 +402,7 @@ class SnippetEditor(QWidget):
 
     def _show_entry(self, entry):
         self._show_class(entry)
+        self.linked_row.show_for(entry, self.strip.entries)
         for section in self.section_objects.values():
             section.show_entry(entry)
 
@@ -396,6 +410,7 @@ class SnippetEditor(QWidget):
         """A section edited a label: recount the list, let every section
         redisplay it."""
         self.strip.refresh(label_id)
+        self.linked_row.refresh()
         for section in self.section_objects.values():
             section.refresh(label_id)
 
