@@ -3,6 +3,7 @@ import hashlib
 from collections import deque
 import json
 import os
+from contextlib import contextmanager
 import platform
 import tempfile
 import threading
@@ -55,6 +56,7 @@ from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
 from . import display_settings, gdal_config, recent, waypoint_io
 from .about import AboutDialog
+from .history import EditHistory
 from .display_dialog import DisplaySettingsDialog
 from .gt_import import apply_import, confirm_import, plan_import
 from .relocate import (RelocateImagesDialog, missing_images,
@@ -316,6 +318,13 @@ class MainWindow(QMainWindow):
         self._async_ui_timer = QTimer()
         self._async_ui_timer.setInterval(50)
         self._async_ui_timer.timeout.connect(self._process_pending_async_files)
+
+        # Undo and redo (app/history.py). A "turn" is one pass of the event
+        # loop: a gesture that reports itself several times within one
+        # (Box Link emits a link per label) is recorded as one step.
+        self._history = EditHistory()
+        self._history_turn = 0
+        self._history_turn_open = False
 
         # Cycle mode state
         self._cycle_layers: list[str] = []  # Layer IDs to cycle through
@@ -789,6 +798,20 @@ class MainWindow(QMainWindow):
         file_menu.addAction(exit_action)
 
         # Labels menu
+        # Edit menu: undo and redo of every edit to labels, flags, presets
+        # and waypoints. The items name the step they would take.
+        edit_menu = menubar.addMenu("&Edit")
+        self.undo_action = QAction("&Undo", self)
+        self.undo_action.setShortcuts(["Ctrl+Z"])
+        self.undo_action.triggered.connect(self._undo)
+        edit_menu.addAction(self.undo_action)
+        self.redo_action = QAction("&Redo", self)
+        self.redo_action.setShortcuts(["Ctrl+Y", "Ctrl+Shift+Z"])
+        self.redo_action.triggered.connect(self._redo)
+        edit_menu.addAction(self.redo_action)
+        self._history.on_change(self._update_undo_actions)
+        self._update_undo_actions()
+
         labels_menu = menubar.addMenu("&Labels")
 
         # Edit Classes
@@ -1707,7 +1730,9 @@ class MainWindow(QMainWindow):
         if dialog.exec_():
             # Unlike classes, nothing to reconcile: presets only seed NEW
             # labels, so editing the list never touches existing ones.
-            self.project.descriptions = dialog.get_descriptions()
+            with self._recorded("Edit description presets",
+                                lists=("descriptions",)):
+                self.project.descriptions = dialog.get_descriptions()
             self._mark_unsaved()
             self._update_description_combo()
 
@@ -1733,7 +1758,8 @@ class MainWindow(QMainWindow):
         if dialog.exec_():
             # Like descriptions, nothing to reconcile: a mask already
             # painted keeps its name; this list only feeds the picker.
-            self.project.mask_names = dialog.get_mask_names()
+            with self._recorded("Edit mask names", lists=("mask_names",)):
+                self.project.mask_names = dialog.get_mask_names()
             self._mark_unsaved()
             self._push_mask_names()
 
@@ -1744,7 +1770,8 @@ class MainWindow(QMainWindow):
 
     def _on_mask_names_changed(self, names):
         """A name typed in the Snippet Editor joined the project's presets."""
-        self.project.mask_names = list(names)
+        with self._recorded("Add mask name", lists=("mask_names",)):
+            self.project.mask_names = list(names)
         self._mark_unsaved()
 
     def _select_description(self, number: int):
@@ -1807,15 +1834,16 @@ class MainWindow(QMainWindow):
         # Add to project, seeded with the active description preset (the
         # toolbar picker / Shift+1-9), so a "spring" pass never retypes it.
         self._mark_unsaved()
-        label = self.project.add_label(
-            class_name=class_name,
-            pixel_x=pixel_x, pixel_y=pixel_y,
-            lon=lon, lat=lat,
-            image_name=image_name,
-            image_group=image_group,
-            image_path=image_path,
-            description=self._active_description()
-        )
+        with self._recorded("Place label"):
+            label = self.project.add_label(
+                class_name=class_name,
+                pixel_x=pixel_x, pixel_y=pixel_y,
+                lon=lon, lat=lat,
+                image_name=image_name,
+                image_group=image_group,
+                image_path=image_path,
+                description=self._active_description()
+            )
         debug(f"label added: #{label.id} '{class_name}' on {image_name} "
               f"at pixel ({pixel_x:.1f}, {pixel_y:.1f}) "
               f"[{self.project.label_count} total]")
@@ -1865,7 +1893,9 @@ class MainWindow(QMainWindow):
         debug(f"label removed: #{label_id} "
               f"[{self.project.label_count - 1} remaining]")
         # Remove from project
-        self.project.remove_label(label_id)
+        with self._recorded("Remove label", labels=[label_id],
+                            coalesce=True):
+            self.project.remove_label(label_id)
         self._mark_unsaved()
 
         # Remove visual marker
@@ -1956,7 +1986,15 @@ class MainWindow(QMainWindow):
 
     def _on_labels_linked(self, label_id1: int, label_id2: int):
         """Handle two labels being linked."""
-        object_id = self.project.link_labels(label_id1, label_id2)
+        with self._recorded("Link labels",
+                            labels=self._object_ids_of(label_id1, label_id2),
+                            coalesce=True):
+            object_id = self.project.link_labels(label_id1, label_id2)
+            # If wiring is on, propagate any existing measurement across
+            # the newly-merged group - inside the step, so undo takes it
+            # back with the link.
+            synced = (self._sync_measurements_in_group(label_id1, label_id2)
+                      if object_id else 0)
 
         if object_id:
             self._mark_unsaved()
@@ -1967,10 +2005,6 @@ class MainWindow(QMainWindow):
                 # Linking may have spread a shared group name onto labels
                 # that did not carry one; their tooltips must follow.
                 self.canvas.set_label_group_id(label.id, label.group_id)
-
-            # If wiring is on, propagate any existing measurement across the
-            # newly-merged group before refreshing the panel.
-            synced = self._sync_measurements_in_group(label_id1, label_id2)
 
             # The whole merged group shares one halo colour now; markers on
             # every affected label (and any waterfall projections) follow.
@@ -2006,7 +2040,8 @@ class MainWindow(QMainWindow):
             f"Describe this {label.class_name}:", label.description)
         if not accepted:
             return
-        label.description = text.strip()
+        with self._recorded("Describe label", labels=[label_id]):
+            label.description = text.strip()
         self._mark_unsaved()
         self.canvas.set_label_description(label_id, label.description)
         self._label_row_changed(label_id)
@@ -2030,7 +2065,9 @@ class MainWindow(QMainWindow):
             "Shared name for this linked group:", text=label.group_id)
         if not accepted:
             return
-        changed = self.project.set_group_id(label_id, text)
+        with self._recorded("Set group ID",
+                            labels=self._object_ids_of(label_id)):
+            changed = self.project.set_group_id(label_id, text)
         self._mark_unsaved()
         for lid in changed:
             # Marker may not exist when its image is not loaded; the
@@ -2048,7 +2085,10 @@ class MainWindow(QMainWindow):
         # First get the labels that were linked before unlinking
         old_linked = self.project.get_linked_labels(label_id)
 
-        self.project.unlink_label(label_id)
+        with self._recorded("Unlink label",
+                            labels=self._object_ids_of(label_id),
+                            coalesce=True):
+            self.project.unlink_label(label_id)
         self._mark_unsaved()
 
         # Update the unlinked label; it left the named group, so its group
@@ -2094,7 +2134,10 @@ class MainWindow(QMainWindow):
         _, label = self.project.get_label_by_id(label_id)
         if label is None:
             return
-        label.length_m, label.width_m = length_m, width_m
+        # Coalesced: a size shared to the linked labels arrives as a report
+        # per label in one turn.
+        with self._recorded("Set size", labels=[label_id], coalesce=True):
+            label.length_m, label.width_m = length_m, width_m
         self._mark_unsaved()
         self._recovery_soon_timer.start()
         # The marker may not exist if its image is not loaded; it is
@@ -2430,6 +2473,8 @@ class MainWindow(QMainWindow):
             editor.size_changed.connect(self._on_size_changed)
             editor.mask_names_changed.connect(self._on_mask_names_changed)
             editor.save_requested.connect(self._save_project)
+            editor.undo_requested.connect(self._undo)
+            editor.redo_requested.connect(self._redo)
         self._snippet_editor.set_mask_names(self._mask_name_presets())
         self._snippet_editor.set_labels(self._label_entries())
         self._push_save_state()
@@ -2446,7 +2491,8 @@ class MainWindow(QMainWindow):
         _, label = self.project.get_label_by_id(label_id)
         if label is None:
             return
-        label.masks = list(masks)
+        with self._recorded("Paint mask", labels=[label_id]):
+            label.masks = list(masks)
         self.setWindowModified(True)
         self._push_save_state(stored=True, label_id=label_id)
         self._recovery_soon_timer.start()
@@ -2460,9 +2506,13 @@ class MainWindow(QMainWindow):
         _, label = self.project.get_label_by_id(label_id)
         if label is None:
             return
-        label.orientation_px_rad = px_rad
-        label.orientation_deg = deg
-        label.orientation_derived = bool(derived) and px_rad is not None
+        # Coalesced: one drawn heading propagates to the linked labels as a
+        # report per label, all in the same turn - one step.
+        with self._recorded("Set orientation", labels=[label_id],
+                            coalesce=True):
+            label.orientation_px_rad = px_rad
+            label.orientation_deg = deg
+            label.orientation_derived = bool(derived) and px_rad is not None
         self._mark_unsaved()
         if px_rad is None:
             self.statusBar.showMessage(
@@ -2481,7 +2531,8 @@ class MainWindow(QMainWindow):
             return
         if value != CONFIDENCE_UNSET and valid_confidence(value) != value:
             return          # not a rating; leave what is stored alone
-        label.confidence = value
+        with self._recorded("Rate confidence", labels=[label_id]):
+            label.confidence = value
         self._mark_unsaved()
         self.statusBar.showMessage(
             f"Confidence cleared for label #{label_id}" if not value
@@ -2524,7 +2575,8 @@ class MainWindow(QMainWindow):
 
     def _add_waypoint_at(self, lon: float, lat: float, name: str = ""):
         """Add a waypoint at a WGS84 position (from the map right-click)."""
-        wp = self.project.add_waypoint(lat, lon, name=name)
+        with self._recorded("Add waypoint", lists=("waypoints", "_next_waypoint_id")):
+            wp = self.project.add_waypoint(lat, lon, name=name)
         self._mark_unsaved()
         self.canvas.add_waypoint_marker(wp.id, wp.name, wp.lon, wp.lat)
         self.layer_panel.refresh_waypoints(
@@ -2567,7 +2619,8 @@ class MainWindow(QMainWindow):
             self, "Rename Waypoint", "Name:", text=wp.name)
         if not accepted or not name.strip():
             return
-        self.project.rename_waypoint(waypoint_id, name)
+        with self._recorded("Rename waypoint", lists=("waypoints", "_next_waypoint_id")):
+            self.project.rename_waypoint(waypoint_id, name)
         self._mark_unsaved()
         self.canvas.add_waypoint_marker(wp.id, wp.name, wp.lon, wp.lat)
         self.layer_panel.refresh_waypoints(
@@ -2580,7 +2633,8 @@ class MainWindow(QMainWindow):
         if wp is None:
             return
         name = wp.name
-        self.project.remove_waypoint(waypoint_id)
+        with self._recorded("Remove waypoint", lists=("waypoints", "_next_waypoint_id")):
+            self.project.remove_waypoint(waypoint_id)
         self._mark_unsaved()
         self.canvas.remove_waypoint_marker(waypoint_id)
         self.layer_panel.refresh_waypoints(
@@ -2662,7 +2716,8 @@ class MainWindow(QMainWindow):
                                      QMessageBox.Yes | QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
-        added = waypoint_io.apply_import(self.project, new)
+        with self._recorded("Import waypoints", lists=("waypoints", "_next_waypoint_id")):
+            added = waypoint_io.apply_import(self.project, new)
         self._mark_unsaved()
         self._refresh_waypoints()
         debug(f"waypoints imported: {len(added)} from {file_path} "
@@ -2725,33 +2780,149 @@ class MainWindow(QMainWindow):
         """Refresh all label markers on the canvas."""
         self.canvas.clear_label_markers()
         for image, label in self.project.get_all_labels():
-            color = self._get_class_color(label.class_name)
-            self.canvas.add_label_marker(
-                label.id, label.lon, label.lat,
-                image.name, image.group, image.path,
-                label.class_name, color,
-                pixel_x=label.pixel_x, pixel_y=label.pixel_y,
-                ring_color=self._label_ring_color(label)
-            )
-            # Check if label is linked to others
-            linked_labels = self.project.get_linked_labels(label.id)
-            self.canvas.set_label_linked(label.id, len(linked_labels) > 1)
-
-            # Restore measurement adornment for labels loaded with dimensions
-            if label.length_m is not None or label.width_m is not None:
-                self.canvas.set_label_measured(
-                    label.id, True, label.length_m, label.width_m)
-
-            # ...and the description tooltip, which is otherwise lost every
-            # time the markers are rebuilt (project load, mode change).
-            if label.description:
-                self.canvas.set_label_description(label.id, label.description)
-            if label.group_id:
-                self.canvas.set_label_group_id(label.id, label.group_id)
+            self._add_label_marker(image, label)
 
         # Refresh labeled images panel
         self.layer_panel.refresh_labeled_panel(self.project)
         self._refresh_snippet_panel()
+
+    def _add_label_marker(self, image, label):
+        """Draw one label with everything its marker shows."""
+        color = self._get_class_color(label.class_name)
+        self.canvas.add_label_marker(
+            label.id, label.lon, label.lat,
+            image.name, image.group, image.path,
+            label.class_name, color,
+            pixel_x=label.pixel_x, pixel_y=label.pixel_y,
+            ring_color=self._label_ring_color(label)
+        )
+        # Check if label is linked to others
+        linked_labels = self.project.get_linked_labels(label.id)
+        self.canvas.set_label_linked(label.id, len(linked_labels) > 1)
+
+        # Restore measurement adornment for labels loaded with dimensions
+        if label.length_m is not None or label.width_m is not None:
+            self.canvas.set_label_measured(
+                label.id, True, label.length_m, label.width_m)
+
+        # ...and the description tooltip, which is otherwise lost every
+        # time the markers are rebuilt (project load, mode change).
+        if label.description:
+            self.canvas.set_label_description(label.id, label.description)
+        if label.group_id:
+            self.canvas.set_label_group_id(label.id, label.group_id)
+
+    # ------------------------------------------------------------------
+    # Undo and redo
+    # ------------------------------------------------------------------
+
+    # Past this many labels a step redraws every marker rather than each.
+    _HISTORY_REDRAW_ALL = 300
+
+    @contextmanager
+    def _recorded(self, name: str, labels=(), images=(), lists=(),
+                  all_labels: bool = False, coalesce: bool = False):
+        """Record the edit made inside the block as one undoable step
+        (app/history.py). ``coalesce`` joins it to a step of the same name
+        made earlier in this turn of the event loop."""
+        token = self._history_token() if coalesce else None
+        with self._history.edit(self.project, name, labels=labels,
+                                images=images, lists=lists,
+                                all_labels=all_labels, coalesce=token):
+            yield
+
+    def _history_token(self):
+        if not self._history_turn_open:
+            self._history_turn += 1
+            self._history_turn_open = True
+            QTimer.singleShot(0, self._close_history_turn)
+        return self._history_turn
+
+    def _close_history_turn(self):
+        self._history_turn_open = False
+
+    def _object_ids_of(self, *label_ids) -> set:
+        """These labels and every label linked to them: what a link,
+        unlink or group-ID edit can change."""
+        ids = set(label_ids)
+        for label_id in label_ids:
+            ids.update(lab.id for _img, lab
+                       in self.project.get_linked_labels(label_id))
+        return ids
+
+    def _update_undo_actions(self):
+        if not hasattr(self, "undo_action"):
+            return
+        undo, redo = self._history.undo_name(), self._history.redo_name()
+        self.undo_action.setEnabled(bool(undo))
+        self.undo_action.setText(f"&Undo {undo}" if undo else "&Undo")
+        self.redo_action.setEnabled(bool(redo))
+        self.redo_action.setText(f"&Redo {redo}" if redo else "&Redo")
+
+    def _undo(self):
+        """Edit > Undo (Ctrl+Z), also from the Snippet Editor."""
+        step = self._history.undo(self.project)
+        if step is None:
+            self.statusBar.showMessage("Nothing to undo", 2000)
+            return
+        self._after_history(step, "Undid")
+
+    def _redo(self):
+        """Edit > Redo (Ctrl+Y or Ctrl+Shift+Z)."""
+        step = self._history.redo(self.project)
+        if step is None:
+            self.statusBar.showMessage("Nothing to redo", 2000)
+            return
+        self._after_history(step, "Redid")
+
+    def _after_history(self, step, verb: str):
+        """The project changed under an undo or redo: show it.
+
+        Only the markers of the labels the step touched are redrawn, unless
+        it touched many (Clear All Labels, an import) or the classes, whose
+        colours every marker takes from.
+        """
+        ids = step.label_ids()
+        lists = set(step.lists_before) | set(step.lists_after)
+        if len(ids) > self._HISTORY_REDRAW_ALL or "classes" in lists:
+            self._refresh_label_markers()
+        else:
+            for label_id in ids:
+                self.canvas.remove_label_marker(label_id)
+                image, label = self.project.get_label_by_id(label_id)
+                if label is not None:
+                    self._add_label_marker(image, label)
+            self._update_ring_colors()
+            self._schedule_refresh("labeled", "snippets")
+        self._update_waterfall_projections()
+        if step.images_before or step.images_after:
+            self._refresh_hard_negative_panel()
+        if "classes" in lists:
+            self._update_class_combo()
+        if "descriptions" in lists:
+            self._update_description_combo()
+        if "waypoints" in lists:
+            self._refresh_waypoints()
+        self._reseat_open_editors()
+        self.setWindowModified(self._has_unsaved_changes())
+        self._push_save_state()
+        self._recovery_soon_timer.start()
+        if len(ids) == 1:
+            self._bring_into_view(next(iter(ids)))
+        debug(f"history: {verb.lower()} '{step.name}' "
+              f"({len(ids)} label(s))")
+        self.statusBar.showMessage(f"{verb}: {step.name}", 4000)
+
+    def _bring_into_view(self, label_id: int):
+        """Centre an undone or redone label if it is off screen, so the
+        user sees what came back or went."""
+        item = self.canvas._label_items.get(label_id)
+        if item is None:
+            return
+        ellipse = item[0]
+        point = self.canvas.mapFromScene(ellipse.sceneBoundingRect().center())
+        if not self.canvas.viewport().rect().contains(point):
+            self.canvas.centerOn(ellipse)
 
     def _edit_classes(self):
         """Open the class editor dialog."""
@@ -2784,13 +2955,15 @@ class MainWindow(QMainWindow):
             # a "removed" class behind, pointing at a class that no longer
             # exists (and silently dropped from exports). Masked until now
             # by the AttributeError above, which fired first.
-            self._mark_unsaved()
-            for class_name in removed:
-                self.project.remove_class(class_name)
+            with self._recorded("Edit classes", all_labels=True,
+                                lists=("classes",)):
+                self._mark_unsaved()
+                for class_name in removed:
+                    self.project.remove_class(class_name)
 
-            # Then adopt the new list, which also carries additions and any
-            # reordering the user made.
-            self.project.classes = new_classes
+                # Then adopt the new list, which also carries additions and any
+                # reordering the user made.
+                self.project.classes = new_classes
 
             self._update_class_combo()
             self._refresh_label_markers()
@@ -2858,6 +3031,9 @@ class MainWindow(QMainWindow):
 
     def _remove_images_from_project(self, images: list) -> tuple:
         """Delete these images and their labels; (images, labels) counts."""
+        # Removing imagery is not undoable, and a step that touches these
+        # images would put labels back on nothing: those steps go.
+        self._history.forget_images([image.path for image in images])
         removed_labels = 0
         for image in images:
             for label in image.labels:
@@ -2935,7 +3111,8 @@ class MainWindow(QMainWindow):
             QMessageBox.Yes | QMessageBox.No
         )
         if reply == QMessageBox.Yes:
-            self.project.clear()
+            with self._recorded("Clear all labels", all_labels=True):
+                self.project.clear()
             self._mark_unsaved()
             self.canvas.clear_label_markers()
             # Refresh labeled images panel (now empty)
@@ -2959,6 +3136,7 @@ class MainWindow(QMainWindow):
 
         # Clear project state
         self._close_display_dialog()
+        self._history.clear()
         self.project = LabelProject()
         self._project_path = None
         self._set_saved_baseline()
@@ -3059,6 +3237,7 @@ class MainWindow(QMainWindow):
             self.layer_panel.clear()
 
             self._close_display_dialog()
+            self._history.clear()
             self.project = LabelProject.load(file_path)
             self._project_path = Path(file_path)
             self._remember_recent_project(file_path)
@@ -3298,6 +3477,7 @@ class MainWindow(QMainWindow):
     def _restore_from_recovery(self):
         """Restore project state from recovery file."""
         try:
+            self._history.clear()
             self.project = LabelProject.load(RECOVERY_FILE)
             self._set_saved_baseline(recovered=True)
 
@@ -3570,7 +3750,11 @@ class MainWindow(QMainWindow):
         plan = plan_import(self.project, gt)
         if not self._confirm_gt_import(plan, Path(path).name):
             return
-        result = apply_import(self.project, plan)
+        with self._recorded(
+                "Import ground truth", all_labels=True,
+                images=list(self.project.images),
+                lists=("classes", "descriptions", "mask_names")):
+            result = apply_import(self.project, plan)
 
         self._update_class_combo()
         self._update_description_combo()
@@ -4970,6 +5154,8 @@ class MainWindow(QMainWindow):
                     self.canvas.remove_layer(layer_id)
             if self.project.relocate_image(
                     old_path, os.path.abspath(res.new_path)):
+                # Steps name the image by its old path, which is gone.
+                self._history.forget_images([old_path])
                 applied += 1
                 self._mark_unsaved()
             else:
@@ -5262,22 +5448,23 @@ class MainWindow(QMainWindow):
         file_path = self.canvas.get_layer_file_path(layer_id)
         if not file_path:
             return
-        img = self.project.images.get(file_path)
-        if img is None:
-            # A never-labelled image has no project entry yet; create one the
-            # same way loading an image does, so the flag has somewhere to
-            # live and survives save/load.
-            name = Path(file_path).stem
-            width, height = self.canvas.get_layer_source_dimensions(layer_id)
-            affine, crs = self.canvas.get_layer_transform(layer_id)
-            # In the group the layer is actually in - "" filed a flagged
-            # image at the project root, where Set Location could not find
-            # it and a reload put it back in the wrong place.
-            group = self.canvas.get_layer_group(layer_id) or ""
-            img = self.project.add_image(
-                file_path, name, group, width, height, affine=affine,
-                crs=crs)
-        img.hard_negative_source = not img.hard_negative_source
+        with self._recorded("Flag hard negative", images=[file_path]):
+            img = self.project.images.get(file_path)
+            if img is None:
+                # A never-labelled image has no project entry yet; create one the
+                # same way loading an image does, so the flag has somewhere to
+                # live and survives save/load.
+                name = Path(file_path).stem
+                width, height = self.canvas.get_layer_source_dimensions(layer_id)
+                affine, crs = self.canvas.get_layer_transform(layer_id)
+                # In the group the layer is actually in - "" filed a flagged
+                # image at the project root, where Set Location could not find
+                # it and a reload put it back in the wrong place.
+                group = self.canvas.get_layer_group(layer_id) or ""
+                img = self.project.add_image(
+                    file_path, name, group, width, height, affine=affine,
+                    crs=crs)
+            img.hard_negative_source = not img.hard_negative_source
         self._mark_unsaved()
         self._refresh_hard_negative_panel()
         self.statusBar.showMessage(

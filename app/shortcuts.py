@@ -28,6 +28,11 @@ SHORTCUT_SECTIONS = [
         ("Ctrl+Shift+O", "Add Directory"),
         ("Ctrl+Q", "Exit"),
     ]),
+    ("Edit", [
+        ("Ctrl+Z", "Undo the last edit (labels, flags, presets, waypoints)"),
+        ("Ctrl+Y", "Redo"),
+        ("Ctrl+Shift+Z", "Redo"),
+    ]),
     ("Navigation", [
         ("Mouse Wheel", "Zoom in/out"),
         ("Click + Drag", "Pan (in Pan mode)"),
@@ -116,6 +121,8 @@ SHORTCUT_SECTIONS = [
         ("Shift+drag", "Pan the zoomed snippet"),
         ("Mouse wheel", "Zoom to the cursor"),
         ("Double-click", "Open a grid cell in the Single view"),
+        ("Ctrl+Z", "Undo - one history with the main window"),
+        ("Ctrl+Y", "Redo"),
         ("Ctrl+S", "Save Project"),
     ]),
     ("Help", [

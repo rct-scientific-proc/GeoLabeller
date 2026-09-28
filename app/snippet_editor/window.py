@@ -107,6 +107,10 @@ class SnippetEditor(QWidget):
     size_changed = pyqtSignal(int, object, object)
     mask_names_changed = pyqtSignal(list)
     save_requested = pyqtSignal()
+    # Ctrl+Z / Ctrl+Y here undo and redo in the main window's one history,
+    # so the order matches what was done across both windows.
+    undo_requested = pyqtSignal()
+    redo_requested = pyqtSignal()
 
     SINGLE, GRID = 0, 1
 
@@ -370,13 +374,16 @@ class SnippetEditor(QWidget):
 
     def _take_key(self, event) -> bool:
         """Step the list, or hand the key to a section that wants it."""
-        if self.view() != self.SINGLE:
-            return False
         focus = QApplication.focusWidget()
         # A mask name is typed, and may hold spaces and digits ("bow
-        # wave"), so a text field keeps every key it is given.
+        # wave"), so a text field keeps every key it is given - its own
+        # Ctrl+Z included.
         if isinstance(focus, (QLineEdit, QTextEdit, QPlainTextEdit)) or (
                 isinstance(focus, QComboBox) and focus.isEditable()):
+            return False
+        if self._take_history_key(event):
+            return True
+        if self.view() != self.SINGLE:
             return False
         if event.key() == Qt.Key_Space:
             self.strip.cycle(
@@ -389,6 +396,20 @@ class SnippetEditor(QWidget):
         for key in self.sections_on():
             if self.section_objects[key].key_pressed(event.key()):
                 return True
+        return False
+
+    def _take_history_key(self, event) -> bool:
+        """Ctrl+Z undoes; Ctrl+Y or Ctrl+Shift+Z redoes - in either view."""
+        mods = event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier
+                                    | Qt.AltModifier)
+        if event.key() == Qt.Key_Z and mods == Qt.ControlModifier:
+            self.undo_requested.emit()
+            return True
+        if (event.key() == Qt.Key_Y and mods == Qt.ControlModifier) or (
+                event.key() == Qt.Key_Z
+                and mods == Qt.ControlModifier | Qt.ShiftModifier):
+            self.redo_requested.emit()
+            return True
         return False
 
     # -- settings -----------------------------------------------------------
