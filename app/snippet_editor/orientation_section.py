@@ -36,7 +36,7 @@ from ..orientation_math import (
 from ..snippets import SnippetLoader, snippet_frame
 from .section import Section
 from .single_view import TOOL_ORIENT
-from .strip import SnippetStrip, Worklist
+from .strip import SnippetStrip, Worklist, group_line
 
 SNIPPET_SIZE = 224      # source pixels per cell, shown 1:1
 GRID_COLUMNS = 3
@@ -389,7 +389,7 @@ class OrientationEditor(QWidget):
             parts.append(f"{deg:.1f}\N{DEGREE SIGN} true")
         if rad is not None and entry.get("orientation_derived"):
             parts.append("auto")
-        caption.setText("   ".join(parts))
+        caption.setText("   ".join(parts) + group_line(entry))
 
     def _on_snippet_ready(self, label_id, arr):
         cell = self._cells.get(label_id)

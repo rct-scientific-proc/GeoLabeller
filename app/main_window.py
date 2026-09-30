@@ -2246,6 +2246,9 @@ class MainWindow(QMainWindow):
                     "label_id": label.id,
                     "image_path": image.path,
                     "image_name": image.name,
+                    # The group (folder) the image was loaded from, shown
+                    # under each snippet in the Snippet Editor.
+                    "group": image.group or "",
                     "pixel_x": label.pixel_x,
                     "pixel_y": label.pixel_y,
                     "class_name": label.class_name,

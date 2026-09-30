@@ -34,6 +34,16 @@ def _no_badge(_entry: dict) -> str:
     return ""
 
 
+def group_line(entry: dict) -> str:
+    """The snippet's group folder, as a caption's last line ("" if none).
+
+    Asked for 2026-09-30: users recall imagery by the folder it was loaded
+    from, so every snippet in the Snippet Editor says which one.
+    """
+    group = entry.get("group") or ""
+    return f"\n{group}" if group else ""
+
+
 @dataclass(frozen=True)
 class Worklist:
     """What "done" means for the Show filter, and how a snippet shows it.
@@ -317,7 +327,8 @@ class SnippetStrip(QObject):
         caption = entry["image_name"]
         if self.class_combo.currentText() == self.ALL_CLASSES:
             caption = f"{entry['class_name']}  \N{MIDDLE DOT}  {caption}"
-        return caption + "".join(w.badge(entry) for w in self._worklists)
+        return (caption + "".join(w.badge(entry) for w in self._worklists)
+                + group_line(entry))
 
     def _update_counts(self):
         """Live counts on the filter, for the class in view - the number

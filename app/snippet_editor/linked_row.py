@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (QLabel, QListView, QListWidget, QListWidgetItem,
                              QVBoxLayout, QWidget)
 
 from ..snippets import SnippetLoader
-from .strip import THUMB_PX
+from .strip import THUMB_PX, group_line
 
 
 class LinkedRow(QWidget):
@@ -102,7 +102,7 @@ class LinkedRow(QWidget):
 
     def caption(self, entry) -> str:
         return (f"{entry['image_name']}\n{entry['class_name']}"
-                + self._badges(entry))
+                + self._badges(entry) + group_line(entry))
 
     @staticmethod
     def _disagreement(members) -> str:
