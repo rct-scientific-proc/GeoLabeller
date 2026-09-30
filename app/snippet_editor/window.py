@@ -351,8 +351,8 @@ class SnippetEditor(QWidget):
                 class_name == entry["class_name"]:
             return
         label_id = entry["label_id"]
-        shown = self.strip.class_combo.currentText()
-        if shown != self.strip.ALL_CLASSES and shown != class_name:
+        shown = self.strip.shown_class()
+        if shown is not None and shown != class_name:
             self.strip.cycle(1)
         self.class_changed.emit(label_id, class_name,
                                 self.class_linked_check.isChecked())

@@ -142,15 +142,64 @@ class SnippetStrip(QObject):
             entries, key=lambda e: (e["class_name"], e["image_name"],
                                     e["label_id"]))
         classes = sorted({e["class_name"] for e in self.entries})
-        current = self.class_combo.currentText()
-        wanted = [self.ALL_CLASSES] + classes
-        self.class_combo.blockSignals(True)
-        self.class_combo.clear()
-        self.class_combo.addItems(wanted)
-        if current in wanted:
-            self.class_combo.setCurrentText(current)
-        self.class_combo.blockSignals(False)
+        current = self.class_combo.currentData()
+        combo = self.class_combo
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(self.ALL_CLASSES, "all:")
+        for name in classes:
+            combo.addItem(name, "class:" + name)
+        # Then every linked object, so its views can be worked through
+        # together (asked for 2026-09-30).
+        objects = self._linked_objects()
+        if objects:
+            combo.insertSeparator(combo.count())
+            for object_id, text in objects:
+                combo.addItem(text, "object:" + object_id)
+        index = combo.findData(current) if current is not None else -1
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
         self._rebuild(chosen_anew=False)
+
+    def _linked_objects(self) -> list:
+        """(object_id, caption) for each object with two or more labels,
+        in class then name order. The caption names the class (classes
+        when its labels disagree), the group ID when it has one, the start
+        of its id - enough to tell two objects apart - and its size."""
+        members: dict = {}
+        for entry in self.entries:
+            if entry.get("object_id"):
+                members.setdefault(entry["object_id"], []).append(entry)
+        rows = []
+        for object_id, group in members.items():
+            if len(group) < 2:
+                continue
+            classes = "/".join(sorted({e["class_name"] for e in group}))
+            named = next((e.get("group_id") for e in group
+                          if e.get("group_id")), "")
+            text = (f"{classes} \N{MIDDLE DOT} "
+                    + (f"{named} \N{MIDDLE DOT} " if named else "")
+                    + f"linked {object_id[:8]} ({len(group)} labels)")
+            rows.append(((classes, named, object_id), object_id, text))
+        return [(object_id, text) for _key, object_id, text in sorted(rows)]
+
+    def shown_object(self) -> "str | None":
+        """The linked object the list is showing, or None."""
+        kind, value = self._shown()
+        return value if kind == "object" else None
+
+    def shown_class(self) -> "str | None":
+        """The one class the list is showing, or None (all classes, or a
+        linked object - whose labels may be of several)."""
+        kind, value = self._shown()
+        return value if kind == "class" else None
+
+    def _shown(self) -> tuple:
+        """("all" | "class" | "object", value) for the dropdown's choice.
+        Item data is a "kind:value" string: Qt keeps strings as they are."""
+        kind, _sep, value = str(self.class_combo.currentData()
+                                or "all:").partition(":")
+        return kind, value
 
     @property
     def worklist(self) -> "Worklist | None":
@@ -230,8 +279,12 @@ class SnippetStrip(QObject):
         return True
 
     def in_class(self, entry: dict) -> bool:
-        wanted = self.class_combo.currentText()
-        return wanted == self.ALL_CLASSES or entry["class_name"] == wanted
+        kind, value = self._shown()
+        if kind == "object":
+            return entry.get("object_id") == value
+        if kind == "class":
+            return entry["class_name"] == value
+        return True
 
     def _chosen(self) -> "tuple[Worklist, bool] | None":
         """(worklist, wants-done) for the filter's choice; None for All."""
@@ -325,7 +378,7 @@ class SnippetStrip(QObject):
 
     def _caption(self, entry: dict) -> str:
         caption = entry["image_name"]
-        if self.class_combo.currentText() == self.ALL_CLASSES:
+        if self.shown_class() is None:       # all classes, or an object
             caption = f"{entry['class_name']}  \N{MIDDLE DOT}  {caption}"
         return (caption + "".join(w.badge(entry) for w in self._worklists)
                 + group_line(entry))

@@ -373,7 +373,7 @@ class OrientationEditor(QWidget):
         if caption is None:
             return
         parts = [entry["image_name"]]
-        if self.strip.class_combo.currentText() == SnippetStrip.ALL_CLASSES:
+        if self.strip.shown_class() is None:    # all classes, or an object
             parts = [f"{entry['class_name']} \N{MIDDLE DOT} "
                      f"{entry['image_name']}"]
         rad = entry.get("orientation_px_rad")
