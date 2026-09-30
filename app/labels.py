@@ -13,6 +13,7 @@ from rasterio.crs import CRS
 
 from .debug_log import debug
 from .display_settings import settings_from_project_data
+from .identity import valid_attribution
 
 # WGS84 CRS (EPSG:4326)
 WGS84 = CRS.from_epsg(4326)
@@ -233,6 +234,11 @@ class PointLabel:
     # out of the HDF5 and sub-image exports.
     review: str = REVIEW_UNREVIEWED
 
+    # Who did what (format 4.8, app/identity.py): {field: {"by", "at"}} for
+    # who created the label and who last set each of its values. Empty for
+    # labels made before user names, or with none set.
+    attribution: dict = field(default_factory=dict)
+
     # Named binary masks painted on this label's snippet in the mask editor.
     # Each entry is a dict {name, x0, y0, width, height, rle}. As of format
     # 4.0 the window is the FULL source image (x0=y0=0, width/height = the
@@ -301,6 +307,9 @@ class PointLabel:
         # Likewise the review (format 4.7).
         if self.review != REVIEW_UNREVIEWED:
             d["review"] = self.review
+        if self.attribution:
+            d["attribution"] = {k: dict(v) for k, v in
+                                sorted(self.attribution.items())}
         if self.masks:
             d["masks"] = self.masks
         return d
@@ -347,6 +356,7 @@ class PointLabel:
             orientation_derived=bool(data.get("orientation_derived", False)),
             confidence=valid_confidence(data.get("confidence")),
             review=valid_review(data.get("review")),
+            attribution=valid_attribution(data.get("attribution")),
             masks=cls._normalized_masks(data.get("masks", []),
                                         image_width, image_height)
         )
@@ -1173,7 +1183,7 @@ class LabelProject:
         return {
             # Single-digit minors only ("4.0" came after "3.9", never
             # "3.10"): the ICD pins readers to STRING comparison.
-            "version": "4.7",
+            "version": "4.8",
             # Copied, not referenced: the recovery snapshot is handed to a
             # background writer and the user carries on editing meanwhile.
             # The image and waypoint entries are freshly built dictionaries,

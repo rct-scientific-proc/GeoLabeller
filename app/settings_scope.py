@@ -52,6 +52,13 @@ def apply(environ=None, modules=None) -> "str | None":
     return folder
 
 
+def is_redirected() -> bool:
+    """True for a test run or a script with its own folder - never for a
+    person using the app. Anything that would stop to ask the user (a
+    first-start question) checks this first."""
+    return _folder is not None
+
+
 def settings():
     """The app's QSettings - every part of the app gets it here.
 

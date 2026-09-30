@@ -5949,6 +5949,13 @@ class MapCanvas(QGraphicsView):
         for item in self._label_items[label_id]:
             item.setOpacity(REJECTED_OPACITY if rejected else 1.0)
 
+    def set_label_made_by(self, label_id: int, text: str):
+        """A "Labelled by ..." line for the marker's tooltip."""
+        if label_id not in self._label_items:
+            return
+        self._label_items[label_id][0].setData(7, text or "")
+        self._refresh_label_tooltip(label_id)
+
     def set_label_description(self, label_id: int, description: str):
         """Record a label's description and refresh the marker's tooltip.
 
@@ -5979,6 +5986,8 @@ class MapCanvas(QGraphicsView):
             parts.append(f"Group: {ellipse.data(6)}")
         if ellipse.data(5):
             parts.append(ellipse.data(5))
+        if ellipse.data(7):
+            parts.append(ellipse.data(7))
         tooltip = "\n".join(parts)
         for item in (ellipse, text):
             item.setToolTip(tooltip)

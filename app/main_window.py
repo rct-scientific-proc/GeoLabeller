@@ -55,7 +55,8 @@ from .h5_export import (EXAMPLES_ALL, EXAMPLES_OBJECT,
                         estimate_export)
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
-from . import display_settings, gdal_config, recent, waypoint_io
+from . import (display_settings, gdal_config, identity, recent,
+               settings_scope, waypoint_io)
 from .about import AboutDialog
 from .history import EditHistory
 from .display_dialog import DisplaySettingsDialog
@@ -446,6 +447,10 @@ class MainWindow(QMainWindow):
         # which replaces this with a "recovered" baseline if it restores.
         self._set_saved_baseline()
         self._check_for_recovery(crashed_last_time)
+        # First start: ask who is working, once the window is up. Never in
+        # a test run or a scripted one, which must not stop to ask.
+        if not identity.current_user() and not settings_scope.is_redirected():
+            QTimer.singleShot(0, self._switch_user)
 
     # -- unsaved changes ----------------------------------------------------
 
@@ -605,6 +610,14 @@ class MainWindow(QMainWindow):
         self.group_label = QLabel("")
         self.group_label.setStyleSheet("color: #0066cc; font-weight: bold;")
         self.statusBar.addPermanentWidget(self.group_label)
+
+        # Who is working (app/identity.py): what they do carries the name.
+        self.user_label = QLabel("")
+        self.user_label.setToolTip(
+            "Labels, masks, ratings and reviews record who made them. "
+            "File > Switch User... changes it.")
+        self.statusBar.addPermanentWidget(self.user_label)
+        self._show_user()
 
         # Connect signals
         self.layer_panel.layer_visibility_changed.connect(
@@ -791,6 +804,15 @@ class MainWindow(QMainWindow):
             "Add the waypoints in a GPX file or another GeoLabeller project")
         import_waypoints_action.triggered.connect(self._import_waypoints)
         file_menu.addAction(import_waypoints_action)
+
+        file_menu.addSeparator()
+        # Who is working - on a shared machine, each person switches in.
+        switch_user_action = QAction("Switch &User...", self)
+        switch_user_action.setStatusTip(
+            "Set the user name your labels, masks, ratings and reviews "
+            "record")
+        switch_user_action.triggered.connect(self._switch_user)
+        file_menu.addAction(switch_user_action)
 
         file_menu.addSeparator()
 
@@ -1852,6 +1874,7 @@ class MainWindow(QMainWindow):
                 image_path=image_path,
                 description=self._active_description()
             )
+            self._stamp(label, "created")
         debug(f"label added: #{label.id} '{class_name}' on {image_name} "
               f"at pixel ({pixel_x:.1f}, {pixel_y:.1f}) "
               f"[{self.project.label_count} total]")
@@ -1873,6 +1896,10 @@ class MainWindow(QMainWindow):
         # The marker tooltip shows the description, like the refresh path.
         if label.description:
             self.canvas.set_label_description(label.id, label.description)
+        made = label.attribution.get("created")
+        if made:
+            self.canvas.set_label_made_by(label.id,
+                                          f"Labelled by {made['by']}")
 
         # Add to labeled images panel incrementally (O(1) instead of full refresh)
         image = self.project.images.get(image_path)
@@ -1998,6 +2025,9 @@ class MainWindow(QMainWindow):
                             labels=self._object_ids_of(label_id1, label_id2),
                             coalesce=True):
             object_id = self.project.link_labels(label_id1, label_id2)
+            if object_id:
+                for lid in (label_id1, label_id2):
+                    self._stamp(self.project.get_label_by_id(lid)[1], "link")
             # If wiring is on, propagate any existing measurement across
             # the newly-merged group - inside the step, so undo takes it
             # back with the link.
@@ -2049,7 +2079,9 @@ class MainWindow(QMainWindow):
         if not accepted:
             return
         with self._recorded("Describe label", labels=[label_id]):
-            label.description = text.strip()
+            if label.description != text.strip():
+                label.description = text.strip()
+                self._stamp(label, "description")
         self._mark_unsaved()
         self.canvas.set_label_description(label_id, label.description)
         self._label_row_changed(label_id)
@@ -2076,6 +2108,8 @@ class MainWindow(QMainWindow):
         with self._recorded("Set group ID",
                             labels=self._object_ids_of(label_id)):
             changed = self.project.set_group_id(label_id, text)
+            for lid in changed:
+                self._stamp(self.project.get_label_by_id(lid)[1], "group_id")
         self._mark_unsaved()
         for lid in changed:
             # Marker may not exist when its image is not loaded; the
@@ -2145,7 +2179,9 @@ class MainWindow(QMainWindow):
         # Coalesced: a size shared to the linked labels arrives as a report
         # per label in one turn.
         with self._recorded("Set size", labels=[label_id], coalesce=True):
-            label.length_m, label.width_m = length_m, width_m
+            if (label.length_m, label.width_m) != (length_m, width_m):
+                label.length_m, label.width_m = length_m, width_m
+                self._stamp(label, "size")
         self._mark_unsaved()
         self._recovery_soon_timer.start()
         # The marker may not exist if its image is not loaded; it is
@@ -2507,7 +2543,10 @@ class MainWindow(QMainWindow):
         if label is None:
             return
         with self._recorded("Paint mask", labels=[label_id]):
-            label.masks = list(masks)
+            new_masks = self._attributed_masks(label.masks, masks)
+            if new_masks != label.masks:
+                label.masks = new_masks
+                self._stamp(label, "masks")
         self.setWindowModified(True)
         self._push_save_state(stored=True, label_id=label_id)
         self._recovery_soon_timer.start()
@@ -2525,9 +2564,14 @@ class MainWindow(QMainWindow):
         # report per label, all in the same turn - one step.
         with self._recorded("Set orientation", labels=[label_id],
                             coalesce=True):
+            before = (label.orientation_px_rad, label.orientation_deg,
+                      label.orientation_derived)
             label.orientation_px_rad = px_rad
             label.orientation_deg = deg
             label.orientation_derived = bool(derived) and px_rad is not None
+            if before != (label.orientation_px_rad, label.orientation_deg,
+                          label.orientation_derived):
+                self._stamp(label, "orientation")
         self._mark_unsaved()
         if px_rad is None:
             self.statusBar.showMessage(
@@ -2574,8 +2618,9 @@ class MainWindow(QMainWindow):
             if new_class:
                 self.project.add_class(class_name)
             for other in changed:
-                self.project.get_label_by_id(other)[1].class_name = \
-                    class_name
+                lab = self.project.get_label_by_id(other)[1]
+                lab.class_name = class_name
+                self._stamp(lab, "class")
         if new_class:
             self._update_class_combo()
         self._mark_unsaved()
@@ -2600,7 +2645,9 @@ class MainWindow(QMainWindow):
         if label is None or valid_review(status) != status:
             return
         with self._recorded("Review label", labels=[label_id]):
-            label.review = status
+            if label.review != status:
+                label.review = status
+                self._stamp(label, "review")
         self._mark_unsaved()
         self.canvas.set_label_rejected(label_id, status == REVIEW_REJECTED)
         self._label_row_changed(label_id)
@@ -2619,7 +2666,9 @@ class MainWindow(QMainWindow):
         if value != CONFIDENCE_UNSET and valid_confidence(value) != value:
             return          # not a rating; leave what is stored alone
         with self._recorded("Rate confidence", labels=[label_id]):
-            label.confidence = value
+            if label.confidence != value:
+                label.confidence = value
+                self._stamp(label, "confidence")
         self._mark_unsaved()
         self.statusBar.showMessage(
             f"Confidence cleared for label #{label_id}" if not value
@@ -2900,6 +2949,64 @@ class MainWindow(QMainWindow):
             self.canvas.set_label_group_id(label.id, label.group_id)
         if label.review == REVIEW_REJECTED:
             self.canvas.set_label_rejected(label.id, True)
+        made = label.attribution.get("created")
+        if made:
+            self.canvas.set_label_made_by(label.id,
+                                          f"Labelled by {made['by']}")
+
+    # ------------------------------------------------------------------
+    # Who did what (app/identity.py)
+    # ------------------------------------------------------------------
+
+    def _stamp(self, label, what: str):
+        """Record that the current user just set ``what`` on ``label``.
+        Called inside the edit's undo step, so undo takes it back too."""
+        if label is None:
+            return
+        stamp = identity.stamp()
+        if stamp is not None:
+            label.attribution[what] = stamp
+
+    @staticmethod
+    def _attributed_masks(old: list, new: list) -> list:
+        """``new`` masks, each carrying who drew it: a mask unchanged since
+        last time keeps its author; a new or repainted one is the current
+        user's."""
+        before = {m.get("name"): m for m in old or ()}
+        stamp = identity.stamp()
+        result = []
+        for mask in new or ():
+            mask = {k: v for k, v in dict(mask).items()
+                    if k not in ("by", "at")}
+            previous = before.get(mask.get("name"))
+            if previous is not None and {
+                    k: v for k, v in previous.items()
+                    if k not in ("by", "at")} == mask:
+                for key in ("by", "at"):
+                    if key in previous:
+                        mask[key] = previous[key]
+            elif stamp is not None:
+                mask.update(stamp)
+            result.append(mask)
+        return result
+
+    def _show_user(self):
+        user = identity.current_user()
+        self.user_label.setText(f"User: {user}" if user
+                                else "User: not set")
+
+    def _switch_user(self):
+        """File > Switch User..., and the first-start question."""
+        name, accepted = QInputDialog.getText(
+            self, "User Name",
+            "Your user name - your labels, masks, ratings and reviews "
+            "will record it.\nNo password: this is a name, not a login.",
+            text=identity.current_user())
+        if accepted and identity.clean(name):
+            identity.set_user(name)
+            self._show_user()
+            self.statusBar.showMessage(
+                f"Working as {identity.current_user()}", 4000)
 
     # ------------------------------------------------------------------
     # Undo and redo
