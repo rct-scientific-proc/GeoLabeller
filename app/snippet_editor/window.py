@@ -50,6 +50,7 @@ _SPLITTER_KEY = "snippet_editor/splitter"
 # on for someone whose settings predate it.
 _SECTIONS_OFF_KEY = "snippet_editor/sections_off"
 _TOOL_KEY = "snippet_editor/tool"
+_CLASS_LINKED_KEY = "snippet_editor/class_change_linked"
 
 
 class SectionFrame(QWidget):
@@ -108,7 +109,7 @@ class SnippetEditor(QWidget):
     review_changed = pyqtSignal(int, str)
     # (label_id, class name): the main window applies it to the label's
     # whole linked object - the same thing seen in different images.
-    class_changed = pyqtSignal(int, str)
+    class_changed = pyqtSignal(int, str, bool)   # +also the linked labels
     # (label_id, length_m or None, width_m or None)
     size_changed = pyqtSignal(int, object, object)
     mask_names_changed = pyqtSignal(list)
@@ -224,15 +225,28 @@ class SnippetEditor(QWidget):
         class_box = QGroupBox("Label class")
         class_layout = QVBoxLayout(class_box)
         self.label_class_combo = QComboBox()
+        # Editable: a name that is not a class yet becomes one - for the
+        # part of an object that turns out to need a label of its own.
+        self.label_class_combo.setEditable(True)
+        self.label_class_combo.setInsertPolicy(QComboBox.NoInsert)
         self.label_class_combo.setToolTip(
-            "The class of the snippet in hand, and of every label linked to "
-            "it - they are the same object (Ctrl+1-9 in the Single view).")
+            "The class of the snippet in hand. Pick one, or type a new name "
+            "and press Enter to create it (Ctrl+1-9 in the Single view).")
         self.label_class_combo.activated.connect(
             lambda index: self.change_class(
                 self.label_class_combo.itemText(index)))
+        self.label_class_combo.lineEdit().returnPressed.connect(
+            lambda: self.change_class(
+                self.label_class_combo.currentText().strip()))
         class_layout.addWidget(self.label_class_combo)
+        self.class_linked_check = QCheckBox("Also change linked labels")
+        self.class_linked_check.setToolTip(
+            "Give every label linked to this one the same class - they are "
+            "the same object. Untick to change only this snippet.")
+        # Ticked unless the user unticked it last time (_restore_settings).
+        class_layout.addWidget(self.class_linked_check)
         class_hint = QLabel("Ctrl+1-9 picks a class by its place in the "
-                            "list. Applies to the whole linked object.")
+                            "list; a new name typed here becomes a class.")
         class_hint.setWordWrap(True)
         class_hint.setStyleSheet("color: palette(mid);")
         class_layout.addWidget(class_hint)
@@ -340,7 +354,8 @@ class SnippetEditor(QWidget):
         shown = self.strip.class_combo.currentText()
         if shown != self.strip.ALL_CLASSES and shown != class_name:
             self.strip.cycle(1)
-        self.class_changed.emit(label_id, class_name)
+        self.class_changed.emit(label_id, class_name,
+                                self.class_linked_check.isChecked())
 
     def redraw_snippets(self):
         """Display Settings changed: read every snippet again, keeping the
@@ -542,6 +557,8 @@ class SnippetEditor(QWidget):
             frame.content.setVisible(frame.is_on())
         tool = settings.value(_TOOL_KEY, TOOL_PAINT)
         self.set_tool(tool if tool in self._tools else TOOL_PAINT)
+        self.class_linked_check.setChecked(
+            str(settings.value(_CLASS_LINKED_KEY, "true")).lower() != "false")
         self._apply_sections()
 
     def save_settings(self):
@@ -554,6 +571,9 @@ class SnippetEditor(QWidget):
             settings.setValue(_SECTIONS_OFF_KEY, ",".join(
                 key for key in self.sections if key not in self.sections_on()))
             settings.setValue(_TOOL_KEY, self.tool())
+            settings.setValue(_CLASS_LINKED_KEY, "true"
+                              if self.class_linked_check.isChecked()
+                              else "false")
         except Exception as exc:                  # noqa: BLE001
             debug(f"snippet editor settings not saved: "
                   f"{type(exc).__name__}: {exc}")

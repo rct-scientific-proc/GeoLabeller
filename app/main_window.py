@@ -2539,25 +2539,45 @@ class MainWindow(QMainWindow):
                 f"Label #{label_id} oriented: {px_rad:+.3f} rad{heading}"
                 f"{source}", 4000)
 
-    def _on_label_class_changed(self, label_id: int, class_name: str):
-        """Give a label - and every label linked to it - another class.
+    def _on_label_class_changed(self, label_id: int, class_name: str,
+                                whole_object: bool = True):
+        """Give a label another class - and, by default, every label linked
+        to it, since linked labels are one object seen in different images.
 
-        Linked labels are one object seen in different images, so they
-        share a class; what differs between the views is what a
-        description is for. From the canvas's Change Class menu and the
-        Snippet Editor's Label class picker.
+        ``whole_object`` False changes only this label: the Snippet
+        Editor's "Also change linked labels" unticked, for the part of an
+        object that needs a label of its own. A name that is not a class
+        yet becomes one (the editor's picker takes typed names), in the
+        same undo step. From the canvas's Change Class menu (always the
+        whole object) and the Snippet Editor's Label class picker.
         """
         _, label = self.project.get_label_by_id(label_id)
-        if label is None or class_name not in self.project.classes:
+        class_name = (class_name or "").strip()
+        if label is None or not class_name:
             return
-        ids = self._object_ids_of(label_id)
-        with self._recorded("Change class", labels=ids):
-            for other in ids:
-                _, lab = self.project.get_label_by_id(other)
-                if lab is not None:
-                    lab.class_name = class_name
-        if self._history.undo_name() != "Change class":
+        new_class = class_name not in self.project.classes
+        if new_class and class_name == HARD_NEGATIVE:
+            self.statusBar.showMessage(
+                f"'{HARD_NEGATIVE}' is reserved for the HDF5 export's "
+                "negatives and cannot be a class.", 6000)
+            return
+        ids = (self._object_ids_of(label_id) if whole_object
+               else {label_id})
+        changed = [other for other in ids
+                   if self.project.get_label_by_id(other)[1] is not None
+                   and self.project.get_label_by_id(other)[1].class_name
+                   != class_name]
+        if not changed:
             return                           # it already had that class
+        with self._recorded("Change class", labels=ids,
+                            lists=("classes",) if new_class else ()):
+            if new_class:
+                self.project.add_class(class_name)
+            for other in changed:
+                self.project.get_label_by_id(other)[1].class_name = \
+                    class_name
+        if new_class:
+            self._update_class_combo()
         self._mark_unsaved()
         for other in ids:
             self.canvas.remove_label_marker(other)
@@ -2568,10 +2588,11 @@ class MainWindow(QMainWindow):
         self._update_waterfall_projections()
         self._schedule_refresh("labeled", "snippets")
         self._reseat_open_editors()
-        n = len(ids)
+        n = len(changed)
         self.statusBar.showMessage(
-            f"Class changed to {class_name}"
-            + (f" on all {n} labels of the object" if n > 1 else ""), 4000)
+            (f"New class '{class_name}'. " if new_class else "")
+            + f"Class changed to {class_name}"
+            + (f" on {n} labels of the object" if n > 1 else ""), 4000)
 
     def _on_review_changed(self, label_id, status):
         """Store a review the Snippet Editor reports ("" clears it)."""
