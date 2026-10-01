@@ -53,6 +53,11 @@ class Step:
     lists_after: dict = field(default_factory=dict)
     next_id_before: int = 1
     next_id_after: int = 1
+    # The project's image paths in order, kept only when the edit
+    # changed that order (images removed or brought back): a restored
+    # entry returns to its place, not to the end.
+    image_order_before: "tuple | None" = None
+    image_order_after: "tuple | None" = None
     token: object = None
 
     def label_ids(self) -> set:
@@ -70,7 +75,8 @@ class Step:
         return (self.labels_before == self.labels_after
                 and self.images_before == self.images_after
                 and self.lists_before == self.lists_after
-                and self.next_id_before == self.next_id_after)
+                and self.next_id_before == self.next_id_after
+                and self.image_order_before == self.image_order_after)
 
 
 # -- reading and writing project state ---------------------------------------
@@ -112,10 +118,32 @@ def _take_label_out(project, label_id):
         image.labels = [lab for lab in image.labels if lab is not label]
 
 
-def _apply(project, labels: dict, images: dict, lists: dict, next_id: int):
+def _reorder_images(project, order):
+    """Put the project's images in ``order``; any not named keep their
+    relative order after those that are."""
+    images = project.images
+    wanted = [path for path in order if path in images]
+    placed = set(wanted)
+    entries = [(path, images[path]) for path in wanted]
+    entries += [(path, image) for path, image in images.items()
+                if path not in placed]
+    images.clear()
+    for path, image in entries:
+        images[path] = image
+
+
+def _apply(project, labels: dict, images: dict, lists: dict, next_id: int,
+           image_order=None):
     """Make the project hold exactly these states."""
     for label_id in labels:
         _take_label_out(project, label_id)
+    # An entry the project no longer has comes back BEFORE the labels do:
+    # undoing a removal of images, its labels need somewhere to return to.
+    # (Put back after them, as it once was, they were skipped for want of
+    # an image and the entry came back empty.)
+    for path, state in images.items():
+        if state is not None and path not in project.images:
+            project.images[path] = copy.deepcopy(state)
     # Back in list order, so a whole image's labels return to their places.
     ordered = sorted(((state[1], label_id, state)
                       for label_id, state in labels.items()
@@ -133,12 +161,10 @@ def _apply(project, labels: dict, images: dict, lists: dict, next_id: int):
             if image is not None and not image.labels:
                 del project.images[path]
             continue
-        if image is None:
-            # An entry the edit made (a flag on a never-labelled image).
-            project.images[path] = copy.deepcopy(state)
-        else:
-            image.hard_negative_source = state.hard_negative_source
-            image.location = state.location
+        image.hard_negative_source = state.hard_negative_source
+        image.location = state.location
+    if image_order is not None:
+        _reorder_images(project, image_order)
     for name, value in lists.items():
         setattr(project, name, copy.deepcopy(value))
     project._next_id = next_id
@@ -204,6 +230,7 @@ class EditHistory:
             else set(labels)
         before_labels = {i: _label_state(project, i) for i in label_ids}
         before_images = {p: _image_state(project, p) for p in images}
+        order_before = tuple(project.images) if images else None
         before_lists = {n: _list_state(project, n) for n in lists}
         next_before = project._next_id
         yield
@@ -212,6 +239,9 @@ class EditHistory:
             created |= set(project._label_id_index)
         for label_id in created - label_ids:
             before_labels[label_id] = None
+        order_after = tuple(project.images) if images else None
+        if order_before == order_after:
+            order_before = order_after = None     # nothing to restore
         step = Step(
             name=name,
             labels_before=before_labels,
@@ -222,6 +252,8 @@ class EditHistory:
             lists_after={n: _list_state(project, n) for n in lists},
             next_id_before=next_before,
             next_id_after=project._next_id,
+            image_order_before=order_before,
+            image_order_after=order_after,
             token=coalesce,
         )
         self.push(step)
@@ -251,6 +283,10 @@ class EditHistory:
         into.images_after.update(later.images_after)
         into.lists_after.update(later.lists_after)
         into.next_id_after = later.next_id_after
+        if later.image_order_after is not None:
+            if into.image_order_before is None:
+                into.image_order_before = later.image_order_before
+            into.image_order_after = later.image_order_after
 
     # -- going back and forth --------------------------------------------------
 
@@ -259,7 +295,8 @@ class EditHistory:
             return None
         step = self._undo.pop()
         _apply(project, step.labels_before, step.images_before,
-               step.lists_before, step.next_id_before)
+               step.lists_before, step.next_id_before,
+               step.image_order_before)
         self._redo.append(step)
         self._changed()
         return step
@@ -269,7 +306,8 @@ class EditHistory:
             return None
         step = self._redo.pop()
         _apply(project, step.labels_after, step.images_after,
-               step.lists_after, step.next_id_after)
+               step.lists_after, step.next_id_after,
+               step.image_order_after)
         self._undo.append(step)
         self._changed()
         return step

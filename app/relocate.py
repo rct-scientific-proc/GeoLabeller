@@ -41,6 +41,8 @@ from PyQt5.QtWidgets import (
     QApplication, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout,
     QLabel, QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout)
 
+from .labels import canonical_path
+
 
 # ---------------------------------------------------------------------------
 # Pure matching logic (no Qt)
@@ -372,6 +374,9 @@ class RelocateImagesDialog(QDialog):
         super().__init__(parent)
         self._images = list(images)
         self._resolutions: dict[str, Resolution] = {}
+        # Set when the user asks to remove the images instead of finding
+        # them; the caller then opens RemoveMissingImagesDialog.
+        self.remove_requested = False
         self.setWindowTitle("Locate Missing Images")
         self.setMinimumSize(700, 400)
         self._build_ui()
@@ -417,6 +422,12 @@ class RelocateImagesDialog(QDialog):
         buttons.addWidget(search_btn)
         buttons.addWidget(locate_btn)
         buttons.addStretch()
+        self.remove_btn = QPushButton("Remove From Project...")
+        self.remove_btn.setToolTip(
+            "These images are not coming back: choose which to take out of "
+            "the project, with their labels.")
+        self.remove_btn.clicked.connect(self._ask_to_remove)
+        buttons.addWidget(self.remove_btn)
         layout.addLayout(buttons)
 
         self._buttons = QDialogButtonBox(
@@ -426,6 +437,11 @@ class RelocateImagesDialog(QDialog):
             self.accept)
         self._buttons.rejected.connect(self.reject)
         layout.addWidget(self._buttons)
+
+    def _ask_to_remove(self):
+        """Close without relocating; the caller offers the removal."""
+        self.remove_requested = True
+        self.reject()
 
     # -- Matching passes ----------------------------------------------------
 
@@ -547,3 +563,141 @@ class RelocateImagesDialog(QDialog):
     def found_resolutions(self) -> list[Resolution]:
         """The FOUND entries, for the caller to apply on accept."""
         return [r for r in self._resolutions.values() if r.status == FOUND]
+
+
+class RemoveMissingImagesDialog(QDialog):
+    """Choose which missing images to take out of the project.
+
+    Asked for 2026-10-01. An image that is not found, and that the user
+    does not go looking for, stays in the project with every label that
+    was on it - in each save and each ground truth export, with nothing on
+    the canvas to remove them from. This lists those images with their
+    label counts; the ticked ones go, labels and all.
+
+    Missing is not the same as gone: a drive or a share that is not
+    connected makes every image on it missing. So the list says how many
+    labels each removal costs, says so loudly when it is the whole
+    project, and the caller records the removal as one undo step.
+    """
+
+    PATH_ROLE = Qt.UserRole
+
+    def __init__(self, images: list, project_image_count: int, parent=None):
+        """``images`` are the missing ImageData entries; the count is the
+        project's total, to notice when all of them are missing."""
+        super().__init__(parent)
+        self._images = list(images)
+        self.setWindowTitle("Remove Missing Images")
+        self.setMinimumSize(700, 400)
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            f"{len(self._images)} image(s) in this project were not found. "
+            "The ticked ones are removed from the project together with "
+            "their labels, which otherwise stay in every save and ground "
+            "truth export. Edit > Undo brings them back.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.warning = QLabel("")
+        self.warning.setWordWrap(True)
+        self.warning.setStyleSheet("color: #b26a00; font-weight: bold;")
+        if self._images and len(self._images) >= project_image_count:
+            self.warning.setText(
+                "EVERY image in this project is missing. If they are on a "
+                "drive or network share that is not connected, cancel and "
+                "connect it - or use Locate Missing Images.")
+        else:
+            self.warning.setText(
+                "If these are on a drive or network share that is not "
+                "connected right now, cancel and connect it instead.")
+        layout.addWidget(self.warning)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["Image", "Labels", "Recorded path"])
+        self.tree.setRootIsDecorated(False)
+        for image in self._images:
+            item = QTreeWidgetItem(
+                [_parse(image.path).name, str(len(image.labels)), image.path])
+            item.setData(0, self.PATH_ROLE, image.path)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(0, Qt.Checked)
+            item.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+            item.setToolTip(2, image.path)
+            self.tree.addTopLevelItem(item)
+        self.tree.resizeColumnToContents(0)
+        self.tree.resizeColumnToContents(1)
+        self.tree.itemChanged.connect(self._update_summary)
+        layout.addWidget(self.tree)
+
+        row = QHBoxLayout()
+        tick_all = QPushButton("Tick All")
+        tick_all.clicked.connect(lambda: self.set_all_checked(True))
+        tick_none = QPushButton("Untick All")
+        tick_none.clicked.connect(lambda: self.set_all_checked(False))
+        with_labels = QPushButton("Only Those With Labels")
+        with_labels.setToolTip(
+            "Tick the images that have labels and untick the rest.")
+        with_labels.clicked.connect(self.check_only_labelled)
+        for button in (tick_all, tick_none, with_labels):
+            button.setAutoDefault(False)     # Enter is Cancel, below
+            row.addWidget(button)
+        row.addStretch()
+        layout.addLayout(row)
+
+        self._buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        self.remove_button = self._buttons.addButton(
+            "Remove", QDialogButtonBox.AcceptRole)
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        # Cancel is the safe answer to Enter.
+        self.remove_button.setAutoDefault(False)
+        self._buttons.button(QDialogButtonBox.Cancel).setDefault(True)
+        layout.addWidget(self._buttons)
+        self._buttons.button(QDialogButtonBox.Cancel).setFocus()
+        self._update_summary()
+
+    def _items(self):
+        return [self.tree.topLevelItem(i)
+                for i in range(self.tree.topLevelItemCount())]
+
+    def chosen_paths(self) -> list:
+        """The recorded paths of the ticked images, in list order."""
+        return [item.data(0, self.PATH_ROLE) for item in self._items()
+                if item.checkState(0) == Qt.Checked]
+
+    def chosen_counts(self) -> tuple:
+        """(images, labels) the ticked rows come to."""
+        chosen = set(self.chosen_paths())
+        images = [image for image in self._images if image.path in chosen]
+        return len(images), sum(len(image.labels) for image in images)
+
+    def set_checked(self, path: str, checked: bool):
+        """Tick or untick one image, by its path in any spelling."""
+        wanted = canonical_path(path)
+        for item in self._items():
+            if canonical_path(item.data(0, self.PATH_ROLE)) == wanted:
+                item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+
+    def set_all_checked(self, checked: bool):
+        state = Qt.Checked if checked else Qt.Unchecked
+        self.tree.blockSignals(True)
+        for item in self._items():
+            item.setCheckState(0, state)
+        self.tree.blockSignals(False)
+        self._update_summary()
+
+    def check_only_labelled(self):
+        labelled = {image.path for image in self._images if image.labels}
+        self.tree.blockSignals(True)
+        for item in self._items():
+            item.setCheckState(
+                0, Qt.Checked if item.data(0, self.PATH_ROLE) in labelled
+                else Qt.Unchecked)
+        self.tree.blockSignals(False)
+        self._update_summary()
+
+    def _update_summary(self, *_args):
+        images, labels = self.chosen_counts()
+        self.remove_button.setEnabled(images > 0)
+        self.remove_button.setText(
+            f"Remove {images} Image(s) and {labels} Label(s)"
+            if images else "Remove")

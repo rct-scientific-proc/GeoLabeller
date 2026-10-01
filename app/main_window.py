@@ -61,8 +61,8 @@ from .about import AboutDialog
 from .history import EditHistory
 from .display_dialog import DisplaySettingsDialog
 from .gt_import import apply_import, confirm_import, plan_import
-from .relocate import (RelocateImagesDialog, missing_images,
-                       silently_resolve)
+from .relocate import (RelocateImagesDialog, RemoveMissingImagesDialog,
+                       missing_images, silently_resolve)
 from .snippet_editor import SnippetEditor
 from .snippet_editor.size_section import shares_with_linked, size_text
 from .snippet_panel import SnippetPanel
@@ -768,8 +768,20 @@ class MainWindow(QMainWindow):
         locate_action.setStatusTip(
             "Find this project's images on this machine when the recorded "
             "paths came from another one")
-        locate_action.triggered.connect(self._offer_relocation)
+        # Through a lambda: triggered carries "checked", and connected
+        # straight to the method it arrived as known_paths - False, which
+        # is not a list of paths. From the menu this never opened.
+        locate_action.triggered.connect(lambda: self._offer_relocation())
         file_menu.addAction(locate_action)
+
+        # ...and for the ones that are not coming back.
+        remove_missing_action = QAction("Remove &Missing Images...", self)
+        remove_missing_action.setStatusTip(
+            "Take images that cannot be found out of the project, with "
+            "their labels")
+        remove_missing_action.triggered.connect(
+            lambda: self._offer_missing_removal())
+        file_menu.addAction(remove_missing_action)
 
         file_menu.addSeparator()
 
@@ -3394,7 +3406,9 @@ class MainWindow(QMainWindow):
         # says it is linked, while the panel correctly shows it is not.
         self._update_ring_colors()
         self.layer_panel.refresh_labeled_panel(self.project)
-        self._refresh_snippet_panel()
+        # The Snippet Editor too, not only the sidebar: it holds its own
+        # copy of the labels and went on listing the ones just deleted.
+        self._reseat_open_editors()
         self._refresh_hard_negative_panel()
         self._update_waterfall_projections()
         self.statusBar.showMessage(
@@ -5455,6 +5469,66 @@ class MainWindow(QMainWindow):
         return [img for img in self.project.images.values()
                 if not os.path.exists(img.path)]
 
+    def _offer_missing_removal(self, known_paths: list | None = None):
+        """File > Remove Missing Images: choose which to take out.
+
+        An image that was not found, and that the user did not go looking
+        for, stays in the project with every label that was on it - in
+        each save and each ground truth export - and has no row in the
+        layer tree to remove it from. Asked for 2026-10-01.
+
+        Only images with no layer on the canvas are offered. One whose
+        file vanished while it was open still has its row, and is removed
+        there like any other.
+        """
+        missing = self._missing_project_images(known_paths)
+        still_open = [img for img in missing
+                      if self.canvas.is_path_loaded(img.path)]
+        candidates = [img for img in missing
+                      if not self.canvas.is_path_loaded(img.path)]
+        if not candidates:
+            QMessageBox.information(
+                self, "Remove Missing Images",
+                (f"The {len(still_open)} image(s) whose files have gone are "
+                 "still open in the layer panel - remove them there.")
+                if still_open else
+                "Every image path in this project resolves on this machine.")
+            return
+        dialog = RemoveMissingImagesDialog(
+            candidates, len(self.project.images), self)
+        if not dialog.exec_():
+            return
+        self._remove_missing_images(dialog.chosen_paths())
+
+    def _remove_missing_images(self, paths: list) -> tuple:
+        """Take these images and their labels out of the project, as one
+        undo step; (images, labels) removed.
+
+        Undoable, unlike removing a layer: nothing was on the canvas, so
+        putting the entries and their labels back is the whole of it - and
+        missing is not the same as gone. A drive that was not connected
+        makes every image on it missing, and the labels must not be one
+        confirmed dialog from lost.
+        """
+        images = [self.project.images[path] for path in paths
+                  if path in self.project.images
+                  and not self.canvas.is_path_loaded(path)]
+        if not images:
+            return 0, 0
+        label_ids = [label.id for image in images for label in image.labels]
+        with self._recorded("Remove missing images", labels=label_ids,
+                            images=[image.path for image in images]):
+            for image in images:
+                for label in image.labels:
+                    self.canvas.remove_label_marker(label.id)
+                self.project.remove_image(image.path)
+        self._mark_unsaved()
+        self._after_project_removal(len(images), len(label_ids))
+        self.statusBar.showMessage(
+            f"Removed {len(images)} missing image(s) and {len(label_ids)} "
+            "label(s) from the project - Ctrl+Z brings them back", 8000)
+        return len(images), len(label_ids)
+
     def _offer_relocation(self, known_paths: list | None = None):
         """Show the relocation dialog for whatever is currently missing.
 
@@ -5470,6 +5544,8 @@ class MainWindow(QMainWindow):
             return
         dialog = RelocateImagesDialog(missing, self)
         if not dialog.exec_():
+            if dialog.remove_requested:
+                self._offer_missing_removal([img.path for img in missing])
             return
         applied, refused = 0, 0
         for res in dialog.found_resolutions():
