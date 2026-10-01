@@ -62,12 +62,15 @@ class ReviewPanel(QWidget):
         grid = QGridLayout()
         self.buttons = {}
         for column, (status, text, key, tip) in enumerate((
-                (REVIEW_ACCEPTED, "&Accept", "A",
+                # No mnemonics: A, X and F (which also advance) are the
+                # keys, and an Alt+A that marked without advancing would
+                # be a second, undocumented way.
+                (REVIEW_ACCEPTED, "Accept", "A",
                  "The label is right."),
                 (REVIEW_REJECTED, "Reject", "X",
                  "The label is wrong: kept in the project, left out of "
                  "the HDF5 and sub-image exports, drawn dimmed."),
-                (REVIEW_RECHECK, "&Look again", "F",
+                (REVIEW_RECHECK, "Look again", "F",
                  "Not sure: stays on the Needs review list."))):
             button = QPushButton(text)
             button.setCheckable(True)

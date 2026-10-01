@@ -82,10 +82,15 @@ class LinkedRow(QWidget):
             self.refresh()
         group = entry.get("group_id") or ""
         self.title.setText(
-            f"This object in {len(members)} images"
+            self._count(members)
             + (f" - {group}" if group else "")
             + self._disagreement(members))
         self.setVisible(True)
+
+    def redraw(self):
+        """Read every thumbnail again (the Display Settings changed)."""
+        if self.entries:
+            self._rebuild(list(self.entries))
 
     def refresh(self):
         """Recaption (an entry was edited) and mark the one in hand."""
@@ -103,6 +108,16 @@ class LinkedRow(QWidget):
     def caption(self, entry) -> str:
         return (f"{entry['image_name']}\n{entry['class_name']}"
                 + self._badges(entry) + group_line(entry))
+
+    @staticmethod
+    def _count(members) -> str:
+        """"This object in 3 images" - or, since nothing stops two labels
+        on one image being linked, "This object: 3 labels in 2 images"."""
+        images = len({e["image_path"] for e in members})
+        if images == len(members):
+            return f"This object in {images} images"
+        return f"This object: {len(members)} labels in {images} image" + (
+            "s" if images != 1 else "")
 
     @staticmethod
     def _disagreement(members) -> str:

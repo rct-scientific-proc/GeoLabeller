@@ -188,6 +188,15 @@ class SnippetStrip(QObject):
         kind, value = self._shown()
         return value if kind == "object" else None
 
+    def show_object(self, object_id) -> bool:
+        """List one linked object - the dropdown's choice, made for the
+        user (a click in the linked row); False if it is not offered."""
+        index = self.class_combo.findData("object:" + str(object_id or ""))
+        if index < 0:
+            return False
+        self.class_combo.setCurrentIndex(index)
+        return True
+
     def shown_class(self) -> "str | None":
         """The one class the list is showing, or None (all classes, or a
         linked object - whose labels may be of several)."""
@@ -352,6 +361,9 @@ class SnippetStrip(QObject):
         # label_id -> item, so a delivered thumbnail lands in O(1).
         # Scanning the list per delivery was O(n^2) on the UI thread, and
         # a cache hit delivers synchronously inside this very loop.
+        # The order before this refill, for landing near a snippet that
+        # has gone from the list (below).
+        old_order = list(self.items_by_label)
         self.items_by_label = {}
         self.entries_by_label = {e["label_id"]: e for e in self.entries}
         keep_id = self._current_id
@@ -369,12 +381,29 @@ class SnippetStrip(QObject):
             row = 0
             if keep_id is not None and keep_id in self.items_by_label:
                 row = self.list_widget.row(self.items_by_label[keep_id])
+            elif not chosen_anew and keep_id in old_order:
+                # The snippet in hand has left the list (its class changed,
+                # say): land on the next one still listed, as stepping
+                # would, rather than back at the top.
+                row = self._nearest_row(old_order, old_order.index(keep_id))
             self.list_widget.setCurrentRow(row)
         else:
             self._current_id = None
             self.entry_picked.emit(None)
         self._update_message()
         self.rebuilt.emit(chosen_anew)
+
+    def _nearest_row(self, old_order: list, at: int) -> int:
+        """The row of the first snippet after position ``at`` of the old
+        order that is still listed - failing that, the nearest before it,
+        or the top."""
+        for label_id in old_order[at + 1:]:
+            if label_id in self.items_by_label:
+                return self.list_widget.row(self.items_by_label[label_id])
+        for label_id in reversed(old_order[:at]):
+            if label_id in self.items_by_label:
+                return self.list_widget.row(self.items_by_label[label_id])
+        return 0
 
     def _caption(self, entry: dict) -> str:
         caption = entry["image_name"]

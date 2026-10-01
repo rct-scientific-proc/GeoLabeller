@@ -20,10 +20,11 @@ values leave for the main window; everything else loops over them
 (section.py has the interface). The next value the ML team asks for is a
 new module, one line in that list, and its outward signal.
 
-It talks to the rest of the app through set_labels / set_mask_names /
-set_save_state in, and masks_changed / orientation_changed /
-size_changed / confidence_changed / mask_names_changed / save_requested
-out.
+It talks to the rest of the app through set_labels / set_classes /
+set_mask_names / set_save_state in, and masks_changed /
+orientation_changed / size_changed / confidence_changed / review_changed /
+class_changed / mask_names_changed / save_requested / undo_requested /
+redo_requested out.
 """
 from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QKeySequence
@@ -206,7 +207,7 @@ class SnippetEditor(QWidget):
         self.linked_row.set_badges(
             lambda entry: "".join(w.badge(entry)
                                   for w in self.strip._worklists))
-        self.linked_row.picked.connect(self.strip.select)
+        self.linked_row.picked.connect(self._pick_linked)
         single_page = QWidget()
         single_box = QVBoxLayout(single_page)
         single_box.setContentsMargins(0, 0, 0, 0)
@@ -361,6 +362,8 @@ class SnippetEditor(QWidget):
         """Display Settings changed: read every snippet again, keeping the
         class, the filter and the snippet in hand."""
         self.strip._rebuild(chosen_anew=False)
+        # The row sees the same object and would only recaption it.
+        self.linked_row.redraw()
 
     def set_save_state(self, text: str, saved: bool):
         """Show whether what has been done is on disk yet."""
@@ -392,6 +395,26 @@ class SnippetEditor(QWidget):
         """A grid cell was double-clicked: look at it closer."""
         if self.strip.select(label_id):
             self.set_view(self.SINGLE)
+
+    def _pick_linked(self, label_id: int):
+        """A snippet clicked in the linked row: put it in hand.
+
+        The row shows the whole object, but the list may not: a view of
+        it in another class, or one the Show filter leaves out, is not
+        listed - and a click that did nothing read as broken. So the list
+        is switched to show it: the Class dropdown to the object, the
+        filter to All, only as far as needed.
+        """
+        if self.strip.select(label_id):
+            return
+        entry = self.strip.entry(label_id)
+        if entry is None:
+            return
+        if not self.strip.in_class(entry):
+            self.strip.show_object(entry.get("object_id"))
+        if not self.strip.matches(entry):
+            self.strip.set_filter_mode(self.strip.FILTER_ALL)
+        self.strip.select(label_id)
 
     # -- sections -----------------------------------------------------------
 

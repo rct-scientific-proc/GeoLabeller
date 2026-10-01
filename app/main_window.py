@@ -4156,11 +4156,15 @@ class MainWindow(QMainWindow):
                 and l.review != REVIEW_REJECTED]
 
     def _rejected_on(self, paths) -> int:
-        """How many labels on these images were rejected in review."""
+        """How many labels on these images the export left out for being
+        rejected in review - not counting those of a class the project no
+        longer has, which _h5_labels_for drops anyway."""
+        classes = set(self.project.classes)
         return sum(1 for path in paths
                    for l in getattr(self.project.images.get(path),
                                     "labels", ())
-                   if l.review == REVIEW_REJECTED)
+                   if l.review == REVIEW_REJECTED
+                   and l.class_name in classes)
 
     def _h5_is_hn_source(self, path: str) -> bool:
         """Is this image flagged as a hard-negative source?"""
