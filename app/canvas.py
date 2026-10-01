@@ -1,6 +1,5 @@
 """Map canvas for displaying GeoTIFF images with tiled rendering."""
 import math
-import time
 import traceback
 from enum import Enum, auto
 from pathlib import Path
@@ -10,9 +9,9 @@ import rasterio
 from collections import deque
 
 from PyQt5 import sip
-from PyQt5.QtCore import (Qt, pyqtSignal, QEvent, QRect, QRectF, QLineF,
-                          QPointF, QSize, QTimer, QThread, QObject,
-                          QThreadPool, QRunnable, QPropertyAnimation)
+from PyQt5.QtCore import (Qt, pyqtSignal, QRect, QRectF, QLineF, QPointF,
+                          QSize, QTimer, QThread, QObject, QThreadPool,
+                          QRunnable, QPropertyAnimation)
 
 from PyQt5.QtGui import (
     QImage,
@@ -27,7 +26,7 @@ from PyQt5.QtGui import (
     QPainter,
     QPainterPath)
 from PyQt5.QtWidgets import (
-    QApplication, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
+    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
     QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem, QGraphicsTextItem,
     QGraphicsPathItem, QGraphicsRectItem, QMenu, QRubberBand, QWidget,
     QLabel, QGraphicsOpacityEffect
@@ -154,46 +153,14 @@ def _rgba_pixmap(rgba: np.ndarray) -> QPixmap:
 # A marker rejected in review is drawn at this opacity.
 REJECTED_OPACITY = 0.3
 
-# The Windows compositor's "wait for the next frame", looked up on first use:
-# None before that, False where there is none.
-_dwm_flush = None
-
-
-def _wait_for_compositor() -> bool:
-    """Block until the desktop compositor has presented its next frame.
-
-    False where that cannot be done - not Windows, the call missing or
-    failing - so a caller pacing itself by this falls back to a timer. The
-    wait is at most one display refresh, and the GIL is released for it.
-    """
-    global _dwm_flush
-    if _dwm_flush is None:
-        try:
-            import ctypes
-            _dwm_flush = ctypes.windll.dwmapi.DwmFlush
-        except (ImportError, AttributeError, OSError):
-            _dwm_flush = False
-    if not _dwm_flush:
-        return False
-    try:
-        return _dwm_flush() == 0
-    except OSError:
-        return False
-
-
 # Waterfall mode: a bottom-level group's images are stacked vertically in the
 # pixel zone (raw pixels, no reprojection) so the view can glide through them
 # like a filmstrip. Vertical gap between stacked images, in scene units.
 WATERFALL_GAP = 2000.0
 # Hold-to-glide navigation: while Space (up) / Ctrl+Space (down) is held, the
-# view scrolls at this many view pixels per this many milliseconds - 500
-# pixels a second at the 1x speed setting - in one step per display refresh
-# (see MapCanvas._on_waterfall_glide_tick).
-WATERFALL_GLIDE_INTERVAL_MS = 16
-WATERFALL_GLIDE_PX = 8
-# The longest stretch one glide step may account for. A stall - the machine
-# busy, a slow frame - becomes a pause in the glide, not a jump.
-WATERFALL_GLIDE_MAX_STEP_S = 0.05
+# view scrolls this many view pixels every timer tick.
+WATERFALL_GLIDE_INTERVAL_MS = 16   # ~60 fps
+WATERFALL_GLIDE_PX = 8             # view pixels per tick (~480 px/s)
 # Prefetch/retention margin while gliding: layers and tiles within this many
 # viewport heights above/below the view are loaded ahead of arrival and kept
 # resident after leaving, so gliding (and reversing) shows no pop-in gaps.
@@ -2386,18 +2353,9 @@ class MapCanvas(QGraphicsView):
         # a user who likes it fast stays fast across waterfall visits.
         self._waterfall_speed = 1.0
         self._waterfall_glide_timer = QTimer()
-        # Precise: the default coarse timer is allowed 5% of slack, and the
-        # steps are a display refresh apart.
-        self._waterfall_glide_timer.setTimerType(Qt.PreciseTimer)
         self._waterfall_glide_timer.setInterval(WATERFALL_GLIDE_INTERVAL_MS)
         self._waterfall_glide_timer.timeout.connect(
             self._on_waterfall_glide_tick)
-        # The glide's clock (when the last step was taken), the fraction of
-        # a pixel carried to the next step, and whether steps are paced by
-        # the desktop compositor rather than the timer.
-        self._glide_clock: float | None = None
-        self._glide_remainder = 0.0
-        self._glide_vsync = False
 
         # Tile update timer (debounce rapid view changes)
         self._tile_update_timer = QTimer()
@@ -2769,32 +2727,7 @@ class MapCanvas(QGraphicsView):
             return
         self._waterfall_glide_dir = direction
         if not self._waterfall_glide_timer.isActive():
-            self._glide_clock = time.perf_counter()
-            self._glide_remainder = 0.0
-            # One step per display refresh. Paced by the compositor, the
-            # timer only has to come round sooner than a refresh does.
-            self._glide_vsync = self._glide_follows_the_compositor()
-            self._waterfall_glide_timer.start(
-                1 if self._glide_vsync else self._glide_interval_ms())
-
-    def _glide_refresh_hz(self) -> float:
-        """The refresh rate of the screen this canvas is on."""
-        screen = (self.screen() if hasattr(self, "screen")
-                  else QApplication.primaryScreen())
-        rate = screen.refreshRate() if screen is not None else 60.0
-        return rate if 20.0 <= rate <= 1000.0 else 60.0
-
-    def _glide_interval_ms(self) -> int:
-        """The timer interval for a step per refresh, without a compositor
-        to follow."""
-        return max(2, round(1000.0 / self._glide_refresh_hz()))
-
-    @staticmethod
-    def _glide_follows_the_compositor() -> bool:
-        """Whether glide steps can be timed by the desktop compositor: a
-        real window on Windows, and the compositor answering."""
-        return (QApplication.platformName() == "windows"
-                and _wait_for_compositor())
+            self._waterfall_glide_timer.start()
 
     def stop_waterfall_glide(self):
         """Stop the waterfall glide (nav key released, or mode left)."""
@@ -2815,62 +2748,14 @@ class MapCanvas(QGraphicsView):
             f"Waterfall glide speed: {self._waterfall_speed:g}x "
             f"(+ faster, - slower)")
 
-    def _glide_px_per_second(self) -> float:
-        return (WATERFALL_GLIDE_PX * 1000.0 / WATERFALL_GLIDE_INTERVAL_MS
-                * self._waterfall_speed)
-
-    def _on_waterfall_glide_tick(self, elapsed: "float | None" = None):
-        """Scroll the view one step in the glide direction.
-
-        The step is the distance the glide covers in the time since the
-        step before (``elapsed``, in seconds; None measures it, which is
-        what the timer does), and there is one per display refresh.
-
-        It used to be a fixed 8 pixels every 16 ms - 62.5 steps a second
-        whatever the display, 64 pixels a step at the 8x speed setting.
-        The view scrolls by copying the whole viewport and handing it to
-        the window, top to bottom, which takes about 2 ms for a maximised
-        window; unsynchronised, a 180 Hz display took its frame mid-copy
-        about four times in ten, showing the top already moved and the
-        bottom not yet - by a whole step. Reported 2026-10-01 as tearing
-        low on the screen, on large images (where the speed is turned up).
-
-        Waiting for the compositor before each step puts the copy at the
-        start of a refresh interval, with the rest of the interval to
-        finish in; a step per refresh makes each one a third the size at
-        180 Hz; and measuring the time makes the speed the same however
-        the steps fall.
-        """
+    def _on_waterfall_glide_tick(self):
+        """Scroll the view a small step in the current glide direction."""
         if self._waterfall_glide_dir == 0 or not self._waterfall_active:
             self._waterfall_glide_timer.stop()
             return
-        paced = elapsed is None and self._glide_vsync
-        if elapsed is None:
-            if self._glide_vsync and not _wait_for_compositor():
-                # It stopped answering (a remote session taking over, say):
-                # the timer paces the glide from here.
-                self._glide_vsync = False
-                self._waterfall_glide_timer.setInterval(
-                    self._glide_interval_ms())
-            now = time.perf_counter()
-            elapsed = now - (self._glide_clock or now)
-            self._glide_clock = now
-        elapsed = min(max(elapsed, 0.0), WATERFALL_GLIDE_MAX_STEP_S)
-        self._glide_remainder += self._glide_px_per_second() * elapsed
-        # Whole pixels now, the fraction carried: at 180 Hz and the slowest
-        # setting a step is 0.7 of a pixel.
-        step = int(self._glide_remainder + 1e-9)
-        if step <= 0:
-            return
-        self._glide_remainder -= step
+        step = max(1, round(WATERFALL_GLIDE_PX * self._waterfall_speed))
         bar = self.verticalScrollBar()
         bar.setValue(bar.value() + self._waterfall_glide_dir * step)
-        if paced and self._glide_vsync:
-            # Present this step now, in the refresh it was timed for. Left
-            # queued, the repaint (a low-priority event) lost to the next
-            # tick, which waited out another refresh first: every second
-            # step was painted, two steps at a time.
-            QApplication.sendPostedEvents(self.window(), QEvent.UpdateRequest)
 
     def _scene_to_web(self, scene_pt: QPointF) -> tuple[float, float]:
         """Convert a scene point to Web Mercator (easting, northing).
