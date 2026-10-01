@@ -2501,7 +2501,7 @@ class MapCanvas(QGraphicsView):
                     QPointF((west + east) / 2.0, -(south + north) / 2.0))
                 rect = self._world_rect_to_scene(
                     QRectF(west, -north, east - west, north - south))
-                self.fitInView(rect, Qt.KeepAspectRatio)
+                self._fit_view(rect)
 
             return layer_id
 
@@ -4077,8 +4077,7 @@ class MapCanvas(QGraphicsView):
             QPointF((west + east) / 2.0, -(south + north) / 2.0))
         rect = self._world_rect_to_scene(
             QRectF(west, -north, east - west, north - south))
-        self.fitInView(rect, Qt.KeepAspectRatio)
-        self._refresh_scene_rect()
+        self._fit_view(rect)
         # Markers are sized in scene units against the view scale, so a
         # zoom that skips this leaves them sub-pixel (after stepping out
         # from a metre-scale wheel zoom) or covering the image (after a
@@ -4126,10 +4125,69 @@ class MapCanvas(QGraphicsView):
         # Create rect in world coords (Y flipped), then shift to scene coords.
         rect = self._world_rect_to_scene(
             QRectF(west, -north, east - west, north - south))
-        self.fitInView(rect, Qt.KeepAspectRatio)
-        self._refresh_scene_rect()
+        self._fit_view(rect)
         self._schedule_tile_update()
         self.update_label_markers_scale()
+
+    # How far around a fit's target the scene rect reaches, in multiples of
+    # the target's larger side: enough for the view to hold the target at
+    # any window shape (the fit pads the short side by the aspect ratio).
+    _FIT_REACH = 8.0
+
+    def _fit_view(self, rect: QRectF):
+        """Fit the view to ``rect`` (scene coords) - and always arrive.
+
+        QGraphicsView.fitInView resets the zoom to 1:1 and then scales to
+        the fit, and each step moves the scrollbars, which calls
+        scrollContentsBy and through it _refresh_scene_rect - mid-fit. At
+        a small final scale the second step clamps the scrollbar to the
+        edge of the current scene rect; the refresh saw a view at the
+        edge and rolled the rect THERE, and the closing centerOn was then
+        trapped inside that window, far from the target. Nothing ever
+        rolled it back: every later zoom was clamped the same way, so an
+        image switched on and zoomed to showed nothing until the app was
+        restarted. Reported 2026-10-01 from waterfall mode, whose
+        pixel-zone scale is small enough to hit it after scrolling less
+        than one large image and then zooming to a layer.
+
+        So nothing rolls while fitting (the wheel zoom has always done
+        the same), and before the fit the scene rect becomes a window
+        around the target - which makes the target reachable whatever the
+        rect was, one already stranded included.
+        """
+        reach = max(rect.width(), rect.height(), 1e-6) * self._FIT_REACH
+        suppressed = self._suppress_scene_rect
+        self._suppress_scene_rect = True
+        try:
+            self.setSceneRect(rect.adjusted(-reach, -reach, reach, reach))
+            self.fitInView(rect, Qt.KeepAspectRatio)
+        finally:
+            self._suppress_scene_rect = suppressed
+        self._refresh_scene_rect()
+
+    def centre_view_on(self, scene_point: QPointF):
+        """Centre the view on a scene point, at the current zoom - and
+        always arrive.
+
+        centerOn alone is clamped by the scene rect, and that is only a
+        window rolled around wherever the view last was: a point further
+        off than the window reaches was approached, not reached. Same
+        cure as _fit_view - a window around the target first.
+        """
+        view = self.mapToScene(self.viewport().rect()).boundingRect()
+        reach_x = view.width() * (0.5 + self._SCENE_RECT_MARGIN)
+        reach_y = view.height() * (0.5 + self._SCENE_RECT_MARGIN)
+        suppressed = self._suppress_scene_rect
+        self._suppress_scene_rect = True
+        try:
+            self.setSceneRect(QRectF(scene_point.x() - reach_x,
+                                     scene_point.y() - reach_y,
+                                     2 * reach_x, 2 * reach_y))
+            self.centerOn(scene_point)
+        finally:
+            self._suppress_scene_rect = suppressed
+        self._refresh_scene_rect()
+        self._schedule_tile_update()
 
     def wheelEvent(self, event: QWheelEvent):
         """Zoom in/out with the mouse wheel, centred on the cursor.
@@ -4306,6 +4364,46 @@ class MapCanvas(QGraphicsView):
             self._rebase_origin(QPointF(vc.x() + self._origin.x(),
                                         vc.y() + self._origin.y()))
 
+    @staticmethod
+    def _scene_rect_is_comfortable(cur: QRectF, view: QRectF,
+                                   world: "QRectF | None") -> bool:
+        """Whether the scene rect ``cur`` can stay as it is for ``view``.
+
+        Each edge wants a viewport of slack beyond the view - or to be
+        sitting on the clamp (``world``) already, where there is no more to
+        give. And the rect must lie inside the clamp.
+
+        Both halves matter. Without "inside the clamp" a clamp that
+        TIGHTENS was never applied: a rect rolled before waterfall mode
+        stayed comfortable at the size of the whole world, the stack's
+        clamp was never reached, and a held Space glided off the end of
+        the stack into empty canvas for as long as it was held (found
+        2026-10-01). Without "or on the clamp" a rect clipped to something
+        narrower than three viewports - the stack, always - was never
+        comfortable, re-rolled on every scroll, and each re-roll re-centres
+        to a whole pixel: the glide ran a pixel a tick fast.
+
+        A rect that does not touch the clamp at all (the view is somewhere
+        the clamp does not cover) is judged on slack alone.
+        """
+        slack_x, slack_y = view.width(), view.height()
+        if world is None or not world.intersects(cur):
+            return (view.left() - cur.left() >= slack_x
+                    and cur.right() - view.right() >= slack_x
+                    and view.top() - cur.top() >= slack_y
+                    and cur.bottom() - view.bottom() >= slack_y)
+        eps = 1e-9 * max(world.width(), world.height(), 1.0)
+        if not world.adjusted(-eps, -eps, eps, eps).contains(cur):
+            return False
+        return ((view.left() - cur.left() >= slack_x
+                 or cur.left() <= world.left() + eps)
+                and (cur.right() - view.right() >= slack_x
+                     or cur.right() >= world.right() - eps)
+                and (view.top() - cur.top() >= slack_y
+                     or cur.top() <= world.top() + eps)
+                and (cur.bottom() - view.bottom() >= slack_y
+                     or cur.bottom() >= world.bottom() - eps))
+
     def _refresh_scene_rect(self):
         """Roll the scene rect to a bounded window around the current view.
 
@@ -4328,13 +4426,10 @@ class MapCanvas(QGraphicsView):
             return
 
         cur = self.sceneRect()
-        # Comfortable if the view sits >1 viewport inside the rect and the rect
-        # still maps to a safe device extent.
-        inset = cur.adjusted(view.width(), view.height(),
-                             -view.width(), -view.height())
+        world = self._world_scene_rect()
         device_extent = max(cur.width(), cur.height()) * scale
-        if (inset.width() > 0 and inset.height() > 0 and inset.contains(view)
-                and device_extent <= self._SCENE_RECT_DEVICE_TARGET):
+        if (device_extent <= self._SCENE_RECT_DEVICE_TARGET
+                and self._scene_rect_is_comfortable(cur, view, world)):
             return
 
         margin = self._SCENE_RECT_MARGIN
@@ -4344,7 +4439,6 @@ class MapCanvas(QGraphicsView):
             view.width() * (1 + 2 * margin),
             view.height() * (1 + 2 * margin))
         target = window
-        world = self._world_scene_rect()
         if world is not None:
             if world.width() <= window.width() and world.height() <= window.height():
                 target = world  # whole world fits: no rolling needed

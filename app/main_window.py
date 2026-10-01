@@ -33,7 +33,7 @@ from PyQt5.QtWidgets import (
     QInputDialog)
 
 from .axis_ruler import MapCanvasWithAxes
-from .canvas import (MapCanvas, CanvasMode, STEP_CYCLE_MODES,
+from .canvas import (MapCanvas, CanvasMode, CYCLE_MODES, STEP_CYCLE_MODES,
                      AsyncFileLoaderThread, LoadCancelled, TiledLayer,
                      _emit_safely)
 from .class_editor import (ClassEditorDialog, DescriptionEditorDialog,
@@ -373,6 +373,10 @@ class MainWindow(QMainWindow):
         # image); forgotten only by being hidden. Layer ids are never
         # reused, so a stale one can only miss, never hit another layer.
         self._cycle_shown: str | None = None
+        # Waterfall mode: the group stacked, and the images it switched on
+        # to show the whole stack - switched off again on the way out.
+        self._waterfall_group: list[str] = []
+        self._waterfall_turned_on: list[str] = []
 
         # Last "Go to Coordinates" entry, re-filled next time it opens.
         self._goto_defaults: dict = {}
@@ -1176,6 +1180,9 @@ class MainWindow(QMainWindow):
             # at image 150 of 300 jumped to 300 and lost the position the
             # park/resume machinery exists to protect.
             self._sync_mode_actions(mode)
+            if mode == CanvasMode.WATERFALL:
+                self._repeat_waterfall()
+                return
             # ...but ignoring EVERY repeat was too much: finish a group,
             # select the next, press C, and nothing happened - the canvas
             # was still in Cycle mode, so the fresh run the completion path
@@ -1196,24 +1203,23 @@ class MainWindow(QMainWindow):
                     self._start_view_cycle_mode()
             return
         was_waterfall = self.canvas._waterfall_active
+        left = self.canvas._mode
+        # Where a cycle is, for a waterfall entered from it - read before
+        # the cycle is parked.
+        cycle_image = self._cycle_image()
         self.canvas.set_mode(mode)
         self._sync_mode_actions(mode)
         # Leaving a cycle parks it, whatever comes next - another cycle
         # mode included. Only a detour through a non-cycle mode used to
         # park, so C straight to V and back lost the C place.
         self._suspend_cycle()
+        if left in CYCLE_MODES:
+            # Its status line describes a mode that is over: "Waterfall: 5
+            # images - hold Space to glide" used to sit there in Pan mode.
+            self.statusBar.clearMessage()
 
-        # Leaving waterfall: restore the normal layout and re-place labels,
-        # then take the view to the geography of the image the user was on in
-        # the stack. Without that zoom the view stays parked over the emptied
-        # pixel zone - a blank canvas, and View Cycle then found no layers
-        # "in view" so it refused to start and nothing ever appeared.
         if was_waterfall and mode != CanvasMode.WATERFALL:
-            focus_layer = self.canvas.waterfall_layer_at_view_center()
-            self.canvas.clear_waterfall()
-            self._refresh_label_markers()
-            if focus_layer is not None:
-                self.canvas.zoom_to_layer(focus_layer)
+            self._leave_waterfall(mode)
 
         # Handle mode entry
         if mode == CanvasMode.CYCLE:
@@ -1221,7 +1227,92 @@ class MainWindow(QMainWindow):
         elif mode == CanvasMode.VIEW_CYCLE:
             self._start_view_cycle_mode()
         elif mode == CanvasMode.WATERFALL:
-            self._start_waterfall_mode()
+            self._start_waterfall_mode(start_at=cycle_image)
+
+    def _cycle_image(self) -> "str | None":
+        """The image a cycle is on: the live run's, else a parked one's."""
+        if (self._cycle_layers
+                and 0 <= self._cycle_index < len(self._cycle_layers)):
+            return self._cycle_layers[self._cycle_index]
+        for parked_mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
+            parked = self._cycle_parked.get(parked_mode)
+            if parked is not None and 0 <= parked[1] < len(parked[0]):
+                return parked[0][parked[1]]
+        return None
+
+    def _leave_waterfall(self, mode: CanvasMode):
+        """Undo the stack - layout, visibility, labels - and keep the place.
+
+        The view goes to the geography of the image the user was on in
+        the stack. Without that it stays parked over the emptied pixel
+        zone: a blank canvas, and View Cycle then found nothing "in view".
+
+        The images the waterfall switched on go off again. It used to
+        leave the whole group on, so a cycle afterwards - which hides only
+        what it switched on itself - hid nothing: overlapping images
+        showed the same top one at every step, and each step read the
+        whole group (24 loads in flight for 24 images, where a cycle
+        makes one or two). Leaving for a mode with no image of its own,
+        the one the user was on stays, so the canvas is not left empty.
+
+        And a cycle started next opens on that image, not wherever it
+        was parked before the waterfall.
+        """
+        focus = self.canvas.waterfall_layer_at_view_center()
+        self.canvas.clear_waterfall()
+        turned_on, self._waterfall_turned_on = self._waterfall_turned_on, []
+        self._waterfall_group = []
+        keep = None if mode in STEP_CYCLE_MODES else focus
+        self.layer_panel.uncheck_layers(
+            [layer_id for layer_id in turned_on if layer_id != keep])
+        self._refresh_label_markers()
+        if focus is None:
+            return
+        self.canvas.zoom_to_layer(focus)
+        group = self.layer_panel.get_all_layers_in_selected_group()
+        if focus not in group:
+            return
+        self._cycle_parked[CanvasMode.CYCLE] = (list(group),
+                                                group.index(focus))
+        if mode == CanvasMode.VIEW_CYCLE:
+            on_screen = set(self.canvas.get_layers_in_view())
+            queue = [layer_id for layer_id in group if layer_id in on_screen]
+            if focus in queue:
+                self._cycle_parked[mode] = (queue, queue.index(focus))
+
+    def _repeat_waterfall(self):
+        """W pressed while in waterfall mode: restack when that means
+        something, stay put when it does not.
+
+        It used to be ignored outright, like a stray C mid-cycle - so
+        selecting another group and pressing W left the old one stacked,
+        and after a new or opened project (which empties the stack) the
+        mode could not be started again without leaving it first.
+        """
+        if self.canvas._waterfall_active:
+            selected = self.layer_panel.get_all_layers_in_selected_group()
+            if not selected or selected == self._waterfall_group:
+                return                  # the same stack: stay where we are
+            if self.layer_panel.selected_group_is_bottom_level() is False:
+                self.statusBar.showMessage(
+                    "Waterfall needs a bottom-level group (no sub-groups) "
+                    "- the current stack is kept", 5000)
+                return
+            # Another group: put this one back as it was found, first.
+            self.canvas.clear_waterfall()
+            turned_on, self._waterfall_turned_on = (
+                self._waterfall_turned_on, [])
+            self._waterfall_group = []
+            self.layer_panel.uncheck_layers(turned_on)
+        self._start_waterfall_mode()
+
+    def _forget_waterfall(self):
+        """The layers are gone (a new or opened project), and the stack
+        with them: do not stay in a mode with nothing to show."""
+        self._waterfall_turned_on = []
+        self._waterfall_group = []
+        if self.canvas._mode == CanvasMode.WATERFALL:
+            self._set_mode(CanvasMode.PAN)
 
     def _repeat_starts_a_new_cycle(self, mode: CanvasMode) -> bool:
         """Whether pressing a cycle mode's key while in it means "go".
@@ -1582,22 +1673,25 @@ class MainWindow(QMainWindow):
         self._cycle_show(self._cycle_layers[self._cycle_index])
         self._show_cycle_status()
 
-    def _start_waterfall_mode(self):
+    def _start_waterfall_mode(self, start_at: "str | None" = None):
         """Stack the selected bottom-level group's images vertically.
 
         All the group's images become visible and are re-laid-out top-to-bottom
         as raw pixels; labels are re-rendered so each lands on its own image
         (every label in the group stays visible at once) and geo labels are
         projected onto the other images that contain them. The view starts at
-        the BOTTOM of the stack; holding Space glides up, Ctrl+Space back down.
+        the BOTTOM of the stack - or on ``start_at``, the image a cycle was
+        on, when that is in the group; holding Space glides up, Ctrl+Space
+        back down.
         """
         # Waterfall only works on bottom-level groups: a group of groups has no
-        # single well-defined image sequence to stack.
+        # single well-defined image sequence to stack. (Pan first, then the
+        # message: leaving a mode clears its status line.)
         if self.layer_panel.selected_group_is_bottom_level() is False:
+            self._set_mode(CanvasMode.PAN)
             self.statusBar.showMessage(
                 "Waterfall needs a bottom-level group (no sub-groups) - "
                 "select one and try again", 5000)
-            self._set_mode(CanvasMode.PAN)
             return
 
         group_name = self.layer_panel.get_selected_group_name()
@@ -1605,20 +1699,29 @@ class MainWindow(QMainWindow):
 
         layer_ids = self.layer_panel.get_all_layers_in_selected_group()
         if not layer_ids:
-            self.statusBar.showMessage("No layers in selected group", 3000)
             self._set_mode(CanvasMode.PAN)
+            self.statusBar.showMessage("No layers in selected group", 3000)
             return
 
-        # Show the whole group so the entire stack renders while gliding.
+        # Show the whole group so the entire stack renders while gliding -
+        # remembering which of them that switches on, to switch them off
+        # again on the way out (_leave_waterfall).
+        self._waterfall_turned_on = [
+            layer_id for layer_id in layer_ids
+            if (layer := self.canvas.get_layer(layer_id)) is not None
+            and not layer.visible]
+        self._waterfall_group = list(layer_ids)
         self.layer_panel.check_layers(layer_ids)
         self.canvas.layout_waterfall(layer_ids)
         # Re-place every label onto its (now stacked) image, then project geo
         # labels onto the other images that also contain them.
         self._refresh_label_markers()
         self._update_waterfall_projections()
-        # Start at the BOTTOM of the stack (the same image the cycle modes
-        # start on) and give the canvas focus so Space glides immediately.
-        self.canvas.zoom_to_layer(layer_ids[-1])
+        # Start on the image the cycle was on, else at the BOTTOM of the
+        # stack (the image the cycle modes start on), and give the canvas
+        # focus so Space glides immediately.
+        self.canvas.zoom_to_layer(
+            start_at if start_at in layer_ids else layer_ids[-1])
         self.canvas.setFocus()
 
         debug(f"waterfall: group '{group_name}' - "
@@ -3118,7 +3221,10 @@ class MainWindow(QMainWindow):
         ellipse = item[0]
         point = self.canvas.mapFromScene(ellipse.sceneBoundingRect().center())
         if not self.canvas.viewport().rect().contains(point):
-            self.canvas.centerOn(ellipse)
+            # Not centerOn: the scene rect would clamp it short of a
+            # label further off than its window reaches.
+            self.canvas.centre_view_on(
+                ellipse.sceneBoundingRect().center())
 
     def _edit_classes(self):
         """Open the class editor dialog."""
@@ -3350,6 +3456,7 @@ class MainWindow(QMainWindow):
         # Clear canvas and UI
         self.canvas.clear_label_markers()
         self.canvas.clear_layers()
+        self._forget_waterfall()
         self.layer_panel.clear()
         self._refresh_waypoints()  # the new project has none
         self._refresh_hard_negative_panel()
@@ -3430,6 +3537,7 @@ class MainWindow(QMainWindow):
             self._supersede_async_loading()
             self.canvas.clear_label_markers()
             self.canvas.clear_layers()
+            self._forget_waterfall()
             self.layer_panel.clear()
 
             self._close_display_dialog()
