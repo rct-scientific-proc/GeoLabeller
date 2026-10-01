@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 from rasterio.windows import Window
 
+from PyQt5 import sip
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QThread, pyqtSignal
 
 from . import display_settings, gdal_config
@@ -394,6 +395,16 @@ class SnippetLoader(QObject):
 
     def _on_finished(self, key, arr, token, signals, content):
         self._signals_alive.discard(signals)
+        if sip.isdeleted(self):
+            # The read finished after the loader - with the widget that
+            # owned it - was destroyed. There is nobody to tell, and
+            # emitting on the dead object raises inside a slot, which PyQt
+            # answers with abort(): exit 0xC0000409, no traceback. Seen as
+            # the test suite's unexplained exit 127s (2026-09-28) and,
+            # once each module ran in its own process, as a crash in one
+            # run in three of any module that deletes a snippet list with
+            # thumbnails still loading (2026-10-01).
+            return
         if self._tokens.get(key) != token:
             return   # superseded while reading; a newer delivery is coming
         del self._tokens[key]
