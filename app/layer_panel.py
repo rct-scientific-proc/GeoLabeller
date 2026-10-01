@@ -9,6 +9,10 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 
+from .collapsible import CollapsibleSection
+from .debug_log import debug
+from .settings_scope import settings as app_settings
+
 
 # The group path a layer item was last seen under. Drag-drop compares
 # against it so only layers that actually moved report a group change - the
@@ -1318,6 +1322,8 @@ class LabeledLayerPanel(QWidget):
         header = QLabel("Labeled Images")
         header.setStyleSheet("font-weight: bold; padding: 4px;")
         layout.addWidget(header)
+        # A host that titles this panel itself hides this one.
+        self.title_label = header
 
         # Tree widget for labeled images grouped by object_id
         self.tree = QTreeWidget()
@@ -1795,6 +1801,7 @@ class WaypointPanel(QWidget):
         header = QLabel("Waypoints")
         header.setStyleSheet("font-weight: bold; padding: 4px;")
         header_row.addWidget(header)
+        self.title_label = header
         header_row.addStretch()
         self.show_check = QCheckBox("Show on map")
         self.show_check.setChecked(True)
@@ -1924,6 +1931,7 @@ class HardNegativePanel(QWidget):
             "confusers but no true positives. The H5 export can include "
             "them as hard negatives.")
         layout.addWidget(header)
+        self.title_label = header
 
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Name", "Group"])
@@ -2055,29 +2063,59 @@ class CombinedLayerPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Vertical splitter for two panels
-        splitter = QSplitter(Qt.Vertical)
-
-        # Main layer panel
         self.main_panel = LayerPanel()
-        splitter.addWidget(self.main_panel)
-
-        # Labeled images panel
         self.labeled_panel = LabeledLayerPanel()
-        splitter.addWidget(self.labeled_panel)
-
         # Waypoints panel (project-wide geographic bookmarks)
         self.waypoint_panel = WaypointPanel()
-        splitter.addWidget(self.waypoint_panel)
-
         # Hard-negative sources (mirror of the flagged layers)
         self.hard_negative_panel = HardNegativePanel()
-        splitter.addWidget(self.hard_negative_panel)
 
-        # Set initial sizes (main panel takes more space)
-        splitter.setSizes([400, 200, 150, 120])
+        # Each under a header that opens and closes it (collapsible.py),
+        # in a splitter. Asked for 2026-10-01: the four took their share
+        # of the column whether or not they were in use.
+        #
+        # The splitter does the sharing. A closed section is pinned to its
+        # header's height, so its room goes to the others; and the
+        # splitter keeps the size each section was given, so one reopened
+        # returns to it, a dragged divider included.
+        self.splitter = QSplitter(Qt.Vertical)
+        # A section dragged to nothing would take its header with it, and
+        # with that the way to bring it back.
+        self.splitter.setChildrenCollapsible(False)
+        self.sections: dict = {}
+        for key, title, panel, description in (
+                ("layers", "Layers", self.main_panel, ""),
+                ("labeled", "Labeled Images", self.labeled_panel, ""),
+                ("waypoints", "Waypoints", self.waypoint_panel, ""),
+                ("hard_negatives", "Hard Negatives",
+                 self.hard_negative_panel,
+                 self.hard_negative_panel.title_label.toolTip())):
+            section = CollapsibleSection(title, panel,
+                                         description=description)
+            section.toggled.connect(lambda _open: self._save_sections())
+            self.sections[key] = section
+            self.splitter.addWidget(section)
+        # The Layers tree takes the most room, as it always has.
+        self.splitter.setSizes([400, 200, 150, 120])
+        # The section headers carry the titles now; the panels' own, and
+        # the one-column trees' headings that repeated them, would only
+        # say it twice.
+        for panel in (self.labeled_panel, self.waypoint_panel,
+                      self.hard_negative_panel):
+            panel.title_label.hide()
+        self.main_panel.tree.setHeaderHidden(True)
+        self.labeled_panel.tree.setHeaderHidden(True)
+        # In the header, so it is in reach while the section is closed.
+        self.sections["waypoints"].add_header_widget(
+            self.waypoint_panel.show_check)
 
-        layout.addWidget(splitter)
+        layout.addWidget(self.splitter, 1)
+        # With every section closed the splitter is four headers tall;
+        # the rest of the column stays empty below them. (And being free
+        # to shrink and grow back is what lets it give a section reopened
+        # from there the whole column, rather than a sliver.)
+        layout.addStretch(0)
+        self._restore_sections()
 
         # Forward waypoint signals
         self.waypoint_panel.goto_requested.connect(
@@ -2235,6 +2273,39 @@ class CombinedLayerPanel(QWidget):
     def end_batch_update(self):
         """End a batch update - re-enables signals and refreshes the tree."""
         self.main_panel.end_batch_update()
+
+    # -- sections: open and closed ------------------------------------------
+
+    _SECTIONS_KEY = "layer_panel/closed_sections"
+
+    def section_expanded(self, key: str) -> bool:
+        return self.sections[key].is_expanded()
+
+    def set_section_expanded(self, key: str, expanded: bool):
+        """Open or close one of "layers", "labeled", "waypoints" and
+        "hard_negatives" (what a click on its header does)."""
+        self.sections[key].set_expanded(expanded)
+
+    def _save_sections(self):
+        try:
+            app_settings().setValue(self._SECTIONS_KEY, ",".join(
+                key for key, section in self.sections.items()
+                if not section.is_expanded()))
+        except Exception as exc:                  # noqa: BLE001
+            debug(f"layer panel sections not saved: "
+                  f"{type(exc).__name__}: {exc}")
+
+    def _restore_sections(self):
+        """Close what was closed last time; a section added in a later
+        release, which no setting names, starts open."""
+        closed = {key for key in str(
+            app_settings().value(self._SECTIONS_KEY, "") or "").split(",")
+            if key}
+        for key, section in self.sections.items():
+            if key in closed:
+                section.blockSignals(True)
+                section.set_expanded(False)
+                section.blockSignals(False)
 
     def uncheck_layers(self, layer_ids: list[str]):
         """Uncheck layers by their IDs in both panels.
