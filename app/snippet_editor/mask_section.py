@@ -752,7 +752,8 @@ class MaskSection(Section):
     key = "masks"
     title = "Masks"
     tool = (TOOL_PAINT, "Paint masks",
-            "Left-drag paints the active mask, right-drag erases.")
+            "Left-drag paints the active mask, right-drag erases.",
+            Qt.Key_P)
 
     def __init__(self, editor: MaskEditor, parent=None):
         super().__init__(MASK_WORKLIST, editor.mask_panel, parent)

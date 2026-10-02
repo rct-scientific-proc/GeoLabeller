@@ -184,6 +184,7 @@ class SnippetEditor(QWidget):
         self._tool_buttons = QButtonGroup(self)
         self._tools = {}                 # tool id -> button
         self._tool_owner = {}            # tool id -> section key, or None
+        self._tool_keys = {}             # Qt key -> tool id
         tools = [(section.key,) + tuple(section.tool)
                  for section in self.section_objects.values()
                  if section.tool is not None]
@@ -192,10 +193,15 @@ class SnippetEditor(QWidget):
         tools.append((None, TOOL_MOVE, "Move label",
                       "Click where the label belongs, and it moves there - "
                       "on this image.\nMasks, orientation and size stay "
-                      "with the imagery they were drawn on."))
-        for owner, tool_id, text, tip in tools:
-            button = QPushButton(text)
-            button.setToolTip(tip)
+                      "with the imagery they were drawn on.", Qt.Key_V))
+        for owner, tool_id, text, tip, key in tools:
+            # A tool is a key away, so a hand on the mouse never has to
+            # leave the snippet for the row above it - and the key is on
+            # the button, where it will be found.
+            letter = QKeySequence(key).toString()
+            button = QPushButton(f"{text} ({letter})")
+            button.setToolTip(f"{tip}\n(key {letter})")
+            self._tool_keys[key] = tool_id
             button.setCheckable(True)
             self._tool_buttons.addButton(button)
             tool_row.insertWidget(len(self._tools) + 1, button)
@@ -531,6 +537,12 @@ class SnippetEditor(QWidget):
         # not a rating.
         if event.modifiers() & (Qt.ControlModifier | Qt.AltModifier):
             return False
+        # A tool's key picks it up - if it is there to pick up: a tool
+        # goes with its section.
+        tool = self._tool_keys.get(event.key())
+        if tool is not None and self._tools[tool].isEnabled():
+            self.set_tool(tool)
+            return True
         for key in self.sections_on():
             if self.section_objects[key].key_pressed(event.key()):
                 return True

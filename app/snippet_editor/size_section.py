@@ -173,7 +173,7 @@ class SizeSection(Section):
     title = "Size"
     tool = (TOOL_MEASURE, "Measure",
             "Left-drag draws the length, then the width, in metres on the\n"
-            "ground. Right-click clears them.")
+            "ground. Right-click clears them.", Qt.Key_M)
 
     # (label_id, length_m or None, width_m or None) - to the main window.
     size_changed = pyqtSignal(int, object, object)

@@ -13,7 +13,7 @@ A section is:
                filter, and its badge on the list's captions (strip.py)
   panel        its widget in the column on the right
   tool         optionally, a tool it owns on the Single view's canvas:
-               (tool id, button text, tooltip)
+               (tool id, button text, tooltip, the key that picks it up)
 
 and these hooks, all optional:
 
@@ -42,7 +42,7 @@ class Section(QObject):
 
     key = ""
     title = ""
-    # (tool id, button text, tooltip) for a Single-view tool, or None.
+    # (tool id, button text, tooltip, key) for a Single-view tool, or None.
     tool = None
 
     # A label this section edited (label_id).

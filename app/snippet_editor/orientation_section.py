@@ -613,7 +613,7 @@ class OrientationSection(Section):
     title = "Orientation"
     tool = (TOOL_ORIENT, "Orient",
             "Drag from the object's tail to its nose to set its\n"
-            "orientation; right-click clears it.")
+            "orientation; right-click clears it.", Qt.Key_O)
 
     def __init__(self, grid: OrientationEditor, single, parent=None):
         """``single`` is the Single view's mask editor: its canvas, its
