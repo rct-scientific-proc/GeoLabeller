@@ -178,11 +178,23 @@ class MaskEditor(QWidget):
             "Back to the imagery as it is.")
         self.reset_adjust_button.clicked.connect(self.reset_display_adjust)
         controls.addWidget(self.reset_adjust_button)
+        # The zoom, which stays as set from one snippet to the next, and
+        # the way back to the whole snippet.
+        controls.addSpacing(16)
+        self.zoom_label = QLabel("")
+        controls.addWidget(self.zoom_label)
+        self.fit_button = QPushButton("Fit")
+        self.fit_button.setToolTip(
+            "A zoom you set with the wheel is kept from snippet to\n"
+            "snippet. Fit goes back to the whole snippet, here and on\n"
+            "the ones that follow.")
+        controls.addWidget(self.fit_button)
         controls.addStretch(1)
         layout.addLayout(controls)
 
         hint = QLabel("Left-drag paints the active mask, right-drag erases; "
-                      "wheel zooms (to the cursor), Shift+drag pans. "
+                      "wheel zooms (to the cursor) and the zoom stays for "
+                      "the next snippet, Shift+drag pans. "
                       "Space / Ctrl+Space step through the snippets. "
                       "Each mask is its own layer; masks do not overlap "
                       "unless Allow Overlap is on.")
@@ -193,11 +205,19 @@ class MaskEditor(QWidget):
         self.canvas = MaskPaintCanvas()
         self.canvas.stroke_finished.connect(self._on_stroke_finished)
         self.brush_spin.valueChanged.connect(self.canvas.set_brush)
+        self.canvas.zoom_changed.connect(self._show_zoom)
+        self.fit_button.clicked.connect(self.canvas.reset_zoom)
+        self._show_zoom(self.canvas.zoom, False)
         self.canvas_scroll = QScrollArea()
         self.canvas_scroll.setWidget(self.canvas)
         self.canvas_scroll.setWidgetResizable(False)
         self.canvas_scroll.setAlignment(Qt.AlignCenter)
         self.canvas_scroll.setMinimumSize(360, 360)
+        # A scroll bar worked by hand is the user placing the view.
+        for bar in (self.canvas_scroll.horizontalScrollBar(),
+                    self.canvas_scroll.verticalScrollBar()):
+            bar.actionTriggered.connect(
+                lambda _action: self.canvas.view_moved())
         layout.addWidget(self.canvas_scroll, 1)
 
         # Mask management + statistics: the host's Masks section.
@@ -345,7 +365,7 @@ class MaskEditor(QWidget):
         size = self.size_spin.value()
         self._display_source = None
         if entry is None:
-            self.canvas.set_snippet(None, size, size)
+            self.canvas.set_snippet(None, size, size, None)
             self.canvas.set_layers({}, [], None)
             self._refresh_mask_list()
             self._refresh_stats()
@@ -395,7 +415,9 @@ class MaskEditor(QWidget):
             self._stored_by_name[name] = stored
         self._display_source = read_label_snippet(
             entry["image_path"], entry["pixel_x"], entry["pixel_y"], size)
-        self.canvas.set_snippet(self._adjusted_display(), w, h)
+        self.canvas.set_snippet(self._adjusted_display(), w, h,
+                                (entry["pixel_x"] - x0,
+                                 entry["pixel_y"] - y0))
         active = self._order[0] if self._order else None
         self.canvas.set_layers(self._layers, self._order, active)
         self._set_editable(not self._unreadable)
@@ -416,8 +438,7 @@ class MaskEditor(QWidget):
         adjusted = self._adjusted_display()
         if adjusted is None:
             return
-        h, w = adjusted.shape[:2]
-        self.canvas.set_snippet(adjusted, w, h)
+        self.canvas.set_pixels(adjusted)
 
     def reset_display_adjust(self):
         """Back to the imagery as it is."""
@@ -441,9 +462,17 @@ class MaskEditor(QWidget):
         for button in (self.add_button, self.delete_button):
             button.setToolTip(tip)
 
+    def _show_zoom(self, scale: float, kept: bool):
+        """The zoom beside Fit, which is live while a zoom is being kept."""
+        self.zoom_label.setText(f"Zoom: {scale:.3g}x")
+        self.fit_button.setEnabled(kept)
+
     def _on_size_changed(self):
         # Strokes commit as they happen, so the entry dicts already hold the
-        # latest masks; re-showing re-anchors them into the new window.
+        # latest masks; re-showing re-anchors them into the new window. A
+        # window of another size is another thing to look at: it starts
+        # fitted, whatever zoom the last one was given.
+        self.canvas.reset_zoom()
         self._show_entry(self._current)
 
     # -- mask management ----------------------------------------------------

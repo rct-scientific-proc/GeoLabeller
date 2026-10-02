@@ -94,6 +94,8 @@ class MaskPaintCanvas(QWidget):
     measure_moved = pyqtSignal(float, float, float, float)
     measure_drawn = pyqtSignal(float, float, float, float)
     measure_clear_requested = pyqtSignal()
+    # The zoom, and whether it is one the user set (and so is kept).
+    zoom_changed = pyqtSignal(float, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -115,6 +117,20 @@ class MaskPaintCanvas(QWidget):
         self._blocked: "np.ndarray | None" = None
         self._w = self._h = MASK_SNIPPET_SIZE
         self._scale = float(display_scale(MASK_SNIPPET_SIZE))
+        # A zoom the user set is theirs until they give it up: it carries
+        # from snippet to snippet, where every snippet used to start over
+        # at the fitted view - a wheel and a pan per snippet, for a pass
+        # of fine brushwork. None: nothing set, each snippet is fitted.
+        self._kept_zoom: "float | None" = None
+        # The label's own point in snippet pixels - what a kept view is
+        # held on, since a label near the image's edge is not at the
+        # middle of its snippet.
+        self._focus: "tuple | None" = None
+        # How far short the scroll bars fell of putting a label there (it
+        # is too near its snippet's edge). Owed to the next snippet, so
+        # one edge label does not leave the view shifted for the rest of
+        # the pass; forgotten once the user moves the view themselves.
+        self._view_owed = (0.0, 0.0)
         self._pan_last = None       # global pos while drag-panning
         # No imagery means no idea what is being painted over, and (when the
         # image size is unknown too) no idea where in the source the strokes
@@ -142,18 +158,40 @@ class MaskPaintCanvas(QWidget):
 
     # -- data ---------------------------------------------------------------
 
-    def set_snippet(self, arr: "np.ndarray | None", width: int, height: int):
-        """Show a snippet's display pixels; masks are set separately."""
+    def set_snippet(self, arr: "np.ndarray | None", width: int, height: int,
+                    focus: "tuple | None" = None):
+        """Show a snippet's display pixels; masks are set separately.
+
+        ``focus`` is the label's own point in snippet pixels. A snippet
+        starts fitted, unless the user has set a zoom: that is kept, and
+        the view with it - the new label's point lands where the last
+        one's was, so the next object is where the eye already is.
+        """
         self._w, self._h = width, height
-        self._scale = float(display_scale(max(width, height)))
+        before, self._focus = self._focus, focus
+        self._scale = (self._kept_zoom if self._kept_zoom is not None
+                       else float(display_scale(max(width, height))))
+        self.set_pixels(arr)
+        self._update_fixed_size()
+        if (self._kept_zoom is not None and before is not None
+                and focus is not None):
+            self._scroll_by((focus[0] - before[0]) * self._scale,
+                            (focus[1] - before[1]) * self._scale)
+        self.zoom_changed.emit(self._scale, self._kept_zoom is not None)
+
+    def set_pixels(self, arr: "np.ndarray | None"):
+        """Redraw the snippet in hand from other display pixels (a
+        brightness change): the same snippet, so the same view of it."""
         if arr is None:
             self._pixmap = None
         else:
             h, w = arr.shape[:2]
             image = QImage(arr.data, w, h, 3 * w, QImage.Format_RGB888)
             self._pixmap = QPixmap.fromImage(image)
-        self._update_fixed_size()
         self.update()
+
+    def focus(self) -> "tuple | None":
+        return self._focus
 
     def set_layers(self, layers: dict, order: list, active: "str | None"):
         self._layers = layers
@@ -316,6 +354,8 @@ class MaskPaintCanvas(QWidget):
         scale = max(MIN_ZOOM, min(MAX_ZOOM, float(scale)))
         if scale == self._scale:
             return
+        self._kept_zoom = scale
+        self.view_moved()
         old = self._scale
         area = self._scroll_area()
         viewport_pos = None
@@ -334,6 +374,40 @@ class MaskPaintCanvas(QWidget):
             area.verticalScrollBar().setValue(
                 round(ay * scale - viewport_pos.y()))
         self.update()
+        self.zoom_changed.emit(self._scale, True)
+
+    def zoom_kept(self) -> bool:
+        """Is the zoom one the user set, carried to the next snippet?"""
+        return self._kept_zoom is not None
+
+    def reset_zoom(self):
+        """Give the kept zoom up: this snippet and the next start fitted."""
+        self._kept_zoom = None
+        self.view_moved()
+        self._scale = float(display_scale(max(self._w, self._h)))
+        self._update_fixed_size()
+        self.update()
+        self.zoom_changed.emit(self._scale, False)
+
+    def view_moved(self):
+        """The user moved the view themselves (a zoom, a pan, a scroll
+        bar): where it is now is where they want it."""
+        self._view_owed = (0.0, 0.0)
+
+    def _scroll_by(self, dx: float, dy: float):
+        """Move the view, with whatever the last move was left owing."""
+        area = self._scroll_area()
+        if area is None:
+            return
+        owed = []
+        for bar, delta, short in ((area.horizontalScrollBar(), dx,
+                                   self._view_owed[0]),
+                                  (area.verticalScrollBar(), dy,
+                                   self._view_owed[1])):
+            wanted = bar.value() + delta + short
+            bar.setValue(round(wanted))
+            owed.append(wanted - bar.value())
+        self._view_owed = tuple(owed)
 
     def wheelEvent(self, event):
         dy = event.angleDelta().y()
@@ -538,6 +612,7 @@ class MaskPaintCanvas(QWidget):
                 vbar = area.verticalScrollBar()
                 hbar.setValue(hbar.value() - delta.x())
                 vbar.setValue(vbar.value() - delta.y())
+                self.view_moved()
             self._pan_last = event.globalPos()
             return
         if self._line_start is not None:
