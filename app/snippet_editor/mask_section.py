@@ -9,7 +9,8 @@ layer with its own overlay colour, kept from overlapping one another
 unless Allow Overlap is on. The Polygon tool fills a shape clicked out
 corner by corner (or cuts it out, begun with a right-click). The Wand
 takes the connected patch of pixels that look like the one clicked - as
-the snippet is displayed - within a tolerance a drag adjusts.
+the snippet is displayed - within a tolerance a drag adjusts. Grow, Shrink
+and Remove Specks tidy a mask a tool left nearly right.
 
 The paint surface itself is single_view.MaskPaintCanvas; the snippet list
 is strip.SnippetStrip, which the window owns and places. This module is
@@ -41,8 +42,9 @@ from PyQt5.QtWidgets import (
 
 from ..settings_scope import settings
 from ..debug_log import debug
-from ..masks import (entry_in_window, fill_enclosed, mask_statistics,
-                     merged_entry, polygon_mask, similar_region)
+from ..masks import (entry_in_window, fill_enclosed, grow, mask_statistics,
+                     merged_entry, polygon_mask, remove_specks, shrink,
+                     similar_region)
 from ..snippets import (read_label_snippet, read_label_window_raw,
                         snippet_frame)
 from .section import Section
@@ -343,6 +345,37 @@ class MaskEditor(QWidget):
         self.canvas.set_allow_overlap(self.overlap_button.isChecked())
         tools.addWidget(self.overlap_button)
         side.addLayout(tools)
+
+        # Tidying a mask a tool left nearly right - the wand, mostly: a
+        # pixel proud or shy of the edge all round, specks left lying
+        # about it. (Holes are Fill Enclosed's, above.)
+        tidy = QHBoxLayout()
+        self.grow_button = QPushButton("Grow")
+        self.grow_button.setToolTip(
+            "Make the active mask one pixel wider all round. It stops at\n"
+            "other masks unless Allow Overlap is on.")
+        self.grow_button.clicked.connect(self._on_grow)
+        tidy.addWidget(self.grow_button)
+        self.shrink_button = QPushButton("Shrink")
+        self.shrink_button.setToolTip(
+            "Make the active mask one pixel narrower all round.")
+        self.shrink_button.clicked.connect(self._on_shrink)
+        tidy.addWidget(self.shrink_button)
+        side.addLayout(tidy)
+        self.specks_button = QPushButton("Remove Specks")
+        self.specks_button.setToolTip(
+            "Remove the separate pieces of the active mask that are\n"
+            "smaller than the brush - specks a wand click or a stroke left\n"
+            "behind. The brush size says how small; the largest piece\n"
+            "always stays.")
+        self.specks_button.clicked.connect(self._on_remove_specks)
+        side.addWidget(self.specks_button)
+        # What Remove Specks found - said here, not in a box to dismiss.
+        self.tidy_note = QLabel("")
+        self.tidy_note.setWordWrap(True)
+        self.tidy_note.setStyleSheet("color: palette(mid);")
+        self.tidy_note.hide()
+        side.addWidget(self.tidy_note)
         side.addWidget(QLabel("Object vs background (raw values):"))
         self.stats_label = QLabel("-")
         self.stats_label.setWordWrap(True)
@@ -431,6 +464,7 @@ class MaskEditor(QWidget):
         self._display_source = None
         self._shown = None
         self._wand_pending = None
+        self._set_tidy_note("")
         if entry is None:
             self.canvas.set_snippet(None, size, size, None)
             self.canvas.set_layers({}, [], None)
@@ -524,7 +558,9 @@ class MaskEditor(QWidget):
     def _set_editable(self, editable: bool):
         """Paint, Add, Delete and Fill all follow the snippet's readability."""
         self.canvas.set_read_only(not editable)
-        for button in (self.add_button, self.delete_button, self.fill_button):
+        for button in (self.add_button, self.delete_button, self.fill_button,
+                       self.grow_button, self.shrink_button,
+                       self.specks_button):
             button.setEnabled(editable)
         tip = ("" if editable else
                "The image could not be read, so its masks are read-only.")
@@ -782,6 +818,63 @@ class MaskEditor(QWidget):
         self.canvas.invalidate_layer(name)
         self._emit_masks()
         self._refresh_stats()
+
+    # -- tidying ------------------------------------------------------------
+
+    def _set_tidy_note(self, text: str):
+        self.tidy_note.setText(text)
+        self.tidy_note.setVisible(bool(text))
+
+    def _tidied(self, name: str, tidied: np.ndarray) -> bool:
+        """Make ``name``'s layer ``tidied`` and commit it - one undo step,
+        or none at all when nothing changed."""
+        layer = self._layers[name]
+        if np.array_equal(tidied, layer):
+            return False
+        layer[:] = tidied
+        self.canvas.invalidate_layer(name)
+        self._emit_masks()
+        self._refresh_stats()
+        return True
+
+    def _tidy_target(self) -> "str | None":
+        """The mask in hand, if it can be edited."""
+        name = self._active_name()
+        if (name is None or name not in self._layers
+                or getattr(self, "_unreadable", False)):
+            return None
+        self._set_tidy_note("")
+        return name
+
+    def _on_grow(self):
+        name = self._tidy_target()
+        if name is not None:
+            self._tidied(name, grow(self._layers[name],
+                                    barrier=self._walls(name)))
+
+    def _on_shrink(self):
+        name = self._tidy_target()
+        if name is not None:
+            self._tidied(name, shrink(self._layers[name]))
+
+    def speck_limit(self) -> int:
+        """How small a speck is: fewer pixels than one stamp of the
+        brush, at the size it is set to."""
+        return int(MaskPaintCanvas._footprint_cells(
+            self.brush_spin.value()).sum())
+
+    def _on_remove_specks(self):
+        name = self._tidy_target()
+        if name is None:
+            return
+        limit = self.speck_limit()
+        cleaned, removed = remove_specks(self._layers[name], limit)
+        self._tidied(name, cleaned)
+        self._set_tidy_note(
+            f"Removed {removed} speck{'s' if removed != 1 else ''} - "
+            f"pieces smaller than the brush ({limit} px)." if removed else
+            f"No specks: no separate piece of '{name}' is smaller than "
+            f"the brush ({limit} px).")
 
     def _on_fill_enclosed(self):
         """Fill the active mask's enclosed interior (a drawn hull)."""

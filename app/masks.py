@@ -382,6 +382,109 @@ def similar_region(pixels: np.ndarray, x: int, y: int, tolerance: int,
     return flood(seed, ground)
 
 
+def grow(mask: np.ndarray,
+         barrier: "np.ndarray | None" = None) -> np.ndarray:
+    """``mask`` a pixel wider all round: every pixel beside one of its own
+    (above, below, left or right) joins it - except ``barrier`` pixels,
+    other masks' when masks may not overlap."""
+    mask = np.asarray(mask, dtype=bool)
+    grown = mask.copy()
+    grown[1:, :] |= mask[:-1, :]
+    grown[:-1, :] |= mask[1:, :]
+    grown[:, 1:] |= mask[:, :-1]
+    grown[:, :-1] |= mask[:, 1:]
+    if barrier is not None:
+        grown &= ~np.asarray(barrier, dtype=bool) | mask
+    return grown
+
+
+def shrink(mask: np.ndarray) -> np.ndarray:
+    """``mask`` a pixel narrower all round: a pixel stays only if the four
+    beside it are in the mask too.
+
+    The window's edge is not an edge of the mask. A mask painted at a
+    larger snippet size runs on beyond the window being edited, so beyond
+    the window counts as mask: nothing is eaten inward from a border the
+    mask merely happens to be cut off by.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    kept = mask.copy()
+    kept[1:, :] &= mask[:-1, :]
+    kept[:-1, :] &= mask[1:, :]
+    kept[:, 1:] &= mask[:, :-1]
+    kept[:, :-1] &= mask[:, 1:]
+    return kept
+
+
+def pieces(mask: np.ndarray) -> "tuple[np.ndarray, int]":
+    """Number the separate pieces of a mask: (labels, how many).
+
+    ``labels`` is 0 off the mask and 1..n on it, one number a piece.
+    Pixels that touch only corner to corner are the same piece: a thin
+    line drawn on the slant is one stroke, not a row of specks.
+
+    Each row is cut into its unbroken runs, runs in neighbouring rows
+    that touch are joined, and every run takes the number of the group
+    it ends up in - so the work that is not numpy's is a loop over the
+    places runs touch, not over pixels.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    if not mask.any():
+        return labels, 0
+    runs = _run_ids(mask, 1)
+    span = int(runs.max()) + 1
+    touching = []
+    for upper, lower in (
+            (np.s_[:-1, :], np.s_[1:, :]),          # straight below
+            (np.s_[:-1, :-1], np.s_[1:, 1:]),       # below and right
+            (np.s_[:-1, 1:], np.s_[1:, :-1])):      # below and left
+        both = mask[upper] & mask[lower]
+        touching.append(runs[upper][both].astype(np.int64) * span
+                        + runs[lower][both])
+    parent = {}
+
+    def root(run):
+        while parent.get(run, run) != run:
+            parent[run] = parent.get(parent[run], parent[run])
+            run = parent[run]
+        return run
+
+    for pair in np.unique(np.concatenate(touching)).tolist():
+        a, b = root(pair // span), root(pair % span)
+        if a != b:
+            parent[max(a, b)] = min(a, b)
+    present = np.unique(runs[mask])
+    roots = np.array([root(run) for run in present.tolist()])
+    numbers = np.unique(roots, return_inverse=True)[1] + 1
+    table = np.zeros(span, dtype=np.int32)
+    table[present] = numbers
+    labels[mask] = table[runs[mask]]
+    return labels, int(numbers.max())
+
+
+def remove_specks(mask: np.ndarray,
+                  smaller_than: int) -> "tuple[np.ndarray, int]":
+    """Drop the separate pieces of ``mask`` with fewer than
+    ``smaller_than`` pixels: (cleaned, pieces removed).
+
+    The largest piece always stays, however small: specks are what is
+    left lying about a mask, and a mask that is one small piece is not
+    a speck of itself.
+    """
+    mask = np.asarray(mask, dtype=bool)
+    labels, count = pieces(mask)
+    sizes = np.bincount(labels.ravel(), minlength=count + 1)
+    sizes[0] = 0
+    specks = sizes < smaller_than
+    specks[0] = False
+    specks[int(np.argmax(sizes))] = False
+    removed = int(specks.sum())
+    if removed == 0:
+        return mask, 0
+    return mask & ~specks[labels], removed
+
+
 def fill_enclosed(mask: np.ndarray,
                   barrier: "np.ndarray | None" = None
                   ) -> "tuple[np.ndarray, int]":
