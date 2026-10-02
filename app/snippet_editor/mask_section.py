@@ -10,7 +10,8 @@ unless Allow Overlap is on. The Polygon tool fills a shape clicked out
 corner by corner (or cuts it out, begun with a right-click). The Wand
 takes the connected patch of pixels that look like the one clicked - as
 the snippet is displayed - within a tolerance a drag adjusts. Grow, Shrink
-and Remove Specks tidy a mask a tool left nearly right.
+and Remove Specks tidy a mask a tool left nearly right. [ and ] make the
+brush smaller and larger, and H, held, shows the imagery under the masks.
 
 The paint surface itself is single_view.MaskPaintCanvas; the snippet list
 is strip.SnippetStrip, which the window owns and places. This module is
@@ -152,7 +153,8 @@ class MaskEditor(QWidget):
         self.brush_spin.setRange(1, 64)
         self.brush_spin.setValue(DEFAULT_BRUSH_PX)
         self.brush_spin.setSuffix(" px")
-        self.brush_spin.setToolTip("Brush diameter in source pixels.")
+        self.brush_spin.setToolTip("Brush diameter in source pixels "
+                                   "([ smaller, ] larger).")
         controls.addWidget(self.brush_spin)
         controls.addWidget(QLabel("Tolerance:"))
         self.tolerance_spin = QSpinBox()
@@ -403,6 +405,14 @@ class MaskEditor(QWidget):
 
     def allow_overlap(self) -> bool:
         return self.overlap_button.isChecked()
+
+    def step_brush(self, direction: int):
+        """Make the brush a step larger (+1) or smaller (-1): about a
+        fifth of its size, and never less than a pixel, so the step is
+        fine on a small brush and worth pressing on a large one."""
+        size = self.brush_spin.value()
+        step = max(1, round(size * 0.2))
+        self.brush_spin.setValue(size + step * (1 if direction > 0 else -1))
 
     def set_tool_hint(self, text: str):
         """Say what the tool in hand does, above the snippet."""
@@ -975,8 +985,9 @@ class MaskSection(Section):
     key = "masks"
     title = "Masks"
     tool = (TOOL_PAINT, "Paint masks",
-            "Left-drag paints the active mask, right-drag erases.",
-            Qt.Key_P)
+            "Left-drag paints the active mask, right-drag erases; [ and ] "
+            "make the brush smaller and larger.\nHold H to look under the "
+            "masks.", Qt.Key_P)
     tools = [
         tool,
         (TOOL_POLYGON, "Polygon",
@@ -1009,4 +1020,17 @@ class MaskSection(Section):
     def key_pressed(self, key):
         # Enter, Backspace and Escape, while a polygon is being clicked
         # out - and only then.
-        return self._editor.canvas.polygon_key(key)
+        if self._editor.canvas.polygon_key(key):
+            return True
+        if key in (Qt.Key_BracketLeft, Qt.Key_BracketRight):
+            self._editor.step_brush(1 if key == Qt.Key_BracketRight else -1)
+            return True
+        if key == Qt.Key_H:
+            # Held: the masks are not drawn until it is let go.
+            self._editor.canvas.set_peek(True)
+            return True
+        return False
+
+    def key_released(self, key):
+        if key == Qt.Key_H:
+            self._editor.canvas.set_peek(False)

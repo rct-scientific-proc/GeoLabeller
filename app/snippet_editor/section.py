@@ -28,6 +28,8 @@ and these hooks, all optional:
   view_changed(single)  the Single / Grid view changed; return a line to
                         show under the header ("" for none)
   key_pressed(key)      a key in the Single view; True if it was used
+  key_released(key)     a key let go, for a section that holds something
+                        on while a key is down
   restore_settings(s)   take up what it remembers between sessions
   save_settings(s)      and leave it for the next one
 
@@ -88,6 +90,9 @@ class Section(QObject):
     def key_pressed(self, key: int) -> bool:
         """A key pressed in the Single view; True if this section used it."""
         return False
+
+    def key_released(self, key: int):
+        """A key was let go - whatever view or focus it was let go in."""
 
     def restore_settings(self, settings):
         """Take up what this section remembers between sessions."""

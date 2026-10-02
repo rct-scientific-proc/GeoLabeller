@@ -131,6 +131,8 @@ SHORTCUT_SECTIONS = [
          "First click: cut the shape out. After: take back a corner"),
         ("Backspace / Escape", "Polygon: take back a corner / give it up"),
         ("Left-drag", "Paint a mask, draw a heading, or measure"),
+        ("[ / ]", "Brush smaller / larger"),
+        ("H (hold)", "Look under the masks"),
         ("Click (Move label)", "Put the label there, on its own image"),
         ("Right-drag", "Erase the mask (Paint)"),
         ("Right-click", "Clear the heading (Orient) or the size (Measure)"),

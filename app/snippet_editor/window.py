@@ -541,7 +541,27 @@ class SnippetEditor(QWidget):
         if (event.type() == QEvent.KeyPress and self._owns(obj)
                 and self._take_key(event)):
             return True
+        if event.type() == QEvent.KeyRelease and self._owns(obj):
+            self._key_released(event)
         return super().eventFilter(obj, event)
+
+    def _key_released(self, event):
+        """A key let go, for a section holding something on while it was
+        down (H: a look under the masks). Told whatever has the focus by
+        now, and never claimed - the focused widget gets its release too.
+        The releases a held key repeats are not the key being let go."""
+        if event.isAutoRepeat():
+            return
+        for section in self.section_objects.values():
+            section.key_released(event.key())
+
+    def changeEvent(self, event):
+        # A key held as the window loses the keyboard is let go somewhere
+        # this window never hears of: end what it was holding on.
+        if (event.type() == QEvent.ActivationChange
+                and not self.isActiveWindow()):
+            self.masks.canvas.set_peek(False)
+        super().changeEvent(event)
 
     def _owns(self, obj) -> bool:
         """Is this event on its way to something in this window?"""
@@ -577,7 +597,8 @@ class SnippetEditor(QWidget):
             return False
         # Sections answer to plain keys: Ctrl+A is not "accept", Ctrl+1 is
         # not a rating.
-        if event.modifiers() & (Qt.ControlModifier | Qt.AltModifier):
+        if (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier)
+                and not self._typed_with_altgr(event)):
             return False
         # A tool's key picks it up - if it is there to pick up: a tool
         # goes with its section.
@@ -589,6 +610,16 @@ class SnippetEditor(QWidget):
             if self.section_objects[key].key_pressed(event.key()):
                 return True
         return False
+
+    @staticmethod
+    def _typed_with_altgr(event) -> bool:
+        """Is this a character that takes AltGr to type on this keyboard?
+        [ and ] do on most European layouts, and Windows reports AltGr as
+        Ctrl+Alt - which would otherwise make them chords, and dead here.
+        A real Ctrl+Alt chord types no character of its own."""
+        both = Qt.ControlModifier | Qt.AltModifier
+        return ((event.modifiers() & both) == both
+                and event.text() in ("[", "]"))
 
     def _take_class_key(self, event) -> bool:
         """Ctrl+1-9: the class at that place in the list."""

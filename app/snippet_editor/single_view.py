@@ -173,6 +173,9 @@ class MaskPaintCanvas(QWidget):
         # Kept apart from _read_only, which means "this image cannot be
         # read" and carries its own cursor and message.
         self._layers_shown = True
+        # A look under the masks, while a key is held: nothing of them is
+        # drawn, and nothing about them has changed.
+        self._peek = False
         self._tool = TOOL_PAINT
         # The orientation arrow, drawn back from a stored angle: (radians,
         # colour, centre in snippet pixels) or None. The colour is the
@@ -333,6 +336,17 @@ class MaskPaintCanvas(QWidget):
         """Draw the mask layers and take strokes - or neither."""
         self._layers_shown = bool(shown)
         self.update()
+
+    def peeking(self) -> bool:
+        return self._peek
+
+    def set_peek(self, peek: bool):
+        """Leave the masks undrawn for a moment, to see the imagery under
+        them - or draw them again. Only what is drawn: the masks, the
+        tool in hand and what it would do are all as they were."""
+        if bool(peek) != self._peek:
+            self._peek = bool(peek)
+            self.update()
 
     def set_read_only(self, read_only: bool):
         """Show the masks but accept no strokes."""
@@ -503,11 +517,12 @@ class MaskPaintCanvas(QWidget):
         if self._pixmap is not None:
             painter.drawPixmap(target, self._pixmap)
         if self._layers_shown:
-            for name in self._order:
-                if name in self._layers:
-                    painter.drawImage(target, self._overlay_image(name))
-            if self._preview is not None:
-                painter.drawImage(target, self._preview)
+            if not self._peek:
+                for name in self._order:
+                    if name in self._layers:
+                        painter.drawImage(target, self._overlay_image(name))
+                if self._preview is not None:
+                    painter.drawImage(target, self._preview)
             if self._tool == TOOL_PAINT:
                 self._draw_brush_preview(painter)
         painter.setRenderHint(QPainter.Antialiasing, True)
