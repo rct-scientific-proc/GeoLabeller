@@ -4282,8 +4282,10 @@ class MainWindow(QMainWindow):
         The GT names its images by paths on the machine that wrote it; here
         they are matched to the images already loaded, by filename, checked
         against the size and CRS it recorded (app/gt_import.py has the
-        rules). A preview shows what will and will not come in, and nothing
-        changes until the user chooses Import.
+        rules) - the same imagery at another resolution included, whose
+        labels go across by ground position. A preview shows what will and
+        will not come in, and nothing changes until the user chooses
+        Import.
         """
         title = "Import Ground Truth"
         if not self.project.images:
@@ -4341,7 +4343,14 @@ class MainWindow(QMainWindow):
             message += f"; {result.duplicates} already here"
         if result.left_out:
             message += f"; {result.left_out} left out (images not loaded)"
-        self.statusBar.showMessage(message, 8000)
+        if result.rescaled_images:
+            message += (f"; {result.rescaled_images} at another resolution "
+                        "here, placed by ground position")
+        if result.masks_left_out:
+            message += (f"; {result.masks_left_out} mask"
+                        f"{'' if result.masks_left_out == 1 else 's'} left "
+                        "out, to be redrawn")
+        self.statusBar.showMessage(message, 12000)
 
     def _confirm_gt_import(self, plan, source_name: str) -> bool:
         """The preview; a method of its own so tests can answer it."""
