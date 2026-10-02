@@ -1,5 +1,6 @@
 """Map canvas for displaying GeoTIFF images with tiled rendering."""
 import math
+import os
 import traceback
 from enum import Enum, auto
 from pathlib import Path
@@ -152,6 +153,54 @@ def _rgba_pixmap(rgba: np.ndarray) -> QPixmap:
 
 # A marker rejected in review is drawn at this opacity.
 REJECTED_OPACITY = 0.3
+
+class _ActiveBrackets(QGraphicsPathItem):
+    """Four corner brackets around a label marker: "this label is on the
+    image being shown".
+
+    White over a dark edge, so they read on bright imagery and dark alike
+    - which one flat colour does not. A child of the marker's ellipse, so
+    position, visibility, opacity and removal come for free.
+    """
+
+    # Brackets' outer size as a multiple of the marker: outside the
+    # linked-group ring (1.9), so both show on a linked label.
+    FACTOR = 2.9
+
+    def __init__(self, marker_size: float, parent):
+        super().__init__(parent)
+        self.setFlag(QGraphicsItem.ItemStacksBehindParent, True)
+        self.resize(marker_size)
+
+    def resize(self, marker_size: float):
+        """Fit the brackets to a marker ``marker_size`` scene units across."""
+        self._line = marker_size / 5.0
+        half = marker_size * self.FACTOR / 2.0
+        arm = half * 0.45
+        path = QPainterPath()
+        for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+            path.moveTo(sx * half, sy * (half - arm))
+            path.lineTo(sx * half, sy * half)
+            path.lineTo(sx * (half - arm), sy * half)
+        self.setPath(path)
+        # The item's own pen is the dark edge's width: it is what sizes
+        # the bounding rect, and the painting below stays inside it.
+        edge = QPen(QColor(0, 0, 0, 210), self._line * 2.2)
+        edge.setCapStyle(Qt.SquareCap)
+        edge.setJoinStyle(Qt.MiterJoin)
+        self.setPen(edge)
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(self.pen())
+        painter.drawPath(self.path())
+        line = QPen(QColor(255, 255, 255), self._line)
+        line.setCapStyle(Qt.SquareCap)
+        line.setJoinStyle(Qt.MiterJoin)
+        painter.setPen(line)
+        painter.drawPath(self.path())
+
 
 # Waterfall mode: a bottom-level group's images are stacked vertically in the
 # pixel zone (raw pixels, no reprojection) so the view can glide through them
@@ -2266,6 +2315,12 @@ class MapCanvas(QGraphicsView):
         # Link mode state
         self._link_mode_active = False
         self._link_source_label_id: int | None = None
+        # The image whose labels wear the "on this image" brackets (the
+        # one a cycle is showing), as a path key; and label ids by the key
+        # of the image they are on, so a cycle step touches the labels of
+        # two images rather than every marker in the project.
+        self._active_image_key: str | None = None
+        self._labels_by_image: dict[str, set] = {}
         # The label being moved (right-click > Move), waiting for the click
         # that says where to; and its marker's pen, to put back.
         self._move_label_id: int | None = None
@@ -3931,6 +3986,7 @@ class MapCanvas(QGraphicsView):
         self._tile_build_queued.clear()
         self._tile_build_timer.stop()
         self._layers.clear()
+        self._active_image_key = None
         self._visible_layer_ids.clear()
         self._empty_tiles.clear()
         self._world_rect_cache = None
@@ -5044,6 +5100,59 @@ class MapCanvas(QGraphicsView):
         ellipse, text = self._make_label_marker_items(
             x, y, class_name, color, image_path, ring_color=ring_color)
         self._label_items[label_id] = (ellipse, text)
+        key = self._image_key(image_path)
+        self._labels_by_image.setdefault(key, set()).add(label_id)
+        if key == self._active_image_key:
+            self._set_brackets(ellipse, True)
+
+    # ------------------------------------------------------------------
+    # The labels of the image being shown. Asked for 2026-10-02: stepping
+    # through images that overlap, the labels of the neighbours lie over
+    # the one on screen, and nothing said which belonged to it.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _image_key(image_path) -> str:
+        """One spelling of an image path, for telling images apart."""
+        return os.path.normcase(canonical_path(image_path or ""))
+
+    @staticmethod
+    def _brackets_of(ellipse) -> "_ActiveBrackets | None":
+        for child in ellipse.childItems():
+            if isinstance(child, _ActiveBrackets):
+                return child
+        return None
+
+    def _set_brackets(self, ellipse, on: bool):
+        brackets = self._brackets_of(ellipse)
+        if on and brackets is None:
+            _ActiveBrackets(ellipse.rect().width(), ellipse)
+        elif not on and brackets is not None:
+            brackets.setParentItem(None)
+            self._scene.removeItem(brackets)
+
+    def set_active_image(self, image_path: "str | None"):
+        """Mark every label on ``image_path`` as being on the image shown
+        - all alike, with corner brackets - and no others. None marks
+        none."""
+        key = self._image_key(image_path) if image_path else None
+        if key == self._active_image_key:
+            return
+        for old_id in self._labels_by_image.get(self._active_image_key, ()):
+            item = self._label_items.get(old_id)
+            if item is not None:
+                self._set_brackets(item[0], False)
+        self._active_image_key = key
+        for new_id in self._labels_by_image.get(key, ()):
+            item = self._label_items.get(new_id)
+            if item is not None:
+                self._set_brackets(item[0], True)
+
+    def active_image_labels(self) -> set:
+        """The ids of the labels now wearing the brackets."""
+        return {label_id for label_id, (ellipse, _t)
+                in self._label_items.items()
+                if self._brackets_of(ellipse) is not None}
 
     # Outer ring diameter as a multiple of the marker: a halo around the
     # marker rather than an outline on it, so it reads at a glance and never
@@ -5233,6 +5342,10 @@ class MapCanvas(QGraphicsView):
         """Remove a label marker from the canvas."""
         if label_id in self._label_items:
             ellipse, text = self._label_items[label_id]
+            on_image = self._labels_by_image.get(
+                self._image_key(ellipse.data(0)))
+            if on_image is not None:
+                on_image.discard(label_id)
             self._scene.removeItem(ellipse)
             self._scene.removeItem(text)
             del self._label_items[label_id]
@@ -5288,6 +5401,9 @@ class MapCanvas(QGraphicsView):
                 ring_pen = ring.pen()
                 ring_pen.setWidthF(marker_size / 4)
                 ring.setPen(ring_pen)
+            brackets = self._brackets_of(ellipse)
+            if brackets is not None:
+                brackets.resize(marker_size)
 
             # Text ignores the view transform (constant size / upright), so it
             # only needs repositioning as the marker size changes.

@@ -1397,6 +1397,8 @@ class MainWindow(QMainWindow):
         """
         # Warmed neighbours are only worth their memory inside the cycle.
         self.canvas.clear_warmed_layers()
+        # ...and the marking of "this image's labels" with the cycle too.
+        self.canvas.set_active_image(None)
         mode = self._cycle_mode
         if self._cycle_layers and self._cycle_index >= 0 and mode is not None:
             # Each mode parks its own run. A finished View Cycle is not
@@ -1483,6 +1485,9 @@ class MainWindow(QMainWindow):
             self._cycle_turned_on.add(layer_id)
         self.layer_panel.check_layers([layer_id])
         self._cycle_shown = layer_id
+        # Its labels are marked: where images overlap, the neighbours'
+        # labels lie over this one and nothing else says which are its.
+        self.canvas.set_active_image(layer.file_path)
         self._cycle_zoom_to(layer_id)
 
     def _cycle_zoom_to(self, layer_id: str):
@@ -1742,6 +1747,7 @@ class MainWindow(QMainWindow):
         self._cycle_turned_on.discard(layer_id)
         if self._cycle_shown == layer_id:
             self._cycle_shown = None
+            self.canvas.set_active_image(None)
         for mode, (queue, index) in list(self._cycle_parked.items()):
             if layer_id in queue:
                 queue, index, _gone = self._without(queue, index, layer_id)
