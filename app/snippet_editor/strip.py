@@ -363,6 +363,16 @@ class SnippetStrip(QObject):
             item.setText(self._caption(entry))
         self._update_counts()
 
+    def refresh_many(self, label_ids):
+        """Several entries changed at once (a page accepted): recaption
+        each, recount once."""
+        for label_id in label_ids:
+            item = self.items_by_label.get(label_id)
+            entry = self.entries_by_label.get(label_id)
+            if item is not None and entry is not None:
+                item.setText(self._caption(entry))
+        self._update_counts()
+
     def refresh_current(self):
         self.refresh()
 

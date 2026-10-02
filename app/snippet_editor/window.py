@@ -54,6 +54,7 @@ _SPLITTER_KEY = "snippet_editor/splitter"
 _SECTIONS_OFF_KEY = "snippet_editor/sections_off"
 _TOOL_KEY = "snippet_editor/tool"
 _CLASS_LINKED_KEY = "snippet_editor/class_change_linked"
+_GRID_MODE_KEY = "snippet_editor/grid_mode"
 
 
 class SectionFrame(QWidget):
@@ -110,6 +111,8 @@ class SnippetEditor(QWidget):
     orientation_changed = pyqtSignal(int, object, object, bool)
     confidence_changed = pyqtSignal(int, int)
     review_changed = pyqtSignal(int, str)
+    # ([label ids], status): a page of the review grid marked at once.
+    reviews_changed = pyqtSignal(list, str)
     # (label_id, class name): the main window applies it to the label's
     # whole linked object - the same thing seen in different images.
     class_changed = pyqtSignal(int, str, bool)   # +also the linked labels
@@ -147,7 +150,7 @@ class SnippetEditor(QWidget):
                     MaskSection(self.masks, self),
                     SizeSection(self.masks, self.grid._geo_info, self),
                     ConfidenceSection(self),
-                    ReviewSection(self))
+                    ReviewSection(self.grid, self))
         self.section_objects = {section.key: section for section in sections}
         self.orientation_panel = self.section_objects["orientation"].panel
         self._apply_worklists(self.section_objects)
@@ -173,7 +176,8 @@ class SnippetEditor(QWidget):
             "rating. Space / Ctrl+Space step through the list.")
         self.grid_button = QPushButton("Grid")
         self.grid_button.setToolTip(
-            "A page of snippets at once - for orienting them quickly.\n"
+            "A page of snippets at once - for orienting them quickly, or\n"
+            "reviewing a page at a time.\n"
             "Double-click one to open it in the Single view.")
         self._view_buttons = QButtonGroup(self)
         for index, button in ((self.SINGLE, self.single_button),
@@ -304,12 +308,11 @@ class SnippetEditor(QWidget):
         layout.addLayout(footer)
         # The one Ctrl+S in this window - the hosted mask panel does not
         # claim it, since two claims of one chord make Qt fire neither.
-        QShortcut(QKeySequence.Save, self,
-                  activated=self.save_requested.emit)
+        QShortcut(QKeySequence.Save, self, activated=self._request_save)
 
     def _wire(self):
         self._view_buttons.idClicked.connect(self.set_view)
-        self.save_button.clicked.connect(self.save_requested.emit)
+        self.save_button.clicked.connect(self._request_save)
         for tool_id, button in self._tools.items():
             button.clicked.connect(
                 lambda _checked=False, t=tool_id: self.set_tool(t))
@@ -321,8 +324,9 @@ class SnippetEditor(QWidget):
         self.section_objects["confidence"].confidence_changed.connect(
             self.confidence_changed)
         self.section_objects["size"].size_changed.connect(self.size_changed)
-        self.section_objects["review"].review_changed.connect(
-            self.review_changed)
+        review = self.section_objects["review"]
+        review.review_changed.connect(self.review_changed)
+        review.reviews_changed.connect(self.reviews_changed)
         notes = self.section_objects["notes"]
         notes.description_changed.connect(self.description_changed)
         notes.group_id_changed.connect(self.group_id_changed)
@@ -333,6 +337,7 @@ class SnippetEditor(QWidget):
         self.masks.snippet_shown.connect(self._show_entry)
         for section in self.section_objects.values():
             section.entry_changed.connect(self._on_entry_changed)
+            section.entries_changed.connect(self._on_entries_changed)
             # A key that finishes the snippet moves on to the next, when
             # its section asks.
             section.advance_requested.connect(lambda: self.strip.cycle(1))
@@ -488,6 +493,19 @@ class SnippetEditor(QWidget):
         for section in self.section_objects.values():
             section.refresh(label_id)
 
+    def _on_entries_changed(self, label_ids: list):
+        """A section edited many labels at once: recount the list once."""
+        self.strip.refresh_many(label_ids)
+        self.linked_row.refresh()
+        for section in self.section_objects.values():
+            for label_id in label_ids:
+                section.refresh(label_id)
+
+    def _request_save(self):
+        # A mark the review grid has shown but not yet stored goes in.
+        self.grid.flush_review()
+        self.save_requested.emit()
+
     # -- tools --------------------------------------------------------------
 
     def tool(self) -> str:
@@ -539,7 +557,11 @@ class SnippetEditor(QWidget):
         if self._take_history_key(event):
             return True
         if self.view() != self.SINGLE:
-            return False
+            # The Grid view has keys of its own (A accepts a page, in
+            # Review mode) - plain ones, like the sections'.
+            if event.modifiers() & (Qt.ControlModifier | Qt.AltModifier):
+                return False
+            return self.grid.key_pressed(event.key())
         if self._take_class_key(event):
             return True
         if event.key() == Qt.Key_Space:
@@ -583,11 +605,15 @@ class SnippetEditor(QWidget):
         mods = event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier
                                     | Qt.AltModifier)
         if event.key() == Qt.Key_Z and mods == Qt.ControlModifier:
+            # What is undone is the last thing done - a mark the review
+            # grid has shown but not yet stored included.
+            self.grid.flush_review()
             self.undo_requested.emit()
             return True
         if (event.key() == Qt.Key_Y and mods == Qt.ControlModifier) or (
                 event.key() == Qt.Key_Z
                 and mods == Qt.ControlModifier | Qt.ShiftModifier):
+            self.grid.flush_review()
             self.redo_requested.emit()
             return True
         return False
@@ -630,6 +656,8 @@ class SnippetEditor(QWidget):
         for section in self.section_objects.values():
             section.restore_settings(settings)
         self._apply_sections()
+        # After the sections: Review mode needs the Review section on.
+        self.grid.set_mode(str(settings.value(_GRID_MODE_KEY, "")))
 
     def save_settings(self):
         """The view, panes, sections and tool - and the mask panel's, which
@@ -641,6 +669,7 @@ class SnippetEditor(QWidget):
             settings.setValue(_SECTIONS_OFF_KEY, ",".join(
                 key for key in self.sections if key not in self.sections_on()))
             settings.setValue(_TOOL_KEY, self.tool())
+            settings.setValue(_GRID_MODE_KEY, self.grid.mode())
             settings.setValue(_CLASS_LINKED_KEY, "true"
                               if self.class_linked_check.isChecked()
                               else "false")
@@ -652,5 +681,6 @@ class SnippetEditor(QWidget):
         self.masks.save_settings()
 
     def closeEvent(self, event):
+        self.grid.flush_review()
         self.save_settings()
         super().closeEvent(event)

@@ -17,6 +17,14 @@ Snippets come from the shared snippet service, so what the user orients on
 is exactly what the exports write. Cells display source pixels 1:1 - no
 scaling - so the drawn vector IS a source-pixel vector once the crop's
 origin is added back.
+
+The grid has a second mode, Review (2.3.12): the same page of snippets,
+each wearing what its review found. A click rejects a snippet (again takes
+that back), a right-click flags it to look at again, and "Accept the rest
+of the page" accepts what is left unmarked and moves on - a page of sixty
+checked with a handful of clicks, where the Single view was a key a
+snippet. What a mark MEANS is the Review section's business; the grid
+reports it (review_marked, reviews_marked).
 """
 import math
 from pathlib import Path
@@ -24,13 +32,15 @@ from pathlib import Path
 import numpy as np
 import rasterio
 
-from PyQt5.QtCore import QPointF, Qt, pyqtSignal
+from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import (
-    QCheckBox, QGridLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QVBoxLayout, QWidget)
+    QApplication, QButtonGroup, QCheckBox, QGridLayout, QHBoxLayout, QLabel,
+    QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
 from ..debug_log import debug
+from ..labels import (REVIEW_ACCEPTED, REVIEW_RECHECK, REVIEW_REJECTED,
+                      REVIEW_UNREVIEWED, valid_review)
 from ..orientation_math import (
     pixel_angle_from_heading, principal_angle_rad, true_heading_deg)
 from ..snippets import SnippetLoader, snippet_frame
@@ -55,6 +65,26 @@ MIN_DRAG_PX = 6         # anything shorter is a click, not a direction
 # glance. Drawing over a violet arrow turns it amber.
 MANUAL_COLOR = QColor(255, 170, 0)
 DERIVED_COLOR = QColor(175, 110, 255)
+
+# The grid's two modes: draw headings, or mark a page at a time.
+MODE_ORIENT = "orient"
+MODE_REVIEW = "review"
+
+# What a review found, on a cell in Review mode: its border, and the mark
+# in its corner.
+REVIEW_COLORS = {REVIEW_ACCEPTED: QColor(70, 200, 100),
+                 REVIEW_REJECTED: QColor(235, 70, 70),
+                 REVIEW_RECHECK: QColor(255, 200, 60)}
+_REVIEW_WORDS = {REVIEW_ACCEPTED: "accepted", REVIEW_REJECTED: "rejected",
+                 REVIEW_RECHECK: "look again"}
+
+_HINTS = {
+    MODE_ORIENT: "Drag across a snippet from the object's tail to its "
+                 "nose to set its orientation; right-click clears it.",
+    MODE_REVIEW: "Click a snippet to reject it (again to take that back); "
+                 "right-click flags it to look at again. Double-click "
+                 "opens it in the Single view.",
+}
 
 
 def _oriented(entry: dict) -> bool:
@@ -81,6 +111,9 @@ class OrientationCell(QWidget):
     # Double-click: look at this one closer (the Snippet Editor opens it
     # in its Single view).
     open_requested = pyqtSignal(int)
+    # Review mode: a click (REVIEW_REJECTED) or a right-click
+    # (REVIEW_RECHECK) - the status asked for: (label_id, status).
+    review_clicked = pyqtSignal(int, str)
 
     def __init__(self, label_id: int, size: int, parent=None):
         super().__init__(parent)
@@ -94,8 +127,13 @@ class OrientationCell(QWidget):
         # The Orientation section switched off: no arrow, no border, no
         # drawing - but a double-click still opens the snippet.
         self._orientation_shown = True
+        # Review mode: clicks mark the snippet instead of drawing on it,
+        # and it wears what its review found.
+        self._review_mode = False
+        self._review = REVIEW_UNREVIEWED
+        self._click_armed = False       # a left press, not yet let go
         self.setFixedSize(size, size)
-        self.setCursor(Qt.CrossCursor)
+        self._apply_cursor()
 
     # -- data ---------------------------------------------------------------
 
@@ -121,8 +159,33 @@ class OrientationCell(QWidget):
     def set_orientation_shown(self, shown: bool):
         self._orientation_shown = bool(shown)
         self._drag_start = self._drag_now = None
-        self.setCursor(Qt.CrossCursor if shown else Qt.ArrowCursor)
+        self._apply_cursor()
         self.update()
+
+    def review_mode(self) -> bool:
+        return self._review_mode
+
+    def set_review_mode(self, on: bool):
+        self._review_mode = bool(on)
+        self._drag_start = self._drag_now = None
+        self._click_armed = False
+        self._apply_cursor()
+        self.update()
+
+    def review(self) -> str:
+        return self._review
+
+    def set_review(self, status: str):
+        """The review status to wear in Review mode."""
+        self._review = valid_review(status)
+        self.update()
+
+    def _apply_cursor(self):
+        if self._review_mode:
+            self.setCursor(Qt.PointingHandCursor)
+        else:
+            self.setCursor(Qt.CrossCursor if self._orientation_shown
+                           else Qt.ArrowCursor)
 
     def _committed_color(self) -> QColor:
         return DERIVED_COLOR if self._derived else MANUAL_COLOR
@@ -135,9 +198,13 @@ class OrientationCell(QWidget):
         if self._pixmap is not None:
             painter.drawPixmap(0, 0, self._pixmap)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        if not self._orientation_shown:
-            painter.end()
-            return
+        if self._orientation_shown:
+            self._paint_orientation(painter)
+        if self._review_mode:
+            self._paint_review(painter)
+        painter.end()
+
+    def _paint_orientation(self, painter):
         if self._drag_start is not None and self._drag_now is not None:
             self._draw_arrow(painter, self._drag_start, self._drag_now,
                              QColor(0, 220, 255))
@@ -152,14 +219,48 @@ class OrientationCell(QWidget):
                              QPointF(cx - dx, cy - dy),
                              QPointF(cx + dx, cy + dy),
                              self._committed_color())
-        if self._angle_rad is not None:
+        if self._angle_rad is not None and not self._review_mode:
             # Oriented snippets get a border in the arrow's colour, so the
             # grid shows what is done (and how) without reading captions.
+            # (In Review mode the border says what the review found.)
             pen = QPen(self._committed_color(), 3)
             painter.setBrush(Qt.NoBrush)
             painter.setPen(pen)
             painter.drawRect(1, 1, self._size - 3, self._size - 3)
-        painter.end()
+
+    def _paint_review(self, painter):
+        """What the review found, to be read across a page: a border in
+        the status's colour and its mark in the corner; a rejected snippet
+        is dimmed and struck through as well, so it cannot pass for one
+        that is merely not looked at yet."""
+        color = REVIEW_COLORS.get(self._review)
+        if color is None:
+            return
+        size = self._size
+        if self._review == REVIEW_REJECTED:
+            painter.fillRect(self.rect(), QColor(0, 0, 0, 120))
+            painter.setPen(QPen(color, 3))
+            painter.drawLine(16, 16, size - 16, size - 16)
+            painter.drawLine(size - 16, 16, 16, size - 16)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(color, 4))
+        painter.drawRect(2, 2, size - 4, size - 4)
+        if self._review == REVIEW_REJECTED:
+            return
+        tab = QRectF(size - 30, 4, 26, 26)
+        painter.fillRect(tab, color)
+        painter.setPen(QPen(QColor(25, 25, 25), 3))
+        if self._review == REVIEW_ACCEPTED:
+            painter.drawPolyline(QPolygonF([
+                QPointF(tab.left() + 6, tab.top() + 14),
+                QPointF(tab.left() + 11, tab.top() + 19),
+                QPointF(tab.left() + 20, tab.top() + 7)]))
+        else:
+            font = painter.font()
+            font.setBold(True)
+            font.setPixelSize(20)
+            painter.setFont(font)
+            painter.drawText(tab, Qt.AlignCenter, "?")
 
     @staticmethod
     def _draw_arrow(painter, start: QPointF, end: QPointF, color: QColor):
@@ -178,6 +279,12 @@ class OrientationCell(QWidget):
     # -- interaction --------------------------------------------------------
 
     def mousePressEvent(self, event):
+        if self._review_mode:
+            if event.button() == Qt.LeftButton:
+                self._click_armed = True
+            elif event.button() == Qt.RightButton:
+                self.review_clicked.emit(self._label_id, REVIEW_RECHECK)
+            return
         if not self._orientation_shown:
             return
         if event.button() == Qt.LeftButton:
@@ -189,8 +296,10 @@ class OrientationCell(QWidget):
 
     def mouseDoubleClickEvent(self, event):
         # A double-click is two clicks, not a drag: drop anything the
-        # second press started, so its release draws nothing.
+        # second press started, so its release draws nothing (and, in
+        # Review mode, marks nothing).
         self._drag_start = self._drag_now = None
+        self._click_armed = False
         if event.button() == Qt.LeftButton:
             self.open_requested.emit(self._label_id)
         self.update()
@@ -201,6 +310,13 @@ class OrientationCell(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, event):
+        if self._review_mode:
+            armed, self._click_armed = self._click_armed, False
+            # Let go off the snippet: a change of mind, not a click.
+            if (armed and event.button() == Qt.LeftButton
+                    and self.rect().contains(event.pos())):
+                self.review_clicked.emit(self._label_id, REVIEW_REJECTED)
+            return
         if event.button() != Qt.LeftButton or self._drag_start is None:
             return
         start, end = self._drag_start, QPointF(event.pos())
@@ -223,6 +339,10 @@ class OrientationEditor(QWidget):
     orientation_changed = pyqtSignal(int, object, object, bool)
     # A cell was double-clicked: (label_id).
     open_requested = pyqtSignal(int)
+    # Review mode: one snippet marked - (label_id, status) - and a page
+    # of them accepted at once - ([label ids], status), one step to undo.
+    review_marked = pyqtSignal(int, str)
+    reviews_marked = pyqtSignal(list, str)
 
     def __init__(self, strip: SnippetStrip, parent=None):
         super().__init__(parent)
@@ -246,6 +366,19 @@ class OrientationEditor(QWidget):
         # behind the view the user was actually in.
         self._active = True
         self._stale = False
+        self._mode = MODE_ORIENT
+        # The Review section switched off: no Review mode to be in.
+        self._review_shown = True
+        # A click that rejects may be the first half of a double-click,
+        # which opens the snippet instead. So the click SHOWS at once and
+        # is stored a moment later, once it is plainly not one: (label_id,
+        # status), or None. Anything that reads or moves on - another
+        # mark, the next page, an undo, a save - stores it first.
+        self._pending_review = None
+        self._review_timer = QTimer(self)
+        self._review_timer.setSingleShot(True)
+        self._review_timer.setInterval(QApplication.doubleClickInterval())
+        self._review_timer.timeout.connect(self.flush_review)
         self._setup_ui()
         strip.rebuilt.connect(self._on_strip_rebuilt)
 
@@ -265,11 +398,28 @@ class OrientationEditor(QWidget):
         # Not laid out here: the host places it, in its Orientation
         # section.
 
-        hint = QLabel(
-            "Drag across a snippet from the object's tail to its nose to "
-            "set its orientation; right-click clears it.")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        # What the page is for: drawing headings, or marking reviews.
+        top = QHBoxLayout()
+        self.orient_mode_button = QPushButton("Orient")
+        self.orient_mode_button.setToolTip(
+            "Draw each snippet's orientation across it.")
+        self.review_mode_button = QPushButton("Review")
+        self.review_mode_button.setToolTip(
+            "Mark a page at a time: click the wrong ones, flag the\n"
+            "doubtful ones, accept the rest.")
+        self._mode_buttons = QButtonGroup(self)
+        for mode, button in ((MODE_ORIENT, self.orient_mode_button),
+                             (MODE_REVIEW, self.review_mode_button)):
+            button.setCheckable(True)
+            self._mode_buttons.addButton(button)
+            button.clicked.connect(
+                lambda _checked=False, m=mode: self.set_mode(m))
+            top.addWidget(button)
+        self.orient_mode_button.setChecked(True)
+        self.hint = QLabel(_HINTS[MODE_ORIENT])
+        self.hint.setWordWrap(True)
+        top.addWidget(self.hint, 1)
+        layout.addLayout(top)
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
@@ -280,6 +430,15 @@ class OrientationEditor(QWidget):
         layout.addWidget(self._scroll)
 
         pager = QHBoxLayout()
+        self.accept_page_button = QPushButton(
+            "Accept the rest of the page (A)")
+        self.accept_page_button.setToolTip(
+            "Accept every snippet on this page that is not marked, and go\n"
+            "on to the next page. Rejected and flagged ones stay as they "
+            "are.")
+        self.accept_page_button.clicked.connect(self.accept_page)
+        self.accept_page_button.setVisible(False)
+        pager.addWidget(self.accept_page_button)
         pager.addStretch(1)
         self.prev_button = QPushButton("< Previous")
         self.prev_button.clicked.connect(lambda: self._step_page(-1))
@@ -319,6 +478,8 @@ class OrientationEditor(QWidget):
         """Say whether the grid is the view showing; coming back into
         view, it catches up with what the list did meanwhile."""
         self._active = bool(active)
+        if not self._active:
+            self.flush_review()
         if self._active and self._stale:
             self._rebuild()
 
@@ -331,6 +492,7 @@ class OrientationEditor(QWidget):
         return max(1, -(-len(self._shown_entries()) // PAGE_SIZE))
 
     def _rebuild(self):
+        self.flush_review()
         self._stale = False
         self._loader.cancel_all()
         while self._grid.count():
@@ -355,10 +517,13 @@ class OrientationEditor(QWidget):
             cell = OrientationCell(label_id, SNIPPET_SIZE)
             cell.vector_drawn.connect(self._on_vector_drawn)
             cell.clear_requested.connect(self._on_clear)
-            cell.open_requested.connect(self.open_requested)
+            cell.open_requested.connect(self._on_open_requested)
+            cell.review_clicked.connect(self._on_review_clicked)
             cell.set_angle(entry.get("orientation_px_rad"),
                            derived=bool(entry.get("orientation_derived")))
             cell.set_orientation_shown(self._orientation_shown)
+            cell.set_review(entry.get("review"))
+            cell.set_review_mode(self._mode == MODE_REVIEW)
             caption = QLabel()
             caption.setAlignment(Qt.AlignHCenter)
             box = QVBoxLayout()
@@ -396,8 +561,14 @@ class OrientationEditor(QWidget):
                      f"{entry['image_name']}"]
         rad = entry.get("orientation_px_rad")
         deg = entry.get("orientation_deg")
-        if not self._orientation_shown:
+        if not self._orientation_shown or self._mode == MODE_REVIEW:
             rad = deg = None
+        if self._mode == MODE_REVIEW:
+            # What the cell wears - a click not stored yet included.
+            word = _REVIEW_WORDS.get(
+                self._cells[entry["label_id"]].review())
+            if word:
+                parts.append(word)
         if rad is not None:
             # + 0.0 turns the -0.0 a due-right drag produces into 0.0: the
             # screen's y axis is flipped into the convention's, and "-0.000
@@ -413,6 +584,128 @@ class OrientationEditor(QWidget):
         cell = self._cells.get(label_id)
         if cell is not None and arr is not None:
             cell.set_pixels(arr)
+
+    # -- Review mode --------------------------------------------------------
+
+    def mode(self) -> str:
+        return self._mode
+
+    def set_mode(self, mode: str):
+        """MODE_ORIENT, or MODE_REVIEW - which needs the Review section
+        on, and is Orient without it."""
+        if mode != MODE_REVIEW or not self._review_shown:
+            mode = MODE_ORIENT
+        self.flush_review()
+        self._mode = mode
+        review = mode == MODE_REVIEW
+        (self.review_mode_button if review
+         else self.orient_mode_button).setChecked(True)
+        self.hint.setText(_HINTS[mode])
+        self.accept_page_button.setVisible(review)
+        for label_id, cell in self._cells.items():
+            cell.set_review_mode(review)
+            entry = self._entry(label_id)
+            if entry is not None:
+                self._set_caption(entry)
+
+    def review_shown(self) -> bool:
+        return self._review_shown
+
+    def set_review_shown(self, shown: bool):
+        """The Review section, on or off: off, there is no Review mode."""
+        self._review_shown = bool(shown)
+        self.review_mode_button.setEnabled(self._review_shown)
+        if not self._review_shown and self._mode == MODE_REVIEW:
+            self.set_mode(MODE_ORIENT)
+
+    def key_pressed(self, key: int) -> bool:
+        """A key in the Grid view; True if it was used."""
+        if key == Qt.Key_A and self._mode == MODE_REVIEW:
+            self.accept_page()
+            return True
+        return False
+
+    def refresh_review(self, label_id: int):
+        """A label's review changed elsewhere (the Single view's keys):
+        its cell, if it is on the page, wears the new one."""
+        if (self._pending_review is not None
+                and self._pending_review[0] == label_id):
+            return                  # a click of its own, still to store
+        self._show_review(label_id)
+
+    def _show_review(self, label_id: int, status: "str | None" = None):
+        """Put a review on a snippet's cell and caption: ``status``, for
+        a click not stored yet, or else what its entry holds."""
+        entry, cell = self._entry(label_id), self._cells.get(label_id)
+        if entry is None or cell is None:
+            return
+        cell.set_review(entry.get("review") if status is None else status)
+        self._set_caption(entry)
+
+    def _on_review_clicked(self, label_id: int, asked: str):
+        """A click (reject) or right-click (look again) on a cell: set
+        that status, or take it back if the snippet already has it."""
+        self.flush_review()
+        entry = self._entry(label_id)
+        if entry is None:
+            return
+        status = (REVIEW_UNREVIEWED
+                  if valid_review(entry.get("review")) == asked else asked)
+        if asked != REVIEW_REJECTED:
+            self._mark(label_id, status)
+            return
+        # A left click: shown now, stored once no double-click followed.
+        self._pending_review = (label_id, status)
+        self._show_review(label_id, status)
+        self._review_timer.start()
+
+    def _on_open_requested(self, label_id: int):
+        """A double-click: open the snippet - and the click it began with
+        was never a mark."""
+        if (self._pending_review is not None
+                and self._pending_review[0] == label_id):
+            self._pending_review = None
+            self._review_timer.stop()
+            self._show_review(label_id)
+        self.open_requested.emit(label_id)
+
+    def flush_review(self):
+        """Store a click still waiting to be told from a double-click."""
+        self._review_timer.stop()
+        if self._pending_review is None:
+            return
+        (label_id, status), self._pending_review = self._pending_review, None
+        self._mark(label_id, status)
+
+    def _mark(self, label_id: int, status: str):
+        entry = self._entry(label_id)
+        if entry is None:
+            return                  # the label went while the click waited
+        if valid_review(entry.get("review")) != status:
+            entry["review"] = status
+            self.review_marked.emit(label_id, status)
+        self._show_review(label_id)
+
+    def accept_page(self):
+        """Accept every snippet on this page nobody has marked, and go on
+        to the next page."""
+        if self._mode != MODE_REVIEW:
+            return
+        self.flush_review()
+        accepted = []
+        for label_id in self._cells:
+            entry = self._entry(label_id)
+            if (entry is not None and valid_review(entry.get("review"))
+                    == REVIEW_UNREVIEWED):
+                entry["review"] = REVIEW_ACCEPTED
+                accepted.append(label_id)
+        if accepted:
+            self.reviews_marked.emit(accepted, REVIEW_ACCEPTED)
+        if self._page < self._page_count() - 1:
+            self._step_page(1)
+        else:
+            for label_id in accepted:
+                self._show_review(label_id)
 
     # -- geo info -----------------------------------------------------------
 

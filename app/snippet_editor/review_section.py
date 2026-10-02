@@ -12,6 +12,10 @@ them out, and the canvas draws them dimmed.
 In the Single view, A accepts, X rejects and F flags for another look;
 with "Advance after marking" on (the default) the editor moves to the next
 snippet, so a review pass needs no mouse. Each mark is one undo step.
+
+In the Grid view's Review mode a page is marked at a time: the grid
+(orientation_section.py) takes the clicks and reports them, and this
+section sends them on - a page accepted at once as one undo step.
 """
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (QCheckBox, QGridLayout, QLabel, QPushButton,
@@ -117,12 +121,34 @@ class ReviewSection(Section):
 
     # (label_id, status) - out to the main window.
     review_changed = pyqtSignal(int, str)
+    # ([label ids], status): a page marked at once - one undo step.
+    reviews_changed = pyqtSignal(list, str)
 
-    def __init__(self, parent=None):
+    def __init__(self, grid=None, parent=None):
+        """``grid`` is the Grid view, whose Review mode this section
+        answers for (None: a section on its own)."""
         super().__init__(REVIEW_WORKLIST, ReviewPanel(), parent)
         self._entry = None
+        self._grid = grid
         self.panel.marked.connect(self.mark)
+        if grid is not None:
+            grid.review_marked.connect(self._on_grid_marked)
+            grid.reviews_marked.connect(self._on_grid_page_marked)
         self.show_entry(None)
+
+    def _on_grid_marked(self, label_id: int, status: str):
+        """The grid marked a snippet (and its entry): send it on."""
+        self.review_changed.emit(label_id, status)
+        self.entry_changed.emit(label_id)
+
+    def _on_grid_page_marked(self, label_ids: list, status: str):
+        self.reviews_changed.emit(label_ids, status)
+        self.entries_changed.emit(label_ids)
+
+    def set_shown(self, shown):
+        super().set_shown(shown)
+        if self._grid is not None:
+            self._grid.set_review_shown(shown)
 
     def show_entry(self, entry):
         self._entry = entry
@@ -133,6 +159,8 @@ class ReviewSection(Section):
     def refresh(self, label_id):
         if self._entry is not None and self._entry["label_id"] == label_id:
             self.show_entry(self._entry)
+        if self._grid is not None:
+            self._grid.refresh_review(label_id)
 
     def mark(self, status: str):
         """Mark the snippet in hand ("" clears)."""
@@ -146,8 +174,8 @@ class ReviewSection(Section):
 
     def view_changed(self, single):
         self.panel.setEnabled(single)
-        return ("" if single else "Reviews are given in the Single view - "
-                                  "double-click a snippet to open it there.")
+        return ("" if single else "In the Grid view, pick Review above the "
+                                  "snippets to mark a page at a time.")
 
     def key_pressed(self, key):
         if key not in KEYS:

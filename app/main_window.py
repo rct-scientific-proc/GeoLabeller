@@ -2927,6 +2927,7 @@ class MainWindow(QMainWindow):
             editor.orientation_changed.connect(self._on_orientation_changed)
             editor.confidence_changed.connect(self._on_confidence_changed)
             editor.review_changed.connect(self._on_review_changed)
+            editor.reviews_changed.connect(self._on_reviews_changed)
             editor.class_changed.connect(self._on_label_class_changed)
             editor.position_changed.connect(self._on_label_position_changed)
             editor.description_changed.connect(self._set_label_description)
@@ -3064,6 +3065,36 @@ class MainWindow(QMainWindow):
         self._label_row_changed(label_id)
         self.statusBar.showMessage(
             f"Label #{label_id} " + {
+                REVIEW_ACCEPTED: "accepted",
+                REVIEW_REJECTED: "rejected - left out of exports",
+                REVIEW_RECHECK: "flagged to look at again",
+            }.get(status, "back to not reviewed"), 3000)
+
+    def _on_reviews_changed(self, label_ids, status):
+        """Store one review on many labels - the Snippet Editor's review
+        grid accepting a page - as ONE undo step."""
+        if valid_review(status) != status:
+            return
+        labels = [label for label in
+                  (self.project.get_label_by_id(i)[1] for i in label_ids)
+                  if label is not None]
+        if not labels:
+            return
+        with self._recorded("Review labels",
+                            labels=[label.id for label in labels]):
+            for label in labels:
+                if label.review != status:
+                    label.review = status
+                    self._stamp(label, "review")
+        self._mark_unsaved()
+        for label in labels:
+            self.canvas.set_label_rejected(label.id,
+                                           status == REVIEW_REJECTED)
+        # One rebuild for the page, not a row at a time.
+        self._schedule_refresh("labeled", "snippets")
+        n = len(labels)
+        self.statusBar.showMessage(
+            f"{n} label{'s' if n != 1 else ''} " + {
                 REVIEW_ACCEPTED: "accepted",
                 REVIEW_REJECTED: "rejected - left out of exports",
                 REVIEW_RECHECK: "flagged to look at again",

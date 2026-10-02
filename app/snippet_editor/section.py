@@ -31,7 +31,8 @@ and these hooks, all optional:
 
 A section that edits a label edits the entry dict it was given in place,
 emits entry_changed(label_id) - the window then recounts the list and
-asks every section to refresh - and emits whatever signal carries the new
+asks every section to refresh (entries_changed([ids]) for many at once,
+recounted once) - and emits whatever signal carries the new
 value out to the main window. A section whose key finishes a snippet can
 emit advance_requested, and the window moves on to the next.
 """
@@ -49,8 +50,10 @@ class Section(QObject):
     # (tool id, button text, tooltip, key) for a Single-view tool, or None.
     tool = None
 
-    # A label this section edited (label_id).
+    # A label this section edited (label_id) - or several at once, which
+    # the window recounts once for ([label ids]).
     entry_changed = pyqtSignal(int)
+    entries_changed = pyqtSignal(list)
     # A key finished the snippet in hand: move on to the next.
     advance_requested = pyqtSignal()
 
