@@ -23,7 +23,8 @@ MAX_LENGTH = 64
 
 # What an attribution records on a label, by key.
 FIELDS = ("created", "class", "description", "group_id", "link",
-          "orientation", "size", "confidence", "review", "masks")
+          "orientation", "size", "confidence", "review", "masks",
+          "position")
 
 
 def clean(name) -> str:

@@ -47,6 +47,8 @@ SHORTCUT_SECTIONS = [
         ("L", "Label mode"),
         ("C", "Cycle mode (group-based)"),
         ("V", "View Cycle (the selected group's images on screen)"),
+        ("Shift+C", "Labeled Cycle (the selected group's images that "
+                    "have labels)"),
         ("W", "Waterfall mode (stack group vertically)"),
         ("R", "Ruler mode"),
     ]),
@@ -58,7 +60,8 @@ SHORTCUT_SECTIONS = [
         ("1-9", "Quick-switch to class 1-9"),
         ("Shift+1-9", "Description preset 1-9; again for none"),
         ("Shift+0", "No description (new labels get none)"),
-        ("Escape", "Cancel link mode"),
+        ("Right-click label > Move", "Then click its new position"),
+        ("Escape", "Cancel link mode, or a move"),
     ]),
     ("Chain Linking", [
         ("K", "Toggle chain-link (any labeling mode)"),
@@ -66,7 +69,7 @@ SHORTCUT_SECTIONS = [
         ("N", "Finish this chain, start a new one"),
         ("Escape", "Exit chain-link (links are kept)"),
     ]),
-    ("Cycle Modes (Cycle / View Cycle)", [
+    ("Cycle Modes (Cycle / View Cycle / Labeled Cycle)", [
         ("Space", "Next image (hides the one the cycle showed)"),
         ("Ctrl+Space", "Go back to previous layer"),
         ("Left-click", "Place label"),

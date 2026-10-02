@@ -25,6 +25,7 @@ from PyQt5.QtWidgets import (
     QStatusBar,
     QLabel,
     QToolBar,
+    QCheckBox,
     QComboBox,
     QMessageBox,
     QProgressDialog,
@@ -59,6 +60,7 @@ from . import (display_settings, gdal_config, identity, recent,
                settings_scope, waypoint_io)
 from .about import AboutDialog
 from .history import EditHistory
+from .orientation_math import pixel_angle_from_heading
 from .display_dialog import DisplaySettingsDialog
 from .gt_import import apply_import, confirm_import, plan_import
 from .relocate import (RelocateImagesDialog, RemoveMissingImagesDialog,
@@ -685,6 +687,9 @@ class MainWindow(QMainWindow):
         self.canvas.label_class_change_requested.connect(
             self._on_label_class_changed)
         self.canvas.link_mode_changed.connect(self._on_link_mode_changed)
+        self.canvas.move_mode_changed.connect(self._on_link_mode_changed)
+        self.canvas.label_move_requested.connect(
+            self._on_label_move_requested)
         self.canvas.label_rejected.connect(
             lambda message: self.statusBar.showMessage(message, 4000))
         self.canvas.ruler_changed.connect(self._on_ruler_changed)
@@ -883,6 +888,20 @@ class MainWindow(QMainWindow):
 
         labels_menu.addSeparator()
 
+        # Moving a label (right-click > Move) onto another image asks
+        # first; this is where that is switched off, and back on.
+        self.warn_move_action = QAction(
+            "&Warn Before Moving a Label to Another Image", self)
+        self.warn_move_action.setCheckable(True)
+        self.warn_move_action.setChecked(self._warns_before_cross_image_move())
+        self.warn_move_action.setStatusTip(
+            "Ask before a moved label lands on a different image from the "
+            "one it was on")
+        self.warn_move_action.toggled.connect(self._set_warn_before_move)
+        labels_menu.addAction(self.warn_move_action)
+
+        labels_menu.addSeparator()
+
         # Clear all labels
         clear_labels_action = QAction("Clear All Labels", self)
         clear_labels_action.triggered.connect(self._clear_all_labels)
@@ -1043,6 +1062,16 @@ class MainWindow(QMainWindow):
             lambda: self._set_mode(CanvasMode.VIEW_CYCLE))
         toolbar.addAction(self.view_cycle_action)
 
+        self.labeled_cycle_action = QAction("Labeled Cycle", self)
+        self.labeled_cycle_action.setCheckable(True)
+        self.labeled_cycle_action.setShortcut("Shift+C")
+        self.labeled_cycle_action.setToolTip(
+            "Labeled Cycle (Shift+C): step through the selected group's "
+            "images that have labels.\nSpace = next, Ctrl+Space = previous.")
+        self.labeled_cycle_action.triggered.connect(
+            lambda: self._set_mode(CanvasMode.LABELED_CYCLE))
+        toolbar.addAction(self.labeled_cycle_action)
+
         self.waterfall_action = QAction("Waterfall", self)
         self.waterfall_action.setCheckable(True)
         self.waterfall_action.setShortcut("W")
@@ -1179,6 +1208,8 @@ class MainWindow(QMainWindow):
         self.label_action.setChecked(mode == CanvasMode.LABEL)
         self.cycle_action.setChecked(mode == CanvasMode.CYCLE)
         self.view_cycle_action.setChecked(mode == CanvasMode.VIEW_CYCLE)
+        self.labeled_cycle_action.setChecked(
+            mode == CanvasMode.LABELED_CYCLE)
         self.ruler_action.setChecked(mode == CanvasMode.RULER)
         self.waterfall_action.setChecked(mode == CanvasMode.WATERFALL)
 
@@ -1209,10 +1240,7 @@ class MainWindow(QMainWindow):
                 if from_the_top:
                     # Starting over - not resuming the end just reached.
                     self._cycle_parked.pop(mode, None)
-                if mode == CanvasMode.CYCLE:
-                    self._start_cycle_mode()
-                else:
-                    self._start_view_cycle_mode()
+                self._start_step_cycle(mode)
             return
         was_waterfall = self.canvas._waterfall_active
         left = self.canvas._mode
@@ -1234,19 +1262,26 @@ class MainWindow(QMainWindow):
             self._leave_waterfall(mode)
 
         # Handle mode entry
+        if mode in STEP_CYCLE_MODES:
+            self._start_step_cycle(mode)
+        elif mode == CanvasMode.WATERFALL:
+            self._start_waterfall_mode(start_at=cycle_image)
+
+    def _start_step_cycle(self, mode: CanvasMode):
+        """Start (or resume) the stepping cycle ``mode`` names."""
         if mode == CanvasMode.CYCLE:
             self._start_cycle_mode()
         elif mode == CanvasMode.VIEW_CYCLE:
             self._start_view_cycle_mode()
-        elif mode == CanvasMode.WATERFALL:
-            self._start_waterfall_mode(start_at=cycle_image)
+        else:
+            self._start_labeled_cycle_mode()
 
     def _cycle_image(self) -> "str | None":
         """The image a cycle is on: the live run's, else a parked one's."""
         if (self._cycle_layers
                 and 0 <= self._cycle_index < len(self._cycle_layers)):
             return self._cycle_layers[self._cycle_index]
-        for parked_mode in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
+        for parked_mode in STEP_CYCLE_MODES:
             parked = self._cycle_parked.get(parked_mode)
             if parked is not None and 0 <= parked[1] < len(parked[0]):
                 return parked[0][parked[1]]
@@ -1289,6 +1324,10 @@ class MainWindow(QMainWindow):
         if mode == CanvasMode.VIEW_CYCLE:
             on_screen = set(self.canvas.get_layers_in_view())
             queue = [layer_id for layer_id in group if layer_id in on_screen]
+            if focus in queue:
+                self._cycle_parked[mode] = (queue, queue.index(focus))
+        elif mode == CanvasMode.LABELED_CYCLE:
+            queue = self._labeled_layers(group)
             if focus in queue:
                 self._cycle_parked[mode] = (queue, queue.index(focus))
 
@@ -1339,7 +1378,7 @@ class MainWindow(QMainWindow):
         follows the cycle, so the layers on screen differ on nearly every
         step - "the queue changed" would be true of almost every press.
         """
-        if mode not in (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE):
+        if mode not in STEP_CYCLE_MODES:
             return False
         if (not self._cycle_layers or self._cycle_index < 0
                 or self._cycle_at_end):
@@ -1407,13 +1446,15 @@ class MainWindow(QMainWindow):
         """What is being cycled, and the key that starts it again."""
         if self.canvas._mode == CanvasMode.VIEW_CYCLE:
             return "view cycle", "V"
+        if self.canvas._mode == CanvasMode.LABELED_CYCLE:
+            return "labeled images", "Shift+C"
         return "group", "C"
 
     def _show_cycle_status(self, prefix: str | None = None):
         if prefix is None:
-            prefix = ("View Cycle"
-                      if self._cycle_mode == CanvasMode.VIEW_CYCLE
-                      else "Cycle mode")
+            prefix = {CanvasMode.VIEW_CYCLE: "View Cycle",
+                      CanvasMode.LABELED_CYCLE: "Labeled Cycle"}.get(
+                          self._cycle_mode, "Cycle mode")
         position, count = self._cycle_position()
         self.statusBar.showMessage(
             f"{prefix}: Layer {position}/{count} - Space=next, "
@@ -1516,6 +1557,73 @@ class MainWindow(QMainWindow):
             "Cycle resumed" if resumed is not None else "Cycle mode")
 
         # Give canvas keyboard focus so Space key works immediately
+        self.canvas.setFocus()
+
+    def _labeled_layers(self, group: list) -> list:
+        """The layers of ``group`` whose image has at least one label, in
+        the group's order."""
+        labeled = []
+        for layer_id in group:
+            layer = self.canvas.get_layer(layer_id)
+            image = (self._project_image_for(layer.file_path)
+                     if layer is not None else None)
+            if image is not None and image.labels:
+                labeled.append(layer_id)
+        return labeled
+
+    def _start_labeled_cycle_mode(self):
+        """Cycle the selected group's images that have labels.
+
+        Asked for 2026-10-02: going back over what has been labelled in a
+        group meant stepping through every image of it, labelled or not.
+        This is Cycle over the labelled ones only - same order, same
+        keys. The queue is what is labelled when the run starts; an image
+        labelled later joins the next run.
+        """
+        group = self.layer_panel.get_all_layers_in_selected_group()
+        group_name = self.layer_panel.get_selected_group_name()
+        self.group_label.setText("Labeled Cycle")
+        if not group:
+            self.statusBar.showMessage(
+                "Labeled Cycle needs a group: select one in the layer "
+                "panel (or one of its images) and press Shift+C again", 5000)
+            self._cycle_index = -1
+            return
+        queue = self._labeled_layers(group)
+        if not queue:
+            self._cycle_parked.pop(CanvasMode.LABELED_CYCLE, None)
+            self.statusBar.showMessage(
+                f"No labeled images in '{group_name}' yet", 5000)
+            self._cycle_index = -1
+            return
+        # Back to the image a detour left - while it is still one of the
+        # labelled images of this group. (Not "the same queue", as Cycle
+        # asks: the detour may well have been to label another image.)
+        resumed = None
+        parked = self._cycle_parked.pop(CanvasMode.LABELED_CYCLE, None)
+        if parked is not None and 0 <= parked[1] < len(parked[0]):
+            was_on = parked[0][parked[1]]
+            if was_on in queue and set(parked[0]) <= set(group):
+                resumed = queue.index(was_on)
+        self._cycle_layers = queue
+        self._cycle_group = list(group)
+        self._cycle_mode = CanvasMode.LABELED_CYCLE
+        self._cycle_at_end = False
+        self._cycle_end_view = None
+        self._cycle_index = (resumed if resumed is not None
+                             else len(queue) - 1)
+        self.group_label.setText(
+            f"Labeled Cycle: {group_name} - {len(queue)} of {len(group)} "
+            "labeled")
+        layer_id = queue[self._cycle_index]
+        self._cycle_show(layer_id)
+        position, count = self._cycle_position()
+        debug(f"labeled cycle {'resume' if resumed is not None else 'start'}"
+              f": '{group_name}' - {count} of {len(group)} labeled; "
+              f"at {self._layer_name(layer_id)} [{position}/{count}]")
+        self._show_cycle_status(
+            "Labeled Cycle resumed" if resumed is not None
+            else "Labeled Cycle")
         self.canvas.setFocus()
 
     def _start_view_cycle_mode(self):
@@ -2061,6 +2169,142 @@ class MainWindow(QMainWindow):
         self._update_waterfall_projections()
 
         self.statusBar.showMessage("Removed label", 3000)
+
+    # ------------------------------------------------------------------
+    # Moving a label (canvas: right-click > Move, then click)
+    # ------------------------------------------------------------------
+
+    _WARN_MOVE_KEY = "labels/warn_move_other_image"
+
+    def _warns_before_cross_image_move(self) -> bool:
+        """Whether a move onto another image asks first (it does, until
+        switched off)."""
+        return str(settings_scope.settings().value(
+            self._WARN_MOVE_KEY, "true")).lower() != "false"
+
+    def _set_warn_before_move(self, on: bool):
+        settings_scope.settings().setValue(
+            self._WARN_MOVE_KEY, "true" if on else "false")
+        if self.warn_move_action.isChecked() != bool(on):
+            self.warn_move_action.setChecked(bool(on))
+
+    def _cross_image_move_plan(self, label, target_image, lon, lat) -> tuple:
+        """What a label keeps of its orientation on another image, and
+        what it loses there: (pixel angle or None, [what is lost]).
+
+        Masks are run-lengths over the image they were painted on, and the
+        pixel angle is an angle in that image's grid; neither means
+        anything on another. The true-north heading does, and is turned
+        back into the new image's pixel angle where both have
+        georeferencing - as it is for a heading shared between linked
+        labels.
+        """
+        lost = []
+        if label.masks:
+            lost.append(f"its {len(label.masks)} mask(s)")
+        px_rad = None
+        if label.orientation_deg is not None and target_image is not None:
+            px_rad = pixel_angle_from_heading(
+                label.orientation_deg, lon, lat,
+                target_image.get_affine(), target_image.get_crs())
+        if px_rad is None and (label.orientation_px_rad is not None
+                               or label.orientation_deg is not None):
+            lost.append("its orientation")
+        return px_rad, lost
+
+    def _move_warning_box(self, text: str) -> QMessageBox:
+        """The question asked before a label moves to another image, with
+        its own switch for not being asked again."""
+        box = QMessageBox(QMessageBox.Warning, "Move Label to Another Image",
+                          text, QMessageBox.NoButton, self)
+        box.move_button = box.addButton("Move", QMessageBox.AcceptRole)
+        cancel = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.keep_warning = QCheckBox(
+            "Warn me before moving a label to another image")
+        box.keep_warning.setChecked(True)
+        box.setCheckBox(box.keep_warning)
+        return box
+
+    def _ask_move_to_other_image(self, text: str) -> tuple:
+        """(go ahead, keep warning) from the question box."""
+        box = self._move_warning_box(text)
+        box.exec_()
+        return (box.clickedButton() is box.move_button,
+                box.keep_warning.isChecked())
+
+    def _on_label_move_requested(self, label_id: int, pixel_x: float,
+                                 pixel_y: float, lon: float, lat: float,
+                                 image_name: str, image_group: str,
+                                 image_path: str):
+        """Move a label to where the user clicked.
+
+        On its own image that is its position and nothing else: what was
+        recorded on it - masks, orientation, size, rating, review - was
+        recorded on that image and stays. Onto ANOTHER image the label
+        changes hands, which is rarely what a click meant, so it asks
+        first (Labels > Warn Before Moving a Label to Another Image, on
+        until switched off) and says what the label cannot take with it.
+        One undo step either way.
+        """
+        image, label = self.project.get_label_by_id(label_id)
+        if label is None or image is None:
+            return
+        target = self._project_image_for(image_path)
+        other_image = (os.path.normcase(canonical_path(image_path))
+                       != os.path.normcase(canonical_path(image.path)))
+        px_rad, lost = None, []
+        if other_image:
+            px_rad, lost = self._cross_image_move_plan(
+                label, target, lon, lat)
+            if self._warns_before_cross_image_move():
+                text = (f"Label #{label.id} ({label.class_name}) is on "
+                        f"{image.name}.\n\nMove it to {image_name}?")
+                if lost:
+                    text += (f"\n\nIt will lose {' and '.join(lost)}, "
+                             f"recorded on {image.name}'s pixels.")
+                go_ahead, keep_warning = self._ask_move_to_other_image(text)
+                if not go_ahead:
+                    self.statusBar.showMessage(
+                        "Move cancelled - the label is where it was", 4000)
+                    return
+                if not keep_warning:
+                    self._set_warn_before_move(False)
+        new_entry = target is None
+        with self._recorded("Move label", labels=[label_id],
+                            images=[image_path] if new_entry else ()):
+            self.project.move_label(
+                label_id, pixel_x, pixel_y, lon, lat,
+                image_path=(target.path if target is not None
+                            else image_path) if other_image else "",
+                image_name=image_name, image_group=image_group)
+            if other_image:
+                label.masks = []
+                label.orientation_px_rad = px_rad
+                label.orientation_derived = px_rad is not None
+                if px_rad is None:
+                    label.orientation_deg = None
+            self._stamp(label, "position")
+        self._mark_unsaved()
+        image, label = self.project.get_label_by_id(label_id)
+        debug(f"label moved: #{label_id} to pixel ({pixel_x:.1f}, "
+              f"{pixel_y:.1f}) on {image.name}"
+              + (" (another image)" if other_image else ""))
+        self.canvas.remove_label_marker(label_id)
+        self._add_label_marker(image, label)
+        if other_image:
+            self.layer_panel.remove_label_from_panel(label_id)
+            self.layer_panel.add_label_to_panel(label, image)
+        else:
+            self.layer_panel.update_label_in_panel(label, image)
+        self._update_waterfall_projections()
+        # Its snippet is cut around the label: every view of it is stale.
+        self._reseat_open_editors()
+        self.statusBar.showMessage(
+            f"Moved label #{label_id} to {image.name}"
+            + (f" - without {' and '.join(lost)}" if lost else "")
+            if other_image else f"Moved label #{label_id}", 5000)
 
     def _update_waterfall_projections(self):
         """Refresh the projected label markers in waterfall mode.

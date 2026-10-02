@@ -175,14 +175,17 @@ class CanvasMode(Enum):
     VIEW_CYCLE = auto()  # Cycle through layers visible in current view
     RULER = auto()    # Measure ground distance by dragging
     WATERFALL = auto()  # Group's images stacked vertically; hold Space to glide
+    LABELED_CYCLE = auto()  # Cycle the group's images that have labels
 
 
 # Cycle-style modes: left click labels, right-drag pans, wheel zooms. WATERFALL
 # shares these interactions but navigates by gliding rather than stepping.
-CYCLE_MODES = (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE, CanvasMode.WATERFALL)
+CYCLE_MODES = (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE, CanvasMode.WATERFALL,
+               CanvasMode.LABELED_CYCLE)
 
 # Modes that step through layers one at a time (Space advances one layer).
-STEP_CYCLE_MODES = (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE)
+STEP_CYCLE_MODES = (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE,
+                    CanvasMode.LABELED_CYCLE)
 
 # Modes where a left click places a label.
 LABELING_MODES = (CanvasMode.LABEL,) + CYCLE_MODES
@@ -2110,6 +2113,13 @@ class MapCanvas(QGraphicsView):
 
     # Signal emitted when link mode state changes: (is_active, message)
     link_mode_changed = pyqtSignal(bool, str)
+    # Right-click a label > Move, then a click on its new place:
+    # (label_id, pixel_x, pixel_y, lon, lat, image name, group, file path)
+    # - the image being the one clicked, which may not be the label's own.
+    label_move_requested = pyqtSignal(int, float, float, float, float,
+                                      str, str, str)
+    # Move mode on or off, with the status text to show (as link mode).
+    move_mode_changed = pyqtSignal(bool, str)
 
     # Signal emitted when chain-link mode state changes: (is_active, message).
     # Lets the main window sync the toolbar toggle and the status bar.
@@ -2256,6 +2266,10 @@ class MapCanvas(QGraphicsView):
         # Link mode state
         self._link_mode_active = False
         self._link_source_label_id: int | None = None
+        # The label being moved (right-click > Move), waiting for the click
+        # that says where to; and its marker's pen, to put back.
+        self._move_label_id: int | None = None
+        self._move_original_pen = None
 
         # Chain-link mode state: while active, left-clicking labels links them
         # all into one object (each click links immediately); N starts a new
@@ -4492,6 +4506,8 @@ class MapCanvas(QGraphicsView):
         # Chain linking only makes sense while labels are clickable.
         if mode not in LABELING_MODES and self._chain_link_active:
             self.set_chain_link_mode(False)
+        # A move waits for a click in the mode it was asked in.
+        self.cancel_move_mode()
         self._mode = mode
         if mode == CanvasMode.PAN:
             # We handle panning manually
@@ -4535,6 +4551,15 @@ class MapCanvas(QGraphicsView):
                 self._box_link_band.show()
             elif event.button() == Qt.RightButton:
                 self._exit_box_link_mode("Box link cancelled")
+            return
+
+        # Moving a label: the next left click is where it goes; a right
+        # click gives up.
+        if self._move_label_id is not None:
+            if event.button() == Qt.LeftButton:
+                self._move_click(event.pos())
+            elif event.button() == Qt.RightButton:
+                self.cancel_move_mode()
             return
 
         # Shift+left-drag measures from whatever mode is active, so reaching for
@@ -4605,28 +4630,8 @@ class MapCanvas(QGraphicsView):
 
             # Only allow labeling on actual images (not "nearest" ones)
             if layer and layer_name and not layer_name.startswith("~"):
-                if layer.geo:
-                    lon, lat = self._web_mercator_to_wgs84(easting, northing)
-                    pixel_x, pixel_y = layer.latlon_to_pixel(lon, lat)
-                else:
-                    # Raw/non-geo display (incl. waterfall): scene coords map
-                    # directly to pixels. If the file carries georeferencing,
-                    # derive the true lat/lon from the clicked pixel; plain
-                    # images have no meaningful lat/lon.
-                    pixel_x, pixel_y = layer.scene_to_pixel(easting, northing)
-                    latlon = layer.pixel_to_latlon(pixel_x, pixel_y)
-                    lon, lat = latlon if latlon is not None else (0.0, 0.0)
-                # A reprojected raster's bounding box contains transparent
-                # margin - a rotated UTM image leaves wedges at the corners
-                # - and layers are resolved by box, so a click there maps
-                # outside the source pixels. Placing it anyway created a
-                # label on the wrong image with negative or past-the-edge
-                # coordinates: a marker floating over empty ground, and a
-                # label the HDF5 export silently skips as "pixel coords
-                # outside image bounds".
-                src_w, src_h = layer._src_width, layer._src_height
-                inside = (not src_w or not src_h
-                          or (0 <= pixel_x < src_w and 0 <= pixel_y < src_h))
+                pixel_x, pixel_y, lon, lat, inside = self._point_on_layer(
+                    layer, easting, northing)
                 if not inside:
                     self.label_rejected.emit(
                         f"No image data there - the click landed in "
@@ -4804,6 +4809,8 @@ class MapCanvas(QGraphicsView):
         if (event.key() == Qt.Key_Escape
                 and self._box_link_anchor is not None):
             self._exit_box_link_mode("Box link cancelled")
+        elif event.key() == Qt.Key_Escape and self._move_label_id is not None:
+            self.cancel_move_mode("Move cancelled")
         elif event.key() == Qt.Key_Escape and self._link_mode_active:
             self._exit_link_mode()
         elif event.key() == Qt.Key_N and self._chain_link_active:
@@ -4948,6 +4955,34 @@ class MapCanvas(QGraphicsView):
 
         # Not within any layer bounds
         return (None, "", "")
+
+    def _point_on_layer(self, layer: TiledLayer, easting: float,
+                        northing: float) -> tuple:
+        """Where a scene point falls on ``layer``:
+        (pixel_x, pixel_y, lon, lat, inside its source pixels)."""
+        if layer.geo:
+            lon, lat = self._web_mercator_to_wgs84(easting, northing)
+            pixel_x, pixel_y = layer.latlon_to_pixel(lon, lat)
+        else:
+            # Raw/non-geo display (incl. waterfall): scene coords map
+            # directly to pixels. If the file carries georeferencing,
+            # derive the true lat/lon from the clicked pixel; plain
+            # images have no meaningful lat/lon.
+            pixel_x, pixel_y = layer.scene_to_pixel(easting, northing)
+            latlon = layer.pixel_to_latlon(pixel_x, pixel_y)
+            lon, lat = latlon if latlon is not None else (0.0, 0.0)
+        # A reprojected raster's bounding box contains transparent
+        # margin - a rotated UTM image leaves wedges at the corners
+        # - and layers are resolved by box, so a click there maps
+        # outside the source pixels. Placing it anyway created a
+        # label on the wrong image with negative or past-the-edge
+        # coordinates: a marker floating over empty ground, and a
+        # label the HDF5 export silently skips as "pixel coords
+        # outside image bounds".
+        src_w, src_h = layer._src_width, layer._src_height
+        inside = (not src_w or not src_h
+                  or (0 <= pixel_x < src_w and 0 <= pixel_y < src_h))
+        return pixel_x, pixel_y, lon, lat, inside
 
     def _get_layer_by_name_and_group(self, name: str, group_path: str):
         """Find a layer by its name and group path."""
@@ -5201,6 +5236,10 @@ class MapCanvas(QGraphicsView):
             self._scene.removeItem(ellipse)
             self._scene.removeItem(text)
             del self._label_items[label_id]
+        if label_id == self._move_label_id:
+            # Its marker is being rebuilt under a pending move: the pen
+            # kept for it belongs to the one just removed.
+            self._move_original_pen = None
         # A removed chain anchor can't take more links; the next chain-link
         # click anchors a fresh chain.
         if self._chain_link_active and label_id == self._chain_link_anchor:
@@ -5344,6 +5383,10 @@ class MapCanvas(QGraphicsView):
                 "Export the true-positive snippets for this object - every "
                 "image it was labelled in, or just the ones toggled on.")
 
+            move_action = menu.addAction("Move")
+            move_action.setToolTip(
+                "Then click where the label should be. Right-click or "
+                "Escape cancels.")
             describe_action = menu.addAction("Description...")
             group_id_action = menu.addAction("Group ID...")
             # The class, for the label and its whole linked object.
@@ -5367,6 +5410,8 @@ class MapCanvas(QGraphicsView):
                 self._enter_link_mode(label_id)
             elif action == box_link_action:
                 self.enter_box_link_mode(label_id)
+            elif action == move_action:
+                self.enter_move_mode(label_id)
             elif action == export_object_action:
                 self.export_object_requested.emit(label_id)
             elif action == describe_action:
@@ -5580,6 +5625,99 @@ class MapCanvas(QGraphicsView):
             self.setCursor(Qt.ArrowCursor)
 
         self.link_mode_changed.emit(False, "")
+
+    # ------------------------------------------------------------------
+    # Moving a label: right-click > Move, then click where it should be.
+    # Asked for 2026-10-02 - a label placed a little off used to mean
+    # removing it and placing another, losing everything recorded on it.
+    # ------------------------------------------------------------------
+
+    def enter_move_mode(self, label_id: int):
+        """Wait for the click that says where ``label_id`` goes."""
+        if label_id not in self._label_items:
+            return
+        if self._link_mode_active:
+            self._exit_link_mode()
+        self.cancel_move_mode()
+        self._move_label_id = label_id
+        ellipse, _ = self._label_items[label_id]
+        self._move_original_pen = ellipse.pen()
+        ellipse.setPen(QPen(QColor(255, 255, 0),
+                            ellipse.pen().widthF() * 2))
+        self.setCursor(_crosshair_cursor())
+        self.move_mode_changed.emit(
+            True, "Move label: click its new position - right-click or "
+                  "Escape cancels")
+
+    def move_mode_active(self) -> bool:
+        return self._move_label_id is not None
+
+    def cancel_move_mode(self, message: str = ""):
+        """Leave move mode without moving anything (no-op when not in it)."""
+        if self._move_label_id is None:
+            return
+        self._end_move_mode()
+        self.move_mode_changed.emit(False, message)
+
+    def _end_move_mode(self):
+        """Put the marker and the cursor back as they were."""
+        item = self._label_items.get(self._move_label_id)
+        if item is not None and self._move_original_pen is not None:
+            item[0].setPen(self._move_original_pen)
+        self._move_label_id = None
+        self._move_original_pen = None
+        if self._mode in LABELING_MODES:
+            self.setCursor(_crosshair_cursor())
+        elif self._mode == CanvasMode.PAN:
+            self.setCursor(Qt.OpenHandCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+
+    def _move_target_layer(self, label_id: int, easting: float,
+                           northing: float) -> "TiledLayer | None":
+        """The image a move's click is on.
+
+        The label's own image whenever the click is on it and it is
+        showing, even with another image drawn over the top: overlapping
+        images are the normal case, and a small correction must not land
+        the label on a neighbour. Otherwise the topmost image there.
+        """
+        item = self._label_items.get(label_id)
+        own_id = self._path_to_layer.get(item[0].data(0)) if item else None
+        own = self._layers.get(own_id) if own_id is not None else None
+        if (own is not None and own.visible
+                and own.contains_point(easting, northing)
+                and self._point_on_layer(own, easting, northing)[4]):
+            return own
+        layer, _name, _group = self._get_layer_and_info_at_position(
+            easting, northing)
+        return layer
+
+    def _move_click(self, view_pos):
+        """A left click in move mode: ask for the move, or say why not.
+        A click that cannot be a destination leaves the mode on, so a
+        miss is not the end of the move."""
+        label_id = self._move_label_id
+        easting, northing = self._scene_to_web(self.mapToScene(view_pos))
+        layer = self._move_target_layer(label_id, easting, northing)
+        if layer is None:
+            self.label_rejected.emit(
+                "No image there - click on an image to move the label, or "
+                "Escape to cancel")
+            return
+        pixel_x, pixel_y, lon, lat, inside = self._point_on_layer(
+            layer, easting, northing)
+        if not inside:
+            self.label_rejected.emit(
+                f"No image data there - the click landed in {layer.name}'s "
+                "transparent margin")
+            return
+        # Out of the mode first: the move rebuilds the marker.
+        self._end_move_mode()
+        self.move_mode_changed.emit(False, "")
+        self.label_move_requested.emit(
+            label_id, pixel_x, pixel_y, lon, lat, layer.name,
+            layer.group_path, layer.file_path)
 
     def set_chain_link_mode(self, active: bool):
         """Enter or leave chain-link mode.

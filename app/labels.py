@@ -958,6 +958,32 @@ class LabelProject:
         self._index_label(label, image_path)
         return label
 
+    def move_label(self, label_id: int, pixel_x: float, pixel_y: float,
+                   lon: float, lat: float, image_path: str = "",
+                   image_name: str = "", image_group: str = "") -> bool:
+        """Put a label somewhere else: on its own image, or - given an
+        ``image_path`` that is not its own - on another, which it then
+        belongs to. Everything else recorded on it is the caller's to
+        keep or drop. False when there is no such label.
+        """
+        entry = self._label_id_index.get(label_id)
+        if entry is None:
+            return False
+        old_path, label = entry
+        label.pixel_x, label.pixel_y = float(pixel_x), float(pixel_y)
+        label.lon, label.lat = float(lon), float(lat)
+        if image_path and canonical_path(image_path) != canonical_path(
+                old_path):
+            if image_path not in self.images:
+                self.add_image(image_path, image_name, image_group)
+            old_image = self.images.get(old_path)
+            if old_image is not None:
+                old_image.labels = [other for other in old_image.labels
+                                    if other is not label]
+            self.images[image_path].labels.append(label)
+            self._label_id_index[label_id] = (image_path, label)
+        return True
+
     def remove_image(self, path: str) -> "ImageData | None":
         """Remove an image AND all its labels from the project.
 
