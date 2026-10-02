@@ -18,7 +18,7 @@ is exactly what the exports write. Cells display source pixels 1:1 - no
 scaling - so the drawn vector IS a source-pixel vector once the crop's
 origin is added back.
 
-The grid has a second mode, Review (2.3.12): the same page of snippets,
+The grid has a second mode, Review (2.4.0): the same page of snippets,
 each wearing what its review found. A click rejects a snippet (again takes
 that back), a right-click flags it to look at again, and "Accept the rest
 of the page" accepts what is left unmarked and moves on - a page of sixty
