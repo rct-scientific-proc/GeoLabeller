@@ -299,19 +299,87 @@ def entry_in_window(entry: dict, x0: int, y0: int,
     return out
 
 
+def _run_ids(ground: np.ndarray, axis: int) -> np.ndarray:
+    """Number every unbroken run of ground along ``axis``: pixels of one
+    run share a number that no other run has. (A pixel that is not ground
+    carries the number of the run after it; callers mask those out.)"""
+    lines, length = ground.shape[1 - axis], ground.shape[axis]
+    ids = np.cumsum(~ground, axis=axis, dtype=np.int32)
+    offsets = np.arange(lines, dtype=np.int32) * (length + 1)
+    return ids + (offsets[:, None] if axis == 1 else offsets[None, :])
+
+
+def flood(seed: np.ndarray, ground: np.ndarray,
+          diagonal: bool = False) -> np.ndarray:
+    """Every ground pixel that can be reached from ``seed`` through
+    ground: stepping up, down, left and right, or - with ``diagonal`` -
+    corner to corner as well.
+
+    Growing a pixel at a time takes as many passes as the region is long
+    (hundreds, for a shadow across a large snippet). Here a pass takes
+    whole runs: anything reached in a row claims the rest of its run in
+    that row, then the same down the columns, so a pass crosses the
+    region and a handful of them finish it - quick enough to follow a
+    drag.
+    """
+    ground = np.asarray(ground, dtype=bool)
+    region = np.asarray(seed, dtype=bool) & ground
+    if not region.any():
+        return region
+    runs = [_run_ids(ground, 1), _run_ids(ground, 0)]
+    sizes = [int(ids.max()) + 1 for ids in runs]
+    count = -1
+    while True:
+        for ids, size in zip(runs, sizes):
+            reached = np.zeros(size, dtype=bool)
+            reached[ids[region]] = True
+            region = reached[ids] & ground
+        if diagonal:
+            grown = region.copy()
+            grown[1:, 1:] |= region[:-1, :-1]
+            grown[1:, :-1] |= region[:-1, 1:]
+            grown[:-1, 1:] |= region[1:, :-1]
+            grown[:-1, :-1] |= region[1:, 1:]
+            region = grown & ground
+        now = int(region.sum())
+        if now == count:
+            return region
+        count = now
+
+
 def _flood(seed: np.ndarray, ground: np.ndarray) -> np.ndarray:
     """Grow ``seed`` 4-connected through ``ground`` until it stops."""
-    region = seed & ground
-    while True:
-        grown = region.copy()
-        grown[1:, :] |= region[:-1, :]
-        grown[:-1, :] |= region[1:, :]
-        grown[:, 1:] |= region[:, :-1]
-        grown[:, :-1] |= region[:, 1:]
-        grown &= ground
-        if np.array_equal(grown, region):
-            return region
-        region = grown
+    return flood(seed, ground)
+
+
+def similar_region(pixels: np.ndarray, x: int, y: int, tolerance: int,
+                   barrier: "np.ndarray | None" = None) -> np.ndarray:
+    """The patch around pixel (x, y) that looks like it: the wand.
+
+    ``pixels`` is the snippet AS DISPLAYED - (height, width) or (height,
+    width, channels), bytes - because "looks like" is a judgement made on
+    what is on the screen. A pixel is like the one clicked when every
+    channel is within ``tolerance`` levels of it, and it belongs to the
+    patch when it can be reached from the click through pixels that are
+    (up, down, left, right). ``barrier`` pixels are never taken and never
+    crossed - other masks, when masks may not overlap.
+
+    Empty when the click is outside the snippet or on the barrier.
+    """
+    pixels = np.asarray(pixels)
+    height, width = pixels.shape[:2]
+    seed = np.zeros((height, width), dtype=bool)
+    if not (0 <= x < width and 0 <= y < height):
+        return seed
+    difference = np.abs(pixels.astype(np.int16)
+                        - pixels[y, x].astype(np.int16))
+    if difference.ndim == 3:
+        difference = difference.max(axis=2)
+    ground = difference <= tolerance
+    if barrier is not None:
+        ground &= ~np.asarray(barrier, dtype=bool)
+    seed[y, x] = True
+    return flood(seed, ground)
 
 
 def fill_enclosed(mask: np.ndarray,

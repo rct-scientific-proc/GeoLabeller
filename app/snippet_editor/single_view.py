@@ -4,9 +4,10 @@ Part of the Snippet Editor package (see app/snippet_editor/__init__.py).
 It is the mask editor's paint surface, and the Snippet Editor's Single
 view, where each section draws its overlay: masks as coloured layers, and
 an arrow for the orientation. Its tools: Paint (left-drag paints the
-active mask, right-drag erases), Polygon (clicks round a shape), Orient
-and Measure (left-drag reports a line, right-click asks for it to be
-cleared) and Move (a click). What a line or a shape MEANS is the host's
+active mask, right-drag erases), Polygon (clicks round a shape), Wand (a
+click on a pixel, a drag for how much like it), Orient and Measure
+(left-drag reports a line, right-click asks for it to be cleared) and
+Move (a click). What a line, a shape or a click MEANS is the host's
 business; this takes the gesture and reports it in snippet pixels.
 
 Deliberately independent of the rest of the app: it needs numpy and Qt and
@@ -31,6 +32,7 @@ TOOL_ORIENT = "orient"      # left-drag reports a line, right-click clears
 TOOL_MEASURE = "measure"    # the same gesture, for a length or a width
 TOOL_MOVE = "move"          # a click puts the label's own point there
 TOOL_POLYGON = "polygon"    # clicks round a shape; the host fills it in
+TOOL_WAND = "wand"          # a click on a pixel; the host finds its like
 
 # The tools that draw a line rather than paint.
 _LINE_TOOLS = (TOOL_ORIENT, TOOL_MEASURE)
@@ -43,6 +45,9 @@ LINE_PREVIEW_COLOR = QColor(0, 220, 255)
 POINT_RING_PX = 6           # the label point's ring, on screen
 # A click this near a polygon's first point (on screen) closes it.
 POLYGON_CLOSE_PX = 9
+DEFAULT_TOLERANCE = 16      # the wand's, in display levels (0-255)
+# Dragging the wand this far sideways on screen is one level of tolerance.
+WAND_DRAG_PX = 3
 # A shape being cut out is previewed as the hole it will leave: dark, so
 # it reads as removal on a mask of any colour (the first mask is red).
 POLYGON_CUT_FILL = QColor(0, 0, 0, 140)
@@ -109,6 +114,14 @@ class MaskPaintCanvas(QWidget):
     # pixels, and whether it is to be cut OUT of the mask (begun with a
     # right-click) rather than filled into it.
     polygon_drawn = pyqtSignal(list, bool)
+    # Wand tool: the button is down on snippet pixel (x, y) at this
+    # tolerance, to take (False) or to take away (True) - sent at the
+    # press and again whenever a drag changes the tolerance, for the host
+    # to answer with set_preview. Then, at the release: do it.
+    wand_changed = pyqtSignal(int, int, int, bool)
+    wand_finished = pyqtSignal()
+    # The wand's tolerance, as a drag changes it.
+    tolerance_changed = pyqtSignal(int)
     # The zoom, and whether it is one the user set (and so is kept).
     zoom_changed = pyqtSignal(float, bool)
 
@@ -174,6 +187,14 @@ class MaskPaintCanvas(QWidget):
         self._polygon: list = []
         self._polygon_erase = False
         self._polygon_cursor: "tuple | None" = None
+        # The wand: how unlike the clicked pixel a pixel may be, and -
+        # while the button is down - (x, y, take away?, where the press
+        # was on screen, the tolerance it began at).
+        self._tolerance = DEFAULT_TOLERANCE
+        self._wand: "tuple | None" = None
+        # What the tool in hand would do, from the host: a region and
+        # whether it would be taken away. Drawn over the layers.
+        self._preview: "QImage | None" = None
         # Brush preview: the cell under the cursor plus the outline edges of
         # the exact pixel set a stamp there would paint.
         self._hover_cell = None
@@ -196,6 +217,7 @@ class MaskPaintCanvas(QWidget):
         self._w, self._h = width, height
         # A shape begun on the last snippet is not a shape on this one.
         self._polygon, self._polygon_cursor = [], None
+        self._wand, self._preview = None, None
         before, self._focus = self._focus, focus
         self._scale = (self._kept_zoom if self._kept_zoom is not None
                        else float(display_scale(max(width, height))))
@@ -280,6 +302,7 @@ class MaskPaintCanvas(QWidget):
         self._tool = tool
         self._line_start = self._line_now = None
         self._polygon, self._polygon_cursor = [], None
+        self._wand, self._preview = None, None
         self.update()
 
     def arrow(self) -> "tuple | None":
@@ -483,6 +506,8 @@ class MaskPaintCanvas(QWidget):
             for name in self._order:
                 if name in self._layers:
                     painter.drawImage(target, self._overlay_image(name))
+            if self._preview is not None:
+                painter.drawImage(target, self._preview)
             if self._tool == TOOL_PAINT:
                 self._draw_brush_preview(painter)
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -746,6 +771,59 @@ class MaskPaintCanvas(QWidget):
         # Every other tool takes it as Qt would have: another press.
         self.mousePressEvent(event)
 
+    # -- the wand tool ------------------------------------------------------
+
+    def tolerance(self) -> int:
+        return self._tolerance
+
+    def set_tolerance(self, tolerance: int):
+        """How unlike the clicked pixel a pixel may be and still be
+        taken, in display levels (0-255)."""
+        tolerance = max(0, min(255, int(tolerance)))
+        if tolerance != self._tolerance:
+            self._tolerance = tolerance
+            self.tolerance_changed.emit(tolerance)
+
+    def wand_down(self) -> bool:
+        """Is the wand's button down - a preview showing, not yet done?"""
+        return self._wand is not None
+
+    def set_preview(self, region: "np.ndarray | None", erase: bool = False):
+        """Show what the tool in hand would do: ``region`` (a boolean
+        array the snippet's size) tinted with the active mask's colour,
+        or darkened as the hole it would leave. None clears it."""
+        if region is None:
+            self._preview = None
+        else:
+            color = QColor(0, 0, 0)
+            if not erase and self._active in self._order:
+                color = MASK_COLORS[self._order.index(self._active)
+                                    % len(MASK_COLORS)]
+            h, w = region.shape
+            rgba = np.zeros((h, w, 4), dtype=np.uint8)
+            rgba[region] = (color.red(), color.green(), color.blue(), 150)
+            self._preview = QImage(rgba.data, w, h, 4 * w,
+                                   QImage.Format_RGBA8888).copy()
+        self.update()
+
+    def _wand_press(self, event):
+        if event.button() not in (Qt.LeftButton, Qt.RightButton):
+            return
+        x, y = self._to_mask_point(event.pos())
+        self._wand = (x, y, event.button() == Qt.RightButton,
+                      event.pos().x(), self._tolerance)
+        self.wand_changed.emit(x, y, self._tolerance, self._wand[2])
+
+    def _wand_drag(self, event):
+        """Right for more, left for less: the tolerance follows the
+        drag, and the host is asked again for what it would take."""
+        x, y, erase, pressed_at, began = self._wand
+        before = self._tolerance
+        self.set_tolerance(
+            began + round((event.pos().x() - pressed_at) / WAND_DRAG_PX))
+        if self._tolerance != before:
+            self.wand_changed.emit(x, y, self._tolerance, erase)
+
     def _line_in_snippet_pixels(self, start: QPointF, end: QPointF):
         return (start.x() / self._scale, start.y() / self._scale,
                 end.x() / self._scale, end.y() / self._scale)
@@ -779,6 +857,9 @@ class MaskPaintCanvas(QWidget):
         if self._tool == TOOL_POLYGON:
             self._polygon_click(event)
             return
+        if self._tool == TOOL_WAND:
+            self._wand_press(event)
+            return
         if event.button() == Qt.LeftButton:
             self._stroke_value = True
         elif event.button() == Qt.RightButton:
@@ -810,6 +891,9 @@ class MaskPaintCanvas(QWidget):
                     self._line_start, self._line_now))
             self.update()
             return
+        if self._wand is not None:
+            self._wand_drag(event)
+            return
         if self._painting:
             self._stroke_to(event.pos())
         else:
@@ -837,6 +921,11 @@ class MaskPaintCanvas(QWidget):
                 (self.measure_drawn if self._tool == TOOL_MEASURE
                  else self.vector_drawn).emit(
                     *self._line_in_snippet_pixels(start, end))
+            return
+        if self._wand is not None and event.button() in (Qt.LeftButton,
+                                                         Qt.RightButton):
+            self._wand = None
+            self.wand_finished.emit()
             return
         if self._painting and event.button() in (Qt.LeftButton,
                                                  Qt.RightButton):

@@ -7,7 +7,9 @@ left-drag paints, right-drag erases, the brush size is adjustable, and
 several masks can coexist on one snippet - each an independent binary
 layer with its own overlay colour, kept from overlapping one another
 unless Allow Overlap is on. The Polygon tool fills a shape clicked out
-corner by corner (or cuts it out, begun with a right-click).
+corner by corner (or cuts it out, begun with a right-click). The Wand
+takes the connected patch of pixels that look like the one clicked - as
+the snippet is displayed - within a tolerance a drag adjusts.
 
 The paint surface itself is single_view.MaskPaintCanvas; the snippet list
 is strip.SnippetStrip, which the window owns and places. This module is
@@ -40,13 +42,13 @@ from PyQt5.QtWidgets import (
 from ..settings_scope import settings
 from ..debug_log import debug
 from ..masks import (entry_in_window, fill_enclosed, mask_statistics,
-                     merged_entry, polygon_mask)
+                     merged_entry, polygon_mask, similar_region)
 from ..snippets import (read_label_snippet, read_label_window_raw,
                         snippet_frame)
 from .section import Section
-from .single_view import (DEFAULT_BRUSH_PX, MASK_COLORS,
+from .single_view import (DEFAULT_BRUSH_PX, DEFAULT_TOLERANCE, MASK_COLORS,
                           MASK_SNIPPET_SIZE, TOOL_PAINT, TOOL_POLYGON,
-                          MaskPaintCanvas, apply_display_adjust)
+                          TOOL_WAND, MaskPaintCanvas, apply_display_adjust)
 from .strip import SnippetStrip, Worklist
 
 
@@ -68,6 +70,7 @@ MASK_WORKLIST = Worklist(
 # this was the Mask Editor window, so the choice carried over to 2.0.0.
 _OVERLAP_KEY = "mask_editor/allow_overlap"
 _POINT_KEY = "snippet_editor/label_point"
+_TOLERANCE_KEY = "snippet_editor/wand_tolerance"
 
 
 class MaskEditor(QWidget):
@@ -108,6 +111,12 @@ class MaskEditor(QWidget):
         # contrast. Kept so moving a slider is a redraw rather than a
         # re-read of the file.
         self._display_source = None
+        # ... and after them: what is on the screen, which is what the
+        # wand judges "looks like" by.
+        self._shown = None
+        # What the wand would do if let go now: (mask name, region,
+        # take away?), or None.
+        self._wand_pending = None
         self._raw_nodata = None                   # its declared nodata
         # Image (width, height) by path - one header read each, so every
         # stroke can serialize against the full image without touching disk.
@@ -117,8 +126,11 @@ class MaskEditor(QWidget):
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
+        # Two rows. The first is the tools (the host puts their buttons
+        # at its front) and what they work with: the brush's size, the
+        # wand's tolerance. The second is the view: how much of the image
+        # the snippet takes in, its brightness, its zoom.
         controls = self.tool_row = QHBoxLayout()
-        controls.addWidget(QLabel("Snippet:"))
         self.size_spin = QSpinBox()
         self.size_spin.setRange(16, 2048)
         self.size_spin.setSingleStep(32)
@@ -133,7 +145,6 @@ class MaskEditor(QWidget):
             "window you paint in - existing masks stay where they are,\n"
             "including any part outside the current view.")
         self.size_spin.valueChanged.connect(self._on_size_changed)
-        controls.addWidget(self.size_spin)
         controls.addWidget(QLabel("Brush:"))
         self.brush_spin = QSpinBox()
         self.brush_spin.setRange(1, 64)
@@ -141,6 +152,16 @@ class MaskEditor(QWidget):
         self.brush_spin.setSuffix(" px")
         self.brush_spin.setToolTip("Brush diameter in source pixels.")
         controls.addWidget(self.brush_spin)
+        controls.addWidget(QLabel("Tolerance:"))
+        self.tolerance_spin = QSpinBox()
+        self.tolerance_spin.setRange(0, 255)
+        self.tolerance_spin.setValue(self._remembered_tolerance())
+        self.tolerance_spin.setToolTip(
+            "The Wand's: how far a pixel may differ from the one clicked\n"
+            "and still be taken - in display levels (0-255), on the\n"
+            "snippet as it is shown, brightness and contrast included.\n"
+            "Dragging the wand right or left changes it.")
+        controls.addWidget(self.tolerance_spin)
         # Nothing on this row wants the spare width (the class picker is on
         # the window's toolbar); without this the number boxes take it.
         controls.addStretch(1)
@@ -154,8 +175,13 @@ class MaskEditor(QWidget):
         # widest row's minimum, and hanging these off the toolbar took
         # that to 1404 px - off the edge of a 1366-wide laptop screen,
         # with no way to drag it back. A strip of height is affordable
-        # where width is not.
+        # where width is not. (The snippet size came down to this row
+        # when the tool row gained the polygon and the wand, for the same
+        # reason.)
         controls = self.view_row = QHBoxLayout()
+        controls.addWidget(QLabel("Snippet:"))
+        controls.addWidget(self.size_spin)
+        controls.addSpacing(16)
         controls.addWidget(QLabel("Bright:"))
         self.brightness_slider = QSlider(Qt.Horizontal)
         self.brightness_slider.setRange(-100, 100)
@@ -220,6 +246,11 @@ class MaskEditor(QWidget):
         self.canvas.zoom_changed.connect(self._show_zoom)
         self.canvas.label_point_picked.connect(self._on_label_point_picked)
         self.canvas.polygon_drawn.connect(self._on_polygon_drawn)
+        self.canvas.wand_changed.connect(self._on_wand_changed)
+        self.canvas.wand_finished.connect(self._on_wand_finished)
+        self.canvas.set_tolerance(self.tolerance_spin.value())
+        self.tolerance_spin.valueChanged.connect(self.canvas.set_tolerance)
+        self.canvas.tolerance_changed.connect(self.tolerance_spin.setValue)
         self.point_check.toggled.connect(self.canvas.set_point_shown)
         self.canvas.set_point_shown(self.point_check.isChecked())
         self.fit_button.clicked.connect(self.canvas.reset_zoom)
@@ -319,6 +350,14 @@ class MaskEditor(QWidget):
         side.addStretch(1)
 
     @staticmethod
+    def _remembered_tolerance() -> int:
+        try:
+            value = int(settings().value(_TOLERANCE_KEY, DEFAULT_TOLERANCE))
+        except (TypeError, ValueError):
+            return DEFAULT_TOLERANCE
+        return max(0, min(255, value))
+
+    @staticmethod
     def _remembered(key: str, default: bool) -> bool:
         """Last session's choice for ``key``; ``default`` when never set."""
         value = settings().value(key)
@@ -345,6 +384,7 @@ class MaskEditor(QWidget):
         try:
             settings().setValue(_OVERLAP_KEY, self.allow_overlap())
             settings().setValue(_POINT_KEY, self.point_check.isChecked())
+            settings().setValue(_TOLERANCE_KEY, self.tolerance_spin.value())
         except Exception as exc:                  # noqa: BLE001
             debug(f"mask editor settings not saved: "
                   f"{type(exc).__name__}: {exc}")
@@ -389,6 +429,8 @@ class MaskEditor(QWidget):
         self._undecodable = set()
         size = self.size_spin.value()
         self._display_source = None
+        self._shown = None
+        self._wand_pending = None
         if entry is None:
             self.canvas.set_snippet(None, size, size, None)
             self.canvas.set_layers({}, [], None)
@@ -440,7 +482,8 @@ class MaskEditor(QWidget):
             self._stored_by_name[name] = stored
         self._display_source = read_label_snippet(
             entry["image_path"], entry["pixel_x"], entry["pixel_y"], size)
-        self.canvas.set_snippet(self._adjusted_display(), w, h,
+        self._shown = self._adjusted_display()
+        self.canvas.set_snippet(self._shown, w, h,
                                 (entry["pixel_x"] - x0,
                                  entry["pixel_y"] - y0))
         active = self._order[0] if self._order else None
@@ -463,6 +506,7 @@ class MaskEditor(QWidget):
         adjusted = self._adjusted_display()
         if adjusted is None:
             return
+        self._shown = adjusted
         self.canvas.set_pixels(adjusted)
 
     def reset_display_adjust(self):
@@ -693,6 +737,52 @@ class MaskEditor(QWidget):
         self._emit_masks()
         self._refresh_stats()
 
+    def _on_wand_changed(self, x: int, y: int, tolerance: int, erase: bool):
+        """The wand is down on a pixel: find the patch that looks like it
+        and show it, to be taken (or taken away) when the button is let
+        go. Judged on the snippet as it is on the screen, so what is
+        taken is what looked alike - and raising the contrast is a way of
+        telling apart what the wand otherwise would not."""
+        self._wand_pending = None
+        name = self._active_name()
+        if (name is None or name not in self._layers
+                or self._shown is None
+                or self._shown.shape[:2] != self._layers[name].shape):
+            self.canvas.set_preview(None)
+            return
+        layer = self._layers[name]
+        if erase:
+            # Only ever from this mask - and what is not in it is not
+            # shown as about to go.
+            region = similar_region(self._shown, x, y, tolerance) & layer
+        else:
+            region = similar_region(self._shown, x, y, tolerance,
+                                    barrier=self._walls(name))
+        self._wand_pending = (name, region, erase)
+        self.canvas.set_preview(region, erase)
+
+    def _on_wand_finished(self):
+        """The wand was let go: what was shown is done. Like a stroke -
+        one commit, one undo step."""
+        pending, self._wand_pending = self._wand_pending, None
+        self.canvas.set_preview(None)
+        if pending is None:
+            return
+        name, region, erase = pending
+        layer = self._layers.get(name)
+        if layer is None or layer.shape != region.shape:
+            return
+        changed = (layer & region) if erase else (region & ~layer)
+        if not changed.any():
+            return                      # nothing to commit, nothing to undo
+        if erase:
+            layer &= ~region
+        else:
+            layer |= region
+        self.canvas.invalidate_layer(name)
+        self._emit_masks()
+        self._refresh_stats()
+
     def _on_fill_enclosed(self):
         """Fill the active mask's enclosed interior (a drawn hull)."""
         name = self._active_name()
@@ -783,10 +873,10 @@ class MaskSection(Section):
     """The Snippet Editor's Masks section (see section.py).
 
     Its panel is the mask editor's own - list, name, add, delete, fill,
-    overlap, statistics - and it owns the tools that make masks: the brush
-    and the polygon. Switched off, the canvas shows no layers and takes no
-    strokes. In the Grid view it waits: masks are painted on the snippet
-    in hand, which the grid does not show.
+    overlap, statistics - and it owns the tools that make masks: the brush,
+    the polygon and the wand. Switched off, the canvas shows no layers and
+    takes no strokes. In the Grid view it waits: masks are painted on the
+    snippet in hand, which the grid does not show.
     """
 
     key = "masks"
@@ -801,6 +891,11 @@ class MaskSection(Section):
          "the shape into the active mask.\nBegin with a right-click to cut "
          "the shape out instead. Right-click or Backspace takes back the "
          "last corner; Escape gives the shape up.", Qt.Key_G),
+        (TOOL_WAND, "Wand",
+         "Click the object: the connected pixels that look like the one "
+         "clicked join the active mask; a right-click takes them out of "
+         "it.\nKeep the button down and drag right or left to take in "
+         "more or less (Tolerance), then let go.", Qt.Key_D),
     ]
 
     def __init__(self, editor: MaskEditor, parent=None):
