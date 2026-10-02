@@ -117,8 +117,6 @@ class ReviewSection(Section):
 
     # (label_id, status) - out to the main window.
     review_changed = pyqtSignal(int, str)
-    # A key marked the snippet and the panel asks to move on.
-    advance_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(REVIEW_WORKLIST, ReviewPanel(), parent)

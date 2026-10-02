@@ -25,11 +25,14 @@ and these hooks, all optional:
   view_changed(single)  the Single / Grid view changed; return a line to
                         show under the header ("" for none)
   key_pressed(key)      a key in the Single view; True if it was used
+  restore_settings(s)   take up what it remembers between sessions
+  save_settings(s)      and leave it for the next one
 
 A section that edits a label edits the entry dict it was given in place,
 emits entry_changed(label_id) - the window then recounts the list and
 asks every section to refresh - and emits whatever signal carries the new
-value out to the main window.
+value out to the main window. A section whose key finishes a snippet can
+emit advance_requested, and the window moves on to the next.
 """
 from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtWidgets import QWidget
@@ -47,6 +50,8 @@ class Section(QObject):
 
     # A label this section edited (label_id).
     entry_changed = pyqtSignal(int)
+    # A key finished the snippet in hand: move on to the next.
+    advance_requested = pyqtSignal()
 
     def __init__(self, worklist: Worklist, panel: QWidget, parent=None):
         super().__init__(parent)
@@ -71,3 +76,9 @@ class Section(QObject):
     def key_pressed(self, key: int) -> bool:
         """A key pressed in the Single view; True if this section used it."""
         return False
+
+    def restore_settings(self, settings):
+        """Take up what this section remembers between sessions."""
+
+    def save_settings(self, settings):
+        """Leave it for the next session."""

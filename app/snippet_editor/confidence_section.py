@@ -4,15 +4,18 @@ For the ML team, to know which snippets to train on and which matter less
 to get exactly right: 1 is the lowest confidence, 5 the highest, and 0
 means nobody has rated the label yet (which is also what the HDF5 export
 writes for it). Five buttons and Clear rate the snippet in hand; in the
-Single view the keys 1-5 do the same and 0 clears.
+Single view the keys 1-5 do the same and 0 clears. With "Advance after
+rating" ticked a key that rates also moves on to the next snippet, so a
+rating pass is one key a snippet; it is off until ticked, since a key
+that used to leave the snippet in hand would otherwise start skipping.
 
 The smallest complete Section (section.py): a worklist, a panel, a key
 handler - no overlay and no tool. The next per-snippet value can start
 from a copy of this file.
 """
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtWidgets import (QButtonGroup, QHBoxLayout, QLabel, QPushButton,
-                             QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QButtonGroup, QCheckBox, QHBoxLayout, QLabel,
+                             QPushButton, QVBoxLayout, QWidget)
 
 from ..labels import (CONFIDENCE_MAX, CONFIDENCE_MIN, CONFIDENCE_UNSET,
                       valid_confidence)
@@ -35,6 +38,8 @@ CONFIDENCE_WORKLIST = Worklist(
 # Qt key -> rating: 1-5 rate, 0 clears.
 _KEYS = {getattr(Qt, f"Key_{n}"): n
          for n in range(CONFIDENCE_UNSET, CONFIDENCE_MAX + 1)}
+
+_ADVANCE_KEY = "snippet_editor/advance_after_rating"
 
 
 class ConfidencePanel(QWidget):
@@ -71,6 +76,12 @@ class ConfidencePanel(QWidget):
         self.clear_button.clicked.connect(
             lambda: self.rated.emit(CONFIDENCE_UNSET))
         layout.addWidget(self.clear_button)
+        self.advance_check = QCheckBox("Advance after rating")
+        self.advance_check.setToolTip(
+            "After a key 1-5, move to the next snippet - a rating pass "
+            "without the mouse.\nClearing with 0, and the buttons, stay "
+            "on the snippet.")
+        layout.addWidget(self.advance_check)
         hint = QLabel("Keys 1-5 rate the snippet in hand; 0 clears. "
                       "Unrated labels export as 0.")
         hint.setWordWrap(True)
@@ -138,5 +149,21 @@ class ConfidenceSection(Section):
     def key_pressed(self, key):
         if key not in _KEYS:
             return False
-        self.rate(_KEYS[key])
+        value = _KEYS[key]
+        self.rate(value)
+        # Clearing is a second thought about this snippet, not the end
+        # of it - and with nothing in hand there is nothing to leave.
+        if (value != CONFIDENCE_UNSET and self._entry is not None
+                and self.panel.advance_check.isChecked()):
+            self.advance_requested.emit()
         return True
+
+    def restore_settings(self, settings):
+        self.panel.advance_check.setChecked(
+            str(settings.value(_ADVANCE_KEY, "false")).lower()
+            in ("true", "1"))
+
+    def save_settings(self, settings):
+        settings.setValue(_ADVANCE_KEY,
+                          "true" if self.panel.advance_check.isChecked()
+                          else "false")

@@ -314,10 +314,8 @@ class SnippetEditor(QWidget):
         self.section_objects["confidence"].confidence_changed.connect(
             self.confidence_changed)
         self.section_objects["size"].size_changed.connect(self.size_changed)
-        review = self.section_objects["review"]
-        review.review_changed.connect(self.review_changed)
-        # A key that marks the snippet moves on to the next, when asked.
-        review.advance_requested.connect(lambda: self.strip.cycle(1))
+        self.section_objects["review"].review_changed.connect(
+            self.review_changed)
         # Between the sections.
         self.grid.open_requested.connect(self._open_in_single_view)
         # After the Single view has put a snippet on its canvas - and knows
@@ -325,6 +323,9 @@ class SnippetEditor(QWidget):
         self.masks.snippet_shown.connect(self._show_entry)
         for section in self.section_objects.values():
             section.entry_changed.connect(self._on_entry_changed)
+            # A key that finishes the snippet moves on to the next, when
+            # its section asks.
+            section.advance_requested.connect(lambda: self.strip.cycle(1))
         for frame in self.sections.values():
             frame.toggled.connect(self._apply_sections)
         # Space steps the list wherever the keyboard is in the window.
@@ -610,6 +611,8 @@ class SnippetEditor(QWidget):
                       else TOOL_PAINT)
         self.class_linked_check.setChecked(
             str(settings.value(_CLASS_LINKED_KEY, "true")).lower() != "false")
+        for section in self.section_objects.values():
+            section.restore_settings(settings)
         self._apply_sections()
 
     def save_settings(self):
@@ -625,6 +628,8 @@ class SnippetEditor(QWidget):
             settings.setValue(_CLASS_LINKED_KEY, "true"
                               if self.class_linked_check.isChecked()
                               else "false")
+            for section in self.section_objects.values():
+                section.save_settings(settings)
         except Exception as exc:                  # noqa: BLE001
             debug(f"snippet editor settings not saved: "
                   f"{type(exc).__name__}: {exc}")

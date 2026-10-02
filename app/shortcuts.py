@@ -115,7 +115,7 @@ SHORTCUT_SECTIONS = [
     ("Snippet Editor", [
         ("Space", "Next snippet (Single view)"),
         ("Ctrl+Space", "Previous snippet (Single view)"),
-        ("1-5", "Rate confidence, 1 lowest (Single view)"),
+        ("1-5", "Rate confidence, 1 lowest; then next, if Advance is ticked"),
         ("0", "Clear the confidence rating"),
         ("A", "Review: accept, then next (Single view)"),
         ("X", "Review: reject, then next"),
