@@ -32,7 +32,7 @@ import numpy as np
 from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QPixmap
 from PyQt5.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QListWidget,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QScrollArea, QSlider,
     QSpinBox, QVBoxLayout, QWidget)
 
@@ -66,6 +66,7 @@ MASK_WORKLIST = Worklist(
 # Where Allow Overlap is remembered. The key keeps the name it had when
 # this was the Mask Editor window, so the choice carried over to 2.0.0.
 _OVERLAP_KEY = "mask_editor/allow_overlap"
+_POINT_KEY = "snippet_editor/label_point"
 
 
 class MaskEditor(QWidget):
@@ -82,6 +83,9 @@ class MaskEditor(QWidget):
     # A snippet was put on the canvas (or None) - after its frame is known,
     # so a host drawing on the canvas can place things in it.
     snippet_shown = pyqtSignal(object)
+    # (label_id, pixel_x, pixel_y) in IMAGE pixels: the Move tool's click,
+    # where on its own image the label belongs.
+    label_moved = pyqtSignal(int, float, float)
 
     def __init__(self, strip: SnippetStrip, parent=None):
         super().__init__(parent)
@@ -189,6 +193,12 @@ class MaskEditor(QWidget):
             "snippet. Fit goes back to the whole snippet, here and on\n"
             "the ones that follow.")
         controls.addWidget(self.fit_button)
+        self.point_check = QCheckBox("Label point")
+        self.point_check.setToolTip(
+            "Mark where the label itself is on the snippet. The Move\n"
+            "label tool puts it somewhere else.")
+        self.point_check.setChecked(self._remembered(_POINT_KEY, True))
+        controls.addWidget(self.point_check)
         controls.addStretch(1)
         layout.addLayout(controls)
 
@@ -206,6 +216,9 @@ class MaskEditor(QWidget):
         self.canvas.stroke_finished.connect(self._on_stroke_finished)
         self.brush_spin.valueChanged.connect(self.canvas.set_brush)
         self.canvas.zoom_changed.connect(self._show_zoom)
+        self.canvas.label_point_picked.connect(self._on_label_point_picked)
+        self.point_check.toggled.connect(self.canvas.set_point_shown)
+        self.canvas.set_point_shown(self.point_check.isChecked())
         self.fit_button.clicked.connect(self.canvas.reset_zoom)
         self._show_zoom(self.canvas.zoom, False)
         self.canvas_scroll = QScrollArea()
@@ -286,7 +299,7 @@ class MaskEditor(QWidget):
         # the project: it is a way of working, not data.
         self.overlap_button = QPushButton("Allow Overlap")
         self.overlap_button.setCheckable(True)
-        self.overlap_button.setChecked(self._remembered_overlap())
+        self.overlap_button.setChecked(self._remembered(_OVERLAP_KEY, False))
         self.overlap_button.setToolTip(
             "On: masks may be painted over each other.\n"
             "Off: a stroke stops at other masks' pixels, and Fill\n"
@@ -303,9 +316,11 @@ class MaskEditor(QWidget):
         side.addStretch(1)
 
     @staticmethod
-    def _remembered_overlap() -> bool:
-        """Last session's Allow Overlap; off when never set."""
-        value = settings().value(_OVERLAP_KEY)
+    def _remembered(key: str, default: bool) -> bool:
+        """Last session's choice for ``key``; ``default`` when never set."""
+        value = settings().value(key)
+        if value is None:
+            return default
         if isinstance(value, bool):
             return value
         # QSettings hands back a string on some backends.
@@ -318,8 +333,8 @@ class MaskEditor(QWidget):
         """Remember Allow Overlap for next time. A panel gets no close
         event of its own, so the window holding it calls this."""
         try:
-            settings().setValue(_OVERLAP_KEY,
-                                           self.allow_overlap())
+            settings().setValue(_OVERLAP_KEY, self.allow_overlap())
+            settings().setValue(_POINT_KEY, self.point_check.isChecked())
         except Exception as exc:                  # noqa: BLE001
             debug(f"mask editor settings not saved: "
                   f"{type(exc).__name__}: {exc}")
@@ -461,6 +476,13 @@ class MaskEditor(QWidget):
                "The image could not be read, so its masks are read-only.")
         for button in (self.add_button, self.delete_button):
             button.setToolTip(tip)
+
+    def _on_label_point_picked(self, x: float, y: float):
+        """The Move tool clicked the snippet: say where on the IMAGE."""
+        if self._current is None:
+            return
+        x0, y0, _w, _h = self._frame
+        self.label_moved.emit(self._current["label_id"], x0 + x, y0 + y)
 
     def _show_zoom(self, scale: float, kept: bool):
         """The zoom beside Fit, which is live while a zoom is being kept."""

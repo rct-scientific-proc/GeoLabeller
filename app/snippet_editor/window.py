@@ -23,8 +23,8 @@ new module, one line in that list, and its outward signal.
 It talks to the rest of the app through set_labels / set_classes /
 set_mask_names / set_save_state in, and masks_changed /
 orientation_changed / size_changed / confidence_changed / review_changed /
-class_changed / mask_names_changed / save_requested / undo_requested /
-redo_requested out.
+class_changed / position_changed / mask_names_changed / save_requested /
+undo_requested / redo_requested out.
 """
 from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QKeySequence
@@ -42,7 +42,7 @@ from .linked_row import LinkedRow
 from .size_section import SizeSection
 from .mask_section import MaskEditor, MaskSection
 from .orientation_section import OrientationEditor, OrientationSection
-from .single_view import TOOL_ORIENT, TOOL_PAINT
+from .single_view import TOOL_MOVE, TOOL_ORIENT, TOOL_PAINT
 from .strip import SnippetStrip
 
 _VIEW_KEY = "snippet_editor/view"
@@ -111,6 +111,9 @@ class SnippetEditor(QWidget):
     # (label_id, class name): the main window applies it to the label's
     # whole linked object - the same thing seen in different images.
     class_changed = pyqtSignal(int, str, bool)   # +also the linked labels
+    # (label_id, pixel_x, pixel_y): the Move label tool - where on its
+    # own image the label belongs.
+    position_changed = pyqtSignal(int, float, float)
     # (label_id, length_m or None, width_m or None)
     size_changed = pyqtSignal(int, object, object)
     mask_names_changed = pyqtSignal(list)
@@ -180,21 +183,28 @@ class SnippetEditor(QWidget):
         tool_row.insertWidget(0, QLabel("Tool:"))
         self._tool_buttons = QButtonGroup(self)
         self._tools = {}                 # tool id -> button
-        self._tool_owner = {}            # tool id -> section key
-        for section in self.section_objects.values():
-            if section.tool is None:
-                continue
-            tool_id, text, tip = section.tool
+        self._tool_owner = {}            # tool id -> section key, or None
+        tools = [(section.key,) + tuple(section.tool)
+                 for section in self.section_objects.values()
+                 if section.tool is not None]
+        # And one that is no section's, so it is always there: the label
+        # itself, which every section's values hang on.
+        tools.append((None, TOOL_MOVE, "Move label",
+                      "Click where the label belongs, and it moves there - "
+                      "on this image.\nMasks, orientation and size stay "
+                      "with the imagery they were drawn on."))
+        for owner, tool_id, text, tip in tools:
             button = QPushButton(text)
             button.setToolTip(tip)
             button.setCheckable(True)
             self._tool_buttons.addButton(button)
             tool_row.insertWidget(len(self._tools) + 1, button)
             self._tools[tool_id] = button
-            self._tool_owner[tool_id] = section.key
+            self._tool_owner[tool_id] = owner
         tool_row.insertSpacing(len(self._tools) + 1, 16)
         self.paint_button = self._tools.get(TOOL_PAINT)
         self.orient_button = self._tools.get(TOOL_ORIENT)
+        self.move_button = self._tools[TOOL_MOVE]
 
         # The list, then whichever view is showing. The Grid view is a list
         # of its own, so it takes the list's pane when it is up.
@@ -293,6 +303,7 @@ class SnippetEditor(QWidget):
         # Out to the main window.
         self.masks.masks_changed.connect(self.masks_changed)
         self.masks.mask_names_changed.connect(self.mask_names_changed)
+        self.masks.label_moved.connect(self.position_changed)
         self.grid.orientation_changed.connect(self.orientation_changed)
         self.section_objects["confidence"].confidence_changed.connect(
             self.confidence_changed)
@@ -432,7 +443,8 @@ class SnippetEditor(QWidget):
         # Each tool goes with its section; if the one in hand went, take up
         # the first that is left.
         for tool_id, button in self._tools.items():
-            button.setEnabled(self._tool_owner[tool_id] in on)
+            owner = self._tool_owner[tool_id]
+            button.setEnabled(owner is None or owner in on)
         if not self._tools[self.tool()].isEnabled():
             for tool_id, button in self._tools.items():
                 if button.isEnabled():
@@ -579,8 +591,11 @@ class SnippetEditor(QWidget):
             frame.set_on(key not in off)
             frame.header.blockSignals(False)
             frame.content.setVisible(frame.is_on())
+        # Not Move label: a tool that moves a label at a click is one to
+        # pick up on purpose, not to find in hand the next morning.
         tool = settings.value(_TOOL_KEY, TOOL_PAINT)
-        self.set_tool(tool if tool in self._tools else TOOL_PAINT)
+        self.set_tool(tool if tool in self._tools and tool != TOOL_MOVE
+                      else TOOL_PAINT)
         self.class_linked_check.setChecked(
             str(settings.value(_CLASS_LINKED_KEY, "true")).lower() != "false")
         self._apply_sections()

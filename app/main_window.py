@@ -2312,6 +2312,23 @@ class MainWindow(QMainWindow):
             + (f" - without {' and '.join(lost)}" if lost else "")
             if other_image else f"Moved label #{label_id}", 5000)
 
+    def _on_label_position_changed(self, label_id: int, pixel_x: float,
+                                   pixel_y: float):
+        """The Snippet Editor's Move label tool: another place on the
+        label's own image. The same move as the canvas's - one undo step,
+        nothing else on the label touched - found from a pixel instead of
+        a click on the map.
+        """
+        image, label = self.project.get_label_by_id(label_id)
+        if label is None or image is None:
+            return
+        # (lat, lon), or None for an image that says nothing of the
+        # ground - whose labels keep the placeholder they have.
+        ground = image.pixel_to_latlon(pixel_x, pixel_y)
+        lat, lon = ground if ground is not None else (label.lat, label.lon)
+        self._on_label_move_requested(label_id, pixel_x, pixel_y, lon, lat,
+                                      image.name, image.group, image.path)
+
     def _update_waterfall_projections(self):
         """Refresh the projected label markers in waterfall mode.
 
@@ -2885,6 +2902,7 @@ class MainWindow(QMainWindow):
             editor.confidence_changed.connect(self._on_confidence_changed)
             editor.review_changed.connect(self._on_review_changed)
             editor.class_changed.connect(self._on_label_class_changed)
+            editor.position_changed.connect(self._on_label_position_changed)
             editor.size_changed.connect(self._on_size_changed)
             editor.mask_names_changed.connect(self._on_mask_names_changed)
             editor.save_requested.connect(self._save_project)

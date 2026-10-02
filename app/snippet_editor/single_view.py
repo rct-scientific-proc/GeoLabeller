@@ -28,6 +28,7 @@ MAX_ZOOM = 32.0             # far enough in for single-pixel brushwork
 TOOL_PAINT = "paint"        # left-drag paints, right-drag erases
 TOOL_ORIENT = "orient"      # left-drag reports a line, right-click clears
 TOOL_MEASURE = "measure"    # the same gesture, for a length or a width
+TOOL_MOVE = "move"          # a click puts the label's own point there
 
 # The tools that draw a line rather than paint.
 _LINE_TOOLS = (TOOL_ORIENT, TOOL_MEASURE)
@@ -37,6 +38,7 @@ MEASURE_COLOR = QColor(0, 200, 255)
 # threshold the orientation grid uses, where screen and source are 1:1.
 MIN_LINE_PX = 6
 LINE_PREVIEW_COLOR = QColor(0, 220, 255)
+POINT_RING_PX = 6           # the label point's ring, on screen
 
 
 def display_scale(size_px: int) -> int:
@@ -94,6 +96,8 @@ class MaskPaintCanvas(QWidget):
     measure_moved = pyqtSignal(float, float, float, float)
     measure_drawn = pyqtSignal(float, float, float, float)
     measure_clear_requested = pyqtSignal()
+    # Move tool: a click, in snippet pixels - where the label belongs.
+    label_point_picked = pyqtSignal(float, float)
     # The zoom, and whether it is one the user set (and so is kept).
     zoom_changed = pyqtSignal(float, bool)
 
@@ -131,6 +135,11 @@ class MaskPaintCanvas(QWidget):
         # one edge label does not leave the view shifted for the rest of
         # the pass; forgotten once the user moves the view themselves.
         self._view_owed = (0.0, 0.0)
+        # Whether the label's own point is marked on the snippet. A
+        # snippet is cut around its label, so the point is usually the
+        # middle - but not near the image's edge, and "usually" is no
+        # way to check a position.
+        self._point_shown = True
         self._pan_last = None       # global pos while drag-panning
         # No imagery means no idea what is being painted over, and (when the
         # image size is unknown too) no idea where in the source the strokes
@@ -247,7 +256,7 @@ class MaskPaintCanvas(QWidget):
         self.update()
 
     def set_tool(self, tool: str):
-        """TOOL_PAINT, TOOL_ORIENT or TOOL_MEASURE."""
+        """TOOL_PAINT, TOOL_ORIENT, TOOL_MEASURE or TOOL_MOVE."""
         self._tool = tool
         self._line_start = self._line_now = None
         self.update()
@@ -262,6 +271,15 @@ class MaskPaintCanvas(QWidget):
         convention's: counter-clockwise from +x with y UP."""
         self._arrow = (None if angle_rad is None or centre is None
                        else (angle_rad, QColor(color), tuple(centre)))
+        self.update()
+
+    def point_shown(self) -> bool:
+        return self._point_shown
+
+    def set_point_shown(self, shown: bool):
+        """Mark the label's own point on the snippet, or leave it clear.
+        The Move tool marks it regardless: it is what is being moved."""
+        self._point_shown = bool(shown)
         self.update()
 
     def layers_shown(self) -> bool:
@@ -467,7 +485,30 @@ class MaskPaintCanvas(QWidget):
             dx, dy = math.cos(rad) * half, -math.sin(rad) * half
             self._draw_arrow(painter, QPointF(x - dx, y - dy),
                              QPointF(x + dx, y + dy), color)
+        if self.point_marked():
+            self._draw_label_point(painter)
         painter.end()
+
+    def point_marked(self) -> bool:
+        """Is the label's own point being drawn on this snippet?"""
+        return self._focus is not None and (self._point_shown
+                                            or self._tool == TOOL_MOVE)
+
+    def _draw_label_point(self, painter):
+        """Where the label itself is: a ring and four ticks, open in the
+        middle so the pixel it marks is not covered. A dark line under a
+        light one, to read on bright and dark imagery alike."""
+        x, y = self._focus[0] * self._scale, self._focus[1] * self._scale
+        painter.setBrush(Qt.NoBrush)
+        for color, width in ((QColor(0, 0, 0, 200), 3),
+                             (QColor(255, 255, 255, 235), 1)):
+            painter.setPen(QPen(color, width))
+            painter.drawEllipse(QPointF(x, y), POINT_RING_PX, POINT_RING_PX)
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                painter.drawLine(
+                    QPointF(x + dx * POINT_RING_PX, y + dy * POINT_RING_PX),
+                    QPointF(x + dx * (POINT_RING_PX + 5),
+                            y + dy * (POINT_RING_PX + 5)))
 
     @staticmethod
     def _draw_measure(painter, start: QPointF, end: QPointF, caption: str):
@@ -578,6 +619,13 @@ class MaskPaintCanvas(QWidget):
                     and event.modifiers() & Qt.ShiftModifier)):
             self._pan_last = event.globalPos()
             self.setCursor(Qt.ClosedHandCursor)
+            return
+        if self._tool == TOOL_MOVE:
+            # An image that cannot be read shows nothing to aim at.
+            if (event.button() == Qt.LeftButton and not self._read_only
+                    and self._focus is not None):
+                self.label_point_picked.emit(event.pos().x() / self._scale,
+                                             event.pos().y() / self._scale)
             return
         if self._tool in _LINE_TOOLS:
             if event.button() == Qt.LeftButton:
