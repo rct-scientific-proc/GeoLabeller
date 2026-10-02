@@ -384,6 +384,7 @@ class SnippetEditor(QWidget):
         self.views.setCurrentIndex(view)
         self._view_buttons.button(view).setChecked(True)
         single = view == self.SINGLE
+        self.grid.set_active(not single)
         self.strip.panel.setVisible(single)
         # A class is changed on the snippet in hand, which only the Single
         # view has.

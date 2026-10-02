@@ -31,6 +31,22 @@ GROUP_COUNTS_ROLE = Qt.UserRole + 3
 _TOGGLE_PUMP_SECONDS = 0.030
 
 
+# The style's stock icons, looked up once each. Asking the style costs
+# about 0.3 ms a time on Windows, and every row of every panel asked for
+# its own: the Labeled Images panel, rebuilt on each undo, redo and class
+# change, spent 1.15 s of a 1.3 s undo on 4,000 lookups of the same two
+# icons at 2,000 labels (2026-10-02).
+_standard_icons: dict = {}
+
+
+def _standard_icon(which):
+    icon = _standard_icons.get(which)
+    if icon is None:
+        icon = QApplication.style().standardIcon(which)
+        _standard_icons[which] = icon
+    return icon
+
+
 class LayerTreeWidget(QTreeWidget):
     """Tree widget that emits signal after drag-drop."""
 
@@ -178,8 +194,7 @@ class LayerPanel(QWidget):
         item.setToolTip(0, file_path)
 
         # Set image icon for layers
-        style = QApplication.style()
-        item.setIcon(0, style.standardIcon(QStyle.SP_FileIcon))
+        item.setIcon(0, _standard_icon(QStyle.SP_FileIcon))
 
         if parent:
             parent.addChild(item)
@@ -213,8 +228,7 @@ class LayerPanel(QWidget):
         item.setCheckState(0, Qt.Checked if visible else Qt.Unchecked)
 
         # Set folder icon and bold font for groups
-        style = QApplication.style()
-        item.setIcon(0, style.standardIcon(QStyle.SP_DirIcon))
+        item.setIcon(0, _standard_icon(QStyle.SP_DirIcon))
         font = item.font(0)
         font.setBold(True)
         item.setFont(0, font)
@@ -1166,8 +1180,7 @@ class LayerPanel(QWidget):
         item.setCheckState(0, Qt.Unchecked)
 
         # Distinct styling: orange color, bold, folder icon
-        style = QApplication.style()
-        item.setIcon(0, style.standardIcon(QStyle.SP_DirIcon))
+        item.setIcon(0, _standard_icon(QStyle.SP_DirIcon))
         font = item.font(0)
         font.setBold(True)
         font.setItalic(True)
@@ -1191,8 +1204,7 @@ class LayerPanel(QWidget):
         item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
         item.setCheckState(0, Qt.Checked if visible else Qt.Unchecked)
 
-        style = QApplication.style()
-        item.setIcon(0, style.standardIcon(QStyle.SP_DirIcon))
+        item.setIcon(0, _standard_icon(QStyle.SP_DirIcon))
         font = item.font(0)
         font.setBold(True)
         item.setFont(0, font)
@@ -1218,8 +1230,7 @@ class LayerPanel(QWidget):
         item.setCheckState(0, Qt.Checked if visible else Qt.Unchecked)
         item.setToolTip(0, file_path)
 
-        style = QApplication.style()
-        item.setIcon(0, style.standardIcon(QStyle.SP_FileIcon))
+        item.setIcon(0, _standard_icon(QStyle.SP_FileIcon))
 
         nongeo_parent.addChild(item)
         item.setData(0, GROUP_PATH_ROLE, self._get_group_path(item))
@@ -1399,7 +1410,6 @@ class LabeledLayerPanel(QWidget):
                 ))
 
         # Create tree items
-        style = QApplication.style()
 
         for object_id, labels in object_groups.items():
             # Create group for this object_id
@@ -1412,7 +1422,7 @@ class LabeledLayerPanel(QWidget):
             group_item.setFlags(group_item.flags() | Qt.ItemIsUserCheckable)
             # Check state will be set after children are added based on their
             # visibility
-            group_item.setIcon(0, style.standardIcon(QStyle.SP_DirIcon))
+            group_item.setIcon(0, _standard_icon(QStyle.SP_DirIcon))
 
             # Bold font for groups, different colors based on link status
             font = group_item.font(0)
@@ -1460,7 +1470,7 @@ class LabeledLayerPanel(QWidget):
                     0, f"Label #{label_id} on {file_path}\nLon: {
                         lon:.6f}, Lat: {
                         lat:.6f}")
-                label_item.setIcon(0, style.standardIcon(QStyle.SP_FileIcon))
+                label_item.setIcon(0, _standard_icon(QStyle.SP_FileIcon))
                 group_item.addChild(label_item)
 
             # Set group check state based on children
@@ -1484,7 +1494,6 @@ class LabeledLayerPanel(QWidget):
         placing a label on a 20,000-label project needs.
         """
         self.tree.blockSignals(True)
-        style = QApplication.style()
 
         object_id = label.object_id
         group_item = self._group_by_object.get(object_id)
@@ -1497,7 +1506,7 @@ class LabeledLayerPanel(QWidget):
             group_item.setData(0, Qt.UserRole, object_id)
             group_item.setData(0, Qt.UserRole + 1, "group")
             group_item.setFlags(group_item.flags() | Qt.ItemIsUserCheckable)
-            group_item.setIcon(0, style.standardIcon(QStyle.SP_DirIcon))
+            group_item.setIcon(0, _standard_icon(QStyle.SP_DirIcon))
 
             font = group_item.font(0)
             font.setBold(True)
@@ -1537,7 +1546,7 @@ class LabeledLayerPanel(QWidget):
 
         label_item.setToolTip(
             0, f"Label #{label.id} on {image.path}\nLon: {label.lon:.6f}, Lat: {label.lat:.6f}")
-        label_item.setIcon(0, style.standardIcon(QStyle.SP_FileIcon))
+        label_item.setIcon(0, _standard_icon(QStyle.SP_FileIcon))
         group_item.addChild(label_item)
         self._item_by_label[label.id] = label_item
 

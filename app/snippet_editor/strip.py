@@ -20,14 +20,18 @@ move between windows without dragging a layout with it.
 from dataclasses import dataclass
 from typing import Callable
 
-from PyQt5.QtCore import QObject, QSize, Qt, pyqtSignal
-from PyQt5.QtGui import QIcon, QImage, QPixmap
+from PyQt5 import sip
+from PyQt5.QtCore import QEvent, QObject, QPoint, QSize, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QIcon, QImage, QPixmap
 from PyQt5.QtWidgets import (QComboBox, QLabel, QListWidget, QListWidgetItem,
                              QVBoxLayout, QWidget)
 
 from ..snippets import SnippetLoader
 
 THUMB_PX = 96
+# Thumbnails are read for the rows on screen and this many either side,
+# so a scroll or a step lands on pictures already there.
+THUMB_AHEAD = 12
 
 
 def _no_badge(_entry: dict) -> str:
@@ -123,6 +127,24 @@ class SnippetStrip(QObject):
         self.list_widget.setIconSize(QSize(THUMB_PX, THUMB_PX))
         self.list_widget.setMinimumWidth(120)
         self.list_widget.currentItemChanged.connect(self._on_item_changed)
+        # Thumbnails are read for the rows in view, not for the list.
+        # Every row used to ask for its own as the list was built: 20,000
+        # labels queued 20,000 file reads to draw the 22 rows on screen,
+        # and held the window for 15 s doing it - again on every undo,
+        # redo and class change, which refill the list (2026-10-02:
+        # 1.4 s an undo at 2,000 labels, 6-7 s at 8,000).
+        self._thumb_asked: set = set()
+        self._placeholder: "QIcon | None" = None
+        self._thumb_timer = QTimer(self)
+        self._thumb_timer.setSingleShot(True)
+        self._thumb_timer.setInterval(0)
+        self._thumb_timer.timeout.connect(self.request_visible_thumbnails)
+        self.list_widget.verticalScrollBar().valueChanged.connect(
+            lambda _value: self._thumb_timer.start())
+        # Held, so the filter can tell it without asking a list that
+        # may be on its way out.
+        self._viewport = self.list_widget.viewport()
+        self._viewport.installEventFilter(self)
         box.addWidget(self.list_widget, 1)
         self.message_label = QLabel("")
         self.message_label.setWordWrap(True)
@@ -365,17 +387,17 @@ class SnippetStrip(QObject):
         # has gone from the list (below).
         old_order = list(self.items_by_label)
         self.items_by_label = {}
+        self._thumb_asked = set()
+        placeholder = self._placeholder_icon()
         self.entries_by_label = {e["label_id"]: e for e in self.entries}
         keep_id = self._current_id
         for entry in self.entries:
             if not self.in_class(entry) or not self.matches(entry):
                 continue
-            item = QListWidgetItem(self._caption(entry))
+            item = QListWidgetItem(placeholder, self._caption(entry))
             item.setData(self.ID_ROLE, entry["label_id"])
             self.list_widget.addItem(item)
             self.items_by_label[entry["label_id"]] = item
-            self.loader.request(entry["label_id"], entry["image_path"],
-                                entry["pixel_x"], entry["pixel_y"], THUMB_PX)
         self._update_counts()
         if self.list_widget.count():
             row = 0
@@ -391,7 +413,65 @@ class SnippetStrip(QObject):
             self._current_id = None
             self.entry_picked.emit(None)
         self._update_message()
+        # Now, not on the timer: a thumbnail already read comes straight
+        # from the cache, so a refill (every undo) redraws its pictures in
+        # the same turn instead of flashing placeholders first.
+        self.request_visible_thumbnails()
         self.rebuilt.emit(chosen_anew)
+
+    # -- thumbnails, for the rows in view --------------------------------------
+
+    def _placeholder_icon(self) -> QIcon:
+        """What a row shows until its thumbnail is read: one icon shared
+        by every row, the thumbnail's size, so the rows do not change
+        height when the pictures arrive."""
+        if self._placeholder is None:
+            pixmap = QPixmap(THUMB_PX, THUMB_PX)
+            pixmap.fill(QColor(46, 46, 46))
+            self._placeholder = QIcon(pixmap)
+        return self._placeholder
+
+    def visible_rows(self) -> range:
+        """The rows on screen, with THUMB_AHEAD either side."""
+        count = self.list_widget.count()
+        if not count:
+            return range(0)
+        viewport = self.list_widget.viewport()
+        top = self.list_widget.indexAt(QPoint(4, 4)).row()
+        bottom = self.list_widget.indexAt(
+            QPoint(4, max(4, viewport.height() - 4))).row()
+        if top < 0:
+            top = 0
+        if bottom < top:
+            bottom = count - 1          # the list ends above the bottom edge
+        return range(max(0, top - THUMB_AHEAD),
+                     min(count, bottom + THUMB_AHEAD + 1))
+
+    def request_visible_thumbnails(self):
+        """Ask for the thumbnails of the rows in view that have not been
+        asked for yet. (The row in hand is in view: selecting a row
+        scrolls to it.)"""
+        if sip.isdeleted(self.list_widget):
+            return          # the list went before its owner did
+        for row in self.visible_rows():
+            label_id = self.list_widget.item(row).data(self.ID_ROLE)
+            if label_id in self._thumb_asked:
+                continue
+            entry = self.entries_by_label.get(label_id)
+            if entry is None:
+                continue
+            self._thumb_asked.add(label_id)
+            self.loader.request(label_id, entry["image_path"],
+                                entry["pixel_x"], entry["pixel_y"], THUMB_PX)
+
+    def eventFilter(self, obj, event):
+        # getattr: Qt still delivers events to a strip Python has
+        # begun to take apart, whose attributes are already gone.
+        viewport = getattr(self, "_viewport", None)
+        if (viewport is not None and obj is viewport
+                and event.type() in (QEvent.Resize, QEvent.Show)):
+            self._thumb_timer.start()
+        return False
 
     def _nearest_row(self, old_order: list, at: int) -> int:
         """The row of the first snippet after position ``at`` of the old
@@ -450,6 +530,7 @@ class SnippetStrip(QObject):
     def _on_item_changed(self, item, previous=None):
         self._current_id = (None if item is None
                             else item.data(self.ID_ROLE))
+        self._thumb_timer.start()
         self.entry_picked.emit(self.current_entry())
         if previous is not None:
             self._retire(previous.data(self.ID_ROLE))

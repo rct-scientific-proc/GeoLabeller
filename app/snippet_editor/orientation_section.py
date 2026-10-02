@@ -239,6 +239,13 @@ class OrientationEditor(QWidget):
         # filter decide what that is.
         self.strip = strip
         self._orientation_shown = True
+        # Whether the grid is the view showing. A host with another view
+        # (the Snippet Editor's Single view) says so, and the grid then
+        # leaves its cells unbuilt until it is shown: every refill of the
+        # list used to rebuild a page of 60 cells, with 60 file reads,
+        # behind the view the user was actually in.
+        self._active = True
+        self._stale = False
         self._setup_ui()
         strip.rebuilt.connect(self._on_strip_rebuilt)
 
@@ -303,7 +310,17 @@ class OrientationEditor(QWidget):
         self._entries_by_id = {e["label_id"]: e for e in self._entries}
         if chosen_anew:
             self._page = 0
+        if not self._active:
+            self._stale = True
+            return
         self._rebuild()
+
+    def set_active(self, active: bool):
+        """Say whether the grid is the view showing; coming back into
+        view, it catches up with what the list did meanwhile."""
+        self._active = bool(active)
+        if self._active and self._stale:
+            self._rebuild()
 
     def _shown_entries(self) -> list:
         """What the strip lists - its class and Show filter - in its
@@ -314,6 +331,7 @@ class OrientationEditor(QWidget):
         return max(1, -(-len(self._shown_entries()) // PAGE_SIZE))
 
     def _rebuild(self):
+        self._stale = False
         self._loader.cancel_all()
         while self._grid.count():
             item = self._grid.takeAt(0)
