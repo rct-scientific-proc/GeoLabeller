@@ -10,7 +10,8 @@ A section is:
 
   key, title   its id (settings, lookups) and the name on its header
   worklist     what "done" means for it - its needs/done pair on the Show
-               filter, and its badge on the list's captions (strip.py)
+               filter, and its badge on the list's captions (strip.py);
+               None for a section with nothing to be done (notes)
   panel        its widget in the column on the right
   tool         optionally, a tool it owns on the Single view's canvas:
                (tool id, button text, tooltip, the key that picks it up)
@@ -53,7 +54,8 @@ class Section(QObject):
     # A key finished the snippet in hand: move on to the next.
     advance_requested = pyqtSignal()
 
-    def __init__(self, worklist: Worklist, panel: QWidget, parent=None):
+    def __init__(self, worklist: "Worklist | None", panel: QWidget,
+                 parent=None):
         super().__init__(parent)
         self.worklist = worklist
         self.panel = panel

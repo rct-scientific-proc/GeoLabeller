@@ -14,7 +14,11 @@ main GUI; tests/test_snippet_editor_embed.py holds that.
     strip.py                 the snippet list: class and Show filters,
                              counts, stepping - shared by every section
     single_view.py           one snippet, zoomable, with paintable layers,
-                             an arrow overlay and the Paint/Orient tools
+                             an arrow overlay, the label's own point and
+                             the Paint/Orient/Measure/Move tools
+    notes_section.py         NotesSection - the label's description and
+                             its object's Group ID; a section with no
+                             worklist
     orientation_section.py   the Grid view (OrientationEditor), and
                              OrientationSection
     mask_section.py          the Single view's mask painting
@@ -24,6 +28,10 @@ main GUI; tests/test_snippet_editor_embed.py holds that.
     confidence_section.py    ConfidenceSection - the 1-5 rating; the
                              smallest complete section, to copy for the
                              next per-snippet value
+    review_section.py        ReviewSection - accepted, rejected, or to
+                             look at again
+    linked_row.py            under the Single view, every snippet of the
+                             object the one in hand belongs to
 
 Through 1.x the two editors were windows of their own (Labels > Mask
 Editor, Labels > Orientation Editor). Now they are panels built around

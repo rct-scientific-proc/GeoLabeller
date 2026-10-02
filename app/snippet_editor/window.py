@@ -23,8 +23,9 @@ new module, one line in that list, and its outward signal.
 It talks to the rest of the app through set_labels / set_classes /
 set_mask_names / set_save_state in, and masks_changed /
 orientation_changed / size_changed / confidence_changed / review_changed /
-class_changed / position_changed / mask_names_changed / save_requested /
-undo_requested / redo_requested out.
+class_changed / position_changed / description_changed /
+group_id_changed / mask_names_changed / save_requested / undo_requested /
+redo_requested out.
 """
 from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QKeySequence
@@ -38,6 +39,7 @@ from ..settings_scope import settings as app_settings
 from ..debug_log import debug
 from .confidence_section import ConfidenceSection
 from .review_section import ReviewSection
+from .notes_section import NotesSection
 from .linked_row import LinkedRow
 from .size_section import SizeSection
 from .mask_section import MaskEditor, MaskSection
@@ -114,6 +116,10 @@ class SnippetEditor(QWidget):
     # (label_id, pixel_x, pixel_y): the Move label tool - where on its
     # own image the label belongs.
     position_changed = pyqtSignal(int, float, float)
+    # (label_id, text): this label's description; and the Group ID, which
+    # the main window gives to the label's whole linked object.
+    description_changed = pyqtSignal(int, str)
+    group_id_changed = pyqtSignal(int, str)
     # (label_id, length_m or None, width_m or None)
     size_changed = pyqtSignal(int, object, object)
     mask_names_changed = pyqtSignal(list)
@@ -136,14 +142,15 @@ class SnippetEditor(QWidget):
         # The sections, in the order they are offered - in the column, on
         # the Show filter, and for tools on the Single view. The only place
         # the window names them.
-        sections = (OrientationSection(self.grid, self.masks, self),
+        sections = (NotesSection(self),
+                    OrientationSection(self.grid, self.masks, self),
                     MaskSection(self.masks, self),
                     SizeSection(self.masks, self.grid._geo_info, self),
                     ConfidenceSection(self),
                     ReviewSection(self))
         self.section_objects = {section.key: section for section in sections}
         self.orientation_panel = self.section_objects["orientation"].panel
-        self.strip.set_worklists([section.worklist for section in sections])
+        self._apply_worklists(self.section_objects)
         self._setup_ui()
         self._wire()
         self._restore_settings()
@@ -316,6 +323,9 @@ class SnippetEditor(QWidget):
         self.section_objects["size"].size_changed.connect(self.size_changed)
         self.section_objects["review"].review_changed.connect(
             self.review_changed)
+        notes = self.section_objects["notes"]
+        notes.description_changed.connect(self.description_changed)
+        notes.group_id_changed.connect(self.group_id_changed)
         # Between the sections.
         self.grid.open_requested.connect(self._open_in_single_view)
         # After the Single view has put a snippet on its canvas - and knows
@@ -443,8 +453,7 @@ class SnippetEditor(QWidget):
     def _apply_sections(self, *_args):
         """Give each section all of itself, or none of it."""
         on = self.sections_on()
-        self.strip.set_worklists([self.section_objects[key].worklist
-                                  for key in on])
+        self._apply_worklists(on)
         for key, section in self.section_objects.items():
             section.set_shown(key in on)
         # Each tool goes with its section; if the one in hand went, take up
@@ -457,6 +466,13 @@ class SnippetEditor(QWidget):
                 if button.isEnabled():
                     self.set_tool(tool_id)
                     break
+
+    def _apply_worklists(self, keys):
+        """The Show filter's pairs: one for each of these sections that
+        has something to be done."""
+        self.strip.set_worklists([
+            self.section_objects[key].worklist for key in keys
+            if self.section_objects[key].worklist is not None])
 
     def _show_entry(self, entry):
         self._show_class(entry)

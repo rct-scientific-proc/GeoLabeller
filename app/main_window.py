@@ -2460,6 +2460,16 @@ class MainWindow(QMainWindow):
             f"Describe this {label.class_name}:", label.description)
         if not accepted:
             return
+        self._set_label_description(label_id, text)
+        # The Snippet Editor shows it too.
+        self._schedule_refresh("editors")
+
+    def _set_label_description(self, label_id: int, text: str):
+        """Store a label's description - from the prompt above, or as the
+        Snippet Editor's Notes section reports it. One undo step."""
+        _, label = self.project.get_label_by_id(label_id)
+        if label is None:
+            return
         with self._recorded("Describe label", labels=[label_id]):
             if label.description != text.strip():
                 label.description = text.strip()
@@ -2487,6 +2497,14 @@ class MainWindow(QMainWindow):
             "Shared name for this linked group:", text=label.group_id)
         if not accepted:
             return
+        self._set_label_group_id(label_id, text)
+
+    def _set_label_group_id(self, label_id: int, text: str):
+        """Name a label's whole linked group - from the prompt above, or
+        as the Snippet Editor's Notes section reports it. One undo step."""
+        _, label = self.project.get_label_by_id(label_id)
+        if label is None:
+            return
         with self._recorded("Set group ID",
                             labels=self._object_ids_of(label_id)):
             changed = self.project.set_group_id(label_id, text)
@@ -2498,6 +2516,10 @@ class MainWindow(QMainWindow):
             # refresh path re-applies it later, like the description.
             self.canvas.set_label_group_id(lid, label.group_id)
             self._label_row_changed(lid)
+        # The Snippet Editor names objects by it, and shows it on every
+        # label of the group. Once this turn is over: the name may have
+        # come from the editor, part-way through showing its next snippet.
+        self._schedule_refresh("editors")
         n = len(changed)
         note = f" across {n} linked labels" if n > 1 else ""
         self.statusBar.showMessage(
@@ -2674,6 +2696,7 @@ class MainWindow(QMainWindow):
                         label.object_id, ())) > 1,
                     "object_id": label.object_id,
                     "group_id": label.group_id,
+                    "description": label.description,
                     "lon": label.lon,
                     "lat": label.lat,
                     "orientation_px_rad": label.orientation_px_rad,
@@ -2705,8 +2728,9 @@ class MainWindow(QMainWindow):
     def _schedule_refresh(self, *kinds: str):
         """Ask for project-wide refreshes once the current burst settles.
 
-        ``kinds`` are "labeled" and "snippets". Repeat requests within one
-        gesture collapse into a single rebuild on the next event-loop turn.
+        ``kinds`` are "labeled", "snippets" and "editors" (the Snippet
+        Editor, re-seated). Repeat requests within one gesture collapse
+        into a single rebuild on the next event-loop turn.
         """
         self._pending_refreshes.update(kinds)
         if not self._refresh_timer.isActive():
@@ -2717,7 +2741,9 @@ class MainWindow(QMainWindow):
         kinds, self._pending_refreshes = self._pending_refreshes, set()
         if "labeled" in kinds:
             self.layer_panel.refresh_labeled_panel(self.project)
-        if "snippets" in kinds:
+        if "editors" in kinds:
+            self._reseat_open_editors()         # the sidebar panel too
+        elif "snippets" in kinds:
             self._refresh_snippet_panel()
 
     def _label_row_changed(self, label_id: int):
@@ -2903,6 +2929,8 @@ class MainWindow(QMainWindow):
             editor.review_changed.connect(self._on_review_changed)
             editor.class_changed.connect(self._on_label_class_changed)
             editor.position_changed.connect(self._on_label_position_changed)
+            editor.description_changed.connect(self._set_label_description)
+            editor.group_id_changed.connect(self._set_label_group_id)
             editor.size_changed.connect(self._on_size_changed)
             editor.mask_names_changed.connect(self._on_mask_names_changed)
             editor.save_requested.connect(self._save_project)
