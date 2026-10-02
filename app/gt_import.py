@@ -18,17 +18,22 @@ reason - a wrong match would put every label on the wrong image:
   this project's image wherever both sides recorded them - except that an
   image of ANOTHER SIZE is accepted when it is the same picture at another
   resolution (see below);
-- several verified candidates: the longest shared folder tail wins, and a
-  tie matches nothing;
+- several verified candidates: one of the GT's own size is preferred to
+  one at another resolution; then the longest shared folder tail wins,
+  and a tie matches nothing;
 - one image here claimed by two GT images: neither is matched.
 
 The same imagery at another resolution (asked for 2026-10-02): ground
 truth made on downsampled copies, to be applied to the full-resolution
-originals loaded here under the same filenames. An image whose size
-differs is still the GT's image when it covers the same ground - the same
-CRS, and corners within a couple of the coarser pixels (or 1% of the
-footprint) of each other - or, where either side has no georeferencing,
-when it has the same shape. Its labels then go across:
+originals loaded here under the same filenames. An image of the same
+name whose size differs is taken to BE the GT's image at another
+resolution. Nothing checks that it covers the same ground (a check that
+it did was built and taken out the same day, at the user's instruction):
+the imagery is a mirror of the GT's, same names and same extents, and
+using the import on the right folder is the user's to get right. The
+preview shows both sizes for each such image, which is where a wrong
+folder shows. Only a different CRS still makes it a different file, as
+it does at the same size. Its labels then go across:
 
 - by GROUND POSITION where both are georeferenced: the GT's pixel through
   the GT image's transform to lon/lat, and back through this image's -
@@ -178,18 +183,6 @@ def _size(image) -> str:
     return f"{image.original_width}x{image.original_height}"
 
 
-# How far apart two images' corners may be and still be the same ground:
-# this many pixels of the coarser image, or this share of the footprint's
-# longer side, whichever is the more. A downsample moves an edge by less
-# than one of its own pixels; a different image of the same name is
-# somewhere else altogether.
-_CORNER_PIXELS = 2.0
-_CORNER_SHARE = 0.01
-# ...and, with no georeferencing to compare, how far their shapes
-# (width / height) may differ.
-_SHAPE_SHARE = 0.02
-
-
 def _has_record(image) -> bool:
     return bool(image.original_width or image.original_height
                 or image.get_crs() is not None)
@@ -215,40 +208,17 @@ def _from_file(image) -> "ImageData | None":
         return None
 
 
-def _corners(image) -> list:
-    affine = image.get_affine()
-    w, h = image.original_width, image.original_height
-    return [affine * point for point in ((0, 0), (w, 0), (w, h), (0, h))]
-
-
-def _pixel_size(image) -> float:
-    affine = image.get_affine()
-    return max(math.hypot(affine.a, affine.d), math.hypot(affine.b, affine.e))
-
-
 def _other_resolution(local, gt_image) -> "str | None":
     """Why ``local``, of another size, is not the GT's image at another
-    resolution - or None when it is."""
-    sizes = f"({_size(local)} here, {_size(gt_image)} in the GT)"
-    if _georeferenced(local) and _georeferenced(gt_image):
-        if local.get_crs() != gt_image.get_crs():
-            return ("a file of this name is loaded here, but its coordinate "
-                    "system differs")
-        here, there = _corners(local), _corners(gt_image)
-        longest = max(math.dist(here[0], here[1]),
-                      math.dist(here[1], here[2]))
-        allowed = max(_CORNER_PIXELS * max(_pixel_size(local),
-                                           _pixel_size(gt_image)),
-                      _CORNER_SHARE * longest)
-        if any(math.dist(a, b) > allowed for a, b in zip(here, there)):
-            return ("a file of this name is loaded here, but its size "
-                    f"differs {sizes} and it does not cover the same ground")
-        return None
-    shape_here = local.original_width / local.original_height
-    shape_there = gt_image.original_width / gt_image.original_height
-    if abs(shape_here - shape_there) > _SHAPE_SHARE * shape_there:
-        return ("a file of this name is loaded here, but its size differs "
-                f"{sizes} and it is not the same shape")
+    resolution - or None when it is taken to be.
+
+    The same name at another size is enough (see the module docstring).
+    A different CRS is still a different file, as at the same size.
+    """
+    here_crs, gt_crs = local.get_crs(), gt_image.get_crs()
+    if here_crs is not None and gt_crs is not None and here_crs != gt_crs:
+        return ("a file of this name is loaded here, but its coordinate "
+                "system differs")
     return None
 
 
@@ -289,7 +259,8 @@ def _fit_label(label, gt_image, local) -> None:
 
     The position goes by ground where both images are georeferenced and
     by fraction of the image otherwise; it is kept inside the image, for
-    an extent a pixel smaller here. Masks are the other image's pixels and
+    an extent a pixel smaller here (or, the wrong imagery having been
+    loaded, for ground this image does not cover at all). Masks are the other image's pixels and
     go. The pixel angle of an orientation changes only when the two axes
     scale differently; the true-north heading and everything measured in
     metres are the object's and stay.
@@ -361,6 +332,12 @@ def plan_import(current, gt) -> ImportPlan:
         if not verified:
             match.status, match.note = MISMATCH, reasons[0]
             continue
+        same_size = [key for key in verified if other_size[key] is None]
+        if same_size and len(same_size) < len(verified):
+            # The GT's own files AND their other-resolution mirror are
+            # both loaded: the labels belong on the files they were made
+            # on.
+            verified = same_size
         if len(verified) > 1:
             scores = {key: _tail_overlap(key, gt_path) for key in verified}
             best = max(scores.values())
@@ -500,9 +477,10 @@ class ImportGroundTruthDialog(QDialog):
                          "redrawn.")
             lines.append(line)
         lines.append("Images are matched by filename and checked against "
-                     "the size and coordinate system the GT recorded; one "
-                     "of another size is accepted when it covers the same "
-                     "ground.")
+                     "the coordinate system the GT recorded. One of another "
+                     "size is taken to be the same imagery at another "
+                     "resolution - check the sizes below are what you "
+                     "expect.")
         self.summary = QLabel("\n".join(lines))
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
