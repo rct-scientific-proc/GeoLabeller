@@ -15,6 +15,8 @@ A section is:
   panel        its widget in the column on the right
   tool         optionally, a tool it owns on the Single view's canvas:
                (tool id, button text, tooltip, the key that picks it up)
+  tools        or several of them, as a list of the same (masks: the
+               brush and the polygon)
 
 and these hooks, all optional:
 
@@ -56,6 +58,11 @@ class Section(QObject):
     entries_changed = pyqtSignal(list)
     # A key finished the snippet in hand: move on to the next.
     advance_requested = pyqtSignal()
+
+    @property
+    def tools(self) -> list:
+        """Every tool this section owns: ``tool``, unless it has more."""
+        return [self.tool] if self.tool is not None else []
 
     def __init__(self, worklist: "Worklist | None", panel: QWidget,
                  parent=None):

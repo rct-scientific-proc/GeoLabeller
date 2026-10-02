@@ -3,10 +3,11 @@
 Part of the Snippet Editor package (see app/snippet_editor/__init__.py).
 It is the mask editor's paint surface, and the Snippet Editor's Single
 view, where each section draws its overlay: masks as coloured layers, and
-an arrow for the orientation. Two tools: Paint (left-drag paints the
-active mask, right-drag erases) and Orient (left-drag reports a line,
-right-click asks for it to be cleared) - what a line MEANS is the host's
-business; this reports it in snippet pixels.
+an arrow for the orientation. Its tools: Paint (left-drag paints the
+active mask, right-drag erases), Polygon (clicks round a shape), Orient
+and Measure (left-drag reports a line, right-click asks for it to be
+cleared) and Move (a click). What a line or a shape MEANS is the host's
+business; this takes the gesture and reports it in snippet pixels.
 
 Deliberately independent of the rest of the app: it needs numpy and Qt and
 nothing else, so it can be read, tested and reused on its own.
@@ -29,6 +30,7 @@ TOOL_PAINT = "paint"        # left-drag paints, right-drag erases
 TOOL_ORIENT = "orient"      # left-drag reports a line, right-click clears
 TOOL_MEASURE = "measure"    # the same gesture, for a length or a width
 TOOL_MOVE = "move"          # a click puts the label's own point there
+TOOL_POLYGON = "polygon"    # clicks round a shape; the host fills it in
 
 # The tools that draw a line rather than paint.
 _LINE_TOOLS = (TOOL_ORIENT, TOOL_MEASURE)
@@ -39,6 +41,11 @@ MEASURE_COLOR = QColor(0, 200, 255)
 MIN_LINE_PX = 6
 LINE_PREVIEW_COLOR = QColor(0, 220, 255)
 POINT_RING_PX = 6           # the label point's ring, on screen
+# A click this near a polygon's first point (on screen) closes it.
+POLYGON_CLOSE_PX = 9
+# A shape being cut out is previewed as the hole it will leave: dark, so
+# it reads as removal on a mask of any colour (the first mask is red).
+POLYGON_CUT_FILL = QColor(0, 0, 0, 140)
 
 
 def display_scale(size_px: int) -> int:
@@ -98,6 +105,10 @@ class MaskPaintCanvas(QWidget):
     measure_clear_requested = pyqtSignal()
     # Move tool: a click, in snippet pixels - where the label belongs.
     label_point_picked = pyqtSignal(float, float)
+    # Polygon tool: a shape, closed - its corners [(x, y), ...] in snippet
+    # pixels, and whether it is to be cut OUT of the mask (begun with a
+    # right-click) rather than filled into it.
+    polygon_drawn = pyqtSignal(list, bool)
     # The zoom, and whether it is one the user set (and so is kept).
     zoom_changed = pyqtSignal(float, bool)
 
@@ -157,6 +168,12 @@ class MaskPaintCanvas(QWidget):
         self._measure_lines: list = []               # see set_measure_lines
         self._line_start: "QPointF | None" = None   # an Orient drag
         self._line_now: "QPointF | None" = None
+        # A polygon being clicked out: its corners so far, in snippet
+        # pixels (so it stays put through a zoom), whether it cuts out
+        # rather than fills, and where the next corner would go.
+        self._polygon: list = []
+        self._polygon_erase = False
+        self._polygon_cursor: "tuple | None" = None
         # Brush preview: the cell under the cursor plus the outline edges of
         # the exact pixel set a stamp there would paint.
         self._hover_cell = None
@@ -177,6 +194,8 @@ class MaskPaintCanvas(QWidget):
         one's was, so the next object is where the eye already is.
         """
         self._w, self._h = width, height
+        # A shape begun on the last snippet is not a shape on this one.
+        self._polygon, self._polygon_cursor = [], None
         before, self._focus = self._focus, focus
         self._scale = (self._kept_zoom if self._kept_zoom is not None
                        else float(display_scale(max(width, height))))
@@ -256,9 +275,11 @@ class MaskPaintCanvas(QWidget):
         self.update()
 
     def set_tool(self, tool: str):
-        """TOOL_PAINT, TOOL_ORIENT, TOOL_MEASURE or TOOL_MOVE."""
+        """TOOL_PAINT, TOOL_POLYGON, TOOL_ORIENT, TOOL_MEASURE or
+        TOOL_MOVE."""
         self._tool = tool
         self._line_start = self._line_now = None
+        self._polygon, self._polygon_cursor = [], None
         self.update()
 
     def arrow(self) -> "tuple | None":
@@ -465,6 +486,8 @@ class MaskPaintCanvas(QWidget):
             if self._tool == TOOL_PAINT:
                 self._draw_brush_preview(painter)
         painter.setRenderHint(QPainter.Antialiasing, True)
+        if self._polygon:
+            self._draw_polygon(painter)
         for sx, sy, ex, ey, caption in self._measure_lines:
             self._draw_measure(
                 painter, QPointF(sx * self._scale, sy * self._scale),
@@ -546,6 +569,38 @@ class MaskPaintCanvas(QWidget):
         painter.setBrush(color)
         painter.drawPolygon(QPolygonF([end, left, right]))
 
+    def _draw_polygon(self, painter):
+        """The shape so far, out to the cursor: filled faintly with the
+        colour it will be painted in (or darkened, when it is to be cut
+        out), its corners marked, and - once it could be closed - a ring
+        on the first corner, which is where a click closes it."""
+        s = self._scale
+        corners = [QPointF(x * s, y * s) for x, y in self._polygon]
+        trail = list(corners)
+        if self._polygon_cursor is not None:
+            trail.append(QPointF(self._polygon_cursor[0] * s,
+                                 self._polygon_cursor[1] * s))
+        fill = QColor(POLYGON_CUT_FILL)
+        if not self._polygon_erase and self._active in self._order:
+            fill = QColor(MASK_COLORS[self._order.index(self._active)
+                                      % len(MASK_COLORS)])
+            fill.setAlpha(80)
+        if len(trail) >= 3:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(fill)
+            painter.drawPolygon(QPolygonF(trail), Qt.OddEvenFill)
+        painter.setBrush(Qt.NoBrush)
+        for line_color, width in ((QColor(0, 0, 0, 200), 3),
+                                  (QColor(255, 255, 255, 235), 1)):
+            painter.setPen(QPen(line_color, width))
+            painter.drawPolyline(QPolygonF(trail))
+            for corner in corners:
+                painter.drawRect(int(corner.x()) - 2, int(corner.y()) - 2,
+                                 4, 4)
+            if len(corners) >= 3:
+                painter.drawEllipse(corners[0], POLYGON_CLOSE_PX,
+                                    POLYGON_CLOSE_PX)
+
     def _draw_brush_preview(self, painter):
         """Wireframe of the exact pixels the next stamp would paint.
 
@@ -607,6 +662,90 @@ class MaskPaintCanvas(QWidget):
         self._overlay_cache.pop(self._active, None)
         self.update()
 
+    def _can_edit(self) -> bool:
+        """Is there a mask in hand, shown, on a snippet that can be read?"""
+        return not (self._read_only or not self._layers_shown
+                    or self._active is None
+                    or self._active not in self._layers)
+
+    # -- the polygon tool ---------------------------------------------------
+
+    def polygon_points(self) -> list:
+        """The corners clicked so far, in snippet pixels."""
+        return list(self._polygon)
+
+    def polygon_erases(self) -> bool:
+        return self._polygon_erase
+
+    def _polygon_click(self, event):
+        """A click with the Polygon tool. The first begins a shape - to
+        fill in (left) or to cut out (right), as the brush paints and
+        erases. After that a left click adds a corner, or closes the
+        shape when it lands on the first one; a right click takes the
+        last corner back."""
+        point = (event.pos().x() / self._scale, event.pos().y() / self._scale)
+        if not self._polygon:
+            if event.button() not in (Qt.LeftButton, Qt.RightButton):
+                return
+            self._polygon_erase = event.button() == Qt.RightButton
+            self._polygon = [point]
+        elif event.button() == Qt.RightButton:
+            self._polygon.pop()
+        elif event.button() == Qt.LeftButton:
+            first = self._polygon[0]
+            near = math.hypot((point[0] - first[0]) * self._scale,
+                              (point[1] - first[1]) * self._scale)
+            if len(self._polygon) >= 3 and near <= POLYGON_CLOSE_PX:
+                self.close_polygon()
+                return
+            self._polygon.append(point)
+        self._polygon_cursor = point if self._polygon else None
+        self.update()
+
+    def close_polygon(self):
+        """Finish the shape and report it. Fewer than three corners
+        enclose nothing, and are dropped."""
+        points, self._polygon = self._polygon, []
+        self._polygon_cursor = None
+        self.update()
+        if len(points) >= 3:
+            self.polygon_drawn.emit(points, self._polygon_erase)
+
+    def cancel_polygon(self):
+        self._polygon, self._polygon_cursor = [], None
+        self.update()
+
+    def polygon_key(self, key: int) -> bool:
+        """Enter closes the shape being clicked out, Backspace takes its
+        last corner back and Escape gives it up. True if the key was
+        used - there is a shape in hand - so that otherwise it is free
+        to mean what it means elsewhere."""
+        if self._tool != TOOL_POLYGON or not self._polygon:
+            return False
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            self.close_polygon()
+        elif key == Qt.Key_Backspace:
+            self._polygon.pop()
+            if not self._polygon:
+                self._polygon_cursor = None
+            self.update()
+        elif key == Qt.Key_Escape:
+            self.cancel_polygon()
+        else:
+            return False
+        return True
+
+    def mouseDoubleClickEvent(self, event):
+        # The first click of the pair put a corner here; the second
+        # closes the shape rather than adding the same corner again.
+        if (self._tool == TOOL_POLYGON and self._polygon
+                and event.button() == Qt.LeftButton
+                and not event.modifiers() & Qt.ShiftModifier):
+            self.close_polygon()
+            return
+        # Every other tool takes it as Qt would have: another press.
+        self.mousePressEvent(event)
+
     def _line_in_snippet_pixels(self, start: QPointF, end: QPointF):
         return (start.x() / self._scale, start.y() / self._scale,
                 end.x() / self._scale, end.y() / self._scale)
@@ -635,9 +774,10 @@ class MaskPaintCanvas(QWidget):
                  if self._tool == TOOL_MEASURE
                  else self.orientation_clear_requested).emit()
             return
-        if (self._read_only or not self._layers_shown
-                or self._active is None
-                or self._active not in self._layers):
+        if not self._can_edit():
+            return
+        if self._tool == TOOL_POLYGON:
+            self._polygon_click(event)
             return
         if event.button() == Qt.LeftButton:
             self._stroke_value = True
@@ -673,6 +813,9 @@ class MaskPaintCanvas(QWidget):
         if self._painting:
             self._stroke_to(event.pos())
         else:
+            if self._polygon:
+                self._polygon_cursor = (event.pos().x() / self._scale,
+                                        event.pos().y() / self._scale)
             self.update()
 
     def leaveEvent(self, _event):

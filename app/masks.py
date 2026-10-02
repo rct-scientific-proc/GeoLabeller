@@ -364,6 +364,48 @@ def fill_enclosed(mask: np.ndarray,
     return mask | holes, added
 
 
+def polygon_mask(points, width: int, height: int) -> np.ndarray:
+    """The pixels inside a polygon, as a (height, width) boolean array.
+
+    ``points`` are its corners in order, (x, y) in pixel coordinates where
+    pixel (c, r) covers the unit square from (c, r) to (c + 1, r + 1) - a
+    click on the screen, divided by the zoom. A pixel is inside when its
+    CENTRE is: the rule every image editor uses, and the one that makes
+    two polygons sharing an edge share no pixel. The polygon is closed
+    from its last point to its first, and may run off the window, where
+    it is clipped. Fewer than three points enclose nothing.
+
+    Even-odd filling, so a shape drawn crossing itself (a figure of eight)
+    fills both its lobes rather than whichever winding happens to count.
+
+    Each edge is walked once: for every row whose centre line it crosses,
+    the column where "inside" flips is found, and a running count along
+    the row turns the flips into the filled spans.
+    """
+    inside = np.zeros((height, width), dtype=bool)
+    if len(points) < 3 or width <= 0 or height <= 0:
+        return inside
+    flips = np.zeros((height, width + 1), dtype=np.int32)
+    closed = list(points) + [points[0]]
+    for (x1, y1), (x2, y2) in zip(closed, closed[1:]):
+        if y1 == y2:
+            continue                    # level with the rows: crosses none
+        if y1 > y2:
+            x1, y1, x2, y2 = x2, y2, x1, y1
+        # Rows whose centre (r + 0.5) lies in [y1, y2): half-open, so a
+        # corner sitting exactly on a centre line is counted once.
+        first = max(0, int(np.ceil(y1 - 0.5)))
+        last = min(height - 1, int(np.ceil(y2 - 0.5)) - 1)
+        if last < first:
+            continue
+        rows = np.arange(first, last + 1)
+        crossing = x1 + (rows + 0.5 - y1) * (x2 - x1) / (y2 - y1)
+        # The first column whose centre is at or right of the crossing.
+        columns = np.clip(np.ceil(crossing - 0.5), 0, width).astype(np.intp)
+        np.add.at(flips, (rows, columns), 1)
+    return (np.cumsum(flips, axis=1)[:, :width] % 2).astype(bool)
+
+
 def merged_entry(name: str, x0: int, y0: int, layer: np.ndarray,
                  previous: "dict | None" = None,
                  image_size: "tuple[int, int] | None" = None) -> dict:

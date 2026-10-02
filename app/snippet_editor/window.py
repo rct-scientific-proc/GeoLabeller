@@ -196,9 +196,10 @@ class SnippetEditor(QWidget):
         self._tools = {}                 # tool id -> button
         self._tool_owner = {}            # tool id -> section key, or None
         self._tool_keys = {}             # Qt key -> tool id
-        tools = [(section.key,) + tuple(section.tool)
+        self._tool_hints = {}            # tool id -> what it does
+        tools = [(section.key,) + tuple(tool)
                  for section in self.section_objects.values()
-                 if section.tool is not None]
+                 for tool in section.tools]
         # And one that is no section's, so it is always there: the label
         # itself, which every section's values hang on.
         tools.append((None, TOOL_MOVE, "Move label",
@@ -213,6 +214,7 @@ class SnippetEditor(QWidget):
             button = QPushButton(f"{text} ({letter})")
             button.setToolTip(f"{tip}\n(key {letter})")
             self._tool_keys[key] = tool_id
+            self._tool_hints[tool_id] = tip
             button.setCheckable(True)
             self._tool_buttons.addButton(button)
             tool_row.insertWidget(len(self._tools) + 1, button)
@@ -515,6 +517,7 @@ class SnippetEditor(QWidget):
         """A tool id from a section's ``tool``, for the Single view."""
         self.masks.canvas.set_tool(tool)
         self._tools[tool].setChecked(True)
+        self.masks.set_tool_hint(self._tool_hints[tool])
 
     # -- keys ---------------------------------------------------------------
 

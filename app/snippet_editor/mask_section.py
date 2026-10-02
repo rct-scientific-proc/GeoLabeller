@@ -6,7 +6,8 @@ of its column. Pick a snippet from the strip, add a named mask, and paint:
 left-drag paints, right-drag erases, the brush size is adjustable, and
 several masks can coexist on one snippet - each an independent binary
 layer with its own overlay colour, kept from overlapping one another
-unless Allow Overlap is on.
+unless Allow Overlap is on. The Polygon tool fills a shape clicked out
+corner by corner (or cuts it out, begun with a right-click).
 
 The paint surface itself is single_view.MaskPaintCanvas; the snippet list
 is strip.SnippetStrip, which the window owns and places. This module is
@@ -39,13 +40,13 @@ from PyQt5.QtWidgets import (
 from ..settings_scope import settings
 from ..debug_log import debug
 from ..masks import (entry_in_window, fill_enclosed, mask_statistics,
-                     merged_entry)
+                     merged_entry, polygon_mask)
 from ..snippets import (read_label_snippet, read_label_window_raw,
                         snippet_frame)
 from .section import Section
 from .single_view import (DEFAULT_BRUSH_PX, MASK_COLORS,
-                          MASK_SNIPPET_SIZE, TOOL_PAINT, MaskPaintCanvas,
-                          apply_display_adjust)
+                          MASK_SNIPPET_SIZE, TOOL_PAINT, TOOL_POLYGON,
+                          MaskPaintCanvas, apply_display_adjust)
 from .strip import SnippetStrip, Worklist
 
 
@@ -202,14 +203,15 @@ class MaskEditor(QWidget):
         controls.addStretch(1)
         layout.addLayout(controls)
 
-        hint = QLabel("Left-drag paints the active mask, right-drag erases; "
-                      "wheel zooms (to the cursor) and the zoom stays for "
-                      "the next snippet, Shift+drag pans. "
-                      "Space / Ctrl+Space step through the snippets. "
-                      "Each mask is its own layer; masks do not overlap "
-                      "unless Allow Overlap is on.")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        # What the tool in hand does, then what every tool shares. Three
+        # lines' room kept, so a longer hint does not shift the snippet.
+        self.hint = QLabel("")
+        self.hint.setWordWrap(True)
+        self.hint.setMinimumHeight(3 * self.hint.fontMetrics().lineSpacing())
+        self.hint.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        layout.addWidget(self.hint)
+        self.set_tool_hint("Left-drag paints the active mask, right-drag "
+                           "erases.")
 
         # The paint surface, scrollable so any zoom level fits on screen.
         self.canvas = MaskPaintCanvas()
@@ -217,6 +219,7 @@ class MaskEditor(QWidget):
         self.brush_spin.valueChanged.connect(self.canvas.set_brush)
         self.canvas.zoom_changed.connect(self._show_zoom)
         self.canvas.label_point_picked.connect(self._on_label_point_picked)
+        self.canvas.polygon_drawn.connect(self._on_polygon_drawn)
         self.point_check.toggled.connect(self.canvas.set_point_shown)
         self.canvas.set_point_shown(self.point_check.isChecked())
         self.fit_button.clicked.connect(self.canvas.reset_zoom)
@@ -328,6 +331,13 @@ class MaskEditor(QWidget):
 
     def allow_overlap(self) -> bool:
         return self.overlap_button.isChecked()
+
+    def set_tool_hint(self, text: str):
+        """Say what the tool in hand does, above the snippet."""
+        self.hint.setText(
+            text.replace("\n", " ")
+            + "  Wheel zooms to the cursor (kept for the next snippet), "
+              "Shift+drag pans; Space / Ctrl+Space step.")
 
     def save_settings(self):
         """Remember Allow Overlap for next time. A panel gets no close
@@ -647,21 +657,50 @@ class MaskEditor(QWidget):
 
     # -- persistence + stats ------------------------------------------------
 
+    def _walls(self, name: str) -> "np.ndarray | None":
+        """The pixels ``name`` may not take: every other mask's, unless
+        Allow Overlap is on. None when there is nothing in the way."""
+        if self.allow_overlap():
+            return None
+        others = [layer for other, layer in self._layers.items()
+                  if other != name and layer is not None]
+        if not others:
+            return None
+        walls = np.zeros_like(self._layers[name])
+        for layer in others:
+            walls |= layer
+        return walls
+
+    def _on_polygon_drawn(self, points: list, erase: bool):
+        """The Polygon tool closed a shape: fill it into the active mask,
+        or cut it out. Like a stroke - one commit, one undo step - and
+        like a stroke it stops at the other masks, and may only remove
+        from this one."""
+        name = self._active_name()
+        if (name is None or name not in self._layers
+                or getattr(self, "_unreadable", False)):
+            return
+        layer = self._layers[name]
+        shape = polygon_mask(points, layer.shape[1], layer.shape[0])
+        if erase:
+            layer &= ~shape
+        else:
+            walls = self._walls(name)
+            if walls is not None:
+                shape &= ~walls
+            layer |= shape
+        self.canvas.invalidate_layer(name)
+        self._emit_masks()
+        self._refresh_stats()
+
     def _on_fill_enclosed(self):
         """Fill the active mask's enclosed interior (a drawn hull)."""
         name = self._active_name()
         if name is None or name not in self._layers:
             return
-        barrier = None
-        if not self.allow_overlap():
-            # The other masks are walls: the shadow drawn up to the hull
-            # is closed by the hull's edge, and the fill stops there.
-            others = [layer for other, layer in self._layers.items()
-                      if other != name and layer is not None]
-            if others:
-                barrier = np.zeros_like(self._layers[name])
-                for layer in others:
-                    barrier |= layer
+        # The other masks are walls: the shadow drawn up to the hull is
+        # closed by the hull's edge, and the fill stops there.
+        barrier = self._walls(name)
         filled, added = fill_enclosed(self._layers[name], barrier=barrier)
         if added == 0:
             QMessageBox.information(
@@ -744,9 +783,10 @@ class MaskSection(Section):
     """The Snippet Editor's Masks section (see section.py).
 
     Its panel is the mask editor's own - list, name, add, delete, fill,
-    overlap, statistics - and it owns the Paint tool. Switched off, the
-    canvas shows no layers and takes no strokes. In the Grid view it waits:
-    masks are painted on the snippet in hand, which the grid does not show.
+    overlap, statistics - and it owns the tools that make masks: the brush
+    and the polygon. Switched off, the canvas shows no layers and takes no
+    strokes. In the Grid view it waits: masks are painted on the snippet
+    in hand, which the grid does not show.
     """
 
     key = "masks"
@@ -754,6 +794,14 @@ class MaskSection(Section):
     tool = (TOOL_PAINT, "Paint masks",
             "Left-drag paints the active mask, right-drag erases.",
             Qt.Key_P)
+    tools = [
+        tool,
+        (TOOL_POLYGON, "Polygon",
+         "Click round the object, then double-click or press Enter to fill "
+         "the shape into the active mask.\nBegin with a right-click to cut "
+         "the shape out instead. Right-click or Backspace takes back the "
+         "last corner; Escape gives the shape up.", Qt.Key_G),
+    ]
 
     def __init__(self, editor: MaskEditor, parent=None):
         super().__init__(MASK_WORKLIST, editor.mask_panel, parent)
@@ -769,3 +817,8 @@ class MaskSection(Section):
         self.panel.setEnabled(single)
         return ("" if single else "Masks are painted in the Single view - "
                                   "double-click a snippet to open it there.")
+
+    def key_pressed(self, key):
+        # Enter, Backspace and Escape, while a polygon is being clicked
+        # out - and only then.
+        return self._editor.canvas.polygon_key(key)
