@@ -90,12 +90,14 @@ _version_file = _repo_root / "VERSION"
 if _version_file.exists():
     include_files.append((str(_version_file), "VERSION"))
 
-# Ships the Interface Control Document so Help > ICD has something to open.
-# app/resources.py looks for it beside the executable, which is where
-# include_files puts it - the docs/ directory itself is not copied.
-_icd_file = _repo_root / "docs" / "GeoLabeller-ICD.pdf"
-if _icd_file.exists():
-    include_files.append((str(_icd_file), "GeoLabeller-ICD.pdf"))
+# Ships the Interface Control Document and the How-To guide so Help > ICD
+# and Help > How-To have something to open. app/resources.py looks for
+# them beside the executable, which is where include_files puts them -
+# the docs/ directory itself is not copied.
+for _document in ("GeoLabeller-ICD.pdf", "GeoLabeller-HowTo.pdf"):
+    _document_file = _repo_root / "docs" / _document
+    if _document_file.exists():
+        include_files.append((str(_document_file), _document))
 
 # Dependencies to include
 build_exe_options = {

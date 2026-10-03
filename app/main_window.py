@@ -69,7 +69,7 @@ from .snippet_editor import SnippetEditor
 from .snippet_editor.size_section import shares_with_linked, size_text
 from .snippet_panel import SnippetPanel
 from .snippets import cached_band_scaling
-from .resources import icd_path
+from .resources import howto_path, icd_path
 from .version import app_title, app_version
 
 
@@ -1000,7 +1000,15 @@ class MainWindow(QMainWindow):
         shortcuts_action.triggered.connect(self._show_shortcuts)
         help_menu.addAction(shortcuts_action)
 
-        # Interface Control Document (ships next to the executable)
+        # The guides ship next to the executable: the How-To (every
+        # picture in it taken from the running software when it was
+        # built) and the Interface Control Document.
+        howto_action = QAction("&How-To", self)
+        howto_action.setStatusTip(
+            "Open the How-To guide (PDF): labelling on the map, and the "
+            "Snippet Editor")
+        howto_action.triggered.connect(self._show_howto)
+        help_menu.addAction(howto_action)
         icd_action = QAction("&ICD", self)
         icd_action.setStatusTip(
             "Open the Interface Control Document (PDF)")
@@ -6252,18 +6260,28 @@ class MainWindow(QMainWindow):
         ShortcutsDialog(self).exec_()
 
     def _show_icd(self):
-        """Open the Interface Control Document in the system PDF viewer.
+        """Help > ICD: the Interface Control Document."""
+        self._open_document(icd_path(), "Interface Control Document",
+                            "The ICD")
 
-        The document ships beside the executable, so an installed copy has it
-        without needing the repository or a network connection. Handing it to
-        the OS rather than rendering it here means the user gets whatever
-        reader they already use, with their own search and bookmarks.
+    def _show_howto(self):
+        """Help > How-To: the user's guide."""
+        self._open_document(howto_path(), "How-To", "The How-To guide")
+
+    def _open_document(self, path, title: str, what: str):
+        """Open a document that ships with the application in the system
+        PDF viewer.
+
+        The documents ship beside the executable, so an installed copy has
+        them without needing the repository or a network connection.
+        Handing one to the OS rather than rendering it here means the user
+        gets whatever reader they already use, with their own search and
+        bookmarks.
         """
-        path = icd_path()
         if not path.exists():
             QMessageBox.information(
-                self, "Interface Control Document",
-                "The ICD was not found at:\n\n"
+                self, title,
+                f"{what} was not found at:\n\n"
                 f"{path}\n\n"
                 "It ships with the installed application; a copy is also in "
                 "the project's docs folder.")
@@ -6273,7 +6291,7 @@ class MainWindow(QMainWindow):
             # No handler registered for PDFs, or the shell refused it. Say
             # where the file is so it can be opened by hand.
             QMessageBox.warning(
-                self, "Interface Control Document",
+                self, title,
                 "Could not open the PDF viewer. The document is at:\n\n"
                 f"{path}")
 

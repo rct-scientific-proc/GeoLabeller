@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 ICD_NAME = "GeoLabeller-ICD.pdf"
+HOWTO_NAME = "GeoLabeller-HowTo.pdf"
 
 
 def install_root() -> Path:
@@ -20,8 +21,8 @@ def install_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def icd_path() -> Path:
-    """Where the Interface Control Document is, if it shipped.
+def _document_path(name: str) -> Path:
+    """Where a document that ships with the application is, if it did.
 
     A source checkout keeps it in docs/; cx_Freeze flattens include_files into
     the install directory, so a frozen build has it beside the executable. The
@@ -29,5 +30,15 @@ def icd_path() -> Path:
     where it looked, which is more use than a None.
     """
     if getattr(sys, "frozen", False):
-        return install_root() / ICD_NAME
-    return install_root() / "docs" / ICD_NAME
+        return install_root() / name
+    return install_root() / "docs" / name
+
+
+def icd_path() -> Path:
+    """Where the Interface Control Document is, if it shipped."""
+    return _document_path(ICD_NAME)
+
+
+def howto_path() -> Path:
+    """Where the How-To guide is, if it shipped."""
+    return _document_path(HOWTO_NAME)
