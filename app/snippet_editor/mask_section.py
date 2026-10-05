@@ -298,6 +298,10 @@ class MaskEditor(QWidget):
             "this snippet already has selects that mask to paint.")
         self.mask_name_combo.currentIndexChanged.connect(
             self._on_active_mask_name_picked)
+        # A name picked from the list is a choice made, not text being
+        # typed: the keys go back to the window (Space steps again).
+        self.mask_name_combo.activated.connect(
+            lambda _index: self.mask_name_combo.clearFocus())
         side.addWidget(self.mask_name_combo)
         # Why Add Mask did nothing, when it did nothing - under the name it
         # is about, not in a box that stops the run of snippets. It goes as
@@ -462,6 +466,11 @@ class MaskEditor(QWidget):
     # -- showing a snippet ------------------------------------------------
 
     def _show_entry(self, entry: "dict | None"):
+        # A stroke still in progress (Space pressed mid-drag) ends here:
+        # what it has painted is kept, on the snippet it was painted on.
+        if self.canvas.painting() and self._current is not None:
+            self.canvas.abandon_stroke()
+            self._emit_masks()
         self._current = entry
         self._layers = {}
         self._order = []

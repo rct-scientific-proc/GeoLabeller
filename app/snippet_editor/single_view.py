@@ -218,9 +218,13 @@ class MaskPaintCanvas(QWidget):
         one's was, so the next object is where the eye already is.
         """
         self._w, self._h = width, height
-        # A shape begun on the last snippet is not a shape on this one.
+        # A shape, a line or a stroke begun on the last snippet is not one
+        # on this (Space is pressed mid-drag): the host has already taken
+        # what a stroke painted; a line or a shape never finished is gone.
         self._polygon, self._polygon_cursor = [], None
         self._wand, self._preview = None, None
+        self._line_start = self._line_now = None
+        self.abandon_stroke()
         before, self._focus = self._focus, focus
         self._scale = (self._kept_zoom if self._kept_zoom is not None
                        else float(display_scale(max(width, height))))
@@ -270,6 +274,17 @@ class MaskPaintCanvas(QWidget):
     def end_stroke(self):
         """A stroke is over: the next one rebuilds its wall from scratch."""
         self._blocked = None
+
+    def painting(self) -> bool:
+        """Is a brush stroke in progress - the button down?"""
+        return self._painting
+
+    def abandon_stroke(self):
+        """Stop a stroke in progress where it is: the button is still
+        down, but what it goes on to cover is not painted."""
+        self._painting = False
+        self._last_pos = None
+        self.end_stroke()
 
     def _wall(self) -> "np.ndarray | None":
         """Pixels this stroke may not paint: every other mask's, when
@@ -782,6 +797,10 @@ class MaskPaintCanvas(QWidget):
                 and event.button() == Qt.LeftButton
                 and not event.modifiers() & Qt.ShiftModifier):
             self.close_polygon()
+            return
+        # The first click of the pair moved the label; a second move to
+        # the same spot would only be a second step to undo.
+        if self._tool == TOOL_MOVE:
             return
         # Every other tool takes it as Qt would have: another press.
         self.mousePressEvent(event)

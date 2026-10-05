@@ -262,11 +262,14 @@ class SnippetEditor(QWidget):
         self.label_class_combo.setToolTip(
             "The class of the snippet in hand. Pick one, or type a new name "
             "and press Enter to create it (Ctrl+1-9 in the Single view).")
+        # A class picked from the list, or a name entered, is a choice
+        # made: the keys go back to the window, so Space steps again
+        # rather than typing into the class.
         self.label_class_combo.activated.connect(
-            lambda index: self.change_class(
+            lambda index: self._class_chosen(
                 self.label_class_combo.itemText(index)))
         self.label_class_combo.lineEdit().returnPressed.connect(
-            lambda: self.change_class(
+            lambda: self._class_chosen(
                 self.label_class_combo.currentText().strip()))
         class_layout.addWidget(self.label_class_combo)
         self.class_linked_check = QCheckBox("Also change linked labels")
@@ -374,6 +377,10 @@ class SnippetEditor(QWidget):
         combo.setCurrentText(current)
         combo.setEnabled(entry is not None and self.view() == self.SINGLE)
         combo.blockSignals(False)
+
+    def _class_chosen(self, class_name: str):
+        self.label_class_combo.clearFocus()
+        self.change_class(class_name)
 
     def change_class(self, class_name: str):
         """Give the snippet in hand (and its linked object) ``class_name``.
@@ -591,9 +598,12 @@ class SnippetEditor(QWidget):
             self.strip.cycle(
                 -1 if event.modifiers() & Qt.ControlModifier else 1)
             return True
-        # Digits in a number box are the value being typed; Space above is
-        # claimed there, since a number box has no use for one.
-        if isinstance(focus, QAbstractSpinBox):
+        # Digits in a number box are the value being typed, and the keys
+        # that edit it stay with it; a letter means nothing to a number
+        # box, and is a section's or a tool's as anywhere else. (Space
+        # above is claimed there too: a number box has no use for one.)
+        if isinstance(focus, QAbstractSpinBox) and self._edits_a_number(
+                event):
             return False
         # Sections answer to plain keys: Ctrl+A is not "accept", Ctrl+1 is
         # not a rating.
@@ -610,6 +620,16 @@ class SnippetEditor(QWidget):
             if self.section_objects[key].key_pressed(event.key()):
                 return True
         return False
+
+    @staticmethod
+    def _edits_a_number(event) -> bool:
+        """Would a number box do something with this key?"""
+        return event.text().isdigit() or event.key() in (
+            Qt.Key_Minus, Qt.Key_Plus, Qt.Key_Period, Qt.Key_Comma,
+            Qt.Key_Backspace, Qt.Key_Delete, Qt.Key_Left, Qt.Key_Right,
+            Qt.Key_Up, Qt.Key_Down, Qt.Key_Home, Qt.Key_End, Qt.Key_PageUp,
+            Qt.Key_PageDown, Qt.Key_Return, Qt.Key_Enter, Qt.Key_Escape,
+            Qt.Key_Tab)
 
     @staticmethod
     def _typed_with_altgr(event) -> bool:
