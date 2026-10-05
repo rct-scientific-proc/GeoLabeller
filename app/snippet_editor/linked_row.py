@@ -74,8 +74,15 @@ class LinkedRow(QWidget):
             self._clear()
             self.setVisible(False)
             return
-        same = [e["label_id"] for e in members]
-        if same != [e["label_id"] for e in self.entries]:
+        # The same snippets, cut from the same places: a recaption will do.
+        # A label moved, or on another image now, needs its picture read
+        # again - its id alone said nothing had changed, and the row kept
+        # showing the old crop until something else rebuilt it.
+        def where(entries):
+            return [(e["label_id"], e["image_path"], e["pixel_x"],
+                     e["pixel_y"]) for e in entries]
+
+        if where(members) != where(self.entries):
             self._rebuild(members)
         else:
             self.entries = members
