@@ -339,8 +339,10 @@ class MaskPaintCanvas(QWidget):
         return self._point_shown
 
     def set_point_shown(self, shown: bool):
-        """Mark the label's own point on the snippet, or leave it clear.
-        The Move tool marks it regardless: it is what is being moved."""
+        """Mark the label's own point on the snippet, or leave it clear -
+        whatever tool is in hand. The Move tool used to mark it
+        regardless, and the one way to see a snippet bare while rating a
+        run of them was to put the tool down first."""
         self._point_shown = bool(shown)
         self.update()
 
@@ -569,8 +571,7 @@ class MaskPaintCanvas(QWidget):
 
     def point_marked(self) -> bool:
         """Is the label's own point being drawn on this snippet?"""
-        return self._focus is not None and (self._point_shown
-                                            or self._tool == TOOL_MOVE)
+        return self._focus is not None and self._point_shown
 
     def _draw_label_point(self, painter):
         """Where the label itself is: a ring and four ticks, open in the

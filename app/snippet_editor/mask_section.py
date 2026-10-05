@@ -226,8 +226,10 @@ class MaskEditor(QWidget):
         controls.addWidget(self.fit_button)
         self.point_check = QCheckBox("Label point")
         self.point_check.setToolTip(
-            "Mark where the label itself is on the snippet. The Move\n"
-            "label tool puts it somewhere else.")
+            "Mark where the label itself is on the snippet, whatever\n"
+            "tool is in hand. Untick it to see the snippet bare - for\n"
+            "rating a run of them, say. The Move label tool puts the\n"
+            "point somewhere else, shown or not.")
         self.point_check.setChecked(self._remembered(_POINT_KEY, True))
         controls.addWidget(self.point_check)
         controls.addStretch(1)
