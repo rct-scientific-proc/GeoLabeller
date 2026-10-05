@@ -2145,6 +2145,7 @@ class MainWindow(QMainWindow):
 
         # In waterfall, show this label on the other images that contain it.
         self._update_waterfall_projections()
+        self._editor_follows()
 
         # Show appropriate message for geo vs pixel layers
         layer = self.canvas.get_layer(self.canvas._path_to_layer.get(image_path, ""))
@@ -2181,6 +2182,7 @@ class MainWindow(QMainWindow):
 
         # Projections may reference the removed label.
         self._update_waterfall_projections()
+        self._editor_follows()
 
         self.statusBar.showMessage("Removed label", 3000)
 
@@ -2441,6 +2443,7 @@ class MainWindow(QMainWindow):
 
             # Refresh labeled images panel (grouping may have changed)
             self._schedule_refresh("labeled", "snippets")
+            self._editor_follows()
 
             count = len(linked_labels)
             msg = f"Linked labels (object has {count} labels)"
@@ -2568,6 +2571,7 @@ class MainWindow(QMainWindow):
         # Grouping changed, so the tree really is rebuilt - but once
         # per gesture, not once per label an unlink or box link touches.
         self._schedule_refresh("labeled", "snippets")
+        self._editor_follows()
 
         self.statusBar.showMessage("Label unlinked from object", 3000)
 
@@ -2766,6 +2770,20 @@ class MainWindow(QMainWindow):
             self._refresh_snippet_panel()
             return
         self._schedule_refresh("labeled", "snippets")
+
+    def _editor_follows(self):
+        """A label placed, removed, linked or unlinked on the map while
+        the Snippet Editor is showing: let it follow, once this gesture
+        is over (a box link reports a label at a time).
+
+        Only while it is showing - opening it re-seats it anyway, and a
+        closed editor need not be rebuilt on every label placed. An edit
+        made in an editor that did not follow a removal went to a label
+        that was gone, and was dropped without a word.
+        """
+        if (self._snippet_editor is not None
+                and self._snippet_editor.isVisible()):
+            self._schedule_refresh("editors")
 
     def _reseat_open_editors(self):
         """Re-seat the Snippet Editor on the CURRENT project.
