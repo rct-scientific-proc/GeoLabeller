@@ -3,7 +3,10 @@
 Opened from View > Display Settings... or a group's right-click menu. It
 edits one group's DisplaySettings (app/display_settings.py): one band as
 grayscale or a band for each of red, green and blue, and brightness,
-contrast and gamma per channel, each over a histogram of that band.
+contrast and gamma per channel, each over a histogram of that band; and,
+for 16-bit and floating-point imagery, which values are drawn black and
+white - a percentile window of each band, or one fixed range of values
+(0 to 1 for imagery that is already a fraction).
 
 Every change is sent out as it happens (``changed``), a moment after the
 last one, so the canvas and the snippets follow the sliders. OK keeps what
@@ -15,15 +18,17 @@ import math
 import numpy as np
 from PyQt5.QtCore import QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter, QPainterPath
-from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
-                             QFormLayout,
-                             QGroupBox, QHBoxLayout, QLabel, QPushButton,
-                             QSizePolicy, QSlider, QSpinBox, QVBoxLayout,
-                             QWidget)
+from PyQt5.QtWidgets import (QAbstractSpinBox, QCheckBox, QComboBox,
+                             QDialog, QDoubleSpinBox, QFormLayout,
+                             QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+                             QPushButton, QRadioButton, QSizePolicy,
+                             QSlider, QSpinBox, QVBoxLayout, QWidget)
 
 from .display_settings import (BRIGHTNESS_RANGE, CONTRAST_RANGE, DEFAULT,
-                               GAMMA_RANGE, MODE_RGB, MODE_SINGLE,
-                               ChannelAdjust, DisplaySettings, auto_adjust)
+                               DEFAULT_PERCENTILES, GAMMA_RANGE, MODE_RGB,
+                               MODE_SINGLE, STRETCH_PERCENTILE,
+                               STRETCH_RANGE, ChannelAdjust,
+                               DisplaySettings, Stretch, auto_adjust)
 
 CHANNEL_NAMES = ("Red", "Green", "Blue")
 CHANNEL_COLOURS = ("#c0392b", "#27ae60", "#2e6fd1")
@@ -260,22 +265,27 @@ class DisplaySettingsDialog(QDialog):
     """Edit one group's display settings, live.
 
     ``band_count`` is how many bands the group's imagery has (the band
-    pickers' range); ``histogram_for(band)`` returns 256 counts of that
-    band's display values from one of the group's images, or None when
-    there is none to read.
+    pickers' range); ``histogram_for(band, stretch)`` returns 256 counts
+    of that band's display values through that stretch, from one of the
+    group's images, or None when there is none to read; ``values`` (a
+    SampledValues) says what that image holds, for the stretch controls
+    to describe and suggest from - None when nothing could be read.
     """
 
     changed = pyqtSignal(object)      # DisplaySettings, while editing
 
     def __init__(self, group_path: str, settings: DisplaySettings,
-                 band_count: int, histogram_for=None, parent=None):
+                 band_count: int, histogram_for=None, parent=None,
+                 values=None):
         super().__init__(parent)
         self.setWindowTitle(f"Display Settings - {group_path}")
         self.group_path = group_path
         self.original = settings
         self.band_count = max(1, int(band_count))
+        self.values = values
         self._histogram_for = histogram_for
         self._histograms: dict = {}
+        self._stretch = settings.stretch
         self._emit_timer = QTimer(self)
         self._emit_timer.setSingleShot(True)
         self._emit_timer.setInterval(EMIT_DELAY_MS)
@@ -313,6 +323,51 @@ class DisplaySettingsDialog(QDialog):
         top.addRow("Show", self.mode_combo)
         top.addRow("Bands", bands)
 
+        # The stretch: which values are drawn black and white, for
+        # imagery that is not 8-bit already (that is drawn as stored).
+        self.stretch_box = QGroupBox("Values drawn black to white")
+        self.percentile_radio = QRadioButton("Percentiles")
+        self.percentile_radio.setToolTip(
+            "Each band's values between these percentiles of its own run "
+            "from black to white; what lies outside clips. 2 to 98 is the "
+            "default: the darkest 2% black, the brightest 2% white.")
+        self.pct_low = self._stretch_spin(0.0, 99.9, 1, 0.5)
+        self.pct_high = self._stretch_spin(0.1, 100.0, 1, 0.5)
+        self.range_radio = QRadioButton("Values")
+        self.range_radio.setToolTip(
+            "These values are drawn black and white, the same for every "
+            "band; what lies outside clips. For imagery that is already a "
+            "fraction, 0 to 1 draws it as stored: times 255.")
+        self.range_low = self._stretch_spin(-1e12, 1e12, 4, None)
+        self.range_high = self._stretch_spin(-1e12, 1e12, 4, None)
+        self.sampled_button = QPushButton("Sampled range")
+        self.sampled_button.setToolTip(
+            "The lowest and highest values sampled from the group's "
+            "imagery - or 0 and 1 when they all lie within it.")
+        self.sampled_button.clicked.connect(self._use_sampled_range)
+        self.values_label = QLabel()
+        self.values_label.setWordWrap(True)
+        grid = QGridLayout(self.stretch_box)
+        grid.addWidget(self.percentile_radio, 0, 0)
+        grid.addWidget(self.pct_low, 0, 1)
+        grid.addWidget(QLabel("to"), 0, 2)
+        grid.addWidget(self.pct_high, 0, 3)
+        grid.addWidget(QLabel("of each band's values"), 0, 4)
+        grid.addWidget(self.range_radio, 1, 0)
+        grid.addWidget(self.range_low, 1, 1)
+        grid.addWidget(QLabel("to"), 1, 2)
+        grid.addWidget(self.range_high, 1, 3)
+        grid.addWidget(QLabel("for every band"), 1, 4)
+        grid.addWidget(self.sampled_button, 1, 5)
+        grid.setColumnStretch(6, 1)
+        grid.addWidget(self.values_label, 2, 0, 1, 7)
+        # One radio's toggle is enough: when either is picked the other
+        # has already been put out, so the controls read consistently.
+        self.range_radio.toggled.connect(self._on_stretch_changed)
+        for spin in (self.pct_low, self.pct_high, self.range_low,
+                     self.range_high):
+            spin.valueChanged.connect(self._on_stretch_changed)
+
         self.panels = [ChannelPanel(name, colour)
                        for name, colour in zip(CHANNEL_NAMES,
                                                CHANNEL_COLOURS)]
@@ -345,6 +400,7 @@ class DisplaySettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(note)
         layout.addLayout(top)
+        layout.addWidget(self.stretch_box)
         layout.addLayout(panels)
         layout.addLayout(buttons)
 
@@ -354,6 +410,22 @@ class DisplaySettingsDialog(QDialog):
         spin = QSpinBox()
         spin.setRange(1, self.band_count)
         spin.valueChanged.connect(self._on_bands_changed)
+        return spin
+
+    @staticmethod
+    def _stretch_spin(low, high, decimals, step):
+        spin = QDoubleSpinBox()
+        spin.setRange(low, high)
+        spin.setDecimals(decimals)
+        if step is None:
+            # Values of any magnitude: a step to suit the number shown.
+            spin.setStepType(QAbstractSpinBox.AdaptiveDecimalStepType)
+        else:
+            spin.setSingleStep(step)
+        # A change here re-reads the imagery; a half-typed number is not
+        # one. Enter, an arrow or leaving the box is.
+        spin.setKeyboardTracking(False)
+        spin.setMinimumWidth(96)
         return spin
 
     # -- the settings in the controls -----------------------------------------
@@ -366,13 +438,27 @@ class DisplaySettingsDialog(QDialog):
             return DisplaySettings(
                 mode=MODE_SINGLE, band=self.band_spin.value(),
                 channels=(self.panels[0].adjust(), ChannelAdjust(),
-                          ChannelAdjust()))
+                          ChannelAdjust()), stretch=self.stretch())
         bands = tuple(spin.value() for spin in self.rgb_spins)
         default_bands = DEFAULT.source_bands(self.band_count)
         return DisplaySettings(
             mode=MODE_RGB,
             bands=None if bands == default_bands else bands,
-            channels=tuple(panel.adjust() for panel in self.panels))
+            channels=tuple(panel.adjust() for panel in self.panels),
+            stretch=self.stretch())
+
+    def stretch(self) -> Stretch:
+        """The stretch the controls say. A window that is no window yet -
+        high not above low, mid-edit - keeps the last one that was."""
+        if self.range_radio.isChecked():
+            kind = STRETCH_RANGE
+            low, high = self.range_low.value(), self.range_high.value()
+        else:
+            kind = STRETCH_PERCENTILE
+            low, high = self.pct_low.value(), self.pct_high.value()
+        if high > low:
+            self._stretch = Stretch(kind, low, high).clamped()
+        return self._stretch
 
     def set_settings(self, settings: DisplaySettings, emit: bool = False):
         self._loading = True
@@ -387,12 +473,75 @@ class DisplaySettingsDialog(QDialog):
                 spin.setValue(band)
             for panel, adjust in zip(self.panels, settings.channels):
                 panel.set_adjust(adjust)
+            self._set_stretch(settings.stretch)
         finally:
             self._loading = False
         self._show_mode()
+        self._show_values()
         self._refresh_histograms()
         if emit:
             self._schedule_emit()
+
+    def _set_stretch(self, stretch: Stretch):
+        """Fill the stretch controls. The kind not in use shows what it
+        would be if picked: the default percentiles, or the range the
+        imagery suggests."""
+        self._stretch = stretch
+        widgets = (self.percentile_radio, self.range_radio, self.pct_low,
+                   self.pct_high, self.range_low, self.range_high)
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            if stretch.kind == STRETCH_RANGE:
+                self.range_radio.setChecked(True)
+                self.range_low.setValue(stretch.low)
+                self.range_high.setValue(stretch.high)
+                self.pct_low.setValue(DEFAULT_PERCENTILES[0])
+                self.pct_high.setValue(DEFAULT_PERCENTILES[1])
+            else:
+                self.percentile_radio.setChecked(True)
+                self.pct_low.setValue(stretch.low)
+                self.pct_high.setValue(stretch.high)
+                low, high = self._suggested_range()
+                self.range_low.setValue(low)
+                self.range_high.setValue(high)
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+
+    def _suggested_range(self) -> tuple:
+        """The fixed range to offer: 0 to 1 for unit-range imagery, else
+        what was sampled, else 0 to 1 for want of anything better."""
+        if self.values is not None:
+            return self.values.suggested_range()
+        return (0.0, 1.0)
+
+    def _use_sampled_range(self):
+        low, high = self._suggested_range()
+        for widget in (self.range_low, self.range_high, self.range_radio):
+            widget.blockSignals(True)
+        self.range_low.setValue(low)
+        self.range_high.setValue(high)
+        self.range_radio.setChecked(True)
+        for widget in (self.range_low, self.range_high, self.range_radio):
+            widget.blockSignals(False)
+        self._on_stretch_changed()
+
+    def _show_values(self):
+        """What the group's imagery holds - and, for 8-bit imagery, that
+        the stretch has no say in it."""
+        if self.values is None:
+            self.values_label.setText(
+                "No image of this group could be read. The stretch applies "
+                "to 16-bit and floating-point imagery.")
+            editable = True
+        else:
+            self.values_label.setText(self.values.describe())
+            editable = not self.values.is_bytes()
+        for widget in (self.percentile_radio, self.range_radio,
+                       self.pct_low, self.pct_high, self.range_low,
+                       self.range_high, self.sampled_button):
+            widget.setEnabled(editable)
 
     # -- reacting --------------------------------------------------------------
 
@@ -406,6 +555,13 @@ class DisplaySettingsDialog(QDialog):
     def _on_bands_changed(self, *_args):
         if self._loading:
             return
+        self._refresh_histograms()
+        self._schedule_emit()
+
+    def _on_stretch_changed(self, *_args):
+        if self._loading:
+            return
+        # The histograms are of display values, which the stretch makes.
         self._refresh_histograms()
         self._schedule_emit()
 
@@ -430,15 +586,16 @@ class DisplaySettingsDialog(QDialog):
         return [spin.value() for spin in self.rgb_spins]
 
     def histogram(self, band: int):
-        if band not in self._histograms:
+        key = (band, self.stretch())
+        if key not in self._histograms:
             counts = None
             if self._histogram_for is not None:
                 try:
-                    counts = self._histogram_for(band)
+                    counts = self._histogram_for(band, key[1])
                 except Exception:   # noqa: BLE001 - no histogram, still usable
                     counts = None
-            self._histograms[band] = counts
-        return self._histograms[band]
+            self._histograms[key] = counts
+        return self._histograms[key]
 
     def _refresh_histograms(self):
         for panel, band in zip(self.panels, self._channel_bands()):

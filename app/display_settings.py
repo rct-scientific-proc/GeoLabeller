@@ -14,21 +14,37 @@ unless they set their own (``resolve``). They are saved in the project
 (format 4.6) under "display_settings", keyed by group path.
 
 The adjustments work on the 8-bit display values: after the per-file
-2-98 percentile stretch that 16-bit and float imagery already gets, before
-anything is drawn. So they are a 256-entry lookup table per channel, cheap
-enough to redraw the canvas while a slider moves. Choosing different bands
-means reading the file again, so that reloads the group's images.
+stretch that 16-bit and float imagery gets, before anything is drawn. So
+they are a 256-entry lookup table per channel, cheap enough to redraw the
+canvas while a slider moves. Choosing different bands means reading the
+file again, so that reloads the group's images.
+
+The stretch itself is a setting too (``Stretch``, asked for 2026-10-05):
+by default each band's values between its 2nd and 98th percentiles run
+from black to white, as the app always drew such imagery; a group can
+set other percentiles, or one fixed range of values for every band - 0 to
+1 for floating-point imagery that is already a fraction, which is then
+simply times 255. 8-bit imagery is drawn as stored whatever the stretch.
+A changed stretch is a re-read, like changed bands. Saved with the
+group's settings (format 4.9).
 """
 from __future__ import annotations
 
 import math
 import threading
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 import numpy as np
 
 MODE_RGB = "rgb"
 MODE_SINGLE = "single"
+
+# How 16-bit and floating-point values become display bytes: a window of
+# each band's own percentiles, or one fixed range of values for every band.
+STRETCH_PERCENTILE = "percentile"
+STRETCH_RANGE = "range"
+DEFAULT_PERCENTILES = (2.0, 98.0)
 
 BRIGHTNESS_RANGE = (-100, 100)
 CONTRAST_RANGE = (-100, 100)
@@ -45,6 +61,16 @@ AUTO_PERCENTILES = (2.0, 98.0)
 
 def _clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def _number(value: float) -> str:
+    """A sampled value as a person reads it: 0.000 rather than 6.6e-07,
+    5590 rather than 5589.9995, 0.3529 rather than 0.35294118."""
+    if abs(value) < 5e-4:
+        return "0" if value == 0 else f"{value:.3f}"
+    if abs(value) >= 1000:
+        return f"{value:.0f}"
+    return f"{value:.4g}"
 
 
 @dataclass(frozen=True)
@@ -111,13 +137,141 @@ class ChannelAdjust:
             return cls()
 
 
+@dataclass(frozen=True)
+class Stretch:
+    """How a band's values become display bytes, for imagery that is not
+    8-bit already (8-bit is drawn as stored, whatever this says).
+
+    Asked for 2026-10-05: floating-point imagery that is already a
+    fraction, 0 to 1, wants nothing more than times 255 - the percentile
+    stretch re-contrasted it; and imagery in some odd range (0 to 5590,
+    say) wants the cutoffs under the user's hand, not fixed at 2 and 98.
+
+    ``kind`` is STRETCH_PERCENTILE - ``low`` and ``high`` are percentiles
+    of each band's own sampled values, 2 and 98 being how the app always
+    drew such imagery - or STRETCH_RANGE - ``low`` and ``high`` are
+    values, the same for every band, mapped to 0 and 255; 0 and 1 for
+    unit-range data is the plain times-255 cast. Values outside the
+    window clip to black or white.
+    """
+    kind: str = STRETCH_PERCENTILE
+    low: float = DEFAULT_PERCENTILES[0]
+    high: float = DEFAULT_PERCENTILES[1]
+
+    def is_default(self) -> bool:
+        return self == Stretch()
+
+    def clamped(self) -> "Stretch":
+        """Percentiles to a tenth within 0..100; low below high. A window
+        that is no window at all falls back to the default."""
+        try:
+            low, high = float(self.low), float(self.high)
+        except (TypeError, ValueError):
+            return Stretch()
+        if not (math.isfinite(low) and math.isfinite(high)):
+            return Stretch()
+        if self.kind == STRETCH_RANGE:
+            return Stretch(STRETCH_RANGE, low, high) if high > low else Stretch()
+        low = round(_clamp(low, 0.0, 100.0), 1)
+        high = round(_clamp(high, 0.0, 100.0), 1)
+        if high <= low:
+            return Stretch()
+        return Stretch(STRETCH_PERCENTILE, low, high)
+
+    def describe(self) -> str:
+        if self.kind == STRETCH_RANGE:
+            return f"values {self.low:g} to {self.high:g}"
+        return f"percentiles {self.low:g} to {self.high:g}"
+
+    def to_dict(self) -> dict:
+        return {"kind": self.kind, "low": self.low, "high": self.high}
+
+    @classmethod
+    def from_dict(cls, data) -> "Stretch":
+        """Tolerant: anything unreadable is the default."""
+        if not isinstance(data, dict):
+            return cls()
+        kind = data.get("kind")
+        if kind not in (STRETCH_PERCENTILE, STRETCH_RANGE):
+            return cls()
+        try:
+            return cls(kind, float(data.get("low")),
+                       float(data.get("high"))).clamped()
+        except (TypeError, ValueError):
+            return cls()
+
+
+DEFAULT_STRETCH = Stretch()
+
+
+@dataclass(frozen=True)
+class SampledValues:
+    """What a file's values look like, for the Display Settings window to
+    say and to suggest a stretch from: the data type, and the lowest and
+    highest sampled value over its bands - None when nothing was sampled
+    (8-bit imagery is never sampled, it is drawn as stored)."""
+    name: str
+    dtype: str
+    low: float | None = None
+    high: float | None = None
+
+    def is_bytes(self) -> bool:
+        return np.dtype(self.dtype) == np.uint8
+
+    def unit_range(self) -> bool:
+        """Values that already lie within 0 to 1 - a fraction, or a mask
+        of 0s and 1s in whatever type - which times 255 draws as stored."""
+        return (self.low is not None
+                and self.low >= 0.0 and self.high <= 1.0)
+
+    def suggested_range(self) -> tuple:
+        """The fixed range to offer: 0 to 1 for unit-range data, else the
+        sampled range, else the byte range."""
+        if self.unit_range():
+            return (0.0, 1.0)
+        if self.low is not None and self.high > self.low:
+            return (float(self.low), float(self.high))
+        return (0.0, 255.0)
+
+    def describe(self) -> str:
+        if self.is_bytes():
+            return (f"{self.name}: 8-bit, drawn as stored. The stretch "
+                    "applies to 16-bit and floating-point imagery.")
+        if self.low is None:
+            return f"{self.name}: {self.dtype}, no values to sample."
+        text = (f"{self.name}: {self.dtype}, sampled values "
+                f"{_number(self.low)} to {_number(self.high)}")
+        if self.unit_range():
+            text += (" - within 0 to 1, so Values 0 to 1 draws them as "
+                     "stored (times 255)")
+        return text + "."
+
+
+def sampled_values(src) -> SampledValues:
+    """``SampledValues`` of an open dataset, from the same per-file sample
+    the stretch is read off (so free once the file has been drawn)."""
+    from .snippets import cached_band_quantiles
+
+    name = Path(src.name).name
+    dtype = str(src.dtypes[0])
+    table = cached_band_quantiles(src)
+    if table is None:
+        return SampledValues(name, dtype)
+    with np.errstate(all="ignore"):
+        low, high = np.nanmin(table[:, 0]), np.nanmax(table[:, -1])
+    if not (np.isfinite(low) and np.isfinite(high)):
+        return SampledValues(name, dtype)
+    return SampledValues(name, dtype, float(low), float(high))
+
+
 def _identity3():
     return (ChannelAdjust(), ChannelAdjust(), ChannelAdjust())
 
 
 @dataclass(frozen=True)
 class DisplaySettings:
-    """One group's display: the bands drawn and each channel's adjustment.
+    """One group's display: the bands drawn, each channel's adjustment,
+    and the stretch its values go through first.
 
     ``mode`` is MODE_RGB (``bands`` go to red, green and blue; None means
     the file's own first three, as always) or MODE_SINGLE (``band`` drawn
@@ -128,6 +282,7 @@ class DisplaySettings:
     bands: tuple | None = None
     band: int = 1
     channels: tuple = field(default_factory=_identity3)
+    stretch: Stretch = field(default_factory=Stretch)
 
     # -- what it means ------------------------------------------------------
 
@@ -135,11 +290,13 @@ class DisplaySettings:
         return self == DisplaySettings()
 
     def band_choice(self) -> tuple:
-        """What decides which bands are read. Two settings with the same
-        choice need no re-read to switch between them."""
+        """What decides which bands are read, and through which stretch.
+        Two settings with the same choice need no re-read to switch
+        between them; a different stretch means the bytes held are the
+        wrong ones, as different bands would."""
         if self.mode == MODE_SINGLE:
-            return (MODE_SINGLE, self.band)
-        return (MODE_RGB, self.bands)
+            return (MODE_SINGLE, self.band, self.stretch)
+        return (MODE_RGB, self.bands, self.stretch)
 
     def source_bands(self, count: int) -> tuple:
         """The three 1-based source bands for red, green and blue, given a
@@ -165,6 +322,9 @@ class DisplaySettings:
         channels[index] = adjust.clamped()
         return replace(self, channels=tuple(channels))
 
+    def with_stretch(self, stretch: Stretch):
+        return replace(self, stretch=stretch.clamped())
+
     # -- file -----------------------------------------------------------------
 
     def to_dict(self) -> dict:
@@ -176,6 +336,10 @@ class DisplaySettings:
             if self.bands is not None:
                 data["bands"] = [int(b) for b in self.bands]
             data["channels"] = [c.to_dict() for c in self.channels]
+        # Written only when it is not the default, so a project saved
+        # before 4.9 and one that never touched it read the same.
+        if not self.stretch.is_default():
+            data["stretch"] = self.stretch.to_dict()
         return data
 
     @classmethod
@@ -205,7 +369,8 @@ class DisplaySettings:
                         ChannelAdjust()]
             bands = None
         return cls(mode=mode, bands=bands, band=band,
-                   channels=tuple(channels))
+                   channels=tuple(channels),
+                   stretch=Stretch.from_dict(data.get("stretch")))
 
 
 DEFAULT = DisplaySettings()

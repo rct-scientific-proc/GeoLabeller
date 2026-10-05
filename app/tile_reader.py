@@ -256,8 +256,9 @@ def read_tile(src, dst_crs, level: int, tx: int, ty: int,
     # The same per-file display stretch the coarse tiles and snippets use,
     # so detail refinement never shifts the imagery's contrast (and float
     # or 16-bit data doesn't clip to black).
-    scaling = cached_band_scaling(src)
-    chosen = (display or DEFAULT_DISPLAY).source_bands(src.count)
+    display = display or DEFAULT_DISPLAY
+    scaling = cached_band_scaling(src, display.stretch)
+    chosen = display.source_bands(src.count)
 
     # The first band in float32: NaN marks both source nodata and the areas
     # the reprojection never writes, which become the alpha channel.

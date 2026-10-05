@@ -2858,26 +2858,30 @@ class MainWindow(QMainWindow):
         self._close_display_dialog()
         reference = self._group_reference(group_path)
         band_count = 3
+        values = None
         if reference is not None:
             try:
                 with gdal_config.opened(reference) as src:
                     band_count = src.count
+                    # What its values look like, for the stretch controls
+                    # to say - from the sample the stretch is read off.
+                    values = display_settings.sampled_values(src)
             except Exception as exc:  # noqa: BLE001 - still editable
                 debug(f"display settings: cannot read {reference}: {exc}")
                 reference = None
 
-        def histogram_for(band):
+        def histogram_for(band, stretch=None):
             if reference is None:
                 return None
             with gdal_config.opened(reference) as src:
                 return display_settings.band_histogram(
-                    src, band, cached_band_scaling(src))
+                    src, band, cached_band_scaling(src, stretch))
 
         own = self.project.display_settings.get(group_path)
         dialog = DisplaySettingsDialog(
             group_path, display_settings.resolve(
                 self.project.display_settings, group_path),
-            band_count, histogram_for, self)
+            band_count, histogram_for, self, values=values)
         dialog.setAttribute(Qt.WA_DeleteOnClose)
         dialog.changed.connect(
             lambda s, g=group_path: self._set_group_display(g, s))

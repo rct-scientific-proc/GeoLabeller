@@ -892,10 +892,11 @@ class TiledLayer:
             # Padding areas are identical for all bands after reprojection.
 
             # Per-file display stretch: None for uint8; for float or 16-bit
-            # imagery the same 2-98 percentile mapping the snippets use, so
-            # the canvas and every snippet view agree. Without it the clip
+            # imagery the same mapping the snippets use (percentiles 2-98
+            # unless the group's Display Settings say otherwise), so the
+            # canvas and every snippet view agree. Without it the clip
             # below rendered e.g. negative-dB float32 sonar as solid black.
-            band_scaling = cached_band_scaling(src)
+            band_scaling = cached_band_scaling(src, self.display.stretch)
 
             # Band 1: reproject as float32 to detect nodata
             self._checkpoint(cancel_check)
@@ -1072,7 +1073,7 @@ class TiledLayer:
             width = max(1, src.width // level)
             height = max(1, src.height // level)
 
-            band_scaling = cached_band_scaling(src)
+            band_scaling = cached_band_scaling(src, self.display.stretch)
             self._checkpoint(cancel_check)
             chosen = self.display.source_bands(src.count)
             first = chosen[0]

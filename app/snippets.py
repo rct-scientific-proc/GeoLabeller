@@ -52,43 +52,85 @@ def centered_window(px: float, py: float, width: int, height: int,
     return x0, y0
 
 
-def _band_scaling(src):
-    """Per-band (low, high) stretch for a non-uint8 raster, else ``None``.
+# The stretch of 16-bit and float imagery is read off a table of each
+# band's quantiles, a tenth of a percent apart, sampled once per file: any
+# percentile window the group's Display Settings ask for is then a lookup,
+# not another read of the raster.
+_QUANTILES = np.arange(1001) / 10.0          # 0.0, 0.1, ... 100.0
+
+
+def _band_quantiles(src):
+    """Each band's quantile table for a non-uint8 raster, else ``None``.
 
     A plain ``astype`` cast of 16-bit or float imagery wraps values modulo
     256 into noise. Instead, sample the raster once (a decimated read, served
-    from overviews when present, with nodata masked out) and derive a
-    per-band 2-98 percentile window - the same idea as a viewer's default
-    contrast stretch. Every snippet of the image is then scaled through this
-    one linear mapping, so snippets stay consistent with each other and with
-    how the imagery looks on screen.
+    from overviews when present, with nodata masked out) and keep, per band,
+    its value at every tenth of a percentile: (bands, 1001) float32. The
+    display stretch is derived from this (``scaling_for``), so every snippet
+    and tile of the image goes through one linear mapping, and a changed
+    percentile window costs a lookup rather than another sample.
     """
     if np.dtype(src.dtypes[0]) == np.uint8:
         return None
     # Every band, not only the first three: Display Settings can draw any
-    # band, and one without a stretch would clip to black. The first
-    # three come out exactly as before - each band's window is its own.
+    # band, and one without a stretch would clip to black.
     bands = min(src.count, 64)
     out_h = min(src.height, 1024)
     out_w = min(src.width, 1024)
     sample = src.read(indexes=list(range(1, bands + 1)),
                       out_shape=(bands, out_h, out_w), masked=True)
     sample = np.ma.filled(sample.astype("float32"), np.nan)
-    lows = np.empty(bands, dtype="float32")
-    highs = np.empty(bands, dtype="float32")
+    table = np.empty((bands, _QUANTILES.size), dtype="float32")
     for b in range(bands):
         band = sample[b]
+        if np.isnan(band).all():
+            table[b] = np.nan          # nothing sampled; see scaling_for
+            continue
         with np.errstate(all="ignore"):
-            lo = np.nanpercentile(band, 2.0)
-            hi = np.nanpercentile(band, 98.0)
-            if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
-                # Degenerate percentiles (e.g. a rare bright object on a flat
-                # background): fall back to the full data range.
-                lo, hi = np.nanmin(band), np.nanmax(band)
+            # float32 in, float32 kept: bit for bit the values the two
+            # scalar percentile calls of old gave at 2 and 98.
+            table[b] = np.nanpercentile(band, _QUANTILES)
+    return table
+
+
+def scaling_for(table, stretch, count: int):
+    """The per-band (lows, highs) a stretch means for one file, from its
+    quantile table - or None when there is nothing to stretch.
+
+    A percentile window is each band's own. The fallbacks are the ones
+    the app always had: degenerate percentiles (a rare bright object on
+    a flat background) widen to the band's whole sampled range, and an
+    empty or flat band gets 0..1. A fixed range of values is one window
+    for every band and needs no sample at all.
+    """
+    if stretch.kind == display_settings.STRETCH_RANGE:
+        n = max(1, int(count))
+        return (np.full(n, stretch.low, dtype="float32"),
+                np.full(n, stretch.high, dtype="float32"))
+    if table is None:
+        return None
+    last = table.shape[1] - 1
+    i_lo = min(max(int(round(stretch.low * 10)), 0), last)
+    i_hi = min(max(int(round(stretch.high * 10)), 0), last)
+    lows = np.empty(table.shape[0], dtype="float32")
+    highs = np.empty(table.shape[0], dtype="float32")
+    for b in range(table.shape[0]):
+        lo, hi = table[b, i_lo], table[b, i_hi]
         if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
-            lo, hi = 0.0, 1.0  # fully empty/flat band - nothing to stretch
+            lo, hi = table[b, 0], table[b, last]
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+            lo, hi = 0.0, 1.0
         lows[b], highs[b] = lo, hi
     return lows, highs
+
+
+def _band_scaling(src, stretch=None):
+    """``scaling_for`` straight from a fresh sample - what the tests
+    compare against; the app goes through ``cached_band_scaling``."""
+    if np.dtype(src.dtypes[0]) == np.uint8:
+        return None
+    return scaling_for(_band_quantiles(src),
+                       stretch or display_settings.DEFAULT_STRETCH, src.count)
 
 
 def nodata_mask(data, nodata):
@@ -165,30 +207,32 @@ def _window_pixels(src, window, channels, nodata, scaling=None):
 # One-shot snippet reads
 # ---------------------------------------------------------------------------
 
-# Per-file stretch cache: computing it samples the raster, and a project's
+# Per-file quantile cache: computing it samples the raster, and a project's
 # labels cluster on few files. Never invalidated within a session - source
 # imagery does not change under the application.
-_scaling_cache: dict[str, object] = {}
+_quantile_cache: dict[str, object] = {}
 # The read behind a miss is a 3 x 1024 x 1024 decimated masked read plus
 # per-band percentiles. Four snippet threads reaching an untouched file at
 # once - which is exactly what a strip of labels on one image does - all
 # missed and all computed it. One computes; the rest wait on its event.
 _scaling_lock = threading.Lock()
 _scaling_pending: dict[str, "threading.Event"] = {}
+# The stretches derived from the tables, by (path, stretch): a tile asks
+# for one on every read, and handing back the same object lets callers
+# tell "the same stretch" by identity.
+_scaling_cache: dict[tuple, object] = {}
+_MISSING = object()
 
 
-def cached_band_scaling(src):
-    """The per-file display stretch for an open dataset (None for uint8).
-
-    One cache for every display surface - snippets, the canvas's coarse
-    and detail tiles, the pixel zone - so a float32 or 16-bit raster shows
-    the SAME contrast everywhere it is drawn. Keyed by the dataset's path.
-    """
+def cached_band_quantiles(src):
+    """The per-file quantile table for an open dataset (None for uint8),
+    sampled once however many threads ask at once. Keyed by the
+    dataset's path."""
     key = src.name
     while True:
         with _scaling_lock:
-            if key in _scaling_cache:
-                return _scaling_cache[key]
+            if key in _quantile_cache:
+                return _quantile_cache[key]
             waiting = _scaling_pending.get(key)
             if waiting is None:
                 waiting = threading.Event()
@@ -200,20 +244,48 @@ def cached_band_scaling(src):
             # Someone else is sampling this raster; take their answer.
             waiting.wait(timeout=30.0)
             with _scaling_lock:
-                if key in _scaling_cache:
-                    return _scaling_cache[key]
+                if key in _quantile_cache:
+                    return _quantile_cache[key]
                 # The computing thread died or timed out; try it ourselves.
                 _scaling_pending.pop(key, None)
             continue
         try:
-            value = _band_scaling(src)
+            value = _band_quantiles(src)
         finally:
             with _scaling_lock:
                 _scaling_pending.pop(key, None)
             waiting.set()
         with _scaling_lock:
-            _scaling_cache[key] = value
+            _quantile_cache[key] = value
         return value
+
+
+def cached_band_scaling(src, stretch=None):
+    """The per-file display stretch for an open dataset (None for uint8),
+    as ``stretch`` - the group's Display Settings' - means it; the default
+    is percentiles 2 to 98, how such imagery was always drawn.
+
+    One cache for every display surface - snippets, the canvas's coarse
+    and detail tiles, the pixel zone - so a float32 or 16-bit raster shows
+    the SAME contrast everywhere it is drawn. Keyed by the dataset's path
+    and the stretch.
+    """
+    stretch = stretch or display_settings.DEFAULT_STRETCH
+    key = (src.name, stretch)
+    with _scaling_lock:
+        found = _scaling_cache.get(key, _MISSING)
+    if found is not _MISSING:
+        return found
+    if np.dtype(src.dtypes[0]) == np.uint8:
+        value = None
+    elif stretch.kind == display_settings.STRETCH_RANGE:
+        value = scaling_for(None, stretch, src.count)   # no sample needed
+    else:
+        value = scaling_for(cached_band_quantiles(src), stretch, src.count)
+    with _scaling_lock:
+        # Two threads may both have derived it; the first in wins, so
+        # every caller holds the one object.
+        return _scaling_cache.setdefault(key, value)
 
 
 def apply_band_stretch(band: np.ndarray, scaling, band_index: int):
@@ -279,7 +351,7 @@ def read_label_snippet(image_path: str, pixel_x: float, pixel_y: float,
     try:
         display = display_settings.for_image(image_path)
         with gdal_config.opened(image_path) as src:
-            scaling = cached_band_scaling(src)
+            scaling = cached_band_scaling(src, display.stretch)
             x0, y0, w, h = snippet_frame(pixel_x, pixel_y, size_px,
                                          src.width, src.height)
             if not display.is_default():
