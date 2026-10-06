@@ -29,7 +29,7 @@ DEFAULT_LIMIT = 200
 
 # Project lists a step can carry, as attribute names on LabelProject.
 LISTS = ("classes", "descriptions", "mask_names", "waypoints",
-         "_next_waypoint_id")
+         "_next_waypoint_id", "model_review")
 
 
 @dataclass

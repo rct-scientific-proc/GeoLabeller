@@ -29,6 +29,7 @@ from .labels import canonical_path
 IMAGERY = "imagery"      # Add Directory, Add GeoTIFF, hunting for images
 PROJECT = "project"      # open, save as, combine, import ground truth
 EXPORT = "export"        # everything written for somebody else
+REVIEW = "review"        # the model team's files of chips (Model Review)
 
 # How many projects File > Open Recent keeps. Ten fills a menu without
 # needing a scrollbar, and nobody reaches for the eleventh.

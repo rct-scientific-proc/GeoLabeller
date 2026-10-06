@@ -150,6 +150,21 @@ SHORTCUT_SECTIONS = [
         ("Ctrl+Y", "Redo"),
         ("Ctrl+S", "Save Project"),
     ]),
+    ("Model Review (Labels > Model Review...)", [
+        ("Ctrl+O", "Open a file of the model's mistakes"),
+        ("Left-click chip", "Give it the active label"),
+        ("Shift+Left-click", "Label every chip from the last click to this"),
+        ("Ctrl+Left-click", "Pick a chip without labelling; a key then "
+                            "labels the picked"),
+        ("1-9", "The class at that place in the list: active, and onto "
+                "the picked chips"),
+        ("0", "Ignore: looked at, nothing to label"),
+        ("Right-click / Delete", "Take a verdict back"),
+        ("Escape / Ctrl+A", "Pick none / every chip shown"),
+        ("Ctrl+Z", "Undo, in the main window's history"),
+        ("Ctrl+Y", "Redo"),
+        ("Ctrl+S", "Save Project"),
+    ]),
     ("Help", [
         ("F1", "Show this help"),
     ]),

@@ -63,6 +63,8 @@ from .history import EditHistory
 from .orientation_math import pixel_angle_from_heading
 from .display_dialog import DisplaySettingsDialog
 from .gt_import import apply_import, confirm_import, plan_import
+from .model_review.importer import apply_verdicts
+from .model_review.window import ModelReviewWindow
 from .relocate import (RelocateImagesDialog, RemoveMissingImagesDialog,
                        missing_images, silently_resolve)
 from .snippet_editor import SnippetEditor
@@ -434,6 +436,10 @@ class MainWindow(QMainWindow):
         # orientation, confidence (2.0.0; it replaced the separate Mask
         # and Orientation Editor windows). Created on first open.
         self._snippet_editor = None
+        # The Model Review window (app/model_review): the model team's
+        # mistakes, labelled and imported. Created on first open, closed
+        # when the project is replaced.
+        self._model_review = None
         # Last-used export settings, so a re-export doesn't start from scratch.
         # An existing target file's own settings still take precedence.
         self._h5_last_options: dict = {}
@@ -885,6 +891,13 @@ class MainWindow(QMainWindow):
             "everything recorded per snippet")
         snippet_action.triggered.connect(self._open_snippet_editor)
         labels_menu.addAction(snippet_action)
+
+        review_action = QAction("&Model Review...", self)
+        review_action.setStatusTip(
+            "The model team's mistakes, looked at and labelled: chips from "
+            "a JSON file, imported as labels")
+        review_action.triggered.connect(self._open_model_review)
+        labels_menu.addAction(review_action)
 
         labels_menu.addSeparator()
 
@@ -1963,6 +1976,9 @@ class MainWindow(QMainWindow):
         self.canvas.class_names = list(self.project.classes)
         if self._snippet_editor is not None:
             self._snippet_editor.set_classes(self.project.classes)
+        if self._model_review is not None:
+            self._model_review.set_classes(self.project.classes,
+                                           self._class_colours())
 
         # The description picker follows the same project switches (open,
         # new, combine, recovery) - refreshed here so no site can update
@@ -3572,6 +3588,9 @@ class MainWindow(QMainWindow):
         if "waypoints" in lists:
             self._refresh_waypoints()
         self._reseat_open_editors()
+        if self._model_review is not None and "model_review" in lists:
+            # An import undone: its chips are back to be looked at.
+            self._model_review.refresh_earlier()
         self.setWindowModified(self._has_unsaved_changes())
         self._push_save_state()
         self._recovery_soon_timer.start()
@@ -3809,6 +3828,7 @@ class MainWindow(QMainWindow):
 
         # Clear project state
         self._close_display_dialog()
+        self._close_model_review()
         self._history.clear()
         self.project = LabelProject()
         self._project_path = None
@@ -3912,6 +3932,7 @@ class MainWindow(QMainWindow):
             self.layer_panel.clear()
 
             self._close_display_dialog()
+            self._close_model_review()
             self._history.clear()
             self.project = LabelProject.load(file_path)
             self._project_path = Path(file_path)
@@ -4462,6 +4483,71 @@ class MainWindow(QMainWindow):
     def _confirm_gt_import(self, plan, source_name: str) -> bool:
         """The preview; a method of its own so tests can answer it."""
         return confirm_import(plan, source_name, self.project, self)
+
+    # ------------------------------------------------------------------
+    # Model Review (app/model_review): the model team's mistakes
+    # ------------------------------------------------------------------
+
+    def _class_colours(self) -> list:
+        return [self._get_class_color(name) for name in self.project.classes]
+
+    def _open_model_review(self):
+        """Labels > Model Review...: a file of the model's mistakes, each
+        chip to be given its real class or ignored, then imported."""
+        if self._model_review is None:
+            window = self._model_review = ModelReviewWindow(
+                lambda: self.project)
+            window.import_requested.connect(self._import_model_review)
+            window.class_requested.connect(self._add_class_from_review)
+            window.save_requested.connect(self._save_project)
+            window.undo_requested.connect(self._undo)
+            window.redo_requested.connect(self._redo)
+        self._model_review.set_classes(self.project.classes,
+                                       self._class_colours())
+        self._model_review.show()
+        self._model_review.raise_()
+        self._model_review.activateWindow()
+
+    def _close_model_review(self):
+        """The project is being replaced: the window's chips were matched
+        onto the old one."""
+        window, self._model_review = self._model_review, None
+        if window is not None:
+            window.close()
+            window.deleteLater()
+
+    def _add_class_from_review(self, name: str):
+        """A class typed in the Model Review window for the clutter it
+        shows - rock, wake - added to the project."""
+        name = identity.clean(name)
+        if not name or name in self.project.classes:
+            return
+        with self._recorded("Add class", lists=("classes",)):
+            self.project.classes.append(name)
+        self._mark_unsaved()
+        self._update_class_combo()
+
+    def _import_model_review(self, chips: list, source: str):
+        """The window's verdicts: a label per chip given a class, a ledger
+        entry per chip given anything - one undo step."""
+        if not chips:
+            return
+        with self._recorded("Model review import",
+                            lists=("model_review", "classes")):
+            result = apply_verdicts(self.project, chips, source)
+        self._update_class_combo()
+        for label_id in result.label_ids:
+            image, label = self.project.get_label_by_id(label_id)
+            if label is not None:
+                self._add_label_marker(image, label)
+        self._schedule_refresh("labeled", "snippets")
+        self._reseat_open_editors()
+        self._mark_unsaved()
+        self._recovery_soon_timer.start()
+        if self._model_review is not None:
+            self._model_review.refresh_earlier()
+        self.statusBar.showMessage("Model review: " + result.summary(source),
+                                   12000)
 
     def _export_ground_truth(self):
         """Export ground truth labels to a JSON file."""
