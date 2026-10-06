@@ -32,7 +32,7 @@ from PyQt5.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QGridLayout,
 from .. import identity, recent
 from ..settings_scope import settings as app_settings
 from ..snippets import SnippetLoader
-from .ledger import DEFAULT_TOLERANCE_PX, IGNORE, find_verdict
+from .ledger import DEFAULT_TOLERANCE_PX, IGNORE, LedgerIndex
 from .source import by_class, match_candidates, read_candidates
 
 CAPTION_PX = 20                 # the strip under each chip's picture
@@ -40,6 +40,11 @@ GRID_SPACING = 8
 MIN_CELL_PX = 64
 DEFAULT_CHIP_PX = 224           # source pixels read around the centre
 DEFAULT_COLUMNS = 6
+# Chips built at once. A file of thousands is read and matched in a
+# blink, but a cell per chip froze the window for seconds and held every
+# chip's pixels in memory (measured 2026-10-06); a page at a time, as the
+# Snippet Editor's grid does, costs nothing the user can feel.
+DEFAULT_PER_PAGE = 60
 ALL_CLASSES = None              # the predicted-class box's first entry
 
 SELECTED_COLOR = QColor(255, 255, 255)
@@ -49,6 +54,7 @@ TEXT_COLOR = QColor(220, 220, 220)
 
 _CHIP_KEY = "model_review/chip_size"
 _COLUMNS_KEY = "model_review/columns"
+_PER_PAGE_KEY = "model_review/per_page"
 _SHOW_REVIEWED_KEY = "model_review/show_reviewed"
 _TOLERANCE_KEY = "model_review/tolerance"
 _GEOMETRY_KEY = "model_review/geometry"
@@ -155,7 +161,10 @@ class ModelReviewWindow(QWidget):
         self.setFocusPolicy(Qt.StrongFocus)
         self._chips: list = []
         self._by_key: dict = {}
-        self._visible: list = []
+        self._listed: list = []         # the chips the filters let through
+        self._visible: list = []        # the page of them on the grid
+        self._page = 0
+        self._page_start = 0            # the rank of the page's first chip
         self._source = ""
         self._report = None
         self._classes: list = []
@@ -211,6 +220,16 @@ class ModelReviewWindow(QWidget):
         self.columns_spin.setKeyboardTracking(False)
         self.columns_spin.valueChanged.connect(lambda _v: self._rebuild())
         top.addWidget(self.columns_spin)
+        top.addWidget(QLabel("Per page"))
+        self.page_spin = QSpinBox()
+        self.page_spin.setRange(6, 600)
+        self.page_spin.setValue(DEFAULT_PER_PAGE)
+        self.page_spin.setToolTip(
+            "Chips on a page. Next and Previous, or PageDown and PageUp,\n"
+            "turn the pages.")
+        self.page_spin.setKeyboardTracking(False)
+        self.page_spin.valueChanged.connect(self._on_per_page)
+        top.addWidget(self.page_spin)
         layout.addLayout(top)
 
         second = QHBoxLayout()
@@ -240,7 +259,7 @@ class ModelReviewWindow(QWidget):
         self.show_reviewed_check.setToolTip(
             "Chips reviewed in an earlier round, shaded, with what they\n"
             "became. Kept off the grid otherwise.")
-        self.show_reviewed_check.toggled.connect(lambda _on: self._rebuild())
+        self.show_reviewed_check.toggled.connect(self._on_show_reviewed)
         second.addWidget(self.show_reviewed_check)
         second.addWidget(QLabel("Same chip within"))
         self.tolerance_spin = QSpinBox()
@@ -282,9 +301,19 @@ class ModelReviewWindow(QWidget):
         self.scroll.viewport().installEventFilter(self)
         layout.addWidget(self.scroll, 1)
 
+        bottom = QHBoxLayout()
         self.status = QLabel("")
         self.status.setWordWrap(True)
-        layout.addWidget(self.status)
+        bottom.addWidget(self.status, 1)
+        self.prev_button = QPushButton("< Previous")
+        self.prev_button.clicked.connect(lambda: self._step_page(-1))
+        bottom.addWidget(self.prev_button)
+        self.page_label = QLabel("")
+        bottom.addWidget(self.page_label)
+        self.next_button = QPushButton("Next >")
+        self.next_button.clicked.connect(lambda: self._step_page(1))
+        bottom.addWidget(self.next_button)
+        layout.addLayout(bottom)
         self._show_counts()
 
     # -- data in --------------------------------------------------------------
@@ -331,20 +360,19 @@ class ModelReviewWindow(QWidget):
         self._by_key = {chip.key: chip for chip in chips}
         self._selected.clear()
         self._anchor = None
+        self._page = 0
         self.setWindowTitle(f"Model Review - {name}")
         self.file_label.setText(f"{name}: {report.summary()}")
-        self.refresh_earlier()
-        self._fill_filter()
-        self._rebuild()
+        self.refresh_earlier()          # which also fills the grid
         return True
 
     def refresh_earlier(self):
         """Ask the project's memory which chips were reviewed before."""
-        ledger = getattr(self._project(), "model_review", [])
-        tolerance = float(self.tolerance_spin.value())
+        index = LedgerIndex(getattr(self._project(), "model_review", []),
+                            float(self.tolerance_spin.value()))
         for chip in self._chips:
-            chip.earlier = find_verdict(ledger, chip.image_name, chip.pixel_x,
-                                        chip.pixel_y, tolerance)
+            chip.earlier = index.find(chip.image_name, chip.pixel_x,
+                                      chip.pixel_y)
             if chip.earlier is not None:
                 chip.verdict = None
         self._fill_filter()
@@ -358,12 +386,25 @@ class ModelReviewWindow(QWidget):
     def source(self) -> str:
         return self._source
 
+    def listed(self) -> list:
+        """The chips the filters let through, in grid order: every page."""
+        return list(self._listed)
+
+    def listed_keys(self) -> list:
+        return [chip.key for chip in self._listed]
+
     def shown(self) -> list:
-        """The chips on the grid, in its order."""
+        """The chips on the grid now: the current page."""
         return list(self._visible)
 
     def shown_keys(self) -> list:
         return [chip.key for chip in self._visible]
+
+    def page(self) -> int:
+        return self._page
+
+    def page_count(self) -> int:
+        return max(1, -(-len(self._listed) // max(1, self.page_spin.value())))
 
     def selected(self) -> set:
         return set(self._selected)
@@ -401,13 +442,29 @@ class ModelReviewWindow(QWidget):
         combo.setCurrentIndex(index if index >= 0 else 0)
         combo.blockSignals(False)
 
-    def _visible_chips(self) -> list:
+    def _listed_chips(self) -> list:
         wanted = self.class_filter.currentData()
         show_reviewed = self.show_reviewed_check.isChecked()
         chosen = [chip for chip in self._chips
                   if (wanted is ALL_CLASSES or chip.predicted == wanted)
                   and (show_reviewed or not chip.reviewed_before())]
         return sorted(chosen, key=lambda c: (-c.score, c.key))
+
+    def _step_page(self, delta: int):
+        page = max(0, min(self.page_count() - 1, self._page + delta))
+        if page != self._page:
+            self._page = page
+            self._rebuild()
+
+    def _on_per_page(self, value):
+        # Keep the place: the chip at the top of the page stays on it.
+        self._page = self._page_start // max(1, int(value))
+        self._rebuild()
+
+    def _on_show_reviewed(self, _on):
+        self._page = 0
+        self._fill_filter()             # its counts change with it
+        self._rebuild()
 
     def _cell_px(self) -> int:
         columns = max(1, self.columns_spin.value())
@@ -421,11 +478,20 @@ class ModelReviewWindow(QWidget):
             if item.widget() is not None:
                 item.widget().deleteLater()
         self._cells.clear()
-        self._visible = self._visible_chips()
+        self._listed = self._listed_chips()
+        per_page = max(1, self.page_spin.value())
+        self._page = max(0, min(self.page_count() - 1, self._page))
+        start = self._page_start = self._page * per_page
+        self._visible = self._listed[start:start + per_page]
         keys = {chip.key for chip in self._visible}
-        self._selected &= keys
+        self._selected &= keys          # a selection lives on its page
         if self._anchor not in keys:
             self._anchor = None
+        self.page_label.setText(
+            f"{start + 1}-{start + len(self._visible)} of {len(self._listed)}"
+            if self._listed else "none")
+        self.prev_button.setEnabled(self._page > 0)
+        self.next_button.setEnabled(self._page < self.page_count() - 1)
         columns = max(1, self.columns_spin.value())
         px = self._cell_px()
         for i, chip in enumerate(self._visible):
@@ -507,11 +573,12 @@ class ModelReviewWindow(QWidget):
                                 "begin.")
             return
         earlier = sum(1 for chip in self._chips if chip.reviewed_before())
-        shown = len(self._visible)
-        left = sum(1 for chip in self._visible
+        listed = len(self._listed)
+        left = sum(1 for chip in self._listed
                    if chip.verdict is None and not chip.reviewed_before())
-        text = (f"{shown} of {len(self._chips)} chips shown: {left} to look "
-                f"at, {labelled} labelled, {ignored} to ignore")
+        text = (f"{listed} chip{'' if listed == 1 else 's'} listed, "
+                f"{len(self._visible)} on this page: {left} to look at, "
+                f"{labelled} labelled, {ignored} to ignore")
         if earlier:
             text += (f"; {earlier} reviewed in an earlier round"
                      + ("" if self.show_reviewed_check.isChecked()
@@ -519,6 +586,7 @@ class ModelReviewWindow(QWidget):
         self.status.setText(text)
 
     def _on_filter(self, _index):
+        self._page = 0
         self._rebuild()
 
     # -- verdicts -------------------------------------------------------------
@@ -675,6 +743,12 @@ class ModelReviewWindow(QWidget):
             if key == Qt.Key_Escape:
                 self.select_none()
                 return
+            if key == Qt.Key_PageDown:
+                self._step_page(1)
+                return
+            if key == Qt.Key_PageUp:
+                self._step_page(-1)
+                return
         super().keyPressEvent(event)
 
     # -- settings, closing ----------------------------------------------------
@@ -684,6 +758,7 @@ class ModelReviewWindow(QWidget):
         for spin, key, fallback in (
                 (self.chip_spin, _CHIP_KEY, DEFAULT_CHIP_PX),
                 (self.columns_spin, _COLUMNS_KEY, DEFAULT_COLUMNS),
+                (self.page_spin, _PER_PAGE_KEY, DEFAULT_PER_PAGE),
                 (self.tolerance_spin, _TOLERANCE_KEY,
                  int(DEFAULT_TOLERANCE_PX))):
             try:
@@ -711,6 +786,7 @@ class ModelReviewWindow(QWidget):
         settings = app_settings()
         settings.setValue(_CHIP_KEY, self.chip_spin.value())
         settings.setValue(_COLUMNS_KEY, self.columns_spin.value())
+        settings.setValue(_PER_PAGE_KEY, self.page_spin.value())
         settings.setValue(_TOLERANCE_KEY, self.tolerance_spin.value())
         settings.setValue(_SHOW_REVIEWED_KEY,
                           self.show_reviewed_check.isChecked())
