@@ -85,9 +85,12 @@ def apply_verdicts(project, chips, source: str) -> ImportResult:
             result.labels_added += 1
             result.classes[chip.verdict] += 1
             result.label_ids.append(label.id)
+        # The memory keeps the centre as the file gave it - what the next
+        # round is matched by - while the label sits where the chip was
+        # re-centred, if it was.
         project.model_review.append(Verdict(
-            image=chip.image_name, pixel_x=float(chip.pixel_x),
-            pixel_y=float(chip.pixel_y), predicted=chip.predicted,
+            image=chip.image_name, pixel_x=float(chip.source_x),
+            pixel_y=float(chip.source_y), predicted=chip.predicted,
             score=float(chip.score), became=chip.verdict, source=source,
             label_id=label_id, by=stamp["by"] if stamp else "",
             at=stamp["at"] if stamp else ""))

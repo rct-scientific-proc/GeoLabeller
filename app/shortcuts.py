@@ -159,7 +159,11 @@ SHORTCUT_SECTIONS = [
         ("1-9", "The class at that place in the list: active, and onto "
                 "the picked chips"),
         ("0", "Ignore: looked at, nothing to label"),
-        ("Right-click / Delete", "Take a verdict back"),
+        ("Double-click chip", "Put the label's centre there, on the object"),
+        ("Auto-center button", "Move the picked chips' centres (or the "
+                               "page's) onto what stands out"),
+        ("Right-click / Delete", "Take a verdict back, and the centre with "
+                                 "it"),
         ("Escape / Ctrl+A", "Pick none / every chip on the page"),
         ("PageDown / PageUp", "Next / previous page of chips"),
         ("Ctrl+Z", "Undo, in the main window's history"),

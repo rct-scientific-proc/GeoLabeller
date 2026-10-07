@@ -71,7 +71,15 @@ class Candidate:
 
 @dataclass
 class Chip:
-    """A candidate matched onto one of the project's images."""
+    """A candidate matched onto one of the project's images.
+
+    ``pixel_x`` / ``pixel_y`` is where the label will go: the file's
+    centre until the user re-centres the chip on the object (or
+    Auto-center does). ``source_x`` / ``source_y`` is the centre as the
+    file gave it, which is what the memory records and the next round
+    is matched by - the model will flag the same clutter near there
+    again, not near where the person put the label.
+    """
     key: int                    # the candidate's index: the grid's id
     image_path: str             # the project's key for the image
     image_name: str             # its file name
@@ -83,9 +91,33 @@ class Chip:
     rescaled: bool = False      # the file stated another size
     verdict: str | None = None  # a class, ledger.IGNORE, or not yet
     earlier: Verdict | None = None   # reviewed in an earlier round
+    image_width: int = 0        # the image's size, for the chip's frame
+    image_height: int = 0
+    source_x: float = 0.0       # the centre as the file gave it
+    source_y: float = 0.0
 
     def reviewed_before(self) -> bool:
         return self.earlier is not None
+
+    def moved(self) -> bool:
+        return (self.pixel_x, self.pixel_y) != (self.source_x, self.source_y)
+
+    def offset(self) -> float:
+        """How far the centre has been moved from the file's, in pixels."""
+        return math.hypot(self.pixel_x - self.source_x,
+                          self.pixel_y - self.source_y)
+
+    def recenter(self, pixel_x: float, pixel_y: float):
+        """Put the centre - where the label will go - here, inside the
+        image."""
+        x, y = float(pixel_x), float(pixel_y)
+        if self.image_width and self.image_height:
+            x = min(max(x, 0.0), self.image_width - 1e-6)
+            y = min(max(y, 0.0), self.image_height - 1e-6)
+        self.pixel_x, self.pixel_y = x, y
+
+    def restore_centre(self):
+        self.pixel_x, self.pixel_y = self.source_x, self.source_y
 
 
 @dataclass
@@ -296,7 +328,9 @@ def match_candidates(candidates, project, malformed: int = 0,
                               "\\", "/")).name,
                           group=image.group or "", pixel_x=px, pixel_y=py,
                           predicted=candidate.predicted,
-                          score=candidate.score, rescaled=rescaled))
+                          score=candidate.score, rescaled=rescaled,
+                          image_width=width, image_height=height,
+                          source_x=px, source_y=py))
         report.matched += 1
     return chips, report
 
