@@ -24,9 +24,10 @@ from pathlib import Path
 import numpy as np
 from PyQt5.QtCore import QPointF, QRect, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
-from PyQt5.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QGridLayout,
-                             QHBoxLayout, QInputDialog, QLabel,
-                             QMessageBox, QPushButton, QScrollArea,
+from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox,
+                             QFileDialog, QGridLayout, QHBoxLayout,
+                             QInputDialog, QLabel, QMessageBox,
+                             QPushButton, QScrollArea, QSizePolicy,
                              QSpinBox, QVBoxLayout, QWidget)
 
 from .. import identity, recent
@@ -56,8 +57,14 @@ TEXT_COLOR = QColor(220, 220, 220)
 # moved from the file's, as the Snippet Editor colours what was measured.
 MARK_COLOR = QColor(255, 255, 255, 230)
 MOVED_MARK_COLOR = QColor(0, 220, 255, 240)
-MARK_PX = 7                     # half the length of each arm, on screen
-MARK_GAP_PX = 3                 # the pixel it marks is left uncovered
+# A ring round the pixel the label will take, four arms outside it, a
+# dark line under a light one. Users found a thin cross-hair hard to see
+# on grey water (2026-10-07).
+MARK_RING_PX = 7                # the ring's radius, on screen
+MARK_GAP_PX = 10                # the arms start here from the centre...
+MARK_PX = 9                     # ...and run this far
+# The window never opens larger than this much of the screen it is on.
+SCREEN_FRACTION = 0.9
 # Auto-center looks for the object within this fraction of the chip.
 AUTO_RADIUS_FRACTION = 0.25
 
@@ -93,6 +100,9 @@ class ChipCell(QWidget):
         self._centre: tuple | None = None   # (column, row) in the picture
         self._moved = False
         self._mark = True
+        # (x0, y0): the source pixel at the picture's top left, so a new
+        # centre can be shown on the old picture while the new is read.
+        self.frame: tuple | None = None
         self.setCursor(Qt.PointingHandCursor)
         self.set_size(128)
 
@@ -189,9 +199,9 @@ class ChipCell(QWidget):
         painter.end()
 
     def _paint_mark(self, painter):
-        """Four short arms around the centre, open in the middle so the
-        pixel it marks is not covered; a dark line under a light one, to
-        read on bright and dark imagery alike."""
+        """A ring round the pixel the label will take, open so the pixel
+        itself is not covered, and four arms outside it; a dark line
+        under a light one, to read on bright and dark imagery alike."""
         geometry = self._picture_geometry()
         if geometry is None:
             return
@@ -200,8 +210,10 @@ class ChipCell(QWidget):
         y = off_y + (self._centre[1] + 0.5) * scale
         light = MOVED_MARK_COLOR if self._moved else MARK_COLOR
         painter.setRenderHint(QPainter.Antialiasing, True)
-        for colour, width in ((QColor(0, 0, 0, 190), 3), (light, 1)):
+        painter.setBrush(Qt.NoBrush)
+        for colour, width in ((QColor(0, 0, 0, 210), 4), (light, 2)):
             painter.setPen(QPen(colour, width))
+            painter.drawEllipse(QPointF(x, y), MARK_RING_PX, MARK_RING_PX)
             for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                 painter.drawLine(
                     QPointF(x + dx * MARK_GAP_PX, y + dy * MARK_GAP_PX),
@@ -263,6 +275,13 @@ class ModelReviewWindow(QWidget):
         self._cells: dict = {}
         self._pixels: dict = {}         # key -> the page's chip pictures
         self._note = ""                 # a word for the status line, once
+        # Centre moves made here, before an import, so Ctrl+Z can take
+        # them back: each entry maps chip key -> (x, y) before the move.
+        self._centre_undo: list = []
+        self._centre_redo: list = []
+        # The last plain click (key, the verdict before it): a double-
+        # click's first half, to be undone when the second half arrives.
+        self._last_click: tuple | None = None
         self.loader = SnippetLoader(self)
         self.loader.ready.connect(self._on_pixels)
         self._setup_ui()
@@ -281,6 +300,13 @@ class ModelReviewWindow(QWidget):
         self.open_button.clicked.connect(self.open_dialog)
         top.addWidget(self.open_button)
         self.file_label = QLabel("No file open")
+        # A long summary wraps; it never decides how wide the window must
+        # be (a window wider than the screen, with no way to shrink it,
+        # 2026-10-07).
+        self.file_label.setWordWrap(True)
+        self.file_label.setSizePolicy(QSizePolicy.Ignored,
+                                      QSizePolicy.Preferred)
+        self.file_label.setMinimumWidth(0)
         top.addWidget(self.file_label, 1)
         top.addWidget(QLabel("Predicted:"))
         self.class_filter = QComboBox()
@@ -375,8 +401,8 @@ class ModelReviewWindow(QWidget):
             "Move each picked chip's centre - or every chip on the page,\n"
             "with none picked - onto the nearest patch that stands out\n"
             "from the background, bright or dark. A first guess to look\n"
-            "at: the mark shows where it landed, and a double-click or a\n"
-            "right-click puts it where you say.")
+            "at: the mark shows where it landed, a double-click or a\n"
+            "right-click puts it where you say, and Ctrl+Z takes it back.")
         self.auto_button.clicked.connect(self._auto_centre)
         second.addWidget(self.auto_button)
         second.addStretch(1)
@@ -393,8 +419,9 @@ class ModelReviewWindow(QWidget):
             "Click a chip to give it the label above; Shift-click labels "
             "the run from the last click. Ctrl-click picks chips, then a "
             "number key labels the picked. 0 is Ignore. Double-click the "
-            "object to put the label's centre there; right-click or "
-            "Delete takes a verdict back, and the centre with it.")
+            "object to put the label's centre there (it does not label); "
+            "Ctrl+Z takes a centre move back. Right-click or Delete takes "
+            "a verdict back, and the centre with it.")
         self.hint.setWordWrap(True)
         layout.addWidget(self.hint)
 
@@ -467,6 +494,9 @@ class ModelReviewWindow(QWidget):
         self._by_key = {chip.key: chip for chip in chips}
         self._selected.clear()
         self._anchor = None
+        self._last_click = None
+        self._centre_undo.clear()
+        self._centre_redo.clear()
         self._page = 0
         self.setWindowTitle(f"Model Review - {name}")
         self.file_label.setText(f"{name}: {report.summary()}")
@@ -574,8 +604,12 @@ class ModelReviewWindow(QWidget):
         self._rebuild()
 
     def _cell_px(self) -> int:
+        """The cells share the viewport's width, margins and all, so the
+        grid never needs a sideways scrollbar."""
         columns = max(1, self.columns_spin.value())
-        width = self.scroll.viewport().width() - GRID_SPACING * (columns + 1)
+        margins = self._grid.contentsMargins()
+        width = (self.scroll.viewport().width() - margins.left()
+                 - margins.right() - GRID_SPACING * (columns - 1) - 2)
         return max(MIN_CELL_PX, width // columns)
 
     def _rebuild(self):
@@ -652,14 +686,25 @@ class ModelReviewWindow(QWidget):
         self._pixels[key] = arr
         cell.set_pixels(arr)
         x0, y0, _w, _h = self._frame_of(chip)
+        cell.frame = (x0, y0)
         cell.set_centre((chip.pixel_x - x0, chip.pixel_y - y0), chip.moved())
 
     def _reload(self, chip):
-        """The chip's centre moved: its picture is read again around it."""
+        """The chip's centre moved: its picture is read again around it,
+        so the centre is the middle again. Until it arrives the mark
+        moves to the new centre on the old picture, so the move shows at
+        once."""
         self._pixels.pop(chip.key, None)
         cell = self._cells.get(chip.key)
         if cell is not None:
-            cell.set_centre(None)
+            shown = None
+            if cell.frame is not None and cell._pixmap is not None:
+                col = chip.pixel_x - cell.frame[0]
+                row = chip.pixel_y - cell.frame[1]
+                if (0 <= col < cell._pixmap.width()
+                        and 0 <= row < cell._pixmap.height()):
+                    shown = (col, row)
+            cell.set_centre(shown, chip.moved())
             self._set_tooltip(cell, chip)
         self.loader.request(chip.key, chip.image_path, chip.pixel_x,
                             chip.pixel_y, self.chip_spin.value())
@@ -670,23 +715,71 @@ class ModelReviewWindow(QWidget):
     # -- the centre: where the label will go -------------------------------
 
     def _on_cell_recentred(self, key, col, row):
-        """A double-click on the object: the label goes there."""
+        """A double-click on the object: the label goes there - and the
+        chip is NOT labelled: the click that began the double-click gave
+        it the active label, as a click does, and that is taken back
+        (users re-centring found chips labelled under them, 2026-10-07)."""
         self.setFocus()
         chip = self._by_key.get(key)
         if chip is None or chip.reviewed_before():
             return
+        if self._last_click is not None and self._last_click[0] == key:
+            chip.verdict = self._last_click[1]
+            self._last_click = None
         x0, y0, _w, _h = self._frame_of(chip)
+        self._remember_centres([chip])
         chip.recenter(x0 + col, y0 + row)
         self._reload(chip)
+        self._refresh_cells()
         self._note = f"Centre moved {chip.offset():.0f} px."
         self._show_counts()
+
+    def _remember_centres(self, chips):
+        """Before a move: where these chips' centres are, for Ctrl+Z."""
+        self._centre_undo.append({chip.key: (chip.pixel_x, chip.pixel_y)
+                                  for chip in chips})
+        self._centre_redo.clear()
+
+    def _apply_centres(self, positions: dict) -> dict:
+        """Put these chips' centres where ``positions`` says; returns
+        where they were, for the other stack."""
+        replaced = {}
+        for key, (x, y) in positions.items():
+            chip = self._by_key.get(key)
+            if chip is None:
+                continue
+            replaced[key] = (chip.pixel_x, chip.pixel_y)
+            chip.recenter(x, y)
+            if key in self._cells:
+                self._reload(chip)
+        self._refresh_cells()
+        return replaced
+
+    def undo_centre(self) -> bool:
+        """Take the last centre move back. False when there is none, and
+        the main window's history is the thing to undo."""
+        if not self._centre_undo:
+            return False
+        self._centre_redo.append(self._apply_centres(self._centre_undo.pop()))
+        self._note = "Centre move taken back."
+        self._show_counts()
+        return True
+
+    def redo_centre(self) -> bool:
+        if not self._centre_redo:
+            return False
+        self._centre_undo.append(self._apply_centres(self._centre_redo.pop()))
+        self._note = "Centre move done again."
+        self._show_counts()
+        return True
 
     def _auto_centre(self):
         """The picked chips - or the page, with none picked - re-centred
         on the nearest thing that stands out (centering.py)."""
         self.setFocus()
         keys = self._selected or set(self.shown_keys())
-        moved, unchanged, waiting = 0, 0, 0
+        unchanged, waiting = 0, 0
+        moves = []                      # (chip, new x, new y)
         radius = self.chip_spin.value() * AUTO_RADIUS_FRACTION
         for key in self.shown_keys():
             if key not in keys:
@@ -709,9 +802,14 @@ class ModelReviewWindow(QWidget):
                     and abs(new_y - chip.pixel_y) < 0.5:
                 unchanged += 1
                 continue
-            chip.recenter(new_x, new_y)
-            self._reload(chip)
-            moved += 1
+            moves.append((chip, new_x, new_y))
+        if moves:
+            # One Ctrl+Z takes the whole run back.
+            self._remember_centres([chip for chip, _x, _y in moves])
+            for chip, new_x, new_y in moves:
+                chip.recenter(new_x, new_y)
+                self._reload(chip)
+        moved = len(moves)
         parts = [f"Auto-center: {moved} chip{'' if moved == 1 else 's'} "
                  "moved"]
         if unchanged:
@@ -824,10 +922,12 @@ class ModelReviewWindow(QWidget):
 
     def clear_verdicts(self, keys):
         """Take the verdict back - and the centre, to the file's."""
-        for key in list(keys):
-            chip = self._by_key.get(key)
-            if chip is None:
-                continue
+        chips = [self._by_key[key] for key in list(keys)
+                 if key in self._by_key]
+        moved = [chip for chip in chips if chip.moved()]
+        if moved:
+            self._remember_centres(moved)
+        for chip in chips:
             chip.verdict = None
             if chip.moved():
                 chip.restore_centre()
@@ -887,8 +987,12 @@ class ModelReviewWindow(QWidget):
         if modifiers & Qt.ShiftModifier and self._anchor in order:
             start, end = sorted((order.index(self._anchor), order.index(key)))
             run = order[start:end + 1]
+            self._last_click = None
         else:
             run = [key]
+            # Should this turn out to be the first half of a double-click,
+            # the verdict it gives is taken back (_on_cell_recentred).
+            self._last_click = (key, self._by_key[key].verdict)
         self._anchor = key
         self._selected.clear()
         self._apply_active(run)
@@ -911,6 +1015,10 @@ class ModelReviewWindow(QWidget):
     def _import(self):
         chips = self.with_verdicts()
         if chips:
+            # The centres go into the project with the labels; from here
+            # Ctrl+Z is the project's history.
+            self._centre_undo.clear()
+            self._centre_redo.clear()
             self.import_requested.emit(chips, self._source)
 
     # -- keys -----------------------------------------------------------------
@@ -925,9 +1033,12 @@ class ModelReviewWindow(QWidget):
             elif key == Qt.Key_S:
                 self.save_requested.emit()
             elif key == Qt.Key_Z:
-                self.undo_requested.emit()
+                # A centre move made here first; then the project's history.
+                if not self.undo_centre():
+                    self.undo_requested.emit()
             elif key == Qt.Key_Y:
-                self.redo_requested.emit()
+                if not self.redo_centre():
+                    self.redo_requested.emit()
             elif key == Qt.Key_A:
                 self.select_all()
             else:
@@ -935,7 +1046,8 @@ class ModelReviewWindow(QWidget):
             return
         if mods == (Qt.ControlModifier | Qt.ShiftModifier) \
                 and key == Qt.Key_Z:
-            self.redo_requested.emit()
+            if not self.redo_centre():
+                self.redo_requested.emit()
             return
         if mods == Qt.NoModifier:
             if Qt.Key_1 <= key <= Qt.Key_9:
@@ -985,13 +1097,37 @@ class ModelReviewWindow(QWidget):
         self.mark_check.setChecked(
             str(settings.value(_MARK_KEY, "true")).lower() != "false")
         geometry = settings.value(_GEOMETRY_KEY)
+        restored = False
         if geometry is not None:
             try:
-                self.restoreGeometry(geometry)
+                restored = self.restoreGeometry(geometry)
             except TypeError:
                 pass
-        else:
+        if not restored:
             self.resize(1100, 760)
+        self._fit_to_screen()
+
+    def _fit_to_screen(self, available=None):
+        """No larger than most of the screen, and on it: a window that
+        opened taller than a laptop screen had its edges out of reach
+        (2026-10-07). ``available`` is the screen's usable rectangle;
+        the primary screen's when not given."""
+        if available is None:
+            screen = QApplication.primaryScreen()
+            if screen is None:
+                return
+            available = screen.availableGeometry()
+        width = min(self.width(), int(available.width() * SCREEN_FRACTION))
+        height = min(self.height(),
+                     int(available.height() * SCREEN_FRACTION))
+        if (width, height) != (self.width(), self.height()):
+            self.resize(width, height)
+        # Left and top edges on the screen first: a window that is still
+        # too big for it (its controls set a minimum) keeps its handles.
+        x = max(available.left(), min(self.x(), available.right() - width + 1))
+        y = max(available.top(), min(self.y(), available.bottom() - height + 1))
+        if (x, y) != (self.x(), self.y()):
+            self.move(x, y)
 
     def save_settings(self):
         settings = app_settings()
