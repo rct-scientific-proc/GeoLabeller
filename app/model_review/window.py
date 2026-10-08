@@ -504,12 +504,19 @@ class ModelReviewWindow(QWidget):
         return True
 
     def refresh_earlier(self):
-        """Ask the project's memory which chips were reviewed before."""
+        """Ask the project's memory which chips were reviewed before.
+
+        By the centre the file gave, which is what the memory records -
+        not the centre the user may have moved it to. Looked up by the
+        moved centre, a chip re-centred further than the tolerance was
+        not known after its own import: it stayed on the grid with its
+        verdict, and the next import made its label again (2026-10-08).
+        """
         index = LedgerIndex(getattr(self._project(), "model_review", []),
                             float(self.tolerance_spin.value()))
         for chip in self._chips:
-            chip.earlier = index.find(chip.image_name, chip.pixel_x,
-                                      chip.pixel_y)
+            chip.earlier = index.find(chip.image_name, chip.source_x,
+                                      chip.source_y)
             if chip.earlier is not None:
                 chip.verdict = None
         self._fill_filter()
