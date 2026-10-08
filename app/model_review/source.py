@@ -126,6 +126,7 @@ class MatchReport:
     total: int = 0              # well-formed records
     malformed: int = 0          # records that could not be read
     matched: int = 0
+    duplicates: int = 0         # the same chip given twice in the file
     unknown_class: Counter = field(default_factory=Counter)  # class -> n
     no_image: Counter = field(default_factory=Counter)       # name -> n
     ambiguous: Counter = field(default_factory=Counter)      # name -> n
@@ -160,6 +161,8 @@ class MatchReport:
             n = sum(self.unreadable.values())
             parts.append(f"{n} on an image whose size could not be read "
                          f"({_some(self.unreadable)})")
+        if self.duplicates:
+            parts.append(f"{self.duplicates} given twice, folded")
         if self.malformed:
             parts.append(f"{self.malformed} record"
                          f"{'' if self.malformed == 1 else 's'} unreadable")
@@ -290,10 +293,20 @@ def match_candidates(candidates, project, malformed: int = 0,
         by_name.setdefault(image_key(image.path or path), []).append(
             (path, image))
     chips = []
+    seen: set = set()
     for candidate in candidates:
         if candidate.predicted not in classes:
             report.unknown_class[candidate.predicted] += 1
             continue
+        # The same chip twice - a file concatenated, a run repeated - would
+        # be two labels at one spot; the first stays, the rest are counted.
+        same = (image_key(candidate.image), candidate.predicted,
+                round(candidate.x, 1), round(candidate.y, 1),
+                candidate.image_width, candidate.image_height)
+        if same in seen:
+            report.duplicates += 1
+            continue
+        seen.add(same)
         found = by_name.get(image_key(candidate.image), [])
         if not found:
             report.no_image[candidate.name] += 1

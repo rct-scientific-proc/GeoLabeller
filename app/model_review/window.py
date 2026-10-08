@@ -274,7 +274,9 @@ class ModelReviewWindow(QWidget):
         self._active: str | None = None
         self._cells: dict = {}
         self._pixels: dict = {}         # key -> the page's chip pictures
+        self._frames: dict = {}         # key -> (x0, y0) of that picture
         self._note = ""                 # a word for the status line, once
+        self._discard_on_close = False  # the project is being replaced
         # Centre moves made here, before an import, so Ctrl+Z can take
         # them back: each entry maps chip key -> (x, y) before the move.
         self._centre_undo: list = []
@@ -315,6 +317,9 @@ class ModelReviewWindow(QWidget):
             "the chip it was surest of to the one it was least.")
         self.class_filter.setMinimumWidth(160)
         self.class_filter.currentIndexChanged.connect(self._on_filter)
+        # A control used hands the keys back to the window, so 1-9 and 0
+        # go on working without a click on a chip first.
+        self.class_filter.activated.connect(lambda _i: self.setFocus())
         top.addWidget(self.class_filter)
         top.addSpacing(12)
         top.addWidget(QLabel("Chip size"))
@@ -346,6 +351,8 @@ class ModelReviewWindow(QWidget):
         self.page_spin.setKeyboardTracking(False)
         self.page_spin.valueChanged.connect(self._on_per_page)
         top.addWidget(self.page_spin)
+        for spin in (self.chip_spin, self.columns_spin, self.page_spin):
+            spin.editingFinished.connect(self.setFocus)
         layout.addLayout(top)
 
         second = QHBoxLayout()
@@ -388,6 +395,7 @@ class ModelReviewWindow(QWidget):
         self.tolerance_spin.setKeyboardTracking(False)
         self.tolerance_spin.valueChanged.connect(
             lambda _v: self.refresh_earlier())
+        self.tolerance_spin.editingFinished.connect(self.setFocus)
         second.addWidget(self.tolerance_spin)
         second.addSpacing(12)
         self.mark_check = QCheckBox("Centre mark")
@@ -453,7 +461,10 @@ class ModelReviewWindow(QWidget):
     # -- data in --------------------------------------------------------------
 
     def set_classes(self, names, colours=None):
-        """The project's classes, in order, with their marker colours."""
+        """The project's classes, in order, with their marker colours.
+
+        A verdict naming a class the project no longer has is taken
+        back: importing it would quietly put the class back."""
         self._classes = list(names)
         self._colours = list(colours or [])
         combo = self.label_combo
@@ -464,20 +475,53 @@ class ModelReviewWindow(QWidget):
         if self._active not in self._classes and self._active != IGNORE:
             self._active = self._classes[0] if self._classes else None
         self._show_active()
+        orphaned = [chip for chip in self._chips
+                    if chip.verdict not in (None, IGNORE)
+                    and chip.verdict not in self._classes]
+        for chip in orphaned:
+            chip.verdict = None
+        if orphaned:
+            n = len(orphaned)
+            self._note = (f"{n} verdict{'' if n == 1 else 's'} of a class "
+                          "no longer in the project taken back.")
         self._refresh_cells()
+        self._show_counts()
 
     def open_dialog(self):
+        if not self._confirm_discard("Open another file anyway?"):
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Open the model's mistakes",
             recent.last_dir(recent.REVIEW), "JSON (*.json);;All Files (*)")
         if path:
             recent.remember_dir(recent.REVIEW, path)
-            self.open_file(path)
+            self.open_file(path, ask=False)
 
-    def open_file(self, path) -> bool:
+    def pending(self) -> int:
+        """Verdicts given and not yet imported."""
+        return len(self.with_verdicts())
+
+    def _confirm_discard(self, question: str) -> bool:
+        """True when there is nothing to lose, or the user says so: a
+        file opened over verdicts, or the window closed on them, took
+        them silently before."""
+        n = self.pending()
+        if n == 0:
+            return True
+        answer = QMessageBox.question(
+            self, "Model Review",
+            f"{n} verdict{'' if n == 1 else 's'} not yet imported will be "
+            f"lost. {question}", QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No)
+        return answer == QMessageBox.Yes
+
+    def open_file(self, path, ask: bool = True) -> bool:
         """Read and match a file of chips. False, having said why, when
-        nothing in it could be shown."""
+        nothing in it could be shown - or when verdicts not yet imported
+        would be lost and the user keeps them (``ask``)."""
         name = Path(str(path)).name
+        if ask and not self._confirm_discard(f"Open {name} anyway?"):
+            return False
         try:
             candidates, malformed = read_candidates(path)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -512,7 +556,19 @@ class ModelReviewWindow(QWidget):
         not known after its own import: it stayed on the grid with its
         verdict, and the next import made its label again (2026-10-08).
         """
-        index = LedgerIndex(getattr(self._project(), "model_review", []),
+        project = self._project()
+        images = getattr(project, "images", {}) or {}
+        gone = [chip for chip in self._chips if chip.image_path not in images]
+        if gone:
+            # Their image left the project (a group removed, say): nothing
+            # to label on, nothing to show.
+            self._chips = [chip for chip in self._chips
+                           if chip.image_path in images]
+            self._by_key = {chip.key: chip for chip in self._chips}
+            n = len(gone)
+            self._note = (f"{n} chip{'' if n == 1 else 's'} whose image "
+                          "left the project dropped.")
+        index = LedgerIndex(getattr(project, "model_review", []),
                             float(self.tolerance_spin.value()))
         for chip in self._chips:
             chip.earlier = index.find(chip.image_name, chip.source_x,
@@ -627,6 +683,7 @@ class ModelReviewWindow(QWidget):
                 item.widget().deleteLater()
         self._cells.clear()
         self._pixels.clear()
+        self._frames.clear()
         self._listed = self._listed_chips()
         per_page = max(1, self.page_spin.value())
         self._page = max(0, min(self.page_count() - 1, self._page))
@@ -674,11 +731,13 @@ class ModelReviewWindow(QWidget):
             self.loader.request(chip.key, chip.image_path, chip.pixel_x,
                                 chip.pixel_y, size)
 
-    def _frame_of(self, chip) -> tuple:
-        """(x0, y0, w, h): the source pixels the chip's picture shows -
-        the window around its centre, shifted to stay inside the image,
-        exactly as the picture was read."""
-        size = self.chip_spin.value()
+    def _frame_of(self, chip, size: "int | None" = None) -> tuple:
+        """(x0, y0, w, h): the source pixels a picture of ``size`` around
+        the chip's centre shows - the window shifted to stay inside the
+        image, exactly as the picture was read. The chip size in hand
+        unless given."""
+        if size is None:
+            size = self.chip_spin.value()
         if chip.image_width and chip.image_height:
             return snippet_frame(chip.pixel_x, chip.pixel_y, size,
                                  chip.image_width, chip.image_height)
@@ -690,9 +749,14 @@ class ModelReviewWindow(QWidget):
         chip = self._by_key.get(key)
         if cell is None or chip is None or arr is None:
             return
+        # The frame of THIS picture, from its own size: the chip size may
+        # have changed since it was asked for. Reading the frame off the
+        # size in hand put a double-click 80 px wrong on an old picture
+        # (probed 2026-10-08).
+        x0, y0, _w, _h = self._frame_of(chip, max(arr.shape[0], arr.shape[1]))
         self._pixels[key] = arr
+        self._frames[key] = (x0, y0)
         cell.set_pixels(arr)
-        x0, y0, _w, _h = self._frame_of(chip)
         cell.frame = (x0, y0)
         cell.set_centre((chip.pixel_x - x0, chip.pixel_y - y0), chip.moved())
 
@@ -728,12 +792,16 @@ class ModelReviewWindow(QWidget):
         (users re-centring found chips labelled under them, 2026-10-07)."""
         self.setFocus()
         chip = self._by_key.get(key)
-        if chip is None or chip.reviewed_before():
+        cell = self._cells.get(key)
+        if chip is None or chip.reviewed_before() or cell is None \
+                or cell.frame is None:
             return
         if self._last_click is not None and self._last_click[0] == key:
             chip.verdict = self._last_click[1]
             self._last_click = None
-        x0, y0, _w, _h = self._frame_of(chip)
+        # Through the frame of the picture clicked on, whatever the chip
+        # size has become since it was read.
+        x0, y0 = cell.frame
         self._remember_centres([chip])
         chip.recenter(x0 + col, y0 + row)
         self._reload(chip)
@@ -793,12 +861,13 @@ class ModelReviewWindow(QWidget):
                 continue
             chip = self._by_key.get(key)
             arr = self._pixels.get(key)
+            frame = self._frames.get(key)
             if chip is None or chip.reviewed_before():
                 continue
-            if arr is None:
+            if arr is None or frame is None:
                 waiting += 1
                 continue
-            x0, y0, _w, _h = self._frame_of(chip)
+            x0, y0 = frame              # the frame of the picture held
             found = find_centre(arr.mean(axis=2), (chip.pixel_x - x0,
                                                    chip.pixel_y - y0), radius)
             if found is None:
@@ -918,7 +987,12 @@ class ModelReviewWindow(QWidget):
         self.ignore_button.setChecked(self._active == IGNORE)
 
     def _apply_active(self, keys):
-        if self._active is None or not keys:
+        if not keys:
+            return
+        if self._active is None:
+            self._note = ("No class to give: the project has none. Add "
+                          "class... makes one; 0 is Ignore.")
+            self._show_counts()
             return
         for key in keys:
             chip = self._by_key.get(key)
@@ -1147,7 +1221,17 @@ class ModelReviewWindow(QWidget):
         settings.setValue(_MARK_KEY, self.mark_check.isChecked())
         settings.setValue(_GEOMETRY_KEY, self.saveGeometry())
 
+    def discard_and_close(self):
+        """Close without asking: the project is being replaced, and the
+        user has already answered for its unsaved work."""
+        self._discard_on_close = True
+        self.close()
+
     def closeEvent(self, event):
+        if not self._discard_on_close and not self._confirm_discard(
+                "Close the window anyway?"):
+            event.ignore()
+            return
         self.save_settings()
         self.loader.cancel_all()
         super().closeEvent(event)

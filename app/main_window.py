@@ -4513,7 +4513,9 @@ class MainWindow(QMainWindow):
         onto the old one."""
         window, self._model_review = self._model_review, None
         if window is not None:
-            window.close()
+            # Without asking about verdicts not imported: the user has
+            # already answered for the project's unsaved work.
+            window.discard_and_close()
             window.deleteLater()
 
     def _add_class_from_review(self, name: str):
@@ -6429,6 +6431,8 @@ class MainWindow(QMainWindow):
         editor = getattr(self, "_snippet_editor", None)
         if editor is not None:
             editor.close()
+        # So would the Model Review window, with verdicts nobody can import.
+        self._close_model_review()
 
         # Clean up crash detection and recovery
         self._clean_exit()
