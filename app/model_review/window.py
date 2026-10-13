@@ -4,13 +4,18 @@ Opened from Labels > Model Review... It reads a file of chips (source.py),
 shows the ones the model called one class from most to least sure, top
 left to bottom right, and takes verdicts: a click gives a chip the
 active label - a class from the New label box, or Ignore - Shift-click a
-run of them, Ctrl-click picks several for a key to label at once. Import
-to project hands the verdicts to the main window, which makes the labels
-and the ledger entries in one undo step; the chips then leave the grid,
-and stay off it in later rounds (ledger.py), unless Show reviewed.
+run of them, Ctrl-click picks several for a key to label at once. Or
+without the mouse: the arrow keys move a cursor from chip to chip, a
+number key or Enter labels the chip under it and moves on, I ignores the
+rest of the page. Import to project (Ctrl+Enter) hands the verdicts to
+the main window, which makes the labels and the ledger entries in one
+undo step; the chips then leave the grid, and stay off it in later rounds
+(ledger.py), unless Show reviewed.
 
-The chip size is the user's, as in the Snippet Editor: the file says
-only where the centre is. Columns set how many chips share the width.
+Ctrl+Z here takes back the last thing done in this window - a verdict, a
+run of them, a centre move - and only then reaches the project's
+history. The chip size is the user's, as in the Snippet Editor: the file
+says only where the centre is.
 
 Nothing here touches the project: the window reads it (through the
 getter it is given, so it is always the current one) and reports what
@@ -23,12 +28,12 @@ from pathlib import Path
 
 import numpy as np
 from PyQt5.QtCore import QPointF, QRect, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PyQt5.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox,
                              QFileDialog, QGridLayout, QHBoxLayout,
                              QInputDialog, QLabel, QMessageBox,
                              QPushButton, QScrollArea, QSizePolicy,
-                             QSpinBox, QVBoxLayout, QWidget)
+                             QSpinBox, QToolButton, QVBoxLayout, QWidget)
 
 from .. import identity, recent
 from ..settings_scope import settings as app_settings
@@ -48,8 +53,11 @@ DEFAULT_COLUMNS = 6
 # Snippet Editor's grid does, costs nothing the user can feel.
 DEFAULT_PER_PAGE = 60
 ALL_CLASSES = None              # the predicted-class box's first entry
+UNDO_LIMIT = 200
 
 SELECTED_COLOR = QColor(255, 255, 255)
+CURSOR_COLOR = QColor(255, 200, 0)
+HOVER_COLOR = QColor(255, 255, 255, 110)
 IGNORE_COLOR = QColor(150, 150, 150)
 EARLIER_SHADE = QColor(0, 0, 0, 150)
 TEXT_COLOR = QColor(220, 220, 220)
@@ -74,6 +82,7 @@ _COLUMNS_KEY = "model_review/columns"
 _PER_PAGE_KEY = "model_review/per_page"
 _SHOW_REVIEWED_KEY = "model_review/show_reviewed"
 _TOLERANCE_KEY = "model_review/tolerance"
+_MORE_KEY = "model_review/more"
 _GEOMETRY_KEY = "model_review/geometry"
 
 
@@ -95,6 +104,8 @@ class ChipCell(QWidget):
         self._verdict = ""
         self._colour: QColor | None = None
         self._selected = False
+        self._cursor = False
+        self._hover = False
         self._earlier = False
         self._pressed = None
         self._centre: tuple | None = None   # (column, row) in the picture
@@ -160,9 +171,10 @@ class ChipCell(QWidget):
         self.update()
 
     def set_state(self, score: str, verdict: str, colour: QColor | None,
-                  selected: bool, earlier: bool):
+                  selected: bool, earlier: bool, cursor: bool = False):
         self._score, self._verdict, self._colour = score, verdict, colour
         self._selected, self._earlier = selected, earlier
+        self._cursor = cursor
         self.update()
 
     def paintEvent(self, _event):
@@ -185,17 +197,29 @@ class ChipCell(QWidget):
         if border is not None:
             painter.setPen(QPen(border, 3))
             painter.drawRect(picture.adjusted(1, 1, -2, -2))
+        elif self._hover:
+            painter.setPen(QPen(HOVER_COLOR, 1))
+            painter.drawRect(picture.adjusted(0, 0, -1, -1))
+        if self._cursor:
+            # The keyboard's chip: a dashed line just inside the edge, on
+            # top of whatever frame the chip wears.
+            pen = QPen(CURSOR_COLOR, 2, Qt.DashLine)
+            painter.setPen(pen)
+            painter.drawRect(picture.adjusted(4, 4, -5, -5))
         caption = QRect(0, self._px, self._px, CAPTION_PX)
         painter.setPen(TEXT_COLOR)
+        metrics = painter.fontMetrics()
+        room = self._px - 8 if not self._verdict else int(self._px * 0.55)
         painter.drawText(caption.adjusted(4, 0, -4, 0),
-                         Qt.AlignLeft | Qt.AlignVCenter, self._score)
+                         Qt.AlignLeft | Qt.AlignVCenter,
+                         metrics.elidedText(self._score, Qt.ElideRight,
+                                            max(20, room)))
         if self._verdict:
             painter.setPen(self._colour or TEXT_COLOR)
             painter.drawText(caption.adjusted(4, 0, -4, 0),
                              Qt.AlignRight | Qt.AlignVCenter,
-                             painter.fontMetrics().elidedText(
-                                 self._verdict, Qt.ElideRight,
-                                 self._px - 48))
+                             metrics.elidedText(self._verdict, Qt.ElideRight,
+                                                max(20, self._px - room - 8)))
         painter.end()
 
     def _paint_mark(self, painter):
@@ -221,6 +245,16 @@ class ChipCell(QWidget):
                             y + dy * (MARK_GAP_PX + MARK_PX)))
         painter.setRenderHint(QPainter.Antialiasing, False)
 
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
     def mousePressEvent(self, event):
         self._pressed = (event.button(), event.modifiers())
 
@@ -242,6 +276,18 @@ class ChipCell(QWidget):
         point = self.picture_point(event.pos())
         if point is not None:
             self.recentred.emit(self.key, point[0], point[1])
+
+
+def _swatch(colour: QColor) -> QIcon:
+    """A small square of a class's colour, for the New label box."""
+    pixmap = QPixmap(14, 14)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setPen(QPen(QColor(40, 40, 40), 1))
+    painter.setBrush(colour)
+    painter.drawRect(1, 1, 11, 11)
+    painter.end()
+    return QIcon(pixmap)
 
 
 class ModelReviewWindow(QWidget):
@@ -271,18 +317,20 @@ class ModelReviewWindow(QWidget):
         self._colours: list = []
         self._selected: set = set()
         self._anchor: int | None = None
+        self._cursor: int | None = None  # the keyboard's chip, on the page
         self._active: str | None = None
         self._cells: dict = {}
         self._pixels: dict = {}         # key -> the page's chip pictures
         self._frames: dict = {}         # key -> (x0, y0) of that picture
         self._note = ""                 # a word for the status line, once
         self._discard_on_close = False  # the project is being replaced
-        # Centre moves made here, before an import, so Ctrl+Z can take
-        # them back: each entry maps chip key -> (x, y) before the move.
-        self._centre_undo: list = []
-        self._centre_redo: list = []
-        # The last plain click (key, the verdict before it): a double-
-        # click's first half, to be undone when the second half arrives.
+        # What was done here and not yet imported, so Ctrl+Z can take it
+        # back: each entry holds, per chip key, (verdict, x, y) before.
+        self._undo: list = []
+        self._redo: list = []
+        # The last plain click (key, the verdict before it, its undo
+        # entry): a double-click's first half, undone when the second
+        # half arrives.
         self._last_click: tuple | None = None
         self.loader = SnippetLoader(self)
         self.loader.ready.connect(self._on_pixels)
@@ -291,10 +339,23 @@ class ModelReviewWindow(QWidget):
 
     # -- layout ---------------------------------------------------------------
 
+    def _titled_row(self, title: str, layout: QVBoxLayout) -> QHBoxLayout:
+        """A row of controls behind a bold name: File, Labelling, View."""
+        row = QHBoxLayout()
+        label = QLabel(title)
+        font = label.font()
+        font.setBold(True)
+        label.setFont(font)
+        label.setFixedWidth(68)
+        row.addWidget(label)
+        layout.addLayout(row)
+        return row
+
     def _setup_ui(self):
         layout = QVBoxLayout(self)
 
-        top = QHBoxLayout()
+        # -- File: the team's file, and what came of it ---------------------
+        top = self._titled_row("File", layout)
         self.open_button = QPushButton("Open file...")
         self.open_button.setToolTip(
             "A JSON list of the model's mistakes: image, image_width,\n"
@@ -310,58 +371,16 @@ class ModelReviewWindow(QWidget):
                                       QSizePolicy.Preferred)
         self.file_label.setMinimumWidth(0)
         top.addWidget(self.file_label, 1)
-        top.addWidget(QLabel("Predicted:"))
-        self.class_filter = QComboBox()
-        self.class_filter.setToolTip(
-            "Which of the model's calls to look at. Each list runs from\n"
-            "the chip it was surest of to the one it was least.")
-        self.class_filter.setMinimumWidth(160)
-        self.class_filter.currentIndexChanged.connect(self._on_filter)
-        # A control used hands the keys back to the window, so 1-9 and 0
-        # go on working without a click on a chip first.
-        self.class_filter.activated.connect(lambda _i: self.setFocus())
-        top.addWidget(self.class_filter)
-        top.addSpacing(12)
-        top.addWidget(QLabel("Chip size"))
-        self.chip_spin = QSpinBox()
-        self.chip_spin.setRange(32, 2048)
-        self.chip_spin.setSingleStep(32)
-        self.chip_spin.setValue(DEFAULT_CHIP_PX)
-        self.chip_spin.setSuffix(" px")
-        self.chip_spin.setToolTip(
-            "Source pixels read around each chip's centre - the file says\n"
-            "only where the centre is.")
-        self.chip_spin.setKeyboardTracking(False)
-        self.chip_spin.valueChanged.connect(self._on_chip_size)
-        top.addWidget(self.chip_spin)
-        top.addWidget(QLabel("Columns"))
-        self.columns_spin = QSpinBox()
-        self.columns_spin.setRange(1, 16)
-        self.columns_spin.setValue(DEFAULT_COLUMNS)
-        self.columns_spin.setKeyboardTracking(False)
-        self.columns_spin.valueChanged.connect(lambda _v: self._rebuild())
-        top.addWidget(self.columns_spin)
-        top.addWidget(QLabel("Per page"))
-        self.page_spin = QSpinBox()
-        self.page_spin.setRange(6, 600)
-        self.page_spin.setValue(DEFAULT_PER_PAGE)
-        self.page_spin.setToolTip(
-            "Chips on a page. Next and Previous, or PageDown and PageUp,\n"
-            "turn the pages.")
-        self.page_spin.setKeyboardTracking(False)
-        self.page_spin.valueChanged.connect(self._on_per_page)
-        top.addWidget(self.page_spin)
-        for spin in (self.chip_spin, self.columns_spin, self.page_spin):
-            spin.editingFinished.connect(self.setFocus)
-        layout.addLayout(top)
 
-        second = QHBoxLayout()
+        # -- Labelling: the verdicts ----------------------------------------
+        second = self._titled_row("Labelling", layout)
         second.addWidget(QLabel("New label:"))
         self.label_combo = QComboBox()
         self.label_combo.setMinimumWidth(160)
         self.label_combo.setToolTip(
             "The class a click gives a chip. Keys 1-9 pick by place in\n"
-            "the list, and label whatever is selected.")
+            "the list: onto the picked chips, or the chip under the\n"
+            "cursor, which then moves on.")
         self.label_combo.activated.connect(self._on_label_picked)
         second.addWidget(self.label_combo)
         self.add_class_button = QPushButton("Add class...")
@@ -377,14 +396,98 @@ class ModelReviewWindow(QWidget):
             "reviewed and makes no label.")
         self.ignore_button.clicked.connect(self._on_ignore_clicked)
         second.addWidget(self.ignore_button)
+        self.ignore_rest_button = QPushButton("Ignore the rest of the page (I)")
+        self.ignore_rest_button.setToolTip(
+            "Every chip on this page not yet given a verdict is ignored,\n"
+            "and the next page comes up. Ctrl+Z takes it back.")
+        self.ignore_rest_button.clicked.connect(self.ignore_rest_of_page)
+        second.addWidget(self.ignore_rest_button)
         second.addSpacing(12)
+        self.auto_button = QPushButton("Auto-center")
+        self.auto_button.setToolTip(
+            "Move each picked chip's centre - or every chip on the page,\n"
+            "with none picked - onto the nearest patch that stands out\n"
+            "from the background, bright or dark. A first guess to look\n"
+            "at: the mark shows where it landed, a double-click or a\n"
+            "right-click puts it where you say, and Ctrl+Z takes it back.")
+        self.auto_button.clicked.connect(self._auto_centre)
+        second.addWidget(self.auto_button)
+        second.addStretch(1)
+
+        # -- View: what the grid shows, and how ---------------------------
+        third = self._titled_row("View", layout)
+        third.addWidget(QLabel("Predicted:"))
+        self.class_filter = QComboBox()
+        self.class_filter.setToolTip(
+            "Which of the model's calls to look at. Each list runs from\n"
+            "the chip it was surest of to the one it was least.")
+        self.class_filter.setMinimumWidth(160)
+        self.class_filter.currentIndexChanged.connect(self._on_filter)
+        # A control used hands the keys back to the window, so 1-9 and 0
+        # go on working without a click on a chip first.
+        self.class_filter.activated.connect(lambda _i: self.setFocus())
+        third.addWidget(self.class_filter)
+        third.addSpacing(12)
+        third.addWidget(QLabel("Chip size"))
+        self.chip_spin = QSpinBox()
+        self.chip_spin.setRange(32, 2048)
+        self.chip_spin.setSingleStep(32)
+        self.chip_spin.setValue(DEFAULT_CHIP_PX)
+        self.chip_spin.setSuffix(" px")
+        self.chip_spin.setToolTip(
+            "Source pixels read around each chip's centre - the file says\n"
+            "only where the centre is.")
+        self.chip_spin.setKeyboardTracking(False)
+        self.chip_spin.valueChanged.connect(self._on_chip_size)
+        third.addWidget(self.chip_spin)
+        third.addWidget(QLabel("Columns"))
+        self.columns_spin = QSpinBox()
+        self.columns_spin.setRange(1, 16)
+        self.columns_spin.setValue(DEFAULT_COLUMNS)
+        self.columns_spin.setKeyboardTracking(False)
+        self.columns_spin.valueChanged.connect(lambda _v: self._rebuild())
+        third.addWidget(self.columns_spin)
+        third.addWidget(QLabel("Per page"))
+        self.page_spin = QSpinBox()
+        self.page_spin.setRange(6, 600)
+        self.page_spin.setValue(DEFAULT_PER_PAGE)
+        self.page_spin.setToolTip(
+            "Chips on a page. Next and Previous, or PageDown and PageUp,\n"
+            "turn the pages.")
+        self.page_spin.setKeyboardTracking(False)
+        self.page_spin.valueChanged.connect(self._on_per_page)
+        third.addWidget(self.page_spin)
+        third.addSpacing(12)
+        self.mark_check = QCheckBox("Centre mark")
+        self.mark_check.setToolTip(
+            "Mark where the label will go on each chip: the file's centre,\n"
+            "or where you put it. Cyan once it has been moved.")
+        self.mark_check.toggled.connect(self._on_mark)
+        third.addWidget(self.mark_check)
+        self.more_button = QToolButton()
+        self.more_button.setText("More")
+        self.more_button.setCheckable(True)
+        self.more_button.setArrowType(Qt.RightArrow)
+        self.more_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.more_button.setToolTip(
+            "Settings seldom changed: the chips reviewed in earlier\n"
+            "rounds, and how close a chip must lie to one to be it again.")
+        self.more_button.toggled.connect(self._on_more)
+        third.addWidget(self.more_button)
+        third.addStretch(1)
+        for spin in (self.chip_spin, self.columns_spin, self.page_spin):
+            spin.editingFinished.connect(self.setFocus)
+
+        self.more_row = QWidget()
+        more = QHBoxLayout(self.more_row)
+        more.setContentsMargins(68 + 8, 0, 0, 0)
         self.show_reviewed_check = QCheckBox("Show reviewed")
         self.show_reviewed_check.setToolTip(
             "Chips reviewed in an earlier round, shaded, with what they\n"
             "became. Kept off the grid otherwise.")
         self.show_reviewed_check.toggled.connect(self._on_show_reviewed)
-        second.addWidget(self.show_reviewed_check)
-        second.addWidget(QLabel("Same chip within"))
+        more.addWidget(self.show_reviewed_check)
+        more.addWidget(QLabel("Same chip within"))
         self.tolerance_spin = QSpinBox()
         self.tolerance_spin.setRange(1, 500)
         self.tolerance_spin.setValue(int(DEFAULT_TOLERANCE_PX))
@@ -396,40 +499,16 @@ class ModelReviewWindow(QWidget):
         self.tolerance_spin.valueChanged.connect(
             lambda _v: self.refresh_earlier())
         self.tolerance_spin.editingFinished.connect(self.setFocus)
-        second.addWidget(self.tolerance_spin)
-        second.addSpacing(12)
-        self.mark_check = QCheckBox("Centre mark")
-        self.mark_check.setToolTip(
-            "Mark where the label will go on each chip: the file's centre,\n"
-            "or where you put it. Cyan once it has been moved.")
-        self.mark_check.toggled.connect(self._on_mark)
-        second.addWidget(self.mark_check)
-        self.auto_button = QPushButton("Auto-center")
-        self.auto_button.setToolTip(
-            "Move each picked chip's centre - or every chip on the page,\n"
-            "with none picked - onto the nearest patch that stands out\n"
-            "from the background, bright or dark. A first guess to look\n"
-            "at: the mark shows where it landed, a double-click or a\n"
-            "right-click puts it where you say, and Ctrl+Z takes it back.")
-        self.auto_button.clicked.connect(self._auto_centre)
-        second.addWidget(self.auto_button)
-        second.addStretch(1)
-        self.import_button = QPushButton("Import to project")
-        self.import_button.setToolTip(
-            "Every labelled chip becomes a label on its image, with what\n"
-            "the model said in its description; ignored chips make none.\n"
-            "One undo step. The chips then leave the grid.")
-        self.import_button.clicked.connect(self._import)
-        second.addWidget(self.import_button)
-        layout.addLayout(second)
+        more.addWidget(self.tolerance_spin)
+        more.addStretch(1)
+        self.more_row.setVisible(False)
+        layout.addWidget(self.more_row)
 
         self.hint = QLabel(
-            "Click a chip to give it the label above; Shift-click labels "
-            "the run from the last click. Ctrl-click picks chips, then a "
-            "number key labels the picked. 0 is Ignore. Double-click the "
-            "object to put the label's centre there (it does not label); "
-            "Ctrl+Z takes a centre move back. Right-click or Delete takes "
-            "a verdict back, and the centre with it.")
+            "Click a chip, or press its label's number with the cursor on "
+            "it, to label it; the arrow keys move the cursor, Enter labels "
+            "and moves on, I ignores the rest of the page. Double-click the "
+            "object to put the centre there. F1 lists every key.")
         self.hint.setWordWrap(True)
         layout.addWidget(self.hint)
 
@@ -455,8 +534,25 @@ class ModelReviewWindow(QWidget):
         self.next_button = QPushButton("Next >")
         self.next_button.clicked.connect(lambda: self._step_page(1))
         bottom.addWidget(self.next_button)
+        bottom.addSpacing(16)
+        # Where every page's work ends: the one action that matters.
+        self.import_button = QPushButton("Import to project")
+        font = self.import_button.font()
+        font.setBold(True)
+        self.import_button.setFont(font)
+        self.import_button.setMinimumHeight(32)
+        self.import_button.setToolTip(
+            "Every labelled chip becomes a label on its image, with what\n"
+            "the model said in its description; ignored chips make none.\n"
+            "One undo step. The chips then leave the grid. Ctrl+Enter.")
+        self.import_button.clicked.connect(self._import)
+        bottom.addWidget(self.import_button)
         layout.addLayout(bottom)
         self._show_counts()
+
+    def _on_more(self, on: bool):
+        self.more_row.setVisible(bool(on))
+        self.more_button.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
 
     # -- data in --------------------------------------------------------------
 
@@ -470,7 +566,11 @@ class ModelReviewWindow(QWidget):
         combo = self.label_combo
         combo.blockSignals(True)
         combo.clear()
-        combo.addItems(self._classes)
+        for index, name in enumerate(self._classes):
+            combo.addItem(name)
+            colour = self._colour_of(name)
+            if colour is not None and self._colours:
+                combo.setItemIcon(index, _swatch(colour))
         combo.blockSignals(False)
         if self._active not in self._classes and self._active != IGNORE:
             self._active = self._classes[0] if self._classes else None
@@ -538,9 +638,10 @@ class ModelReviewWindow(QWidget):
         self._by_key = {chip.key: chip for chip in chips}
         self._selected.clear()
         self._anchor = None
+        self._cursor = None
         self._last_click = None
-        self._centre_undo.clear()
-        self._centre_redo.clear()
+        self._undo.clear()
+        self._redo.clear()
         self._page = 0
         self.setWindowTitle(f"Model Review - {name}")
         self.file_label.setText(f"{name}: {report.summary()}")
@@ -578,6 +679,11 @@ class ModelReviewWindow(QWidget):
         self._fill_filter()
         self._rebuild()
 
+    def note(self, text: str):
+        """A word for the status line - what an import came to, say."""
+        self._note = text
+        self._show_counts()
+
     # -- what is shown --------------------------------------------------------
 
     def chips(self) -> list:
@@ -608,6 +714,10 @@ class ModelReviewWindow(QWidget):
 
     def selected(self) -> set:
         return set(self._selected)
+
+    def cursor(self) -> "int | None":
+        """The key of the keyboard's chip, or None."""
+        return self._cursor
 
     def active(self) -> str | None:
         return self._active
@@ -693,6 +803,8 @@ class ModelReviewWindow(QWidget):
         self._selected &= keys          # a selection lives on its page
         if self._anchor not in keys:
             self._anchor = None
+        if self._cursor not in keys:
+            self._cursor = None
         self.page_label.setText(
             f"{start + 1}-{start + len(self._visible)} of {len(self._listed)}"
             if self._listed else "none")
@@ -723,6 +835,16 @@ class ModelReviewWindow(QWidget):
         if chip.moved():
             text += (f"\ncentre moved {chip.offset():.0f} px from the "
                      f"file's ({chip.source_x:.1f}, {chip.source_y:.1f})")
+        if chip.reviewed_before():
+            earlier = chip.earlier
+            became = "Ignore" if earlier.became == IGNORE else earlier.became
+            text += f"\nearlier: {became}"
+            if earlier.by:
+                text += f" by {earlier.by}"
+            if earlier.at:
+                text += f" on {earlier.at[:10]}"
+            if earlier.source:
+                text += f" ({earlier.source})"
         cell.setToolTip(text)
 
     def _request_pixels(self):
@@ -797,56 +919,20 @@ class ModelReviewWindow(QWidget):
                 or cell.frame is None:
             return
         if self._last_click is not None and self._last_click[0] == key:
-            chip.verdict = self._last_click[1]
+            _key, before, entry = self._last_click
+            chip.verdict = before
+            if entry is not None and self._undo and self._undo[-1] is entry:
+                self._undo.pop()            # the half-click never happened
             self._last_click = None
         # Through the frame of the picture clicked on, whatever the chip
         # size has become since it was read.
         x0, y0 = cell.frame
-        self._remember_centres([chip])
+        self._remember([chip], "a centre move")
         chip.recenter(x0 + col, y0 + row)
         self._reload(chip)
         self._refresh_cells()
         self._note = f"Centre moved {chip.offset():.0f} px."
         self._show_counts()
-
-    def _remember_centres(self, chips):
-        """Before a move: where these chips' centres are, for Ctrl+Z."""
-        self._centre_undo.append({chip.key: (chip.pixel_x, chip.pixel_y)
-                                  for chip in chips})
-        self._centre_redo.clear()
-
-    def _apply_centres(self, positions: dict) -> dict:
-        """Put these chips' centres where ``positions`` says; returns
-        where they were, for the other stack."""
-        replaced = {}
-        for key, (x, y) in positions.items():
-            chip = self._by_key.get(key)
-            if chip is None:
-                continue
-            replaced[key] = (chip.pixel_x, chip.pixel_y)
-            chip.recenter(x, y)
-            if key in self._cells:
-                self._reload(chip)
-        self._refresh_cells()
-        return replaced
-
-    def undo_centre(self) -> bool:
-        """Take the last centre move back. False when there is none, and
-        the main window's history is the thing to undo."""
-        if not self._centre_undo:
-            return False
-        self._centre_redo.append(self._apply_centres(self._centre_undo.pop()))
-        self._note = "Centre move taken back."
-        self._show_counts()
-        return True
-
-    def redo_centre(self) -> bool:
-        if not self._centre_redo:
-            return False
-        self._centre_undo.append(self._apply_centres(self._centre_redo.pop()))
-        self._note = "Centre move done again."
-        self._show_counts()
-        return True
 
     def _auto_centre(self):
         """The picked chips - or the page, with none picked - re-centred
@@ -881,7 +967,9 @@ class ModelReviewWindow(QWidget):
             moves.append((chip, new_x, new_y))
         if moves:
             # One Ctrl+Z takes the whole run back.
-            self._remember_centres([chip for chip, _x, _y in moves])
+            n = len(moves)
+            self._remember([chip for chip, _x, _y in moves],
+                           f"{n} centre move{'' if n == 1 else 's'}")
             for chip, new_x, new_y in moves:
                 chip.recenter(new_x, new_y)
                 self._reload(chip)
@@ -898,6 +986,60 @@ class ModelReviewWindow(QWidget):
     def _on_mark(self, on):
         for cell in self._cells.values():
             cell.set_mark(on)
+
+    # -- taking things back ---------------------------------------------------
+
+    def _remember(self, chips, what: str) -> dict:
+        """Before a change: these chips' verdicts and centres, for Ctrl+Z.
+        ``what`` is how the status line will name it."""
+        entry = {"what": what,
+                 "chips": {chip.key: (chip.verdict, chip.pixel_x, chip.pixel_y)
+                           for chip in chips}}
+        self._undo.append(entry)
+        del self._undo[:-UNDO_LIMIT]
+        self._redo.clear()
+        return entry
+
+    def _restore(self, entry: dict) -> dict:
+        """Put these chips back as the entry holds them; returns the
+        entry that undoes that, for the other stack."""
+        replaced = {}
+        for key, (verdict, x, y) in entry["chips"].items():
+            chip = self._by_key.get(key)
+            if chip is None:
+                continue
+            replaced[key] = (chip.verdict, chip.pixel_x, chip.pixel_y)
+            if not chip.reviewed_before():
+                chip.verdict = verdict
+            if (x, y) != (chip.pixel_x, chip.pixel_y):
+                chip.recenter(x, y)
+                if key in self._cells:
+                    self._reload(chip)
+        self._refresh_cells()
+        return {"what": entry["what"], "chips": replaced}
+
+    def undo(self) -> bool:
+        """Take the last thing done here back. False when there is
+        nothing, and the main window's history is the thing to undo."""
+        if not self._undo:
+            return False
+        entry = self._undo.pop()
+        self._redo.append(self._restore(entry))
+        self._last_click = None
+        self._note = f"Taken back: {entry['what']}."
+        self._show_counts()
+        return True
+
+    def redo(self) -> bool:
+        if not self._redo:
+            return False
+        entry = self._redo.pop()
+        self._undo.append(self._restore(entry))
+        self._note = f"Done again: {entry['what']}."
+        self._show_counts()
+        return True
+
+    # -- the grid's state -----------------------------------------------------
 
     def eventFilter(self, obj, event):
         if obj is self.scroll.viewport() and event.type() == event.Resize:
@@ -916,6 +1058,7 @@ class ModelReviewWindow(QWidget):
         return TEXT_COLOR if class_name else None
 
     def _refresh_cells(self):
+        every_class = self.class_filter.currentData() is ALL_CLASSES
         for chip in self._visible:
             cell = self._cells.get(chip.key)
             if cell is None:
@@ -931,9 +1074,12 @@ class ModelReviewWindow(QWidget):
                         else chip.verdict)
                 colour = (None if chip.verdict is None
                           else self._colour_of(chip.verdict))
-            cell.set_state(f"{chip.score:.2f}", text, colour,
-                           chip.key in self._selected,
-                           chip.reviewed_before())
+            score = f"{chip.score:.2f}"
+            if every_class:
+                # Which of the model's calls this is, when they are mixed.
+                score += f"  {chip.predicted}"
+            cell.set_state(score, text, colour, chip.key in self._selected,
+                           chip.reviewed_before(), chip.key == self._cursor)
 
     def _show_counts(self):
         verdicts = self.with_verdicts()
@@ -971,12 +1117,16 @@ class ModelReviewWindow(QWidget):
 
     def set_active(self, verdict):
         """The label a click gives: a class name, or IGNORE. Also given to
-        whatever is selected now."""
+        the picked chips - or, with none picked, to the chip under the
+        cursor, which then moves on."""
         if verdict != IGNORE and verdict not in self._classes:
             return
         self._active = verdict
         self._show_active()
-        self._apply_active(self._selected)
+        if self._selected:
+            self._give(self._selected, verdict, None)
+        elif self._cursor is not None:
+            self._label_cursor(verdict)
 
     def _show_active(self):
         combo = self.label_combo
@@ -986,28 +1136,46 @@ class ModelReviewWindow(QWidget):
         combo.blockSignals(False)
         self.ignore_button.setChecked(self._active == IGNORE)
 
-    def _apply_active(self, keys):
+    def _give(self, keys, verdict, what: "str | None") -> "dict | None":
+        """These chips get this verdict, as one thing to take back;
+        returns the undo entry, or None when nothing changed. ``what``
+        names it for the status line; None names it by its count."""
+        chips = [self._by_key[key] for key in keys
+                 if key in self._by_key
+                 and not self._by_key[key].reviewed_before()
+                 and self._by_key[key].verdict != verdict]
+        if not chips:
+            return None
+        if what is None:
+            n = len(chips)
+            what = f"{n} verdict{'' if n == 1 else 's'}"
+        entry = self._remember(chips, what)
+        for chip in chips:
+            chip.verdict = verdict
+        self._refresh_cells()
+        self._show_counts()
+        return entry
+
+    def _apply_active(self, keys) -> "dict | None":
         if not keys:
-            return
+            return None
         if self._active is None:
             self._note = ("No class to give: the project has none. Add "
                           "class... makes one; 0 is Ignore.")
             self._show_counts()
-            return
-        for key in keys:
-            chip = self._by_key.get(key)
-            if chip is not None and not chip.reviewed_before():
-                chip.verdict = self._active
-        self._refresh_cells()
-        self._show_counts()
+            return None
+        return self._give(keys, self._active, None)
 
     def clear_verdicts(self, keys):
         """Take the verdict back - and the centre, to the file's."""
         chips = [self._by_key[key] for key in list(keys)
-                 if key in self._by_key]
-        moved = [chip for chip in chips if chip.moved()]
-        if moved:
-            self._remember_centres(moved)
+                 if key in self._by_key
+                 and (self._by_key[key].verdict is not None
+                      or self._by_key[key].moved())]
+        if not chips:
+            return
+        n = len(chips)
+        self._remember(chips, f"{n} verdict{'' if n == 1 else 's'} cleared")
         for chip in chips:
             chip.verdict = None
             if chip.moved():
@@ -1052,11 +1220,13 @@ class ModelReviewWindow(QWidget):
         """A plain click labels the chip and a Shift-click the run from
         the last click, and both leave nothing selected: the next key
         picks the label for what comes next, as on the canvas. Only a
-        Ctrl-click builds a selection, for a key to label at once."""
+        Ctrl-click builds a selection, for a key to label at once. A
+        click is the mouse's: the keyboard's cursor steps aside."""
         self.setFocus()
         order = self.shown_keys()
         if key not in order:
             return
+        self.set_cursor(None)
         if modifiers & Qt.ControlModifier:
             if key in self._selected:
                 self._selected.discard(key)
@@ -1065,18 +1235,20 @@ class ModelReviewWindow(QWidget):
             self._anchor = key
             self._refresh_cells()
             return
+        self._selected.clear()
         if modifiers & Qt.ShiftModifier and self._anchor in order:
             start, end = sorted((order.index(self._anchor), order.index(key)))
             run = order[start:end + 1]
             self._last_click = None
+            self._anchor = key
+            self._apply_active(run)
         else:
-            run = [key]
             # Should this turn out to be the first half of a double-click,
             # the verdict it gives is taken back (_on_cell_recentred).
-            self._last_click = (key, self._by_key[key].verdict)
-        self._anchor = key
-        self._selected.clear()
-        self._apply_active(run)
+            before = self._by_key[key].verdict
+            self._anchor = key
+            entry = self._apply_active([key])
+            self._last_click = (key, before, entry)
         self._refresh_cells()
 
     def _on_cell_cleared(self, key):
@@ -1089,18 +1261,128 @@ class ModelReviewWindow(QWidget):
 
     def select_none(self):
         self._selected.clear()
+        self.set_cursor(None)
+
+    # -- the keyboard's cursor -----------------------------------------------
+
+    def set_cursor(self, key: "int | None"):
+        """Put the keyboard's cursor on this chip of the page, or on
+        none, and bring it into view."""
+        if key is not None and key not in self._cells:
+            key = None
+        self._cursor = key
         self._refresh_cells()
+        if key is not None:
+            self.scroll.ensureWidgetVisible(self._cells[key], 16, 16)
+
+    def _cursor_start(self) -> int:
+        """Where a cursor begins: after the chip last clicked, else at the
+        first chip of the page."""
+        order = self.shown_keys()
+        if self._anchor in order:
+            return min(order.index(self._anchor) + 1, len(order) - 1)
+        return 0
+
+    def _move_cursor(self, delta: int):
+        """Step the cursor ``delta`` chips along the page's order; past
+        either end the page turns and the cursor lands on the first or
+        last chip of the next."""
+        order = self.shown_keys()
+        if not order:
+            return
+        if self._cursor not in order:
+            index = self._cursor_start() if delta >= 0 else len(order) - 1
+        else:
+            index = order.index(self._cursor) + delta
+        if index >= len(order):
+            if self._page < self.page_count() - 1:
+                self._step_page(1)
+                self.set_cursor(self.shown_keys()[0])
+            else:
+                self.set_cursor(order[-1])
+                self._note = "The last chip of the last page."
+                self._show_counts()
+            return
+        if index < 0:
+            if self._page > 0:
+                self._step_page(-1)
+                self.set_cursor(self.shown_keys()[-1])
+            else:
+                self.set_cursor(order[0])
+            return
+        self.set_cursor(order[index])
+
+    def _label_cursor(self, verdict):
+        """The chip under the cursor gets this verdict, and the cursor
+        moves on."""
+        if self._cursor is None:
+            return
+        self._give([self._cursor], verdict, None)
+        self._move_cursor(1)
+
+    def ignore_rest_of_page(self):
+        """Every chip on the page without a verdict is ignored, as one
+        thing to take back, and the next page comes up with the cursor on
+        its first chip."""
+        self.setFocus()
+        rest = [chip.key for chip in self._visible
+                if chip.verdict is None and not chip.reviewed_before()]
+        n = len(rest)
+        if rest:
+            self._give(rest, IGNORE, f"the rest of the page ignored ({n})")
+        if self._page < self.page_count() - 1:
+            self._step_page(1)
+            self.set_cursor(self.shown_keys()[0])
+        else:
+            self.set_cursor(None)
+        self._note = (f"{n} chip{'' if n == 1 else 's'} ignored"
+                      + (", next page" if self._page_start else "") + ".")
+        self._show_counts()
 
     # -- import ---------------------------------------------------------------
 
+    def _import_summary(self, chips) -> str:
+        """What an import would do, for the question that precedes it."""
+        counts: dict = {}
+        ignored = moved = 0
+        for chip in chips:
+            if chip.verdict == IGNORE:
+                ignored += 1
+            else:
+                counts[chip.verdict] = counts.get(chip.verdict, 0) + 1
+            if chip.moved():
+                moved += 1
+        parts = [f"{n} {name}" for name, n in
+                 sorted(counts.items(), key=lambda item: (-item[1], item[0]))]
+        if ignored:
+            parts.append(f"{ignored} ignored")
+        text = (f"Import {len(chips)} chip{'' if len(chips) == 1 else 's'} "
+                f"from {self._source}?\n\n" + ", ".join(parts) + ".")
+        if moved:
+            text += (f"\n{moved} re-centred: the label sits where the "
+                     "centre was put.")
+        return text
+
+    def _confirm_import(self, text: str) -> bool:
+        """The question before an import; a method of its own so tests
+        can answer it."""
+        answer = QMessageBox.question(
+            self, "Import to project", text, QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes)
+        return answer == QMessageBox.Yes
+
     def _import(self):
         chips = self.with_verdicts()
-        if chips:
-            # The centres go into the project with the labels; from here
-            # Ctrl+Z is the project's history.
-            self._centre_undo.clear()
-            self._centre_redo.clear()
-            self.import_requested.emit(chips, self._source)
+        if not chips:
+            return
+        if not self._confirm_import(self._import_summary(chips)):
+            return
+        # The verdicts and centres go into the project with the labels;
+        # from here Ctrl+Z is the project's history.
+        self._undo.clear()
+        self._redo.clear()
+        self._last_click = None
+        self.import_requested.emit(chips, self._source)
 
     # -- keys -----------------------------------------------------------------
 
@@ -1114,20 +1396,22 @@ class ModelReviewWindow(QWidget):
             elif key == Qt.Key_S:
                 self.save_requested.emit()
             elif key == Qt.Key_Z:
-                # A centre move made here first; then the project's history.
-                if not self.undo_centre():
+                # What was done here first; then the project's history.
+                if not self.undo():
                     self.undo_requested.emit()
             elif key == Qt.Key_Y:
-                if not self.redo_centre():
+                if not self.redo():
                     self.redo_requested.emit()
             elif key == Qt.Key_A:
                 self.select_all()
+            elif key in (Qt.Key_Return, Qt.Key_Enter):
+                self._import()
             else:
                 super().keyPressEvent(event)
             return
         if mods == (Qt.ControlModifier | Qt.ShiftModifier) \
                 and key == Qt.Key_Z:
-            if not self.redo_centre():
+            if not self.redo():
                 self.redo_requested.emit()
             return
         if mods == Qt.NoModifier:
@@ -1140,7 +1424,10 @@ class ModelReviewWindow(QWidget):
                 self.set_active(IGNORE)
                 return
             if key in (Qt.Key_Delete, Qt.Key_Backspace):
-                self.clear_verdicts(self._selected)
+                if self._selected:
+                    self.clear_verdicts(self._selected)
+                elif self._cursor is not None:
+                    self.clear_verdicts([self._cursor])
                 return
             if key == Qt.Key_Escape:
                 self.select_none()
@@ -1150,6 +1437,43 @@ class ModelReviewWindow(QWidget):
                 return
             if key == Qt.Key_PageUp:
                 self._step_page(-1)
+                return
+            if key == Qt.Key_Right:
+                self._move_cursor(1)
+                return
+            if key == Qt.Key_Left:
+                self._move_cursor(-1)
+                return
+            if key == Qt.Key_Down:
+                self._move_cursor(max(1, self.columns_spin.value()))
+                return
+            if key == Qt.Key_Up:
+                self._move_cursor(-max(1, self.columns_spin.value()))
+                return
+            if key == Qt.Key_Home:
+                if self.shown_keys():
+                    self.set_cursor(self.shown_keys()[0])
+                return
+            if key == Qt.Key_End:
+                if self.shown_keys():
+                    self.set_cursor(self.shown_keys()[-1])
+                return
+            if key == Qt.Key_Space:
+                # On to the next chip, this one left as it is.
+                self._move_cursor(1)
+                return
+            if key in (Qt.Key_Return, Qt.Key_Enter):
+                # The active label onto the cursor's chip, and on - or,
+                # with no cursor yet, the cursor's first step.
+                if self._cursor is None:
+                    self._move_cursor(1)
+                elif self._active is not None:
+                    self._label_cursor(self._active)
+                else:
+                    self._apply_active([self._cursor])
+                return
+            if key == Qt.Key_I:
+                self.ignore_rest_of_page()
                 return
         super().keyPressEvent(event)
 
@@ -1177,6 +1501,8 @@ class ModelReviewWindow(QWidget):
         self.show_reviewed_check.blockSignals(False)
         self.mark_check.setChecked(
             str(settings.value(_MARK_KEY, "true")).lower() != "false")
+        self.more_button.setChecked(
+            str(settings.value(_MORE_KEY, "false")).lower() == "true")
         geometry = settings.value(_GEOMETRY_KEY)
         restored = False
         if geometry is not None:
@@ -1219,6 +1545,7 @@ class ModelReviewWindow(QWidget):
         settings.setValue(_SHOW_REVIEWED_KEY,
                           self.show_reviewed_check.isChecked())
         settings.setValue(_MARK_KEY, self.mark_check.isChecked())
+        settings.setValue(_MORE_KEY, self.more_button.isChecked())
         settings.setValue(_GEOMETRY_KEY, self.saveGeometry())
 
     def discard_and_close(self):

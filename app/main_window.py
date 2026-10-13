@@ -4546,10 +4546,12 @@ class MainWindow(QMainWindow):
         self._reseat_open_editors()
         self._mark_unsaved()
         self._recovery_soon_timer.start()
+        summary = result.summary(source)
         if self._model_review is not None:
             self._model_review.refresh_earlier()
-        self.statusBar.showMessage("Model review: " + result.summary(source),
-                                   12000)
+            # Where the user is looking: the window's own status line.
+            self._model_review.note("Imported: " + summary + ".")
+        self.statusBar.showMessage("Model review: " + summary, 12000)
 
     def _export_ground_truth(self):
         """Export ground truth labels to a JSON file."""

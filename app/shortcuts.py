@@ -156,9 +156,15 @@ SHORTCUT_SECTIONS = [
         ("Shift+Left-click", "Label every chip from the last click to this"),
         ("Ctrl+Left-click", "Pick a chip without labelling; a key then "
                             "labels the picked"),
-        ("1-9", "The class at that place in the list: active, and onto "
-                "the picked chips"),
+        ("1-9", "The class at that place in the list: onto the picked "
+                "chips, or the chip under the cursor (then the next)"),
         ("0", "Ignore: looked at, nothing to label"),
+        ("Arrows / Home / End", "Move the cursor from chip to chip; past the "
+                                "page's end it turns the page"),
+        ("Enter", "The active label onto the chip under the cursor, then "
+                  "the next"),
+        ("Space", "The next chip, this one left as it is"),
+        ("I", "Ignore the rest of the page, then the next page"),
         ("Double-click chip", "Put the label's centre there, on the object "
                               "(it does not label)"),
         ("Auto-center button", "Move the picked chips' centres (or the "
@@ -167,8 +173,9 @@ SHORTCUT_SECTIONS = [
                                  "it"),
         ("Escape / Ctrl+A", "Pick none / every chip on the page"),
         ("PageDown / PageUp", "Next / previous page of chips"),
-        ("Ctrl+Z", "Take a centre move back; then undo in the main "
-                   "window's history"),
+        ("Ctrl+Enter", "Import to project"),
+        ("Ctrl+Z", "Take back the last thing done here - a verdict, a run, "
+                   "a centre move; then undo in the main window's history"),
         ("Ctrl+Y", "Redo, likewise"),
         ("Ctrl+S", "Save Project"),
     ]),
