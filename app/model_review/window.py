@@ -109,6 +109,7 @@ DEFAULT_ACCEPT = 0.90           # a suggestion at least this sure is taken
 _ACCEPT_KEY = "model_review/accept"
 _BACKBONE_KEY = "model_review/backbone"
 _RIGHT_KEY = "model_review/right_splitter"
+WORK_WAIT_MS = 5000             # closing waits this long for the work
 LOOKING = "Looking for PyTorch..."
 
 
@@ -117,6 +118,8 @@ class ChipCell(QWidget):
 
     clicked = pyqtSignal(int, object)       # key, keyboard modifiers
     cleared = pyqtSignal(int)               # right-click: take it back
+    double_clicked = pyqtSignal(int)        # its second press, whatever
+                                            # the picture
     hovered = pyqtSignal(int)               # the mouse came onto it...
     left = pyqtSignal(int)                  # ...and went again
     # Double-click: put the centre here - (key, column, row) in the
@@ -303,6 +306,7 @@ class ChipCell(QWidget):
         click, and did what a click does): put the centre here."""
         if event.button() != Qt.LeftButton:
             return
+        self.double_clicked.emit(self.key)
         point = self.picture_point(event.pos())
         if point is not None:
             self.recentred.emit(self.key, point[0], point[1])
@@ -324,6 +328,8 @@ def _passes(chip, standing: str) -> bool:
     """Does the chip belong on the Show: list? A chip reviewed in an
     earlier round counts by what it became."""
     verdict = chip.earlier.became if chip.reviewed_before() else chip.verdict
+    if standing and standing.startswith("labelled:"):
+        return verdict == standing[len("labelled:"):]
     if standing == "todo":
         return verdict is None
     if standing == "labelled":
@@ -398,6 +404,9 @@ class ModelReviewWindow(QWidget):
         self._verdict_seq: dict = {}        # key -> when its verdict came
         self._tick = 0
         self._ref_gen = 0                   # the reference strip's reads
+        self._reference_dirty = True        # the verdicts changed since
+        self._chips_gen = 0                 # bumped by each file opened
+        self._work_gen = 0                  # the file the work is for
         self._store = SnippetStore()
         self._learn_window: LearnWindow | None = None
         self.loader = SnippetLoader(self)
@@ -502,9 +511,9 @@ class ModelReviewWindow(QWidget):
             self.verdict_filter.addItem(text, data)
         self.verdict_filter.setToolTip(
             "Which chips the grid lists: all of them, the ones still to\n"
-            "look at, the labelled, or the ignored. The list settles at\n"
-            "the next page turn, so a chip just labelled stays put till\n"
-            "then.")
+            "look at, the labelled - all, or one class - or the ignored.\n"
+            "The list settles at the next page turn, so a chip just\n"
+            "labelled stays put till then.")
         self.verdict_filter.currentIndexChanged.connect(self._on_filter)
         self.verdict_filter.activated.connect(lambda _i: self.setFocus())
         third.addWidget(self.verdict_filter)
@@ -810,6 +819,7 @@ class ModelReviewWindow(QWidget):
                     and chip.verdict not in self._classes]
         for chip in orphaned:
             chip.verdict = None
+        self._reference_dirty = True
         if orphaned:
             n = len(orphaned)
             self._note = (f"{n} verdict{'' if n == 1 else 's'} of a class "
@@ -874,6 +884,13 @@ class ModelReviewWindow(QWidget):
         self._redo.clear()
         self._page_start = 0
         self._set_detail(None)
+        self._chips_gen += 1
+        self._verdict_seq.clear()
+        self._reference_dirty = True
+        if self._image_window is not None:
+            self._image_window.close()      # its chip was the old file's
+        if self._working is not None:
+            self.stop_work()                # its result would be the old file's
         self._suggestions.clear()
         self._learn_report = None
         self._fill_suggested_filter()
@@ -915,6 +932,7 @@ class ModelReviewWindow(QWidget):
             self._suggestions = {key: s for key, s in self._suggestions.items()
                                  if key in self._by_key}
             self._fill_suggested_filter()
+        self._reference_dirty = True
         self._fill_filter()
         self._rebuild()
 
@@ -988,6 +1006,44 @@ class ModelReviewWindow(QWidget):
         for name in sorted(grouped):
             combo.addItem(f"{name} ({len(grouped[name])})", name)
         index = combo.findData(current) if current is not None else 0
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _fill_verdict_filter(self):
+        """The Show: list's entries: the four, then one per class with
+        chips labelled that class - this session's verdicts, and earlier
+        rounds' when they are shown - the choice kept."""
+        combo = self.verdict_filter
+        show_reviewed = self.show_reviewed_check.isChecked()
+        counts: Counter = Counter()
+        for chip in self._chips:
+            if chip.reviewed_before():
+                standing = chip.earlier.became if show_reviewed else None
+            else:
+                standing = chip.verdict
+            if standing not in (None, IGNORE):
+                counts[standing] += 1
+        current = combo.currentData()
+        if (isinstance(current, str) and current.startswith("labelled:")
+                and current[len("labelled:"):] not in counts):
+            # The choice stays while it is the choice: the list settles
+            # at a page turn, not under the cursor.
+            counts[current[len("labelled:"):]] = 0
+        wanted = [(f"Labelled {name} ({counts[name]})", "labelled:" + name)
+                  for name in sorted(counts)]
+        have = [(combo.itemText(i), combo.itemData(i))
+                for i in range(len(VERDICT_FILTERS), combo.count())
+                if combo.itemData(i) is not None]
+        if have == wanted:
+            return
+        combo.blockSignals(True)
+        while combo.count() > len(VERDICT_FILTERS):
+            combo.removeItem(combo.count() - 1)
+        if wanted:
+            combo.insertSeparator(combo.count())
+            for text, data in wanted:
+                combo.addItem(text, data)
+        index = combo.findData(current) if current is not None else -1
         combo.setCurrentIndex(index if index >= 0 else 0)
         combo.blockSignals(False)
 
@@ -1100,6 +1156,7 @@ class ModelReviewWindow(QWidget):
             self._set_tooltip(cell, chip)
             cell.clicked.connect(self._on_cell_clicked)
             cell.cleared.connect(self._on_cell_cleared)
+            cell.double_clicked.connect(self._on_cell_double_clicked)
             cell.recentred.connect(self._on_cell_recentred)
             cell.hovered.connect(self._on_cell_hovered)
             cell.left.connect(self._on_cell_left)
@@ -1204,6 +1261,9 @@ class ModelReviewWindow(QWidget):
         self._refresh_image_window()
 
     def _on_chip_size(self, _value):
+        # Reads in flight at the old size would land after the new ones
+        # served from the cache, and show the old size.
+        self.loader.cancel_all()
         self._request_pixels()
         self._request_detail()
         self._refresh_image_window()
@@ -1211,23 +1271,35 @@ class ModelReviewWindow(QWidget):
 
     # -- the centre: where the label will go -------------------------------
 
-    def _on_cell_recentred(self, key, col, row):
-        """A double-click on the object: the label goes there - and the
-        chip is NOT labelled: the click that began the double-click gave
-        it the active label, as a click does, and that is taken back
-        (users re-centring found chips labelled under them, 2026-10-07)."""
+    def _on_cell_double_clicked(self, key):
+        """The second press of a double-click: the verdict its first
+        press gave is taken back, picture or no picture yet - a
+        double-click is for the centre, not for labelling (users
+        re-centring found chips labelled under them, 2026-10-07; on a
+        chip still blank the verdict stayed, 2026-10-13)."""
         self.setFocus()
+        chip = self._by_key.get(key)
+        if chip is None or self._last_click is None \
+                or self._last_click[0] != key:
+            return
+        _key, before, entry = self._last_click
+        chip.verdict = before
+        if entry is not None and self._undo and self._undo[-1] is entry:
+            self._undo.pop()                # the half-click never happened
+        self._last_click = None
+        self._reference_dirty = True
+        self._refresh_cells()
+        self._show_counts()
+
+    def _on_cell_recentred(self, key, col, row):
+        """A double-click on the object: the label goes there. (The
+        verdict the first press gave was taken back already, in
+        _on_cell_double_clicked.)"""
         chip = self._by_key.get(key)
         cell = self._cells.get(key)
         if chip is None or chip.reviewed_before() or cell is None \
                 or cell.frame is None:
             return
-        if self._last_click is not None and self._last_click[0] == key:
-            _key, before, entry = self._last_click
-            chip.verdict = before
-            if entry is not None and self._undo and self._undo[-1] is entry:
-                self._undo.pop()            # the half-click never happened
-            self._last_click = None
         # Through the frame of the picture clicked on, whatever the chip
         # size has become since it was read.
         x0, y0 = cell.frame
@@ -1313,6 +1385,8 @@ class ModelReviewWindow(QWidget):
             if chip is None:
                 continue
             replaced[key] = (chip.verdict, chip.pixel_x, chip.pixel_y)
+            if verdict not in (None, IGNORE) and verdict not in self._classes:
+                verdict = None              # a class the project lost
             if not chip.reviewed_before():
                 chip.verdict = verdict
             if (x, y) != (chip.pixel_x, chip.pixel_y):
@@ -1321,6 +1395,7 @@ class ModelReviewWindow(QWidget):
                     self._reload(chip)
                 elif key == self._detail_key:
                     self._request_detail()
+        self._reference_dirty = True
         self._refresh_cells()
         return {"what": entry["what"], "chips": replaced}
 
@@ -1396,6 +1471,7 @@ class ModelReviewWindow(QWidget):
         self._refresh_detail_text()
         self._refresh_image_window()
         self._refresh_reference()
+        self._fill_verdict_filter()
 
     def _show_counts(self):
         verdicts = self.with_verdicts()
@@ -1469,6 +1545,7 @@ class ModelReviewWindow(QWidget):
         for chip in chips:
             chip.verdict = verdict
             self._verdict_seq[chip.key] = self._next_tick()
+        self._reference_dirty = True
         self._refresh_cells()
         self._show_counts()
         return entry
@@ -1498,6 +1575,7 @@ class ModelReviewWindow(QWidget):
             if chip.moved():
                 chip.restore_centre()
                 self._reload(chip)
+        self._reference_dirty = True
         self._refresh_cells()
         self._show_counts()
 
@@ -1737,7 +1815,7 @@ class ModelReviewWindow(QWidget):
         if shown is None or not shown.isVisible():
             return
         chip = shown.chip()
-        if chip is not None and chip.key in self._by_key:
+        if chip is not None and self._by_key.get(chip.key) is chip:
             shown.refresh(self.chip_spin.value(), standing_of(chip))
 
     def show_on_image(self):
@@ -1768,6 +1846,9 @@ class ModelReviewWindow(QWidget):
         the pictures again (the chip size changed)."""
         if not self.details_check.isChecked():
             return
+        if not force and not self._reference_dirty:
+            return                      # a cursor step gathers nothing
+        self._reference_dirty = False
         examples = gather_examples(self._project(), self._chips)
         self.reference.set_classes(
             Counter(e.class_name for e in examples))
@@ -1994,6 +2075,7 @@ class ModelReviewWindow(QWidget):
         """Run the job on a thread of its own, the training window
         showing it; a method of its own so tests can stand in for it."""
         self._work_kind = kind
+        self._work_gen = self._chips_gen
         self._learn_progress = title + "..."
         thread = LearnThread(job, self)
         thread.progress.connect(self._on_work_progress)
@@ -2023,7 +2105,8 @@ class ModelReviewWindow(QWidget):
     def _take_suggestions(self, suggestions: dict):
         """The model's suggestions are in: the grid goes over to them,
         the surest first."""
-        self._suggestions = dict(suggestions)
+        self._suggestions = {key: s for key, s in suggestions.items()
+                             if key in self._by_key}
         self._fill_suggested_filter()
         combo = self.order_combo
         combo.blockSignals(True)
@@ -2035,6 +2118,16 @@ class ModelReviewWindow(QWidget):
     def _on_work_done(self, result):
         kind = self._work_kind
         text = None
+        if self._work_gen != self._chips_gen:
+            # Begun for the file before this one: its suggestions would
+            # land on this file's chips by number.
+            text = ("Finished, for the file before this one; dropped. "
+                    "Train again for this one.")
+            self._note = text
+            self._show_counts()
+            self._results_window().finished(None, self._suggestions,
+                                            self.accept_spin.value(), text)
+            return
         if kind == "train":
             report, suggestions = result
             self._learn_report = report
@@ -2093,6 +2186,7 @@ class ModelReviewWindow(QWidget):
         for chip in chips:
             chip.verdict = wanted[chip.key]
             self._verdict_seq[chip.key] = self._next_tick()
+        self._reference_dirty = True
         self._refresh_cells()
         self._show_counts()
         return entry
@@ -2402,7 +2496,19 @@ class ModelReviewWindow(QWidget):
             self._image_window.close()
         if self._working is not None:
             self._working.stop()
-            self._working.wait(5000)
+            if not self._working.wait(WORK_WAIT_MS):
+                # Still reading or training: a QThread destroyed while
+                # running aborts the whole process. It goes on alone,
+                # its result unheard, and deletes itself when done.
+                worker = self._working
+                for signal, slot in ((worker.progress, self._on_work_progress),
+                                     (worker.done, self._on_work_done),
+                                     (worker.failed, self._on_work_failed),
+                                     (worker.finished, self._on_work_finished)):
+                    signal.disconnect(slot)
+                worker.setParent(None)
+                worker.finished.connect(worker.deleteLater)
+                self._working = None
         if self._learn_window is not None:
             self._learn_window.close()
         if self._probe is not None and self._probe.isRunning():

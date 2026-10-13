@@ -32,6 +32,7 @@ from ..snippets import read_label_snippets
 INPUT_PX = 64                   # every chip is seen at this size
 WORKERS = 4                     # images read at once
 REPORT_EVERY = 100              # chips between progress reports
+CHUNK = 200                     # chips read between looks at Stop
 
 
 class Cancelled(Exception):
@@ -116,10 +117,20 @@ class SnippetStore:
         ys = np.array([k[1] for k in keys], dtype=np.int32)
         pixels = (np.stack([chips[k] for k in keys]) if keys
                   else np.zeros((0, self.input_px, self.input_px, 3), np.uint8))
-        tmp = path.with_suffix(".tmp.npz")
+        # A tmp file of this writer's own: two GeoLabellers sharing the
+        # store must not trip over each other's.
+        tmp = path.with_name(f"{path.stem}.{os.getpid()}-"
+                             f"{threading.get_ident()}.tmp.npz")
         with open(tmp, "wb") as handle:
             np.savez(handle, xs=xs, ys=ys, pixels=pixels)
-        os.replace(tmp, path)
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            # Another writer got there; its chips are as good.
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     # -- what -----------------------------------------------------------------
 
@@ -138,8 +149,6 @@ class SnippetStore:
         counted = [0]
 
         def one_image(path, items):
-            if should_stop():
-                raise Cancelled()
             file = self.file_for(path, chip_size)
             with self._lock:
                 saved = self._load(file)
@@ -152,8 +161,14 @@ class SnippetStore:
                     missing.append((i, x, y, key))
             fresh = {}
             if missing:
-                centres = [(x, y) for _i, x, y, _key in missing]
-                arrays = read_label_snippets(path, centres, chip_size)
+                arrays: list = []
+                for start in range(0, len(missing), CHUNK):
+                    if should_stop():
+                        raise Cancelled()
+                    chunk = missing[start:start + CHUNK]
+                    arrays += read_label_snippets(
+                        path, [(x, y) for _i, x, y, _key in chunk],
+                        chip_size)
                 for (i, _x, _y, key), arr in zip(missing, arrays):
                     arr = _resized(arr, self.input_px)
                     out[i] = arr

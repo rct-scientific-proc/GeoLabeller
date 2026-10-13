@@ -42,7 +42,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .ledger import IGNORE
+from .ledger import IGNORE, image_key
 from .snippet_store import INPUT_PX, Cancelled, SnippetStore
 
 MIN_CLASSES = 2
@@ -178,13 +178,13 @@ def gather_examples(project, chips, labels_per_class: int = LABELS_PER_CLASS,
     images = getattr(project, "images", {}) or {}
     by_name: dict = {}
     for path in images:
-        by_name.setdefault(Path(path).name, []).append(path)
+        by_name.setdefault(image_key(path), []).append(path)
     classes = {example.class_name for example in examples.values()}
     for verdict in getattr(project, "model_review", []) or []:
         if not verdict.became:
             continue
         classes.add(verdict.became)
-        paths = by_name.get(verdict.image, [])
+        paths = by_name.get(image_key(verdict.image), [])
         if len(paths) == 1 and (verdict.became == IGNORE
                                 or verdict.label_id is None):
             add(paths[0], verdict.pixel_x, verdict.pixel_y, verdict.became,
@@ -343,14 +343,16 @@ def _augment(torch, batch, generator):
     return out
 
 
-def _views(torch, batch):
-    """The VIEWS dihedral views of each chip: (VIEWS, N, 3, H, W)."""
-    views = []
+def _each_view(torch, batch):
+    """The VIEWS dihedral views of the chips, one (N, 3, H, W) at a
+    time - all eight at once was a gigabyte for a few thousand chips."""
+    made = 0
     for turn in range(4):
         turned = torch.rot90(batch, turn, dims=(2, 3))
-        views.append(turned)
-        views.append(torch.flip(turned, dims=(3,)))
-    return torch.stack(views[:VIEWS])
+        for view in (turned, torch.flip(turned, dims=(3,))):
+            if made < VIEWS:
+                made += 1
+                yield view
 
 
 def _logits(torch, model, x, device):
@@ -406,7 +408,8 @@ class Learner:
             fetched = self.store.fetch([place for _i, place in wanted],
                                        self.chip_size, progress, should_stop)
             for (_i, place), arr in zip(wanted, fetched):
-                self._pixels[self._key(*place)] = arr
+                if arr is not None:     # unreadable now: tried again next time
+                    self._pixels[self._key(*place)] = arr
         return [self._pixels.get(self._key(*place)) for place in places]
 
     # -- training -------------------------------------------------------------
@@ -431,8 +434,21 @@ class Learner:
         pixels = self.read([(e.image_path, e.pixel_x, e.pixel_y)
                             for e in used], progress, should_stop)
         kept = [i for i, p in enumerate(pixels) if p is not None]
-        if not kept:
-            raise ValueError("None of the chips could be read.")
+        # A class whose chips could not be read - an image missing, or
+        # all nodata - is left out, not learned around: trained on the
+        # rest, every suggestion would be the rest.
+        readable = Counter(used[i].class_name for i in kept)
+        unreadable = [c for c in classes if readable[c] < MIN_PER_CLASS]
+        if unreadable:
+            for c in unreadable:
+                left_out[c] = counts[c]
+            classes = [c for c in classes if c not in unreadable]
+            if len(classes) < MIN_CLASSES:
+                raise ValueError(
+                    "Not enough chips could be read to learn from: "
+                    + ", ".join(f"{readable[c]} of {counts[c]} {name_of(c)}"
+                                for c in sorted(counts)) + ".")
+            kept = [i for i in kept if used[i].class_name in classes]
         X = np.stack([pixels[i] for i in kept]).astype(np.float32) / 255.0
         y = np.array([classes.index(used[i].class_name) for i in kept])
         rng = np.random.default_rng(self.seed)
@@ -466,9 +482,10 @@ class Learner:
             xt = torch.from_numpy(X.transpose(0, 3, 1, 2).copy())
             # Features once, of VIEWS views of each training chip and the
             # plain view of each held-out one: the head trains on those.
-            train_views = self._features(torch, _views(torch, xt[train_idx])
-                                         .flatten(0, 1), device, progress,
-                                         should_stop, "Features")
+            train_views = torch.cat([
+                self._features(torch, view, device, progress, should_stop,
+                               f"Features, view {v + 1} of {VIEWS}")
+                for v, view in enumerate(_each_view(torch, xt[train_idx]))])
             items = train_views                   # (VIEWS * n_train, 512)
             labels = yt[train_idx].repeat(VIEWS)
             val_x = (self._features(torch, xt[val_idx], device, progress,
