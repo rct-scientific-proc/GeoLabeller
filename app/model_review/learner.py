@@ -42,6 +42,8 @@ INPUT_PX = 64                   # every chip is seen at this size
 MIN_CLASSES = 2
 MIN_PER_CLASS = 5
 HOLD_OUT = 0.2                  # of each class, for the accuracy reported
+HOLD_OUT_FROM = 30              # examples; fewer, and nothing is held out
+SELECT_FROM = 10                # held-out chips; fewer, and they pick no model
 LABELS_PER_CLASS = 500          # the project's own labels, at most
 DEFAULT_EPOCHS = 20
 MIN_STEPS = 300                 # optimiser steps at least, however few chips
@@ -217,6 +219,8 @@ class Report:
                                   if t)
             text += (f"; held-out accuracy {self.accuracy:.0%} on "
                      f"{self.held_out} ({per_class})")
+        else:
+            text += f"; nothing held out (fewer than {HOLD_OUT_FROM} chips)"
         if self.left_out:
             text += "; too few to learn: " + ", ".join(
                 f"{n} {name_of(c)}" for c, n in self.left_out.items())
@@ -344,11 +348,14 @@ class Learner:
         rng = np.random.default_rng(self.seed)
         train_idx: list = []
         val_idx: list = []
+        # A tiny set is trained on whole: two chips held out say
+        # nothing, and cost a fifth of what there is to learn from.
+        hold_out = len(kept) >= HOLD_OUT_FROM
         for c in range(len(classes)):
             idx = np.flatnonzero(y == c)
             rng.shuffle(idx)
             n_val = (int(round(HOLD_OUT * len(idx)))
-                     if len(idx) >= MIN_PER_CLASS else 0)
+                     if hold_out and len(idx) >= MIN_PER_CLASS else 0)
             val_idx += idx[:n_val].tolist()
             train_idx += idx[n_val:].tolist()
         mean = X[train_idx].mean(axis=(0, 1, 2))
@@ -377,6 +384,10 @@ class Learner:
         per_pass = max(1, math.ceil(len(train_idx) / BATCH))
         passes = max(1, int(epochs), math.ceil(MIN_STEPS / per_pass))
         say_every = max(1, passes // 20)
+        # A small held-out slice reports but does not choose: picking the
+        # pass with the best loss on two chips kept the untrained first
+        # pass over three hundred steps of learning.
+        select = len(val_idx) >= SELECT_FROM
         best_loss, best_state, best_epoch, best_step = math.inf, None, 0, 0
         step = ran = 0
         for epoch in range(passes):
@@ -405,7 +416,9 @@ class Learner:
                 if ran % say_every == 0 or ran == passes:
                     progress(f"Pass {ran} of {passes}: loss {train_loss:.3f}, "
                              f"held-out accuracy {val_acc:.0%}")
-                if val_loss < best_loss - 1e-4:
+                if not select:
+                    best_epoch = ran
+                elif val_loss < best_loss - 1e-4:
                     best_loss, best_epoch, best_step = val_loss, ran, step
                     best_state = {k: v.detach().clone()
                                   for k, v in model.state_dict().items()}
@@ -415,7 +428,7 @@ class Learner:
                 if ran % say_every == 0 or ran == passes:
                     progress(f"Pass {ran} of {passes}: loss {train_loss:.3f}")
                 best_epoch = ran
-        if best_state is not None:
+        if select and best_state is not None:
             model.load_state_dict(best_state)
         model.eval()
         self._model, self._classes = model, classes
