@@ -1,0 +1,11 @@
+# Optional: Model Review's "Train on verdicts" (a small PyTorch classifier
+# that suggests a class for the chips still to look at). Source runs only:
+# the installed (MSI) build leaves PyTorch out.
+#
+#   CPU (any machine):
+#     pip install -r requirements-ml.txt --index-url https://download.pytorch.org/whl/cpu
+#   NVIDIA GPU (CUDA 12.8 driver or newer):
+#     pip install -r requirements-ml.txt --index-url https://download.pytorch.org/whl/cu128
+#
+# The app says which it found under Labels > Model Review... > Learn.
+torch>=2.9

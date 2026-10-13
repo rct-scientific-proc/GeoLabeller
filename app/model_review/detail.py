@@ -195,9 +195,10 @@ class DetailPanel(QWidget):
         self.info.setText(NOTHING)
         self.image_button.setEnabled(False)
 
-    def show_chip(self, chip, latlon: "tuple | None"):
+    def show_chip(self, chip, latlon: "tuple | None", suggestion=None):
         """Everything known of the chip; the picture follows when read.
-        ``latlon`` is (lat, lon), or None for imagery without ground."""
+        ``latlon`` is (lat, lon), or None for imagery without ground;
+        ``suggestion`` what the model learned here thinks, if trained."""
         if chip is not self._chip:
             self.view.set_reading()
         self._chip = chip
@@ -217,6 +218,8 @@ class DetailPanel(QWidget):
             if earlier.source:
                 standing += f" ({earlier.source})"
         lines.append(standing)
+        if suggestion is not None:
+            lines.append("suggested: " + suggestion.describe())
         if chip.moved():
             lines.append(f"centre moved {chip.offset():.0f} px from the "
                          f"file's ({chip.source_x:.1f}, {chip.source_y:.1f})")

@@ -24,6 +24,21 @@ pip install PyQt5 rasterio numpy pyproj h5py affine
 python main.py
 ```
 
+**Optional, source runs only**: Model Review's *Train on verdicts* (a small
+PyTorch classifier that suggests a class for the chips still to look at)
+needs PyTorch, which the installer leaves out. Pick the build for the
+machine:
+
+```bash
+# CPU, any machine (about 125 MB)
+pip install -r requirements-ml.txt --index-url https://download.pytorch.org/whl/cpu
+# NVIDIA GPU, CUDA 12.8 driver or newer (about 2.5 GB)
+pip install -r requirements-ml.txt --index-url https://download.pytorch.org/whl/cu128
+```
+
+The Learn row of the Model Review window says which it found. On Windows
+PyTorch needs the latest Microsoft Visual C++ Redistributable.
+
 Runs on FIPS-enabled systems (no md5/sha1 anywhere; the test suite enforces
 this).
 

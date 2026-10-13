@@ -10,3 +10,5 @@ dependencies:
   - pillow
   - pyproj
   - h5py
+# Optional, for Model Review's training: see requirements-ml.txt (pip,
+# because the CPU and GPU builds come from PyTorch's own index).

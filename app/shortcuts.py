@@ -167,6 +167,12 @@ SHORTCUT_SECTIONS = [
         ("I", "Ignore the rest of the page, then the next page"),
         ("M", "Show the chip in hand on its whole image, in a window: "
               "the wheel zooms, a drag pans, F fits, Escape closes"),
+        ("Train on verdicts button", "A small model learned from the "
+                                     "verdicts suggests a class for the "
+                                     "chips left (source runs with "
+                                     "PyTorch, requirements-ml.txt)"),
+        ("S", "Accept the suggested class: onto the picked chips, or the "
+              "chip under the cursor (then the next)"),
         ("Double-click chip", "Put the label's centre there, on the object "
                               "(it does not label)"),
         ("Auto-center button", "Move the picked chips' centres (or the "

@@ -32,9 +32,9 @@ from PyQt5.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox,
                              QFileDialog, QGridLayout, QHBoxLayout,
                              QInputDialog, QLabel, QMessageBox,
-                             QPushButton, QScrollArea, QSizePolicy,
-                             QSpinBox, QSplitter, QToolButton,
-                             QVBoxLayout, QWidget)
+                             QDoubleSpinBox, QPushButton, QScrollArea,
+                             QSizePolicy, QSpinBox, QSplitter,
+                             QToolButton, QVBoxLayout, QWidget)
 
 from .. import identity, recent
 from ..settings_scope import settings as app_settings
@@ -42,6 +42,9 @@ from ..snippets import SnippetLoader, snippet_frame
 from .centering import find_centre
 from .detail import DEFAULT_CONTEXT, DetailPanel, standing_of
 from .image_window import ImageWindow
+from .learner import (Learner, available as learning_available,
+                      gather_examples, name_of, readiness)
+from .training import TrainingThread
 from .ledger import DEFAULT_TOLERANCE_PX, IGNORE, LedgerIndex
 from .source import by_class, match_candidates, read_candidates
 
@@ -94,6 +97,10 @@ HOVER_MS = 250                  # the mouse rests on a chip this long
                                 # before the panel turns to it
 VERDICT_FILTERS = (("All", "all"), ("To look at", "todo"),
                    ("Labelled", "labelled"), ("Ignored", "ignored"))
+ORDERS = (("Model score", "score"), ("Suggestion", "suggestion"))
+ANY_SUGGESTION = None           # the Suggested box's first entry
+DEFAULT_ACCEPT = 0.90           # a suggestion at least this sure is taken
+_ACCEPT_KEY = "model_review/accept"
 
 
 class ChipCell(QWidget):
@@ -366,6 +373,14 @@ class ModelReviewWindow(QWidget):
         self._hover_timer.setInterval(HOVER_MS)
         self._hover_timer.timeout.connect(self._on_hover_rest)
         self._image_window: ImageWindow | None = None
+        # Learning (learner.py, training.py): the verdicts taught to a
+        # small model, which suggests for what is left.
+        self._learner: Learner | None = None
+        self._training: TrainingThread | None = None
+        self._suggestions: dict = {}        # key -> Suggestion
+        self._learn_report = None
+        self._learn_progress = ""
+        self._learning = learning_available()   # (device, why not)
         self.loader = SnippetLoader(self)
         self.loader.ready.connect(self._on_pixels)
         self._setup_ui()
@@ -558,6 +573,71 @@ class ModelReviewWindow(QWidget):
         self.more_row.setVisible(False)
         layout.addWidget(self.more_row)
 
+        # -- Learn: a model from the verdicts, to sort what is left ------
+        fourth = self._titled_row("Learn", layout)
+        self.train_button = QPushButton("Train on verdicts")
+        self.train_button.setToolTip(
+            "A small classifier trained on the verdicts given here, the\n"
+            "project's memory of earlier rounds and its labels of those\n"
+            "classes, Ignore counting as a class. Every chip still to look\n"
+            "at then gets a suggested class and a confidence. A fifth of\n"
+            "the chips is held out, and the accuracy reported is on those.\n"
+            "Needs a source run with PyTorch (requirements-ml.txt).")
+        self.train_button.clicked.connect(self.train)
+        fourth.addWidget(self.train_button)
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.clicked.connect(self.stop_training)
+        self.stop_button.setVisible(False)
+        fourth.addWidget(self.stop_button)
+        fourth.addSpacing(12)
+        fourth.addWidget(QLabel("Order by:"))
+        self.order_combo = QComboBox()
+        for text, data in ORDERS:
+            self.order_combo.addItem(text, data)
+        self.order_combo.setToolTip(
+            "The grid's order: the model's score, or the suggestion's\n"
+            "confidence - the surest first either way.")
+        self.order_combo.currentIndexChanged.connect(self._on_filter)
+        self.order_combo.activated.connect(lambda _i: self.setFocus())
+        fourth.addWidget(self.order_combo)
+        fourth.addWidget(QLabel("Suggested:"))
+        self.suggested_filter = QComboBox()
+        self.suggested_filter.setToolTip(
+            "Only the chips the model suggests this class for.")
+        self.suggested_filter.currentIndexChanged.connect(self._on_filter)
+        self.suggested_filter.activated.connect(lambda _i: self.setFocus())
+        fourth.addWidget(self.suggested_filter)
+        fourth.addSpacing(12)
+        self.accept_button = QPushButton("Accept (S)")
+        self.accept_button.setToolTip(
+            "The suggested class onto the picked chips, or onto the chip\n"
+            "under the cursor, which then moves on.")
+        self.accept_button.clicked.connect(self.accept_suggestions)
+        fourth.addWidget(self.accept_button)
+        self.accept_page_button = QPushButton("Accept the page at or above")
+        self.accept_page_button.setToolTip(
+            "Every chip on this page still without a verdict whose\n"
+            "suggestion is at least this sure gets it - one thing to take\n"
+            "back with Ctrl+Z.")
+        self.accept_page_button.clicked.connect(self.accept_page)
+        fourth.addWidget(self.accept_page_button)
+        self.accept_spin = QDoubleSpinBox()
+        self.accept_spin.setRange(0.5, 0.99)
+        self.accept_spin.setSingleStep(0.05)
+        self.accept_spin.setDecimals(2)
+        self.accept_spin.setValue(DEFAULT_ACCEPT)
+        self.accept_spin.setKeyboardTracking(False)
+        self.accept_spin.editingFinished.connect(self.setFocus)
+        fourth.addWidget(self.accept_spin)
+        self.learn_label = QLabel("")
+        self.learn_label.setWordWrap(True)
+        self.learn_label.setSizePolicy(QSizePolicy.Ignored,
+                                       QSizePolicy.Preferred)
+        self.learn_label.setMinimumWidth(0)
+        fourth.addWidget(self.learn_label, 1)
+        self._fill_suggested_filter()
+        self._show_learning()
+
         self.hint = QLabel(
             "Click a chip, or press its label's number with the cursor on "
             "it, to label it; the arrow keys move the cursor, Enter labels "
@@ -716,9 +796,13 @@ class ModelReviewWindow(QWidget):
         self._redo.clear()
         self._page_start = 0
         self._set_detail(None)
+        self._suggestions.clear()
+        self._learn_report = None
+        self._fill_suggested_filter()
         self.setWindowTitle(f"Model Review - {name}")
         self.file_label.setText(f"{name}: {report.summary()}")
         self.refresh_earlier()          # which also fills the grid
+        self._show_learning()
         return True
 
     def refresh_earlier(self):
@@ -749,6 +833,10 @@ class ModelReviewWindow(QWidget):
                                       chip.source_y)
             if chip.earlier is not None:
                 chip.verdict = None
+        if self._suggestions:
+            self._suggestions = {key: s for key, s in self._suggestions.items()
+                                 if key in self._by_key}
+            self._fill_suggested_filter()
         self._fill_filter()
         self._rebuild()
 
@@ -829,10 +917,17 @@ class ModelReviewWindow(QWidget):
         wanted = self.class_filter.currentData()
         show_reviewed = self.show_reviewed_check.isChecked()
         standing = self.verdict_filter.currentData()
+        suggested = (self.suggested_filter.currentData()
+                     if self._suggestions else ANY_SUGGESTION)
         chosen = [chip for chip in self._chips
                   if (wanted is ALL_CLASSES or chip.predicted == wanted)
                   and (show_reviewed or not chip.reviewed_before())
-                  and _passes(chip, standing)]
+                  and _passes(chip, standing)
+                  and (suggested is ANY_SUGGESTION
+                       or self._suggested_class(chip.key) == suggested)]
+        if self._suggestions and self.order_combo.currentData() == "suggestion":
+            return sorted(chosen, key=lambda c: (-self._confidence(c.key),
+                                                 -c.score, c.key))
         return sorted(chosen, key=lambda c: (-c.score, c.key))
 
     def _step_page(self, delta: int) -> bool:
@@ -941,10 +1036,12 @@ class ModelReviewWindow(QWidget):
         self._request_detail()
         self._show_counts()
 
-    @staticmethod
-    def _set_tooltip(cell, chip):
+    def _set_tooltip(self, cell, chip):
         text = (f"{chip.image_name}  ({chip.pixel_x:.1f}, {chip.pixel_y:.1f})"
                 f"\nmodel: {chip.predicted} {chip.score:.2f}")
+        suggestion = self._suggestions.get(chip.key)
+        if suggestion is not None:
+            text += "\nsuggested: " + suggestion.describe()
         if chip.rescaled:
             text += "\n(scaled from the size the file stated)"
         if chip.moved():
@@ -1204,6 +1301,13 @@ class ModelReviewWindow(QWidget):
             if every_class:
                 # Which of the model's calls this is, when they are mixed.
                 score += f"  {chip.predicted}"
+            suggestion = self._suggestions.get(chip.key)
+            if suggestion is not None and chip.verdict is None \
+                    and not chip.reviewed_before():
+                # What the model learned here thinks, with a question
+                # mark: the chip is still to look at.
+                score = (f"{name_of(suggestion.class_name)}? "
+                         f"{suggestion.confidence:.2f}")
             cell.set_state(score, text, colour, chip.key in self._selected,
                            chip.reviewed_before(), chip.key == self._cursor)
         self._refresh_detail_text()
@@ -1503,7 +1607,8 @@ class ModelReviewWindow(QWidget):
             return
         changed = key != self._detail_key
         self._detail_key = key
-        self.detail.show_chip(chip, self._latlon_of(chip))
+        self.detail.show_chip(chip, self._latlon_of(chip),
+                              self._suggestions.get(chip.key))
         if changed:
             self._request_detail()
 
@@ -1517,7 +1622,8 @@ class ModelReviewWindow(QWidget):
     def _refresh_detail_text(self):
         chip = self._by_key.get(self._detail_key)
         if chip is not None:
-            self.detail.show_chip(chip, self._latlon_of(chip))
+            self.detail.show_chip(chip, self._latlon_of(chip),
+                                  self._suggestions.get(chip.key))
 
     def _request_detail(self):
         """The surroundings of the chip in hand, read at the context
@@ -1563,6 +1669,203 @@ class ModelReviewWindow(QWidget):
             self._image_window = ImageWindow(self)
         self._image_window.show_chip(chip, self.chip_spin.value(),
                                      standing_of(chip))
+
+    # -- learning: the verdicts taught to a model, to sort what is left --
+
+    def _suggestion(self, key):
+        return self._suggestions.get(key)
+
+    def _suggested_class(self, key):
+        suggestion = self._suggestions.get(key)
+        return None if suggestion is None else suggestion.class_name
+
+    def _confidence(self, key) -> float:
+        suggestion = self._suggestions.get(key)
+        return -1.0 if suggestion is None else suggestion.confidence
+
+    def suggestions(self) -> dict:
+        """key -> Suggestion, for the chips the model suggested for."""
+        return dict(self._suggestions)
+
+    def _fill_suggested_filter(self):
+        combo = self.suggested_filter
+        current = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        counts: dict = {}
+        for suggestion in self._suggestions.values():
+            counts[suggestion.class_name] = counts.get(
+                suggestion.class_name, 0) + 1
+        combo.addItem(f"Any ({len(self._suggestions)})", ANY_SUGGESTION)
+        for name in sorted(counts):
+            combo.addItem(f"{name_of(name)} ({counts[name]})", name)
+        index = combo.findData(current) if current is not None else 0
+        combo.setCurrentIndex(index if index >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _show_learning(self):
+        """The Learn row's state: what can be done, and what came of
+        the last training."""
+        device, text = self._learning
+        training = self._training is not None
+        self.train_button.setEnabled(device is not None and not training
+                                     and bool(self._chips))
+        self.stop_button.setVisible(training)
+        have = bool(self._suggestions)
+        for widget in (self.order_combo, self.suggested_filter,
+                       self.accept_button, self.accept_page_button,
+                       self.accept_spin):
+            widget.setEnabled(have)
+        if training:
+            self.learn_label.setText(self._learn_progress)
+        elif self._learn_report is not None:
+            self.learn_label.setText(self._learn_report.summary())
+        else:
+            self.learn_label.setText(text)
+
+    def train(self):
+        """Train on the verdicts and suggest for what is left, off the
+        GUI thread (learner.py, training.py)."""
+        self.setFocus()
+        if self._training is not None:
+            return
+        device, text = self._learning
+        if device is None:
+            self._note = text
+            self._show_counts()
+            return
+        examples = gather_examples(self._project(), self._chips)
+        why_not = readiness(examples)
+        if why_not:
+            self._note = why_not
+            self._show_counts()
+            return
+        size = self.chip_spin.value()
+        if self._learner is None or self._learner.chip_size != size:
+            self._learner = Learner(size, device)
+        places = [(chip.key, chip.image_path, chip.pixel_x, chip.pixel_y)
+                  for chip in self._chips
+                  if chip.verdict is None and not chip.reviewed_before()]
+        self._learn_progress = (f"Training on {len(examples)} chips, "
+                                f"for {len(places)} to look at...")
+        self._run_training(examples, places)
+        self._show_learning()
+
+    def _run_training(self, examples, places):
+        """Start the thread; a method of its own so tests can stand in
+        for it."""
+        thread = TrainingThread(self._learner, examples, places, self)
+        thread.progress.connect(self._on_training_progress)
+        thread.done.connect(self._on_trained)
+        thread.failed.connect(self._on_training_failed)
+        thread.finished.connect(self._on_training_finished)
+        self._training = thread
+        thread.start()
+
+    def stop_training(self):
+        if self._training is not None:
+            self._training.stop()
+            self._learn_progress = "Stopping..."
+            self._show_learning()
+
+    def _on_training_progress(self, text):
+        self._learn_progress = text
+        self.learn_label.setText(text)
+
+    def _on_trained(self, report, suggestions):
+        """The model's suggestions are in: the grid goes over to them,
+        the surest first."""
+        self._learn_report = report
+        self._suggestions = dict(suggestions)
+        self._fill_suggested_filter()
+        combo = self.order_combo
+        combo.blockSignals(True)
+        combo.setCurrentIndex(max(0, combo.findData("suggestion")))
+        combo.blockSignals(False)
+        self._page_start = 0
+        self._rebuild()
+        n = len(suggestions)
+        accuracy = (f"held-out accuracy {report.accuracy:.0%}; "
+                    if report.held_out else "")
+        self._note = (f"Trained: {accuracy}{n} chip{'' if n == 1 else 's'} "
+                      "given a suggestion, the grid ordered by it.")
+        self._show_counts()
+
+    def _on_training_failed(self, text):
+        self._learn_progress = ""
+        self._note = text
+        self._show_counts()
+
+    def _on_training_finished(self):
+        thread, self._training = self._training, None
+        if thread is not None:
+            thread.deleteLater()
+        self._show_learning()
+
+    def _suggested_pairs(self, keys) -> list:
+        """(chip, suggested class) for these keys, where there is a
+        suggestion and no verdict yet."""
+        pairs = []
+        for key in keys:
+            chip = self._by_key.get(key)
+            suggestion = self._suggestions.get(key)
+            if (chip is not None and suggestion is not None
+                    and chip.verdict is None and not chip.reviewed_before()):
+                pairs.append((chip, suggestion.class_name))
+        return pairs
+
+    def _give_each(self, pairs, what: str) -> "dict | None":
+        """Each chip its own verdict, as one thing to take back."""
+        chips = [chip for chip, verdict in pairs
+                 if not chip.reviewed_before() and chip.verdict != verdict]
+        if not chips:
+            return None
+        entry = self._remember(chips, what)
+        wanted = {chip.key: verdict for chip, verdict in pairs}
+        for chip in chips:
+            chip.verdict = wanted[chip.key]
+        self._refresh_cells()
+        self._show_counts()
+        return entry
+
+    def accept_suggestions(self):
+        """The suggested class onto the picked chips - or onto the chip
+        under the cursor, which then moves on. S."""
+        self.setFocus()
+        if self._selected:
+            pairs = self._suggested_pairs(sorted(self._selected))
+            n = len(pairs)
+            if self._give_each(pairs, f"{n} suggestion"
+                               f"{'' if n == 1 else 's'} accepted") is None:
+                self._note = "No suggestion to accept on the picked chips."
+                self._show_counts()
+        elif self._cursor is not None:
+            pairs = self._suggested_pairs([self._cursor])
+            if pairs:
+                self._give_each(pairs, "a suggestion accepted")
+            self._move_cursor(1)
+        else:
+            self._note = ("Pick chips, or put the cursor on one, to accept "
+                          "the suggestion.")
+            self._show_counts()
+
+    def accept_page(self):
+        """Every chip on the page without a verdict whose suggestion is
+        at least as sure as the box says gets it, as one thing to take
+        back."""
+        self.setFocus()
+        floor = self.accept_spin.value()
+        pairs = [(chip, suggestion.class_name) for chip in self._visible
+                 for suggestion in [self._suggestions.get(chip.key)]
+                 if suggestion is not None and chip.verdict is None
+                 and not chip.reviewed_before()
+                 and suggestion.confidence >= floor]
+        n = len(pairs)
+        if pairs:
+            self._give_each(pairs, f"the page's suggestions accepted ({n})")
+        self._note = (f"{n} suggestion{'' if n == 1 else 's'} at or above "
+                      f"{floor:.2f} accepted on this page.")
+        self._show_counts()
 
     # -- import ---------------------------------------------------------------
 
@@ -1703,6 +2006,9 @@ class ModelReviewWindow(QWidget):
             if key == Qt.Key_M:
                 self.show_on_image()
                 return
+            if key == Qt.Key_S:
+                self.accept_suggestions()
+                return
         super().keyPressEvent(event)
 
     # -- settings, closing ----------------------------------------------------
@@ -1741,6 +2047,11 @@ class ModelReviewWindow(QWidget):
         self.detail.context_spin.blockSignals(True)
         self.detail.context_spin.setValue(context)
         self.detail.context_spin.blockSignals(False)
+        try:
+            accept = float(settings.value(_ACCEPT_KEY, DEFAULT_ACCEPT))
+        except (TypeError, ValueError):
+            accept = DEFAULT_ACCEPT
+        self.accept_spin.setValue(accept)
         geometry = settings.value(_GEOMETRY_KEY)
         restored = False
         if geometry is not None:
@@ -1793,6 +2104,7 @@ class ModelReviewWindow(QWidget):
         settings.setValue(_DETAILS_KEY, self.details_check.isChecked())
         settings.setValue(_CONTEXT_KEY, self.detail.context_spin.value())
         settings.setValue(_SPLITTER_KEY, self.splitter.saveState())
+        settings.setValue(_ACCEPT_KEY, self.accept_spin.value())
         settings.setValue(_GEOMETRY_KEY, self.saveGeometry())
 
     def discard_and_close(self):
@@ -1811,6 +2123,9 @@ class ModelReviewWindow(QWidget):
         self._hover_timer.stop()
         if self._image_window is not None:
             self._image_window.close()
+        if self._training is not None:
+            self._training.stop()
+            self._training.wait(5000)
         super().closeEvent(event)
 
     def _say(self, text: str):

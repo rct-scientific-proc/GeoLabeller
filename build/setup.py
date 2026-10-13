@@ -139,6 +139,7 @@ build_exe_options = {
     ],
     "excludes": [
         "tkinter",
+        "torch",        # optional, for a source run only: requirements-ml.txt
         "unittest",
         "email",
         # NOT "html": app/shortcuts.py imports html.escape, and main_window
