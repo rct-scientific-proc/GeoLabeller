@@ -37,7 +37,10 @@ pip install -r requirements-ml.txt --index-url https://download.pytorch.org/whl/
 ```
 
 The Learn row of the Model Review window says which it found. On Windows
-PyTorch needs the latest Microsoft Visual C++ Redistributable.
+PyTorch needs the latest Microsoft Visual C++ Redistributable, and in a
+script of your own import `app` (or `torch`) before `PyQt5`: Qt otherwise
+loads its own, older C++ runtime first and torch's DLLs refuse to start
+under it (WinError 1114). `python main.py` gets the order right.
 
 Runs on FIPS-enabled systems (no md5/sha1 anywhere; the test suite enforces
 this).

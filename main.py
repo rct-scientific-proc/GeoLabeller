@@ -93,8 +93,12 @@ sys.excepthook = _handle_unhandled_exception
 
 def main():
     try:
-        from PyQt5.QtWidgets import QApplication
+        # The app package before Qt: on a Windows source run it loads
+        # the system's C++ runtime first, which PyTorch's DLLs need -
+        # Qt otherwise brings its own older copy and torch fails with
+        # WinError 1114 (app/__init__.py). Harmless in the frozen build.
         from app.main_window import MainWindow
+        from PyQt5.QtWidgets import QApplication
 
         app = QApplication(sys.argv)
         app.setApplicationName("GeoLabeller")
