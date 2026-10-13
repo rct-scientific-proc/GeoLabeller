@@ -8,4 +8,7 @@
 #     pip install -r requirements-ml.txt --index-url https://download.pytorch.org/whl/cu128
 #
 # The app says which it found under Labels > Model Review... > Learn.
+# torchvision is for the pretrained ResNet18 backbone; it must come from the
+# same index as torch (a CUDA torchvision over a CPU torch fails to load).
 torch>=2.9
+torchvision>=0.24

@@ -7,19 +7,26 @@ agree with, and the hopeless chips dealt with in a stroke.
 
 What it learns from: the verdicts given in the window, the project's
 memory of earlier rounds (Ignore included), and the project's own labels
-of those classes, up to a cap per class. Ignore is a class like any
-other. A fifth of each class is held out and the accuracy reported is on
-that slice - the only honest number. The net is small (four conv blocks,
-some 80k weights) and sees every chip at 64 px, flipped and rotated at
-random while training, so a few hundred examples are enough to be useful
-on a CPU in well under a minute.
+- of the verdict classes, and of every class the file's model does not
+predict - up to a cap per class. Ignore is a class like any other. From
+thirty examples a fifth of each class is held out and the accuracy
+reported is on that slice; from ten held out they also choose the model.
 
-PyTorch is imported by name, through importlib, only when asked for: the
-installed build leaves it out (build/setup.py excludes it) and the import
-gate (build/check_frozen_imports.py) reads import statements. Training
-is for a source run with requirements-ml.txt installed. Everything up to
-the tensors - gathering, reading, resizing - is torch-free, and so can be
-tested without it.
+Two backbones. The small net (four conv blocks, some 80k weights) is
+trained from scratch and sees every chip at INPUT_PX, flipped and turned
+at random while training. ResNet18 (torchvision, ImageNet weights) is
+frozen: each chip's 512 features are taken once - eight turned and
+mirrored views of each training chip - and a linear head is trained on
+them, which is what a few labels can support. Both train by steps, not
+passes: a pass over forty chips is one step.
+
+Chips come through the snippet store (snippet_store.py): read once from
+the imagery with the file opened once, saved small, read from there
+after. PyTorch and torchvision are imported by name, through importlib,
+only when asked for: the installed build leaves them out (build/setup.py
+excludes torch) and the import gate reads import statements. Training is
+for a source run with requirements-ml.txt installed. Everything up to the
+tensors is torch-free. Progress is reported as (text, done, total).
 """
 from __future__ import annotations
 
@@ -33,12 +40,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
 
-from ..snippets import read_label_snippet
 from .ledger import IGNORE
+from .snippet_store import INPUT_PX, Cancelled, SnippetStore
 
-INPUT_PX = 64                   # every chip is seen at this size
 MIN_CLASSES = 2
 MIN_PER_CLASS = 5
 HOLD_OUT = 0.2                  # of each class, for the accuracy reported
@@ -50,11 +55,19 @@ MIN_STEPS = 300                 # optimiser steps at least, however few chips
 PATIENCE_STEPS = 120            # then: steps without a better held-out loss
 BATCH = 64
 INFER_BATCH = 256
-REPORT_EVERY = 200              # chips read between progress reports
+FEATURE_BATCH = 64
+SMALL, RESNET18 = "small", "resnet18"
+BACKBONES = ((SMALL, "Small net, from scratch"),
+             (RESNET18, "ResNet18, pretrained"))
+VIEWS = 8                       # turned and mirrored views of a training chip
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+__all__ = ["Cancelled", "INPUT_PX"]
 
 
-class Cancelled(Exception):
-    """Training or suggesting was stopped."""
+class WeightsMissing(Exception):
+    """ResNet18's weights are not here and could not be fetched."""
 
 
 def name_of(class_name: str) -> str:
@@ -90,9 +103,19 @@ def _availability() -> tuple:
                       f"({exc}). On Windows, install the latest Microsoft "
                       "Visual C++ Redistributable.")
     if torch.cuda.is_available():
-        return "cuda", (f"PyTorch {torch.__version__} on "
-                        f"{torch.cuda.get_device_name(0)}")
-    return "cpu", f"PyTorch {torch.__version__} on the CPU"
+        text = f"PyTorch {torch.__version__} on {torch.cuda.get_device_name(0)}"
+        device = "cuda"
+    else:
+        text, device = f"PyTorch {torch.__version__} on the CPU", "cpu"
+    why = backbone_reason(RESNET18)
+    return device, text + ("" if why is None else f"; {why}")
+
+
+def backbone_reason(backbone: str) -> "str | None":
+    """Why this backbone cannot be used, or None."""
+    if backbone == RESNET18 and importlib.util.find_spec("torchvision") is None:
+        return "ResNet18 needs torchvision (requirements-ml.txt)"
+    return None
 
 
 # -- what there is to learn from ---------------------------------------------
@@ -173,24 +196,6 @@ def readiness(examples) -> "str | None":
             f"as a class. So far: {sofar or 'nothing'}.")
 
 
-# -- pixels ------------------------------------------------------------------
-
-def chip_pixels(image_path: str, x: float, y: float, chip_size: int,
-                cache: "dict | None" = None) -> "np.ndarray | None":
-    """The chip as the model sees it: (INPUT_PX, INPUT_PX, 3) uint8, the
-    grid's own read scaled down. None when it cannot be read."""
-    key = (image_path, int(round(x)), int(round(y)), int(chip_size))
-    if cache is not None and key in cache:
-        return cache[key]
-    arr = read_label_snippet(image_path, x, y, chip_size)
-    if arr is not None and arr.shape[:2] != (INPUT_PX, INPUT_PX):
-        arr = np.asarray(Image.fromarray(arr).resize((INPUT_PX, INPUT_PX),
-                                                     Image.BOX))
-    if cache is not None:
-        cache[key] = arr
-    return arr
-
-
 # -- what came of it ---------------------------------------------------------
 
 @dataclass
@@ -202,17 +207,33 @@ class Report:
     accuracy: float                 # on the held-out slice; nan if none
     per_class: dict                 # class -> (right, total) held out
     confusion: Counter              # (true, predicted) -> n
-    epochs: int
+    epochs: int                     # the pass the model is from
     seconds: float
     device: str
+    backbone: str = SMALL
+    steps: int = 0
+    history: list = field(default_factory=list)   # a dict per pass
     suggested: int = 0              # chips given a suggestion after
+
+    def precision_recall(self) -> dict:
+        """class -> (precision, recall) on the held-out slice, nan where
+        undefined."""
+        out = {}
+        for c in self.classes:
+            true_c = sum(n for (t, _p), n in self.confusion.items() if t == c)
+            said_c = sum(n for (_t, p), n in self.confusion.items() if p == c)
+            right = self.confusion.get((c, c), 0)
+            out[c] = (right / said_c if said_c else math.nan,
+                      right / true_c if true_c else math.nan)
+        return out
 
     def summary(self) -> str:
         trained = ", ".join(f"{n} {name_of(c)}" for c, n in sorted(
             self.counts.items(), key=lambda item: -item[1]))
-        text = (f"Trained on {sum(self.counts.values())} chips ({trained}) "
-                f"in {self.seconds:.0f} s on {self.device}, "
-                f"{self.epochs} pass{'' if self.epochs == 1 else 'es'}")
+        which = dict(BACKBONES).get(self.backbone, self.backbone)
+        text = (f"Trained {which.split(',')[0]} on "
+                f"{sum(self.counts.values())} chips ({trained}) in "
+                f"{self.seconds:.0f} s on {self.device}, {self.steps} steps")
         if self.held_out:
             per_class = ", ".join(f"{name_of(c)} {r}/{t}"
                                   for c, (r, t) in self.per_class.items()
@@ -246,9 +267,9 @@ class Suggestion:
         return text
 
 
-# -- the learner -------------------------------------------------------------
+# -- the nets ----------------------------------------------------------------
 
-def _build(torch, n_classes: int):
+def _small_net(torch, n_classes: int):
     nn = torch.nn
 
     def block(i, o):
@@ -260,6 +281,26 @@ def _build(torch, n_classes: int):
                          block(64, 96), nn.AdaptiveAvgPool2d(1),
                          nn.Flatten(), nn.Dropout(0.3),
                          nn.Linear(96, n_classes))
+
+
+def _resnet18(torch):
+    """ImageNet's ResNet18 without its last layer, frozen; raises
+    WeightsMissing when the weights are not here and cannot be fetched."""
+    torchvision = importlib.import_module("torchvision")
+    weights = torchvision.models.ResNet18_Weights.DEFAULT
+    try:
+        net = torchvision.models.resnet18(weights=weights)
+    except Exception as exc:  # noqa: BLE001 - offline, most likely
+        where = Path(torch.hub.get_dir()) / "checkpoints"
+        raise WeightsMissing(
+            f"ResNet18's weights are not here and could not be fetched "
+            f"({type(exc).__name__}). Download {weights.url} and put it in "
+            f"{where}.") from exc
+    net.fc = torch.nn.Identity()
+    net.eval()
+    for parameter in net.parameters():
+        parameter.requires_grad_(False)
+    return net
 
 
 def _augment(torch, batch, generator):
@@ -278,6 +319,16 @@ def _augment(torch, batch, generator):
     return out
 
 
+def _views(torch, batch):
+    """The VIEWS dihedral views of each chip: (VIEWS, N, 3, H, W)."""
+    views = []
+    for turn in range(4):
+        turned = torch.rot90(batch, turn, dims=(2, 3))
+        views.append(turned)
+        views.append(torch.flip(turned, dims=(3,)))
+    return torch.stack(views[:VIEWS])
+
+
 def _logits(torch, model, x, device):
     model.eval()
     pieces = []
@@ -287,18 +338,25 @@ def _logits(torch, model, x, device):
     return torch.cat(pieces) if pieces else torch.empty((0, 1))
 
 
+# -- the learner -------------------------------------------------------------
+
 class Learner:
-    """Trains on examples, then suggests for places. One per window;
-    the pixels it reads are kept, so training again reads nothing twice."""
+    """Trains on examples, then suggests for places. One per window; the
+    pixels it reads are kept for the session, and in the store for
+    good, so training again reads nothing twice."""
 
     def __init__(self, chip_size: int, device: "str | None" = None,
-                 seed: int = 0):
+                 seed: int = 0, backbone: str = SMALL,
+                 store: "SnippetStore | None" = None):
         self.chip_size = int(chip_size)
         self.device = device
         self.seed = seed
+        self.backbone = backbone
+        self.store = store if store is not None else SnippetStore()
         self.report: "Report | None" = None
-        self._cache: dict = {}
-        self._model = None
+        self._pixels: dict = {}         # (path, rx, ry) -> (INPUT_PX, INPUT_PX, 3)
+        self._model = None              # the small net, or the head
+        self._features_net = None       # ResNet18, frozen
         self._classes: list = []
         self._mean = self._std = None
         self._torch_device = None
@@ -309,27 +367,34 @@ class Learner:
     def classes(self) -> list:
         return list(self._classes)
 
+    @staticmethod
+    def _key(path, x, y):
+        return (path, int(round(x)), int(round(y)))
+
     def read(self, places, progress=None, should_stop=None) -> list:
-        """Pixels for (path, x, y) places, None where unreadable."""
-        progress = progress or (lambda text: None)
+        """Pixels for (path, x, y) places, None where unreadable: from
+        the session, the store, or the imagery, in that order."""
+        progress = progress or (lambda text, done, total: None)
         should_stop = should_stop or (lambda: False)
-        pixels = []
-        for i, (path, x, y) in enumerate(places):
-            if should_stop():
-                raise Cancelled()
-            pixels.append(chip_pixels(path, x, y, self.chip_size,
-                                      self._cache))
-            if (i + 1) % REPORT_EVERY == 0:
-                progress(f"Read {i + 1} of {len(places)} chips...")
-        return pixels
+        wanted = [(i, place) for i, place in enumerate(places)
+                  if self._key(*place) not in self._pixels]
+        if wanted:
+            fetched = self.store.fetch([place for _i, place in wanted],
+                                       self.chip_size, progress, should_stop)
+            for (_i, place), arr in zip(wanted, fetched):
+                self._pixels[self._key(*place)] = arr
+        return [self._pixels.get(self._key(*place)) for place in places]
+
+    # -- training -------------------------------------------------------------
 
     def train(self, examples, progress=None, should_stop=None,
               epochs: int = DEFAULT_EPOCHS) -> Report:
         """Train on the examples; the report says what came of it.
-        Raises ValueError when there is too little to learn from and
+        Raises ValueError when there is too little to learn from,
+        WeightsMissing when ResNet18's weights are out of reach, and
         Cancelled when stopped."""
         torch = importlib.import_module("torch")
-        progress = progress or (lambda text: None)
+        progress = progress or (lambda text, done, total: None)
         should_stop = should_stop or (lambda: False)
         started = time.time()
         counts = Counter(example.class_name for example in examples)
@@ -339,10 +404,11 @@ class Learner:
         if len(classes) < MIN_CLASSES:
             raise ValueError(readiness(examples))
         used = [e for e in examples if e.class_name in classes]
-        progress(f"Reading {len(used)} chips...")
         pixels = self.read([(e.image_path, e.pixel_x, e.pixel_y)
                             for e in used], progress, should_stop)
         kept = [i for i, p in enumerate(pixels) if p is not None]
+        if not kept:
+            raise ValueError("None of the chips could be read.")
         X = np.stack([pixels[i] for i in kept]).astype(np.float32) / 255.0
         y = np.array([classes.index(used[i].class_name) for i in kept])
         rng = np.random.default_rng(self.seed)
@@ -358,64 +424,127 @@ class Learner:
                      if hold_out and len(idx) >= MIN_PER_CLASS else 0)
             val_idx += idx[:n_val].tolist()
             train_idx += idx[n_val:].tolist()
-        mean = X[train_idx].mean(axis=(0, 1, 2))
-        std = X[train_idx].std(axis=(0, 1, 2)) + 1e-3
-        self._mean, self._std = mean, std
         device = torch.device(self.device or (
             "cuda" if torch.cuda.is_available() else "cpu"))
         self._torch_device = device
         torch.manual_seed(self.seed)
-        xt = torch.from_numpy(((X - mean) / std).transpose(0, 3, 1, 2).copy())
         yt = torch.from_numpy(y).long()
-        model = _build(torch, len(classes)).to(device)
         shares = np.bincount(y[train_idx], minlength=len(classes))
         weights = torch.tensor(len(train_idx) / (len(classes)
                                                  * np.maximum(shares, 1)),
                                dtype=torch.float32, device=device)
         loss_fn = torch.nn.CrossEntropyLoss(weight=weights)
+        history: list = []
+        if self.backbone == RESNET18:
+            self._mean = self._std = None
+            net = self._features_net or _resnet18(torch).to(device)
+            self._features_net = net
+            xt = torch.from_numpy(X.transpose(0, 3, 1, 2).copy())
+            # Features once, of VIEWS views of each training chip and the
+            # plain view of each held-out one: the head trains on those.
+            train_views = self._features(torch, _views(torch, xt[train_idx])
+                                         .flatten(0, 1), device, progress,
+                                         should_stop, "Features")
+            items = train_views                   # (VIEWS * n_train, 512)
+            labels = yt[train_idx].repeat(VIEWS)
+            val_x = (self._features(torch, xt[val_idx], device, progress,
+                                    should_stop, "Features, held out")
+                     if val_idx else None)
+            model = torch.nn.Sequential(torch.nn.Dropout(0.2),
+                                        torch.nn.Linear(items.shape[1],
+                                                        len(classes))).to(device)
+
+            def make_batch(idx):
+                return items[idx]
+        else:
+            mean = X[train_idx].mean(axis=(0, 1, 2))
+            std = X[train_idx].std(axis=(0, 1, 2)) + 1e-3
+            self._mean, self._std = mean, std
+            xt = torch.from_numpy(((X - mean) / std).transpose(0, 3, 1, 2)
+                                  .copy())
+            items = xt[train_idx]
+            labels = yt[train_idx]
+            val_x = xt[val_idx] if val_idx else None
+            model = _small_net(torch, len(classes)).to(device)
+            generator = torch.Generator().manual_seed(self.seed)
+
+            def make_batch(idx):
+                return _augment(torch, items[idx], generator)
+        val_y = yt[val_idx] if val_idx else None
+        best_epoch, ran, step = self._fit(
+            torch, model, len(items), labels, make_batch, val_x, val_y,
+            loss_fn, device, epochs, progress, should_stop, history)
+        model.eval()
+        self._model, self._classes = model, classes
+        per_class = {c: [0, 0] for c in classes}
+        confusion: Counter = Counter()
+        right = 0
+        if val_idx:
+            predicted = _logits(torch, model, val_x, device).argmax(1).numpy()
+            for truth, guess in zip(y[val_idx], predicted):
+                confusion[(classes[truth], classes[guess])] += 1
+                per_class[classes[truth]][1] += 1
+                if truth == guess:
+                    per_class[classes[truth]][0] += 1
+                    right += 1
+        accuracy = right / len(val_idx) if val_idx else math.nan
+        self.report = Report(
+            classes=classes,
+            counts=Counter(classes[c] for c in y[train_idx]),
+            left_out=left_out, held_out=len(val_idx), accuracy=accuracy,
+            per_class={c: tuple(v) for c, v in per_class.items()},
+            confusion=confusion, epochs=best_epoch,
+            seconds=time.time() - started, device=str(device),
+            backbone=self.backbone, steps=step, history=history)
+        return self.report
+
+    def _fit(self, torch, model, n_items, labels, make_batch, val_x, val_y,
+             loss_fn, device, epochs, progress, should_stop, history):
+        """The step loop: by steps, with the held-out slice reporting,
+        and choosing the model only when it is big enough."""
         optimiser = torch.optim.Adam(model.parameters(), lr=1e-3,
                                      weight_decay=1e-4)
         generator = torch.Generator().manual_seed(self.seed)
-        train_t = torch.tensor(train_idx, dtype=torch.long)
-        val_t = torch.tensor(val_idx, dtype=torch.long)
         # By steps: a pass over forty chips is one step, and twelve of
         # them taught nothing (2026-10-13). Enough passes for MIN_STEPS,
         # then patience in steps too.
-        per_pass = max(1, math.ceil(len(train_idx) / BATCH))
+        per_pass = max(1, math.ceil(n_items / BATCH))
         passes = max(1, int(epochs), math.ceil(MIN_STEPS / per_pass))
-        say_every = max(1, passes // 20)
+        total_steps = passes * per_pass
         # A small held-out slice reports but does not choose: picking the
         # pass with the best loss on two chips kept the untrained first
         # pass over three hundred steps of learning.
-        select = len(val_idx) >= SELECT_FROM
+        select = val_x is not None and len(val_y) >= SELECT_FROM
         best_loss, best_state, best_epoch, best_step = math.inf, None, 0, 0
         step = ran = 0
         for epoch in range(passes):
             if should_stop():
                 raise Cancelled()
             model.train()
-            order = train_t[torch.randperm(len(train_t), generator=generator)]
+            order = torch.randperm(n_items, generator=generator)
             total = 0.0
-            for start in range(0, len(order), BATCH):
-                batch = order[start:start + BATCH]
-                xb = _augment(torch, xt[batch], generator).to(device)
-                yb = yt[batch].to(device)
+            for start in range(0, n_items, BATCH):
+                idx = order[start:start + BATCH]
+                xb = make_batch(idx).to(device)
+                yb = labels[idx].to(device)
                 optimiser.zero_grad()
                 loss = loss_fn(model(xb), yb)
                 loss.backward()
                 optimiser.step()
-                total += loss.item() * len(batch)
+                total += loss.item() * len(idx)
                 step += 1
             ran = epoch + 1
-            train_loss = total / max(1, len(order))
-            if len(val_idx):
-                logits = _logits(torch, model, xt[val_t], device)
-                val_loss = float(loss_fn(logits.to(device),
-                                         yt[val_t].to(device)))
-                val_acc = float((logits.argmax(1) == yt[val_t]).float().mean())
-                if ran % say_every == 0 or ran == passes:
-                    progress(f"Pass {ran} of {passes}: loss {train_loss:.3f}, "
-                             f"held-out accuracy {val_acc:.0%}")
+            train_loss = total / max(1, n_items)
+            entry = {"pass": ran, "step": step, "loss": train_loss,
+                     "val_loss": None, "val_acc": None}
+            if val_x is not None:
+                logits = _logits(torch, model, val_x, device)
+                val_loss = float(loss_fn(logits.to(device), val_y.to(device)))
+                val_acc = float((logits.argmax(1) == val_y).float().mean())
+                entry["val_loss"], entry["val_acc"] = val_loss, val_acc
+                progress(f"Training: pass {ran} of {passes}, loss "
+                         f"{train_loss:.3f}, held-out accuracy {val_acc:.0%}",
+                         step, total_steps)
                 if not select:
                     best_epoch = ran
                 elif val_loss < best_loss - 1e-4:
@@ -423,40 +552,41 @@ class Learner:
                     best_state = {k: v.detach().clone()
                                   for k, v in model.state_dict().items()}
                 elif step >= MIN_STEPS and step - best_step >= PATIENCE_STEPS:
+                    history.append(entry)
                     break
             else:
-                if ran % say_every == 0 or ran == passes:
-                    progress(f"Pass {ran} of {passes}: loss {train_loss:.3f}")
+                progress(f"Training: pass {ran} of {passes}, loss "
+                         f"{train_loss:.3f}", step, total_steps)
                 best_epoch = ran
+            history.append(entry)
         if select and best_state is not None:
             model.load_state_dict(best_state)
-        model.eval()
-        self._model, self._classes = model, classes
-        per_class = {c: [0, 0] for c in classes}
-        confusion: Counter = Counter()
-        right = 0
-        if len(val_idx):
-            predicted = _logits(torch, model, xt[val_t], device).argmax(1).numpy()
-            for truth, guess in zip(y[val_idx], predicted):
-                confusion[(classes[truth], classes[guess])] += 1
-                per_class[classes[truth]][1] += 1
-                if truth == guess:
-                    per_class[classes[truth]][0] += 1
-                    right += 1
-        accuracy = right / len(val_idx) if len(val_idx) else math.nan
-        self.report = Report(
-            classes=classes,
-            counts=Counter(classes[c] for c in y[train_idx]),
-            left_out=left_out, held_out=len(val_idx), accuracy=accuracy,
-            per_class={c: tuple(v) for c, v in per_class.items()},
-            confusion=confusion, epochs=best_epoch,
-            seconds=time.time() - started, device=str(device))
-        return self.report
+        return best_epoch, ran, step
+
+    def _features(self, torch, x, device, progress, should_stop, what):
+        """ResNet18's 512 features of (N, 3, H, W) chips in [0, 1]."""
+        mean = torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
+        std = torch.tensor(IMAGENET_STD).view(1, 3, 1, 1)
+        pieces = []
+        n = len(x)
+        progress(what, 0, n)
+        with torch.no_grad():
+            for start in range(0, n, FEATURE_BATCH):
+                if should_stop():
+                    raise Cancelled()
+                batch = ((x[start:start + FEATURE_BATCH] - mean) / std)
+                pieces.append(self._features_net(batch.to(device)).cpu())
+                progress(what, min(n, start + FEATURE_BATCH), n)
+        return torch.cat(pieces) if pieces else torch.empty((0, 512))
+
+    # -- suggesting -----------------------------------------------------------
 
     def suggest(self, places, progress=None, should_stop=None) -> list:
         """A Suggestion per (path, x, y) place, None where the chip could
         not be read."""
         torch = importlib.import_module("torch")
+        progress = progress or (lambda text, done, total: None)
+        should_stop = should_stop or (lambda: False)
         if self._model is None:
             raise RuntimeError("Train first.")
         pixels = self.read(places, progress, should_stop)
@@ -465,8 +595,14 @@ class Learner:
         if not kept:
             return results
         X = np.stack([pixels[i] for i in kept]).astype(np.float32) / 255.0
-        xt = torch.from_numpy(((X - self._mean) / self._std)
-                              .transpose(0, 3, 1, 2).copy())
+        if self.backbone == RESNET18:
+            xt = self._features(torch, torch.from_numpy(
+                X.transpose(0, 3, 1, 2).copy()), self._torch_device,
+                progress, should_stop, "Suggesting")
+        else:
+            progress("Suggesting", 0, len(kept))
+            xt = torch.from_numpy(((X - self._mean) / self._std)
+                                  .transpose(0, 3, 1, 2).copy())
         probabilities = torch.softmax(
             _logits(torch, self._model, xt, self._torch_device), dim=1).numpy()
         for row, i in enumerate(kept):
@@ -475,6 +611,7 @@ class Learner:
             results[i] = Suggestion(
                 self._classes[best], float(p[best]),
                 {c: float(p[j]) for j, c in enumerate(self._classes)})
+        progress("Suggesting", len(kept), len(kept))
         if self.report is not None:
             self.report.suggested = len(kept)
         return results

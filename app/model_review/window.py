@@ -42,9 +42,12 @@ from ..snippets import SnippetLoader, snippet_frame
 from .centering import find_centre
 from .detail import DEFAULT_CONTEXT, DetailPanel, standing_of
 from .image_window import ImageWindow
-from .learner import (Learner, available as learning_available,
+from .learn_window import LearnWindow
+from .learner import (BACKBONES, RESNET18, Learner,
+                      available as learning_available, backbone_reason,
                       gather_examples, name_of, readiness)
-from .training import TrainingThread
+from .snippet_store import SnippetStore
+from .training import LearnThread, save_job, suggest_job, train_job
 from .ledger import DEFAULT_TOLERANCE_PX, IGNORE, LedgerIndex
 from .source import by_class, match_candidates, read_candidates
 
@@ -101,6 +104,7 @@ ORDERS = (("Model score", "score"), ("Suggestion", "suggestion"))
 ANY_SUGGESTION = None           # the Suggested box's first entry
 DEFAULT_ACCEPT = 0.90           # a suggestion at least this sure is taken
 _ACCEPT_KEY = "model_review/accept"
+_BACKBONE_KEY = "model_review/backbone"
 
 
 class ChipCell(QWidget):
@@ -374,13 +378,17 @@ class ModelReviewWindow(QWidget):
         self._hover_timer.timeout.connect(self._on_hover_rest)
         self._image_window: ImageWindow | None = None
         # Learning (learner.py, training.py): the verdicts taught to a
-        # small model, which suggests for what is left.
+        # model, which suggests for what is left; chips through the
+        # snippet store; the training window shows the work.
         self._learner: Learner | None = None
-        self._training: TrainingThread | None = None
+        self._working: LearnThread | None = None
+        self._work_kind = ""                # "train", "suggest", "save"
         self._suggestions: dict = {}        # key -> Suggestion
         self._learn_report = None
         self._learn_progress = ""
         self._learning = learning_available()   # (device, why not)
+        self._store = SnippetStore()
+        self._learn_window: LearnWindow | None = None
         self.loader = SnippetLoader(self)
         self.loader.ready.connect(self._on_pixels)
         self._setup_ui()
@@ -585,12 +593,64 @@ class ModelReviewWindow(QWidget):
             "Needs a source run with PyTorch (requirements-ml.txt).")
         self.train_button.clicked.connect(self.train)
         fourth.addWidget(self.train_button)
+        self.suggest_button = QPushButton("Suggest")
+        self.suggest_button.setToolTip(
+            "Suggestions again from the model as trained - after a\n"
+            "chip-size change, or for the next round's file - without\n"
+            "training again.")
+        self.suggest_button.clicked.connect(self.suggest)
+        fourth.addWidget(self.suggest_button)
         self.stop_button = QPushButton("Stop")
-        self.stop_button.clicked.connect(self.stop_training)
+        self.stop_button.clicked.connect(self.stop_work)
         self.stop_button.setVisible(False)
         fourth.addWidget(self.stop_button)
         fourth.addSpacing(12)
-        fourth.addWidget(QLabel("Order by:"))
+        fourth.addWidget(QLabel("Backbone:"))
+        self.backbone_combo = QComboBox()
+        for name, text in BACKBONES:
+            self.backbone_combo.addItem(text, name)
+        self.backbone_combo.setToolTip(
+            "The small net learns from scratch and needs nothing more.\n"
+            "ResNet18 brings ImageNet's eyes - torchvision, and a 45 MB\n"
+            "weights file fetched once - and does better with few\n"
+            "verdicts.")
+        why = backbone_reason(RESNET18)
+        if why:
+            index = self.backbone_combo.findData(RESNET18)
+            self.backbone_combo.model().item(index).setEnabled(False)
+            self.backbone_combo.setItemData(index, why, Qt.ToolTipRole)
+        self.backbone_combo.activated.connect(lambda _i: self.setFocus())
+        fourth.addWidget(self.backbone_combo)
+        fourth.addSpacing(12)
+        self.save_button = QPushButton("Save snippets")
+        self.save_button.setToolTip(
+            "Read every chip of the file, and everything there is to\n"
+            "learn from, into the snippet store now - small, under the\n"
+            "system's temporary folder - so training and suggesting read\n"
+            "them and not the imagery. Done anyway as chips are needed;\n"
+            "this does it ahead.")
+        self.save_button.clicked.connect(self.save_snippets)
+        fourth.addWidget(self.save_button)
+        self.clear_button = QPushButton("Clear")
+        self.clear_button.setToolTip("Delete the saved snippets.")
+        self.clear_button.clicked.connect(self.clear_snippets)
+        fourth.addWidget(self.clear_button)
+        self.results_button = QPushButton("Results...")
+        self.results_button.setToolTip(
+            "The training window: the progress while it runs, the\n"
+            "report after.")
+        self.results_button.clicked.connect(self.show_results)
+        fourth.addWidget(self.results_button)
+        self.learn_label = QLabel("")
+        self.learn_label.setWordWrap(True)
+        self.learn_label.setSizePolicy(QSizePolicy.Ignored,
+                                       QSizePolicy.Preferred)
+        self.learn_label.setMinimumWidth(0)
+        fourth.addWidget(self.learn_label, 1)
+
+        # -- Suggestions: what the model thinks, on the grid -------------
+        fifth = self._titled_row("Suggestions", layout)
+        fifth.addWidget(QLabel("Order by:"))
         self.order_combo = QComboBox()
         for text, data in ORDERS:
             self.order_combo.addItem(text, data)
@@ -599,28 +659,28 @@ class ModelReviewWindow(QWidget):
             "confidence - the surest first either way.")
         self.order_combo.currentIndexChanged.connect(self._on_filter)
         self.order_combo.activated.connect(lambda _i: self.setFocus())
-        fourth.addWidget(self.order_combo)
-        fourth.addWidget(QLabel("Suggested:"))
+        fifth.addWidget(self.order_combo)
+        fifth.addWidget(QLabel("Suggested:"))
         self.suggested_filter = QComboBox()
         self.suggested_filter.setToolTip(
             "Only the chips the model suggests this class for.")
         self.suggested_filter.currentIndexChanged.connect(self._on_filter)
         self.suggested_filter.activated.connect(lambda _i: self.setFocus())
-        fourth.addWidget(self.suggested_filter)
-        fourth.addSpacing(12)
+        fifth.addWidget(self.suggested_filter)
+        fifth.addSpacing(12)
         self.accept_button = QPushButton("Accept (S)")
         self.accept_button.setToolTip(
             "The suggested class onto the picked chips, or onto the chip\n"
             "under the cursor, which then moves on.")
         self.accept_button.clicked.connect(self.accept_suggestions)
-        fourth.addWidget(self.accept_button)
+        fifth.addWidget(self.accept_button)
         self.accept_page_button = QPushButton("Accept the page at or above")
         self.accept_page_button.setToolTip(
             "Every chip on this page still without a verdict whose\n"
             "suggestion is at least this sure gets it - one thing to take\n"
             "back with Ctrl+Z.")
         self.accept_page_button.clicked.connect(self.accept_page)
-        fourth.addWidget(self.accept_page_button)
+        fifth.addWidget(self.accept_page_button)
         self.accept_spin = QDoubleSpinBox()
         self.accept_spin.setRange(0.5, 0.99)
         self.accept_spin.setSingleStep(0.05)
@@ -628,13 +688,8 @@ class ModelReviewWindow(QWidget):
         self.accept_spin.setValue(DEFAULT_ACCEPT)
         self.accept_spin.setKeyboardTracking(False)
         self.accept_spin.editingFinished.connect(self.setFocus)
-        fourth.addWidget(self.accept_spin)
-        self.learn_label = QLabel("")
-        self.learn_label.setWordWrap(True)
-        self.learn_label.setSizePolicy(QSizePolicy.Ignored,
-                                       QSizePolicy.Preferred)
-        self.learn_label.setMinimumWidth(0)
-        fourth.addWidget(self.learn_label, 1)
+        fifth.addWidget(self.accept_spin)
+        fifth.addStretch(1)
         self._fill_suggested_filter()
         self._show_learning()
 
@@ -1707,9 +1762,17 @@ class ModelReviewWindow(QWidget):
         """The Learn row's state: what can be done, and what came of
         the last training."""
         device, text = self._learning
-        training = self._training is not None
+        training = self._working is not None
+        have_chips = bool(self._chips)
         self.train_button.setEnabled(device is not None and not training
-                                     and bool(self._chips))
+                                     and have_chips)
+        self.suggest_button.setEnabled(
+            device is not None and not training and have_chips
+            and self._learner is not None and self._learner.trained())
+        self.save_button.setEnabled(not training and have_chips)
+        self.clear_button.setEnabled(not training)
+        self.backbone_combo.setEnabled(not training)
+        self.results_button.setEnabled(self._learn_window is not None)
         self.stop_button.setVisible(training)
         have = bool(self._suggestions)
         for widget in (self.order_combo, self.suggested_filter,
@@ -1723,15 +1786,33 @@ class ModelReviewWindow(QWidget):
         else:
             self.learn_label.setText(text)
 
+    def _places_to_look_at(self) -> list:
+        """(key, path, x, y) for every chip still without a verdict."""
+        return [(chip.key, chip.image_path, chip.pixel_x, chip.pixel_y)
+                for chip in self._chips
+                if chip.verdict is None and not chip.reviewed_before()]
+
+    def _learning_device(self) -> "str | None":
+        """The device, or None having said why there is none."""
+        device, text = self._learning
+        if device is None:
+            self._note = text
+            self._show_counts()
+        return device
+
     def train(self):
         """Train on the verdicts and suggest for what is left, off the
         GUI thread (learner.py, training.py)."""
         self.setFocus()
-        if self._training is not None:
+        if self._working is not None:
             return
-        device, text = self._learning
+        device = self._learning_device()
         if device is None:
-            self._note = text
+            return
+        backbone = self.backbone_combo.currentData()
+        why = backbone_reason(backbone)
+        if why:
+            self._note = why + "."
             self._show_counts()
             return
         examples = gather_examples(self._project(), self._chips)
@@ -1741,41 +1822,101 @@ class ModelReviewWindow(QWidget):
             self._show_counts()
             return
         size = self.chip_spin.value()
-        if self._learner is None or self._learner.chip_size != size:
-            self._learner = Learner(size, device)
-        places = [(chip.key, chip.image_path, chip.pixel_x, chip.pixel_y)
-                  for chip in self._chips
-                  if chip.verdict is None and not chip.reviewed_before()]
-        self._learn_progress = (f"Training on {len(examples)} chips, "
-                                f"for {len(places)} to look at...")
-        self._run_training(examples, places)
+        if (self._learner is None or self._learner.chip_size != size
+                or self._learner.backbone != backbone):
+            self._learner = Learner(size, device, backbone=backbone,
+                                    store=self._store)
+        places = self._places_to_look_at()
+        self._start_work("train", f"Training on {len(examples)} chips, "
+                         f"for {len(places)} to look at",
+                         train_job(self._learner, examples, places))
+
+    def suggest(self):
+        """Suggestions again from the model as trained."""
+        self.setFocus()
+        if self._working is not None or self._learning_device() is None:
+            return
+        if self._learner is None or not self._learner.trained():
+            self._note = "Train first."
+            self._show_counts()
+            return
+        places = self._places_to_look_at()
+        self._start_work("suggest", f"Suggesting for {len(places)} chips",
+                         suggest_job(self._learner, places))
+
+    def save_snippets(self):
+        """Every chip of the file, and everything there is to learn
+        from, into the snippet store ahead of time."""
+        self.setFocus()
+        if self._working is not None:
+            return
+        places = [(chip.image_path, chip.pixel_x, chip.pixel_y)
+                  for chip in self._chips]
+        places += [(e.image_path, e.pixel_x, e.pixel_y)
+                   for e in gather_examples(self._project(), self._chips)]
+        self._start_work("save", f"Saving {len(places)} snippets",
+                         save_job(self._store, places,
+                                  self.chip_spin.value()))
+
+    def clear_snippets(self):
+        self.setFocus()
+        n = self._store.clear()
+        if self._learner is not None:
+            self._learner._pixels.clear()
+        self._note = (f"{n} snippet file{'' if n == 1 else 's'} deleted "
+                      f"from {self._store.root}.")
+        self._show_counts()
+
+    def show_results(self):
+        window = self._results_window()
+        window.show()
+        window.raise_()
+
+    def _results_window(self) -> LearnWindow:
+        if self._learn_window is None:
+            self._learn_window = LearnWindow(self)
+            self._learn_window.stop_requested.connect(self.stop_work)
+            self.accept_spin.valueChanged.connect(
+                self._learn_window.set_threshold)
+            self._learn_window.set_suggestions(self._suggestions,
+                                               self.accept_spin.value())
+            if self._learn_report is not None:
+                self._learn_window.set_report(self._learn_report)
+        return self._learn_window
+
+    def _start_work(self, kind: str, title: str, job):
+        """Run the job on a thread of its own, the training window
+        showing it; a method of its own so tests can stand in for it."""
+        self._work_kind = kind
+        self._learn_progress = title + "..."
+        thread = LearnThread(job, self)
+        thread.progress.connect(self._on_work_progress)
+        thread.done.connect(self._on_work_done)
+        thread.failed.connect(self._on_work_failed)
+        thread.finished.connect(self._on_work_finished)
+        self._working = thread
+        window = self._results_window()
+        window.start(title)
+        window.show()
+        window.raise_()
+        thread.start()
         self._show_learning()
 
-    def _run_training(self, examples, places):
-        """Start the thread; a method of its own so tests can stand in
-        for it."""
-        thread = TrainingThread(self._learner, examples, places, self)
-        thread.progress.connect(self._on_training_progress)
-        thread.done.connect(self._on_trained)
-        thread.failed.connect(self._on_training_failed)
-        thread.finished.connect(self._on_training_finished)
-        self._training = thread
-        thread.start()
-
-    def stop_training(self):
-        if self._training is not None:
-            self._training.stop()
+    def stop_work(self):
+        if self._working is not None:
+            self._working.stop()
             self._learn_progress = "Stopping..."
+            self._results_window().stopping()
             self._show_learning()
 
-    def _on_training_progress(self, text):
+    def _on_work_progress(self, text, done, total):
         self._learn_progress = text
         self.learn_label.setText(text)
+        self._results_window().progress(text, done, total)
 
-    def _on_trained(self, report, suggestions):
+    def _take_suggestions(self, suggestions: dict):
         """The model's suggestions are in: the grid goes over to them,
         the surest first."""
-        self._learn_report = report
         self._suggestions = dict(suggestions)
         self._fill_suggested_filter()
         combo = self.order_combo
@@ -1784,20 +1925,41 @@ class ModelReviewWindow(QWidget):
         combo.blockSignals(False)
         self._page_start = 0
         self._rebuild()
-        n = len(suggestions)
-        accuracy = (f"held-out accuracy {report.accuracy:.0%}; "
-                    if report.held_out else "")
-        self._note = (f"Trained: {accuracy}{n} chip{'' if n == 1 else 's'} "
-                      "given a suggestion, the grid ordered by it.")
-        self._show_counts()
 
-    def _on_training_failed(self, text):
+    def _on_work_done(self, result):
+        kind = self._work_kind
+        text = None
+        if kind == "train":
+            report, suggestions = result
+            self._learn_report = report
+            self._take_suggestions(suggestions)
+            n = len(suggestions)
+            accuracy = (f"held-out accuracy {report.accuracy:.0%}; "
+                        if report.held_out else "")
+            self._note = (f"Trained: {accuracy}{n} chip"
+                          f"{'' if n == 1 else 's'} given a suggestion, "
+                          "the grid ordered by it.")
+        elif kind == "suggest":
+            self._take_suggestions(result)
+            n = len(result)
+            self._note = (f"{n} chip{'' if n == 1 else 's'} given a "
+                          "suggestion, the grid ordered by it.")
+        else:
+            text = f"{result} snippets read; " + self._store.describe()
+            self._note = text
+        self._show_counts()
+        self._results_window().finished(
+            self._learn_report if kind == "train" else None,
+            self._suggestions, self.accept_spin.value(), text)
+
+    def _on_work_failed(self, text):
         self._learn_progress = ""
         self._note = text
         self._show_counts()
+        self._results_window().failed(text)
 
-    def _on_training_finished(self):
-        thread, self._training = self._training, None
+    def _on_work_finished(self):
+        thread, self._working = self._working, None
         if thread is not None:
             thread.deleteLater()
         self._show_learning()
@@ -2052,6 +2214,10 @@ class ModelReviewWindow(QWidget):
         except (TypeError, ValueError):
             accept = DEFAULT_ACCEPT
         self.accept_spin.setValue(accept)
+        index = self.backbone_combo.findData(
+            str(settings.value(_BACKBONE_KEY, "")))
+        if index >= 0 and self.backbone_combo.model().item(index).isEnabled():
+            self.backbone_combo.setCurrentIndex(index)
         geometry = settings.value(_GEOMETRY_KEY)
         restored = False
         if geometry is not None:
@@ -2105,6 +2271,7 @@ class ModelReviewWindow(QWidget):
         settings.setValue(_CONTEXT_KEY, self.detail.context_spin.value())
         settings.setValue(_SPLITTER_KEY, self.splitter.saveState())
         settings.setValue(_ACCEPT_KEY, self.accept_spin.value())
+        settings.setValue(_BACKBONE_KEY, self.backbone_combo.currentData())
         settings.setValue(_GEOMETRY_KEY, self.saveGeometry())
 
     def discard_and_close(self):
@@ -2123,9 +2290,11 @@ class ModelReviewWindow(QWidget):
         self._hover_timer.stop()
         if self._image_window is not None:
             self._image_window.close()
-        if self._training is not None:
-            self._training.stop()
-            self._training.wait(5000)
+        if self._working is not None:
+            self._working.stop()
+            self._working.wait(5000)
+        if self._learn_window is not None:
+            self._learn_window.close()
         super().closeEvent(event)
 
     def _say(self, text: str):

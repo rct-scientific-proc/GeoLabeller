@@ -36,6 +36,13 @@ pip install -r requirements-ml.txt --index-url https://download.pytorch.org/whl/
 pip install -r requirements-ml.txt --index-url https://download.pytorch.org/whl/cu128
 ```
 
+Chips are read from the imagery once and saved small under the system's
+temporary folder (`GeoLabeller/snippets`); *Save snippets* in the window
+does that ahead for a whole file. The ResNet18 backbone fetches its weights
+(45 MB) from download.pytorch.org once, into the torch hub cache; offline,
+download `resnet18-f37072fd.pth` and put it in that cache's `checkpoints`
+folder (the window says where).
+
 The Learn row of the Model Review window says which it found. On Windows
 PyTorch needs the latest Microsoft Visual C++ Redistributable, and in a
 script of your own import `app` (or `torch`) before `PyQt5`: Qt otherwise

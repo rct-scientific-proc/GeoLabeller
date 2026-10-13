@@ -367,6 +367,43 @@ def read_label_snippet(image_path: str, pixel_x: float, pixel_y: float,
         return None
 
 
+def read_label_snippets(image_path: str, centres, size_px: int) -> list:
+    """read_label_snippet for many (x, y) centres of one image, the file
+    opened once and the windows read in row order: the same bytes, at
+    a fraction of the cost (one open per chip was most of the time of
+    suggesting for thousands, 2026-10-13). A list in the centres' order,
+    None where a chip cannot be read; an unreadable file gives all None."""
+    out: list = [None] * len(centres)
+    if not centres:
+        return out
+    try:
+        display = display_settings.for_image(image_path)
+        with gdal_config.opened(image_path) as src:
+            scaling = cached_band_scaling(src, display.stretch)
+            default = display.is_default()
+            order = sorted(range(len(centres)),
+                           key=lambda i: (centres[i][1], centres[i][0]))
+            for i in order:
+                x, y = centres[i]
+                x0, y0, w, h = snippet_frame(x, y, size_px, src.width,
+                                             src.height)
+                window = Window(x0, y0, w, h)
+                try:
+                    if default:
+                        out[i] = _window_pixels(src, window, 3, src.nodata,
+                                                scaling=scaling)
+                    else:
+                        out[i] = display_settings.display_rgb(
+                            src, window, src.nodata, scaling, display)
+                except Exception as exc:  # noqa: BLE001 - one chip
+                    debug(f"snippet read failed: {Path(image_path).name} "
+                          f"({x:.0f},{y:.0f}): {type(exc).__name__}: {exc}")
+    except Exception as exc:  # noqa: BLE001 - a bad file costs its chips
+        debug(f"snippet reads failed: {Path(image_path).name}: "
+              f"{type(exc).__name__}: {exc}")
+    return out
+
+
 def read_image_overview(image_path: str, max_side: int = 1600) -> tuple:
     """The whole image, decimated to at most ``max_side`` on a side, as
     (H, W, 3) uint8 drawn the group's way, with the factor one of its
