@@ -367,6 +367,33 @@ def read_label_snippet(image_path: str, pixel_x: float, pixel_y: float,
         return None
 
 
+def read_image_overview(image_path: str, max_side: int = 1600) -> tuple:
+    """The whole image, decimated to at most ``max_side`` on a side, as
+    (H, W, 3) uint8 drawn the group's way, with the factor one of its
+    pixels stands for - for a window that shows where a chip sits on its
+    image (Model Review's Show on image, 2026-10-13). Served from
+    overviews where the file has them. Nodata draws black."""
+    display = display_settings.for_image(image_path)
+    with gdal_config.opened(image_path) as src:
+        factor = max(1.0, max(src.width, src.height) / float(max_side))
+        out_w = max(1, int(round(src.width / factor)))
+        out_h = max(1, int(round(src.height / factor)))
+        chosen = display.source_bands(src.count)
+        unique = sorted(set(chosen))
+        data = src.read(indexes=unique, out_shape=(len(unique), out_h, out_w))
+        scaling = cached_band_scaling(src, display.stretch)
+        planes = {}
+        for position, band in enumerate(unique):
+            plane = apply_band_stretch(data[position], scaling, band - 1)
+            if np.issubdtype(plane.dtype, np.floating):
+                plane = np.nan_to_num(plane, nan=0.0, posinf=255.0,
+                                      neginf=0.0)
+            planes[band] = np.clip(plane, 0, 255).astype(np.uint8)
+        rgb = np.stack([planes[b] for b in chosen], axis=-1)
+        rgb = display_settings.apply_lut(rgb, display.lut())
+        return np.ascontiguousarray(rgb), factor
+
+
 # ---------------------------------------------------------------------------
 # Background loader with cache and stale-drop
 # ---------------------------------------------------------------------------

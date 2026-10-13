@@ -27,18 +27,21 @@ import json
 from pathlib import Path
 
 import numpy as np
-from PyQt5.QtCore import QPointF, QRect, Qt, pyqtSignal
+from PyQt5.QtCore import QPointF, QRect, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox,
                              QFileDialog, QGridLayout, QHBoxLayout,
                              QInputDialog, QLabel, QMessageBox,
                              QPushButton, QScrollArea, QSizePolicy,
-                             QSpinBox, QToolButton, QVBoxLayout, QWidget)
+                             QSpinBox, QSplitter, QToolButton,
+                             QVBoxLayout, QWidget)
 
 from .. import identity, recent
 from ..settings_scope import settings as app_settings
 from ..snippets import SnippetLoader, snippet_frame
 from .centering import find_centre
+from .detail import DEFAULT_CONTEXT, DetailPanel, standing_of
+from .image_window import ImageWindow
 from .ledger import DEFAULT_TOLERANCE_PX, IGNORE, LedgerIndex
 from .source import by_class, match_candidates, read_candidates
 
@@ -84,6 +87,13 @@ _SHOW_REVIEWED_KEY = "model_review/show_reviewed"
 _TOLERANCE_KEY = "model_review/tolerance"
 _MORE_KEY = "model_review/more"
 _GEOMETRY_KEY = "model_review/geometry"
+_DETAILS_KEY = "model_review/details"
+_CONTEXT_KEY = "model_review/context"
+_SPLITTER_KEY = "model_review/splitter"
+HOVER_MS = 250                  # the mouse rests on a chip this long
+                                # before the panel turns to it
+VERDICT_FILTERS = (("All", "all"), ("To look at", "todo"),
+                   ("Labelled", "labelled"), ("Ignored", "ignored"))
 
 
 class ChipCell(QWidget):
@@ -91,6 +101,8 @@ class ChipCell(QWidget):
 
     clicked = pyqtSignal(int, object)       # key, keyboard modifiers
     cleared = pyqtSignal(int)               # right-click: take it back
+    hovered = pyqtSignal(int)               # the mouse came onto it...
+    left = pyqtSignal(int)                  # ...and went again
     # Double-click: put the centre here - (key, column, row) in the
     # picture's own pixels.
     recentred = pyqtSignal(int, float, float)
@@ -248,11 +260,13 @@ class ChipCell(QWidget):
     def enterEvent(self, event):
         self._hover = True
         self.update()
+        self.hovered.emit(self.key)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
         self._hover = False
         self.update()
+        self.left.emit(self.key)
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
@@ -290,6 +304,19 @@ def _swatch(colour: QColor) -> QIcon:
     return QIcon(pixmap)
 
 
+def _passes(chip, standing: str) -> bool:
+    """Does the chip belong on the Show: list? A chip reviewed in an
+    earlier round counts by what it became."""
+    verdict = chip.earlier.became if chip.reviewed_before() else chip.verdict
+    if standing == "todo":
+        return verdict is None
+    if standing == "labelled":
+        return verdict is not None and verdict != IGNORE
+    if standing == "ignored":
+        return verdict == IGNORE
+    return True
+
+
 class ModelReviewWindow(QWidget):
     """The window. ``project_getter()`` returns the current project."""
 
@@ -309,8 +336,8 @@ class ModelReviewWindow(QWidget):
         self._by_key: dict = {}
         self._listed: list = []         # the chips the filters let through
         self._visible: list = []        # the page of them on the grid
-        self._page = 0
         self._page_start = 0            # the rank of the page's first chip
+        self._page = 0                  # its number, from that
         self._source = ""
         self._report = None
         self._classes: list = []
@@ -332,6 +359,13 @@ class ModelReviewWindow(QWidget):
         # entry): a double-click's first half, undone when the second
         # half arrives.
         self._last_click: tuple | None = None
+        self._detail_key: int | None = None     # the panel's chip
+        self._hover_key: int | None = None
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.setInterval(HOVER_MS)
+        self._hover_timer.timeout.connect(self._on_hover_rest)
+        self._image_window: ImageWindow | None = None
         self.loader = SnippetLoader(self)
         self.loader.ready.connect(self._on_pixels)
         self._setup_ui()
@@ -427,6 +461,18 @@ class ModelReviewWindow(QWidget):
         # go on working without a click on a chip first.
         self.class_filter.activated.connect(lambda _i: self.setFocus())
         third.addWidget(self.class_filter)
+        third.addWidget(QLabel("Show:"))
+        self.verdict_filter = QComboBox()
+        for text, data in VERDICT_FILTERS:
+            self.verdict_filter.addItem(text, data)
+        self.verdict_filter.setToolTip(
+            "Which chips the grid lists: all of them, the ones still to\n"
+            "look at, the labelled, or the ignored. The list settles at\n"
+            "the next page turn, so a chip just labelled stays put till\n"
+            "then.")
+        self.verdict_filter.currentIndexChanged.connect(self._on_filter)
+        self.verdict_filter.activated.connect(lambda _i: self.setFocus())
+        third.addWidget(self.verdict_filter)
         third.addSpacing(12)
         third.addWidget(QLabel("Chip size"))
         self.chip_spin = QSpinBox()
@@ -464,6 +510,14 @@ class ModelReviewWindow(QWidget):
             "or where you put it. Cyan once it has been moved.")
         self.mark_check.toggled.connect(self._on_mark)
         third.addWidget(self.mark_check)
+        self.details_check = QCheckBox("Details")
+        self.details_check.setToolTip(
+            "A panel beside the grid: the chip in hand - under the cursor,\n"
+            "last clicked, or under the mouse - read larger with its\n"
+            "surroundings, and everything known of it.")
+        self.details_check.setChecked(True)
+        self.details_check.toggled.connect(self._on_details)
+        third.addWidget(self.details_check)
         self.more_button = QToolButton()
         self.more_button.setText("More")
         self.more_button.setCheckable(True)
@@ -508,7 +562,8 @@ class ModelReviewWindow(QWidget):
             "Click a chip, or press its label's number with the cursor on "
             "it, to label it; the arrow keys move the cursor, Enter labels "
             "and moves on, I ignores the rest of the page. Double-click the "
-            "object to put the centre there. F1 lists every key.")
+            "object to put the centre there; M shows the chip in hand on "
+            "its whole image. F1 lists every key.")
         self.hint.setWordWrap(True)
         layout.addWidget(self.hint)
 
@@ -520,7 +575,19 @@ class ModelReviewWindow(QWidget):
         self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.scroll.setWidget(self._grid_host)
         self.scroll.viewport().installEventFilter(self)
-        layout.addWidget(self.scroll, 1)
+        self.detail = DetailPanel()
+        self.detail.show_on_image.connect(self.show_on_image)
+        self.detail.context_changed.connect(
+            lambda _v: self._request_detail())
+        self.detail.context_spin.editingFinished.connect(self.setFocus)
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.addWidget(self.scroll)
+        self.splitter.addWidget(self.detail)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 0)
+        self.splitter.setCollapsible(0, False)
+        self.splitter.setCollapsible(1, False)
+        layout.addWidget(self.splitter, 1)
 
         bottom = QHBoxLayout()
         self.status = QLabel("")
@@ -553,6 +620,11 @@ class ModelReviewWindow(QWidget):
     def _on_more(self, on: bool):
         self.more_row.setVisible(bool(on))
         self.more_button.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
+
+    def _on_details(self, on: bool):
+        self.detail.setVisible(bool(on))
+        if on:
+            self._request_detail()
 
     # -- data in --------------------------------------------------------------
 
@@ -642,7 +714,8 @@ class ModelReviewWindow(QWidget):
         self._last_click = None
         self._undo.clear()
         self._redo.clear()
-        self._page = 0
+        self._page_start = 0
+        self._set_detail(None)
         self.setWindowTitle(f"Model Review - {name}")
         self.file_label.setText(f"{name}: {report.summary()}")
         self.refresh_earlier()          # which also fills the grid
@@ -755,24 +828,54 @@ class ModelReviewWindow(QWidget):
     def _listed_chips(self) -> list:
         wanted = self.class_filter.currentData()
         show_reviewed = self.show_reviewed_check.isChecked()
+        standing = self.verdict_filter.currentData()
         chosen = [chip for chip in self._chips
                   if (wanted is ALL_CLASSES or chip.predicted == wanted)
-                  and (show_reviewed or not chip.reviewed_before())]
+                  and (show_reviewed or not chip.reviewed_before())
+                  and _passes(chip, standing)]
         return sorted(chosen, key=lambda c: (-c.score, c.key))
 
-    def _step_page(self, delta: int):
-        page = max(0, min(self.page_count() - 1, self._page + delta))
-        if page != self._page:
-            self._page = page
-            self._rebuild()
+    def _step_page(self, delta: int) -> bool:
+        """Turn ``delta`` pages on; True when the grid changed.
+
+        The Show: list settles here: chips given verdicts since the
+        page was built may have left it. The page turned to then
+        begins at the chip that would have begun it, wherever that
+        chip now stands in the list - so Next brings the chips after
+        the ones on screen, however many of those left, and no chip
+        is skipped or shown twice."""
+        per_page = max(1, self.page_spin.value())
+        old_keys = self.listed_keys()
+        fresh_keys = [chip.key for chip in self._listed_chips()]
+        has_next = self._page_start + per_page < len(old_keys)
+        has_prev = self._page_start > 0
+        if delta > 0 and has_next:
+            want = self._page_start + per_page
+        elif delta < 0 and has_prev:
+            want = max(0, self._page_start - per_page)
+        elif fresh_keys == old_keys:
+            return False            # no page there, nothing changed
+        else:
+            want = self._page_start  # no page there: this one settles
+        if fresh_keys != old_keys:
+            place = {key: i for i, key in enumerate(fresh_keys)}
+            landing = next((place[key] for key in old_keys[want:]
+                            if key in place), None)
+            want = (landing if landing is not None
+                    else max(0, len(fresh_keys) - per_page))
+        self._page_start = want
+        self._rebuild()
+        return True
 
     def _on_per_page(self, value):
-        # Keep the place: the chip at the top of the page stays on it.
-        self._page = self._page_start // max(1, int(value))
+        # Keep the place: the chip at the top of the page stays on it,
+        # the page beginning at a multiple of the new size.
+        per_page = max(1, int(value))
+        self._page_start = (self._page_start // per_page) * per_page
         self._rebuild()
 
     def _on_show_reviewed(self, _on):
-        self._page = 0
+        self._page_start = 0
         self._fill_filter()             # its counts change with it
         self._rebuild()
 
@@ -796,8 +899,13 @@ class ModelReviewWindow(QWidget):
         self._frames.clear()
         self._listed = self._listed_chips()
         per_page = max(1, self.page_spin.value())
-        self._page = max(0, min(self.page_count() - 1, self._page))
-        start = self._page_start = self._page * per_page
+        total = len(self._listed)
+        start = max(0, self._page_start)
+        if start >= total:
+            # The list shrank under the page: the last page of it.
+            start = max(0, (total - 1) // per_page * per_page)
+        self._page_start = start
+        self._page = start // per_page
         self._visible = self._listed[start:start + per_page]
         keys = {chip.key for chip in self._visible}
         self._selected &= keys          # a selection lives on its page
@@ -808,8 +916,8 @@ class ModelReviewWindow(QWidget):
         self.page_label.setText(
             f"{start + 1}-{start + len(self._visible)} of {len(self._listed)}"
             if self._listed else "none")
-        self.prev_button.setEnabled(self._page > 0)
-        self.next_button.setEnabled(self._page < self.page_count() - 1)
+        self.prev_button.setEnabled(start > 0)
+        self.next_button.setEnabled(start + len(self._visible) < total)
         columns = max(1, self.columns_spin.value())
         px = self._cell_px()
         for i, chip in enumerate(self._visible):
@@ -820,10 +928,17 @@ class ModelReviewWindow(QWidget):
             cell.clicked.connect(self._on_cell_clicked)
             cell.cleared.connect(self._on_cell_cleared)
             cell.recentred.connect(self._on_cell_recentred)
+            cell.hovered.connect(self._on_cell_hovered)
+            cell.left.connect(self._on_cell_left)
             self._grid.addWidget(cell, i // columns, i % columns)
             self._cells[chip.key] = cell
+        if self._detail_key is not None \
+                and self._detail_key not in self._by_key:
+            self._set_detail(None)      # imported, or its image gone
         self._refresh_cells()
         self._request_pixels()
+        # cancel_all above dropped a read in flight for the panel too.
+        self._request_detail()
         self._show_counts()
 
     @staticmethod
@@ -867,6 +982,10 @@ class ModelReviewWindow(QWidget):
                 int(round(chip.pixel_y)) - size // 2, size, size)
 
     def _on_pixels(self, key, arr):
+        if isinstance(key, tuple):
+            if key[0] == "detail":
+                self._on_detail_pixels(key[1], arr)
+            return
         cell = self._cells.get(key)
         chip = self._by_key.get(key)
         if cell is None or chip is None or arr is None:
@@ -901,9 +1020,14 @@ class ModelReviewWindow(QWidget):
             self._set_tooltip(cell, chip)
         self.loader.request(chip.key, chip.image_path, chip.pixel_x,
                             chip.pixel_y, self.chip_spin.value())
+        if chip.key == self._detail_key:
+            self._request_detail()
+        self._refresh_image_window()
 
     def _on_chip_size(self, _value):
         self._request_pixels()
+        self._request_detail()
+        self._refresh_image_window()
 
     # -- the centre: where the label will go -------------------------------
 
@@ -1015,6 +1139,8 @@ class ModelReviewWindow(QWidget):
                 chip.recenter(x, y)
                 if key in self._cells:
                     self._reload(chip)
+                elif key == self._detail_key:
+                    self._request_detail()
         self._refresh_cells()
         return {"what": entry["what"], "chips": replaced}
 
@@ -1080,6 +1206,8 @@ class ModelReviewWindow(QWidget):
                 score += f"  {chip.predicted}"
             cell.set_state(score, text, colour, chip.key in self._selected,
                            chip.reviewed_before(), chip.key == self._cursor)
+        self._refresh_detail_text()
+        self._refresh_image_window()
 
     def _show_counts(self):
         verdicts = self.with_verdicts()
@@ -1110,7 +1238,7 @@ class ModelReviewWindow(QWidget):
         self.status.setText(text)
 
     def _on_filter(self, _index):
-        self._page = 0
+        self._page_start = 0
         self._rebuild()
 
     # -- verdicts -------------------------------------------------------------
@@ -1227,6 +1355,7 @@ class ModelReviewWindow(QWidget):
         if key not in order:
             return
         self.set_cursor(None)
+        self._set_detail(key)
         if modifiers & Qt.ControlModifier:
             if key in self._selected:
                 self._selected.discard(key)
@@ -1253,6 +1382,7 @@ class ModelReviewWindow(QWidget):
 
     def _on_cell_cleared(self, key):
         self.setFocus()
+        self._set_detail(key)
         self.clear_verdicts([key])
 
     def select_all(self):
@@ -1271,6 +1401,8 @@ class ModelReviewWindow(QWidget):
         if key is not None and key not in self._cells:
             key = None
         self._cursor = key
+        if key is not None:
+            self._set_detail(key)
         self._refresh_cells()
         if key is not None:
             self.scroll.ensureWidgetVisible(self._cells[key], 16, 16)
@@ -1295,20 +1427,24 @@ class ModelReviewWindow(QWidget):
         else:
             index = order.index(self._cursor) + delta
         if index >= len(order):
-            if self._page < self.page_count() - 1:
-                self._step_page(1)
-                self.set_cursor(self.shown_keys()[0])
-            else:
-                self.set_cursor(order[-1])
+            turned = self._step_page(1)
+            keys = self.shown_keys()
+            if turned and keys:
+                self.set_cursor(keys[0])
+            elif keys:
+                self.set_cursor(keys[-1])
                 self._note = "The last chip of the last page."
+                self._show_counts()
+            else:
+                self.set_cursor(None)
+                self._note = "Nothing left on this list."
                 self._show_counts()
             return
         if index < 0:
-            if self._page > 0:
-                self._step_page(-1)
-                self.set_cursor(self.shown_keys()[-1])
-            else:
-                self.set_cursor(order[0])
+            turned = self._page_start > 0 and self._step_page(-1)
+            keys = self.shown_keys()
+            if keys:
+                self.set_cursor(keys[-1] if turned else keys[0])
             return
         self.set_cursor(order[index])
 
@@ -1330,14 +1466,103 @@ class ModelReviewWindow(QWidget):
         n = len(rest)
         if rest:
             self._give(rest, IGNORE, f"the rest of the page ignored ({n})")
-        if self._page < self.page_count() - 1:
-            self._step_page(1)
-            self.set_cursor(self.shown_keys()[0])
-        else:
-            self.set_cursor(None)
+        turned = self._step_page(1)
+        keys = self.shown_keys()
+        self.set_cursor(keys[0] if turned and keys else None)
         self._note = (f"{n} chip{'' if n == 1 else 's'} ignored"
-                      + (", next page" if self._page_start else "") + ".")
+                      + (", next page" if turned and keys else "") + ".")
         self._show_counts()
+
+    # -- the detail panel: the chip in hand -----------------------------------
+
+    def _on_cell_hovered(self, key):
+        self._hover_key = key
+        self._hover_timer.start()
+
+    def _on_cell_left(self, key):
+        if self._hover_key == key:
+            self._hover_timer.stop()
+            self._hover_key = None
+
+    def _on_hover_rest(self):
+        """The mouse has rested on a chip: the panel turns to it."""
+        if self._hover_key in self._cells:
+            self._set_detail(self._hover_key)
+
+    def detail_key(self) -> "int | None":
+        """The key of the chip in hand - the panel's - or None."""
+        return self._detail_key
+
+    def _set_detail(self, key):
+        """This chip is in hand: the panel shows it, and reads its
+        surroundings if it is new to it."""
+        chip = self._by_key.get(key) if key is not None else None
+        if chip is None:
+            self._detail_key = None
+            self.detail.clear()
+            return
+        changed = key != self._detail_key
+        self._detail_key = key
+        self.detail.show_chip(chip, self._latlon_of(chip))
+        if changed:
+            self._request_detail()
+
+    def _latlon_of(self, chip) -> "tuple | None":
+        images = getattr(self._project(), "images", {}) or {}
+        image = images.get(chip.image_path)
+        if image is None:
+            return None
+        return image.pixel_to_latlon(chip.pixel_x, chip.pixel_y)
+
+    def _refresh_detail_text(self):
+        chip = self._by_key.get(self._detail_key)
+        if chip is not None:
+            self.detail.show_chip(chip, self._latlon_of(chip))
+
+    def _request_detail(self):
+        """The surroundings of the chip in hand, read at the context
+        factor times the chip size - unless the panel is hidden, when
+        nothing is read for it."""
+        chip = self._by_key.get(self._detail_key)
+        if chip is None or not self.details_check.isChecked():
+            return
+        self.loader.request(("detail", chip.key), chip.image_path,
+                            chip.pixel_x, chip.pixel_y,
+                            self.chip_spin.value() * self.detail.factor())
+
+    def _on_detail_pixels(self, key, arr):
+        chip = self._by_key.get(key)
+        if chip is None or key != self._detail_key or arr is None:
+            return
+        # The picture's own frame, from its size (see _on_pixels).
+        px0, py0, _w, _h = self._frame_of(chip, max(arr.shape[0],
+                                                    arr.shape[1]))
+        self.detail.set_picture(chip, arr, (px0, py0), self._frame_of(chip))
+
+    def _refresh_image_window(self):
+        """The image window, if up, follows its chip's verdict, centre
+        and the chip size - without coming forward."""
+        shown = self._image_window
+        if shown is None or not shown.isVisible():
+            return
+        chip = shown.chip()
+        if chip is not None and chip.key in self._by_key:
+            shown.refresh(self.chip_spin.value(), standing_of(chip))
+
+    def show_on_image(self):
+        """The chip in hand on the whole of its image, in a window of
+        its own (image_window.py). M."""
+        self.setFocus()
+        chip = self._by_key.get(self._detail_key)
+        if chip is None:
+            self._note = ("No chip in hand to show: move the cursor onto "
+                          "one, or click one.")
+            self._show_counts()
+            return
+        if self._image_window is None:
+            self._image_window = ImageWindow(self)
+        self._image_window.show_chip(chip, self.chip_spin.value(),
+                                     standing_of(chip))
 
     # -- import ---------------------------------------------------------------
 
@@ -1475,6 +1700,9 @@ class ModelReviewWindow(QWidget):
             if key == Qt.Key_I:
                 self.ignore_rest_of_page()
                 return
+            if key == Qt.Key_M:
+                self.show_on_image()
+                return
         super().keyPressEvent(event)
 
     # -- settings, closing ----------------------------------------------------
@@ -1503,6 +1731,16 @@ class ModelReviewWindow(QWidget):
             str(settings.value(_MARK_KEY, "true")).lower() != "false")
         self.more_button.setChecked(
             str(settings.value(_MORE_KEY, "false")).lower() == "true")
+        self.details_check.setChecked(
+            str(settings.value(_DETAILS_KEY, "true")).lower() != "false")
+        self.detail.setVisible(self.details_check.isChecked())
+        try:
+            context = int(settings.value(_CONTEXT_KEY, DEFAULT_CONTEXT))
+        except (TypeError, ValueError):
+            context = DEFAULT_CONTEXT
+        self.detail.context_spin.blockSignals(True)
+        self.detail.context_spin.setValue(context)
+        self.detail.context_spin.blockSignals(False)
         geometry = settings.value(_GEOMETRY_KEY)
         restored = False
         if geometry is not None:
@@ -1513,6 +1751,12 @@ class ModelReviewWindow(QWidget):
         if not restored:
             self.resize(1100, 760)
         self._fit_to_screen()
+        state = settings.value(_SPLITTER_KEY)
+        if state is not None:
+            try:
+                self.splitter.restoreState(state)
+            except TypeError:
+                pass
 
     def _fit_to_screen(self, available=None):
         """No larger than most of the screen, and on it: a window that
@@ -1546,6 +1790,9 @@ class ModelReviewWindow(QWidget):
                           self.show_reviewed_check.isChecked())
         settings.setValue(_MARK_KEY, self.mark_check.isChecked())
         settings.setValue(_MORE_KEY, self.more_button.isChecked())
+        settings.setValue(_DETAILS_KEY, self.details_check.isChecked())
+        settings.setValue(_CONTEXT_KEY, self.detail.context_spin.value())
+        settings.setValue(_SPLITTER_KEY, self.splitter.saveState())
         settings.setValue(_GEOMETRY_KEY, self.saveGeometry())
 
     def discard_and_close(self):
@@ -1561,6 +1808,9 @@ class ModelReviewWindow(QWidget):
             return
         self.save_settings()
         self.loader.cancel_all()
+        self._hover_timer.stop()
+        if self._image_window is not None:
+            self._image_window.close()
         super().closeEvent(event)
 
     def _say(self, text: str):
