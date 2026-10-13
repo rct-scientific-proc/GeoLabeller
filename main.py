@@ -106,6 +106,13 @@ def main():
         window = MainWindow()
         window.show()
 
+        # PyTorch, when installed for Model Review's training, is
+        # imported on a thread of its own from here, so the first
+        # Model Review window opens at once (nothing in the installed
+        # build, or without PyTorch).
+        from app.model_review import learner
+        learner.probe_in_background()
+
         return app.exec_()
     except Exception:
         _handle_unhandled_exception(*sys.exc_info())

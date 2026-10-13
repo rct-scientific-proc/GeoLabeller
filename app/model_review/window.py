@@ -24,6 +24,7 @@ the user decided through signals.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -45,7 +46,9 @@ from .image_window import ImageWindow
 from .learn_window import LearnWindow
 from .learner import (BACKBONES, RESNET18, Learner,
                       available as learning_available, backbone_reason,
-                      gather_examples, name_of, readiness)
+                      checked as learning_checked, gather_examples,
+                      name_of, readiness)
+from .reference import MAX_SHOWN, ReferencePanel
 from .snippet_store import SnippetStore
 from .training import LearnThread, save_job, suggest_job, train_job
 from .ledger import DEFAULT_TOLERANCE_PX, IGNORE, LedgerIndex
@@ -105,6 +108,8 @@ ANY_SUGGESTION = None           # the Suggested box's first entry
 DEFAULT_ACCEPT = 0.90           # a suggestion at least this sure is taken
 _ACCEPT_KEY = "model_review/accept"
 _BACKBONE_KEY = "model_review/backbone"
+_RIGHT_KEY = "model_review/right_splitter"
+LOOKING = "Looking for PyTorch..."
 
 
 class ChipCell(QWidget):
@@ -386,13 +391,20 @@ class ModelReviewWindow(QWidget):
         self._suggestions: dict = {}        # key -> Suggestion
         self._learn_report = None
         self._learn_progress = ""
-        self._learning = learning_available()   # (device, why not)
+        # (device, why not) - or LOOKING until the probe begun at
+        # startup (main.py), or here, reports back.
+        self._learning = learning_checked() or (None, LOOKING)
+        self._probe: LearnThread | None = None
+        self._verdict_seq: dict = {}        # key -> when its verdict came
+        self._tick = 0
+        self._ref_gen = 0                   # the reference strip's reads
         self._store = SnippetStore()
         self._learn_window: LearnWindow | None = None
         self.loader = SnippetLoader(self)
         self.loader.ready.connect(self._on_pixels)
         self._setup_ui()
         self._restore_settings()
+        self._start_probe()
 
     # -- layout ---------------------------------------------------------------
 
@@ -715,9 +727,17 @@ class ModelReviewWindow(QWidget):
         self.detail.context_changed.connect(
             lambda _v: self._request_detail())
         self.detail.context_spin.editingFinished.connect(self.setFocus)
+        self.reference = ReferencePanel()
+        self.reference.class_changed.connect(
+            lambda: self._refresh_reference(force=True))
+        self.right = QSplitter(Qt.Vertical)
+        self.right.addWidget(self.detail)
+        self.right.addWidget(self.reference)
+        self.right.setStretchFactor(0, 3)
+        self.right.setStretchFactor(1, 2)
         self.splitter = QSplitter(Qt.Horizontal)
         self.splitter.addWidget(self.scroll)
-        self.splitter.addWidget(self.detail)
+        self.splitter.addWidget(self.right)
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 0)
         self.splitter.setCollapsible(0, False)
@@ -757,9 +777,12 @@ class ModelReviewWindow(QWidget):
         self.more_button.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
 
     def _on_details(self, on: bool):
+        self.right.setVisible(bool(on))
         self.detail.setVisible(bool(on))
+        self.reference.setVisible(bool(on))
         if on:
             self._request_detail()
+            self._refresh_reference(force=True)
 
     # -- data in --------------------------------------------------------------
 
@@ -1087,8 +1110,10 @@ class ModelReviewWindow(QWidget):
             self._set_detail(None)      # imported, or its image gone
         self._refresh_cells()
         self._request_pixels()
-        # cancel_all above dropped a read in flight for the panel too.
+        # cancel_all above dropped reads in flight for the panel and the
+        # reference strip too.
         self._request_detail()
+        self._refresh_reference(force=True)
         self._show_counts()
 
     def _set_tooltip(self, cell, chip):
@@ -1137,6 +1162,8 @@ class ModelReviewWindow(QWidget):
         if isinstance(key, tuple):
             if key[0] == "detail":
                 self._on_detail_pixels(key[1], arr)
+            elif key[0] == "ref" and key[1] == self._ref_gen:
+                self.reference.set_pixels(key[2], arr)
             return
         cell = self._cells.get(key)
         chip = self._by_key.get(key)
@@ -1180,6 +1207,7 @@ class ModelReviewWindow(QWidget):
         self._request_pixels()
         self._request_detail()
         self._refresh_image_window()
+        self._refresh_reference(force=True)
 
     # -- the centre: where the label will go -------------------------------
 
@@ -1367,6 +1395,7 @@ class ModelReviewWindow(QWidget):
                            chip.reviewed_before(), chip.key == self._cursor)
         self._refresh_detail_text()
         self._refresh_image_window()
+        self._refresh_reference()
 
     def _show_counts(self):
         verdicts = self.with_verdicts()
@@ -1439,6 +1468,7 @@ class ModelReviewWindow(QWidget):
         entry = self._remember(chips, what)
         for chip in chips:
             chip.verdict = verdict
+            self._verdict_seq[chip.key] = self._next_tick()
         self._refresh_cells()
         self._show_counts()
         return entry
@@ -1725,6 +1755,82 @@ class ModelReviewWindow(QWidget):
         self._image_window.show_chip(chip, self.chip_spin.value(),
                                      standing_of(chip))
 
+    # -- the reference strip: chips already given a class ------------------
+
+    def _next_tick(self) -> int:
+        self._tick += 1
+        return self._tick
+
+    def _refresh_reference(self, force: bool = False):
+        """The strip follows the verdicts: the classes with examples,
+        and the chosen class's chips, the newest verdict first, then
+        earlier rounds, then the project's labels. ``force`` reads
+        the pictures again (the chip size changed)."""
+        if not self.details_check.isChecked():
+            return
+        examples = gather_examples(self._project(), self._chips)
+        self.reference.set_classes(
+            Counter(e.class_name for e in examples))
+        chosen = self.reference.chosen()
+        when = {(chip.image_path, int(round(chip.pixel_x)),
+                 int(round(chip.pixel_y))): self._verdict_seq.get(chip.key, 0)
+                for chip in self._chips if chip.verdict is not None}
+        rank = {"verdict": 0, "memory": 1, "label": 2}
+        wanted = sorted(
+            (e for e in examples if e.class_name == chosen),
+            key=lambda e: (rank.get(e.origin, 3), -when.get(
+                (e.image_path, int(round(e.pixel_x)),
+                 int(round(e.pixel_y))), 0)))
+        shown = wanted[:MAX_SHOWN]
+        text = ""
+        if chosen is not None and wanted:
+            n = len(wanted)
+            parts = []
+            here = sum(1 for e in wanted if e.origin == "verdict")
+            earlier = sum(1 for e in wanted if e.origin == "memory")
+            labels = sum(1 for e in wanted if e.origin == "label")
+            if here:
+                parts.append(f"{here} verdict{'' if here == 1 else 's'} here")
+            if earlier:
+                parts.append(f"{earlier} from earlier rounds")
+            if labels:
+                parts.append(f"{labels} label{'' if labels == 1 else 's'}")
+            text = (f"{n} {name_of(chosen)}"
+                    + (f", the first {len(shown)} shown" if n > len(shown)
+                       else "")
+                    + " - " + ", ".join(parts) + ".")
+        if self.reference.set_examples(shown, text) or force:
+            self._ref_gen += 1
+            for i, e in enumerate(shown):
+                self.loader.request(("ref", self._ref_gen, i),
+                                    e.image_path, e.pixel_x, e.pixel_y,
+                                    self.chip_spin.value())
+
+    # -- PyTorch, looked for without waiting ---------------------------------
+
+    def _start_probe(self):
+        """What PyTorch there is, found on a thread unless known
+        already: the import takes seconds, and the window need not."""
+        known = learning_checked()
+        if known is not None:
+            self._learning = known
+            self._show_learning()
+            return
+        probe = LearnThread(lambda _progress, _stop: learning_available(),
+                            self)
+        probe.done.connect(self._on_probed)
+        probe.finished.connect(self._on_probe_finished)
+        probe.finished.connect(probe.deleteLater)
+        self._probe = probe
+        probe.start()
+
+    def _on_probed(self, result):
+        self._learning = tuple(result)
+        self._show_learning()
+
+    def _on_probe_finished(self):
+        self._probe = None
+
     # -- learning: the verdicts taught to a model, to sort what is left --
 
     def _suggestion(self, key):
@@ -1986,6 +2092,7 @@ class ModelReviewWindow(QWidget):
         wanted = {chip.key: verdict for chip, verdict in pairs}
         for chip in chips:
             chip.verdict = wanted[chip.key]
+            self._verdict_seq[chip.key] = self._next_tick()
         self._refresh_cells()
         self._show_counts()
         return entry
@@ -2228,12 +2335,14 @@ class ModelReviewWindow(QWidget):
         if not restored:
             self.resize(1100, 760)
         self._fit_to_screen()
-        state = settings.value(_SPLITTER_KEY)
-        if state is not None:
-            try:
-                self.splitter.restoreState(state)
-            except TypeError:
-                pass
+        for widget, key in ((self.splitter, _SPLITTER_KEY),
+                            (self.right, _RIGHT_KEY)):
+            state = settings.value(key)
+            if state is not None:
+                try:
+                    widget.restoreState(state)
+                except TypeError:
+                    pass
 
     def _fit_to_screen(self, available=None):
         """No larger than most of the screen, and on it: a window that
@@ -2270,6 +2379,7 @@ class ModelReviewWindow(QWidget):
         settings.setValue(_DETAILS_KEY, self.details_check.isChecked())
         settings.setValue(_CONTEXT_KEY, self.detail.context_spin.value())
         settings.setValue(_SPLITTER_KEY, self.splitter.saveState())
+        settings.setValue(_RIGHT_KEY, self.right.saveState())
         settings.setValue(_ACCEPT_KEY, self.accept_spin.value())
         settings.setValue(_BACKBONE_KEY, self.backbone_combo.currentData())
         settings.setValue(_GEOMETRY_KEY, self.saveGeometry())
@@ -2295,6 +2405,11 @@ class ModelReviewWindow(QWidget):
             self._working.wait(5000)
         if self._learn_window is not None:
             self._learn_window.close()
+        if self._probe is not None and self._probe.isRunning():
+            # An import cannot be stopped: the thread goes on alone and
+            # deletes itself when done.
+            self._probe.setParent(None)
+            self._probe = None
         super().closeEvent(event)
 
     def _say(self, text: str):

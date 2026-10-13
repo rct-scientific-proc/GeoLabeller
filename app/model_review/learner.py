@@ -34,6 +34,7 @@ import importlib
 import math
 import random
 import sys
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -75,6 +76,12 @@ def name_of(class_name: str) -> str:
 
 
 _checked: "tuple | None" = None
+_check_lock = threading.Lock()
+
+
+def checked() -> "tuple | None":
+    """What available() found, if it has run; None before."""
+    return _checked
 
 
 def available() -> tuple:
@@ -83,8 +90,25 @@ def available() -> tuple:
     import is seconds, and a failed one fails again."""
     global _checked
     if _checked is None:
-        _checked = _availability()
+        with _check_lock:               # one import, whoever asks first
+            if _checked is None:
+                _checked = _availability()
     return _checked
+
+
+def probe_in_background() -> "threading.Thread | None":
+    """Begin importing PyTorch on a thread of its own, so the first
+    Model Review window opens at once instead of waiting on the import
+    - a second here, several with CUDA, more on a cold disk (asked for
+    2026-10-13). None when there is nothing to import: the installed
+    build, or no PyTorch."""
+    if getattr(sys, "frozen", False) \
+            or importlib.util.find_spec("torch") is None:
+        return None
+    thread = threading.Thread(target=available, name="pytorch-probe",
+                              daemon=True)
+    thread.start()
+    return thread
 
 
 def _availability() -> tuple:

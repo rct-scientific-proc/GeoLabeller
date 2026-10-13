@@ -55,7 +55,7 @@ class ContextView(QWidget):
         self._centre: tuple | None = None   # (column, row) in picture pixels
         self._moved = False
         self._reading = False
-        self.setMinimumSize(160, 160)
+        self.setMinimumSize(120, 100)
 
     def clear(self):
         self._pixmap = None
