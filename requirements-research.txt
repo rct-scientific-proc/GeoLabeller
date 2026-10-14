@@ -2,3 +2,4 @@
 # On top of requirements.txt and requirements-ml.txt:
 #   pip install -r requirements-research.txt
 scikit-learn>=1.5
+fpdf2>=2.7

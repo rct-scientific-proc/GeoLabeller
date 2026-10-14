@@ -20,7 +20,7 @@ import numpy as np
 # The first app import runs app/__init__ (the C++ runtime preload),
 # before anything imports torch or Qt.
 from app.model_review.ledger import IGNORE
-from research.partition import benchmark, embed, methods
+from research.partition import benchmark, embed, methods, report_pdf
 from research.partition.data import ReviewSet, load_review
 
 HERE = Path(__file__).resolve().parent
@@ -55,7 +55,7 @@ def evaluate(review: ReviewSet, X_all: np.ndarray, ok: np.ndarray,
     y, names = encode(r.truth for r in records)
     predicted = np.array([r.predicted for r in records])
     out: dict = {"chips": int(len(records)), "classes": names,
-                 "groups": {}}
+                 "index": idx.tolist(), "y": y.tolist(), "groups": {}}
     for group in sorted(set(predicted)) + ["all"]:
         mask = np.ones(len(y), dtype=bool) if group == "all" \
             else predicted == group
@@ -216,6 +216,11 @@ def main(argv=None) -> int:
     parser.add_argument("--repeats", type=int, default=10,
                         help="random draws per seeded score")
     parser.add_argument("--name", help="the report's name")
+    parser.add_argument("--no-pdf", action="store_true",
+                        help="skip the PDF with the chips")
+    parser.add_argument("--pdf-embedding",
+                        help="whose pictures the PDF shows (default: "
+                             "dinov2, else resnet18, else pixels)")
     parser.add_argument("--out", help="where the benchmark is built "
                                       "(synthetic only)")
     parser.add_argument("--results", default=str(RESULTS),
@@ -246,6 +251,7 @@ def main(argv=None) -> int:
     chips, ok = embed.read_chips(places, args.chip_size, 128, cache_dir, log)
     log(f"{int(ok.sum())} of {len(ok)} chips read")
     results: dict = {}
+    vectors: dict = {}
     key = embed.cache_key(places, args.chip_size, 128)
     for embedding in [e.strip() for e in args.embedding.split(",") if e]:
         log(f"embedding: {embedding}")
@@ -259,6 +265,7 @@ def main(argv=None) -> int:
             log(f"  {embedding} failed: {type(exc).__name__}: {exc}")
             results[embedding] = {"error": f"{type(exc).__name__}: {exc}"}
             continue
+        vectors[embedding] = X
         results[embedding] = evaluate(review, X, ok, args.repeats)
     text = render(name, review.summary(), results, time.time() - started)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -269,6 +276,17 @@ def main(argv=None) -> int:
     log("")
     log(text)
     log(f"written: {results_dir / f'{stamp}-{name}.md'}")
+    if not args.no_pdf:
+        shown = args.pdf_embedding or next(
+            (e for e in ("dinov2", "resnet18", "pixels")
+             if "error" not in results.get(e, {"error": 1})), None)
+        if shown in vectors and "error" not in results[shown]:
+            pdf_path = results_dir / f"{stamp}-{name}.pdf"
+            report_pdf.write_pdf(pdf_path, name, review, chips,
+                                 vectors[shown], results, shown)
+            log(f"written: {pdf_path}")
+        else:
+            log("no PDF: no embedding to show")
     return 0
 
 

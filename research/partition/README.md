@@ -27,8 +27,12 @@ review with known truth:
 Options: `--chip-size` (source pixels read around a chip; 224 is the
 review window's default), `--embedding pixels,resnet18,dinov2`,
 `--no-tta` (one view per chip instead of eight), `--repeats` (random
-draws per seeded score). Reports land in `results/` as Markdown and
-JSON; chips are cached in `cache/`.
+draws per seeded score), `--results` and `--cache` (where the report
+and the cached chips go; the defaults are `results/` and `cache/`
+here). A run writes three files: the report as Markdown and as JSON
+(every number, plus the cluster each chip landed in), and a PDF with
+the chips themselves - `--pdf-embedding` picks whose pictures it
+shows, `--no-pdf` skips it.
 
 Only chips with a verdict are scored. A chip the ledger does not know is
 carried but not counted, so the first run on a real review should be on
@@ -73,6 +77,21 @@ scored by AUROC. Generalized Category Discovery (Vaze et al. 2022) rests
 on the same distances; the confident-learning line (Northcutt et al.
 2021) is what produced the review file in the first place and has
 nothing further to say about which chips are new.
+
+## The PDF
+
+The PDF is the report to read with a reviewer. A cover compares the
+embeddings and gives the tables for the one shown. Then, for each
+predicted class and for all chips together, the ten k-means clusters
+as contact sheets: every chip captioned with its verdict and
+underlined in the verdict's colour, ordered from the cluster's centre
+outward, a red frame on a chip whose verdict is not the cluster's
+majority. A page shows one seeded fill-in: the three seeds per class
+and the chips label spreading got wrong, captioned with what it
+called them. The last page shows the chips farthest from every known
+class - what a reviewer should look at first when a new class may be
+hiding - with an orange frame on those whose verdict is a class the
+model never predicts.
 
 ## Reading a report
 

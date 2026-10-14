@@ -111,11 +111,13 @@ def cluster_scores(X: np.ndarray, y: np.ndarray) -> dict:
     k_est = choose_k(X)
     k_over = over_k(len(y))
     out = {"n": int(len(y)), "k_true": int(k_true), "k_estimated": int(k_est),
-           "k_over": int(k_over), "methods": {}}
+           "k_over": int(k_over), "methods": {}, "assignments": {}}
     for method in ("kmeans", "spectral", "agglomerative"):
         for k, tag in ((k_true, "true_k"), (k_est, "est_k"),
                        (k_over, "over_k")):
             labels = _cluster(method, X, k)
+            if tag == "over_k":
+                out["assignments"][method] = labels.tolist()
             acc, clicks = purity(labels, y)
             out["methods"][f"{method}@{tag}"] = {
                 "ari": float(adjusted_rand_score(y, labels)),
@@ -123,6 +125,7 @@ def cluster_scores(X: np.ndarray, y: np.ndarray) -> dict:
                 "purity": float(acc), "clicks": int(clicks),
                 "clusters": int(len(np.unique(labels)))}
     labels = _cluster("hdbscan", X, 0)
+    out["assignments"]["hdbscan"] = labels.tolist()
     acc, clicks = purity(labels, y)
     out["methods"]["hdbscan"] = {
         "ari": float(adjusted_rand_score(y, labels)),
@@ -210,6 +213,11 @@ def seeded_scores(X: np.ndarray, y: np.ndarray, seeds=SEEDS,
             out[per_class] = {key: (float(np.mean(v)), float(np.std(v)))
                               for key, v in rows.items()}
     return out
+
+
+# The report draws one seeded fill-in with the same pieces.
+seed_split = _seed_split
+spread = _spread
 
 
 # -- cluster, then label ----------------------------------------------------
