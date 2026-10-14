@@ -2875,10 +2875,14 @@ class MainWindow(QMainWindow):
         reference = self._group_reference(group_path)
         band_count = 3
         values = None
+        palette_bands = []
         if reference is not None:
             try:
                 with gdal_config.opened(reference) as src:
                     band_count = src.count
+                    palette_bands = [
+                        b for b in range(1, src.count + 1)
+                        if display_settings.colour_table(src, b) is not None]
                     # What its values look like, for the stretch controls
                     # to say - from the sample the stretch is read off.
                     values = display_settings.sampled_values(src)
@@ -2897,7 +2901,8 @@ class MainWindow(QMainWindow):
         dialog = DisplaySettingsDialog(
             group_path, display_settings.resolve(
                 self.project.display_settings, group_path),
-            band_count, histogram_for, self, values=values)
+            band_count, histogram_for, self, values=values,
+            palette_bands=palette_bands)
         dialog.setAttribute(Qt.WA_DeleteOnClose)
         dialog.changed.connect(
             lambda s, g=group_path: self._set_group_display(g, s))

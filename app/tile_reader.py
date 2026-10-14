@@ -32,7 +32,8 @@ from rasterio.warp import (Resampling, calculate_default_transform, reproject,
 from rasterio.windows import Window
 
 from . import gdal_config
-from .display_settings import DEFAULT as DEFAULT_DISPLAY
+from .display_settings import (DEFAULT as DEFAULT_DISPLAY, colour_table,
+                               palette_rgb, paletted_band)
 from .snippets import apply_band_stretch, cached_band_scaling
 
 # Tile edge in destination pixels. Matches the canvas's own TILE_SIZE.
@@ -259,6 +260,27 @@ def read_tile(src, dst_crs, level: int, tx: int, ty: int,
     display = display or DEFAULT_DISPLAY
     scaling = cached_band_scaling(src, display.stretch)
     chosen = display.source_bands(src.count)
+
+    band = paletted_band(display, src)
+    if band is not None:
+        # The file's own colour table: the index band reprojected
+        # nearest - an index is a category, not a quantity - then each
+        # value's colour.
+        values = src.read(band, window=window,
+                          out_shape=(read_h, read_w)).astype(np.float32)
+        if src.nodata is not None:
+            values[values == src.nodata] = np.nan
+        dst_values = np.full((out_h, out_w), np.nan, dtype=np.float32)
+        reproject(source=values, destination=dst_values,
+                  src_nodata=np.nan, dst_nodata=np.nan,
+                  **{**common, "resampling": Resampling.nearest})
+        nodata_mask = np.isnan(dst_values)
+        if bool(nodata_mask.all()):
+            return None
+        rgba = np.zeros((out_h, out_w, 4), dtype=np.uint8)
+        rgba[:, :, :3] = palette_rgb(dst_values, colour_table(src, band))
+        rgba[:, :, 3] = np.where(nodata_mask, 0, 255).astype(np.uint8)
+        return rgba
 
     # The first band in float32: NaN marks both source nodata and the areas
     # the reprojection never writes, which become the alpha channel.

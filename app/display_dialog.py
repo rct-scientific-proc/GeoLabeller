@@ -276,7 +276,9 @@ class DisplaySettingsDialog(QDialog):
 
     def __init__(self, group_path: str, settings: DisplaySettings,
                  band_count: int, histogram_for=None, parent=None,
-                 values=None):
+                 values=None, palette_bands=()):
+        """``palette_bands`` are the bands of the group's imagery that
+        carry an embedded colour table; the tick is offered for them."""
         super().__init__(parent)
         self.setWindowTitle(f"Display Settings - {group_path}")
         self.group_path = group_path
@@ -319,9 +321,21 @@ class DisplaySettingsDialog(QDialog):
         bands.addStretch(1)
         bands.addWidget(QLabel(f"of {self.band_count}"))
 
+        self.palette_bands = tuple(int(b) for b in (palette_bands or ()))
+        self.palette_check = QCheckBox(
+            "Draw through the file's own colour table")
+        self.palette_check.setToolTip(
+            "The file names a colour for each pixel value - a palette, as\n"
+            "a classified raster or an indexed-colour image carries, and\n"
+            "as QGIS draws it. Ticked, the band is drawn in those colours\n"
+            "and the stretch does not apply; unticked, as grey values.")
+        self.palette_check.toggled.connect(self._on_palette_changed)
+
         top = QFormLayout()
         top.addRow("Show", self.mode_combo)
         top.addRow("Bands", bands)
+        if self.palette_bands:
+            top.addRow("Colour table", self.palette_check)
 
         # The stretch: which values are drawn black and white, for
         # imagery that is not 8-bit already (that is drawn as stored).
@@ -433,19 +447,36 @@ class DisplaySettingsDialog(QDialog):
     def mode(self) -> str:
         return self.mode_combo.currentData()
 
+    def palette(self) -> "bool | None":
+        """What the tick says: None (draw through the table, as by
+        default) or False; what the settings had when the imagery
+        offers no table to tick."""
+        if not self.palette_bands:
+            return self.original.palette
+        return None if self.palette_check.isChecked() else False
+
+    def palette_in_use(self) -> bool:
+        """Is the band drawn through its colour table as set?"""
+        if not self.palette_bands or not self.palette_check.isChecked():
+            return False
+        if self.mode() == MODE_SINGLE:
+            return self.band_spin.value() in self.palette_bands
+        return self.band_count == 1 and 1 in self.palette_bands
+
     def settings(self) -> DisplaySettings:
         if self.mode() == MODE_SINGLE:
             return DisplaySettings(
                 mode=MODE_SINGLE, band=self.band_spin.value(),
                 channels=(self.panels[0].adjust(), ChannelAdjust(),
-                          ChannelAdjust()), stretch=self.stretch())
+                          ChannelAdjust()), stretch=self.stretch(),
+                palette=self.palette())
         bands = tuple(spin.value() for spin in self.rgb_spins)
         default_bands = DEFAULT.source_bands(self.band_count)
         return DisplaySettings(
             mode=MODE_RGB,
             bands=None if bands == default_bands else bands,
             channels=tuple(panel.adjust() for panel in self.panels),
-            stretch=self.stretch())
+            stretch=self.stretch(), palette=self.palette())
 
     def stretch(self) -> Stretch:
         """The stretch the controls say. A window that is no window yet -
@@ -474,6 +505,7 @@ class DisplaySettingsDialog(QDialog):
             for panel, adjust in zip(self.panels, settings.channels):
                 panel.set_adjust(adjust)
             self._set_stretch(settings.stretch)
+            self.palette_check.setChecked(settings.palette is not False)
         finally:
             self._loading = False
         self._show_mode()
@@ -555,7 +587,14 @@ class DisplaySettingsDialog(QDialog):
     def _on_bands_changed(self, *_args):
         if self._loading:
             return
+        self.stretch_box.setEnabled(not self.palette_in_use())
         self._refresh_histograms()
+        self._schedule_emit()
+
+    def _on_palette_changed(self, *_args):
+        if self._loading:
+            return
+        self.stretch_box.setEnabled(not self.palette_in_use())
         self._schedule_emit()
 
     def _on_stretch_changed(self, *_args):
@@ -579,6 +618,8 @@ class DisplaySettingsDialog(QDialog):
         for panel in self.panels[1:]:
             panel.setVisible(not single)
         self.panels[0].set_hideable(not single)
+        # Through a colour table the stretch has nothing to do.
+        self.stretch_box.setEnabled(not self.palette_in_use())
 
     def _channel_bands(self) -> list:
         if self.mode() == MODE_SINGLE:

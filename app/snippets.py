@@ -354,9 +354,11 @@ def read_label_snippet(image_path: str, pixel_x: float, pixel_y: float,
             scaling = cached_band_scaling(src, display.stretch)
             x0, y0, w, h = snippet_frame(pixel_x, pixel_y, size_px,
                                          src.width, src.height)
-            if not display.is_default():
+            if not display.is_default() \
+                    or display_settings.paletted_band(display, src) is not None:
                 # Drawn the way the group's Display Settings draw it on
-                # the canvas. Exports never come through here.
+                # the canvas - a file's own colour table included.
+                # Exports never come through here.
                 return display_settings.display_rgb(
                     src, Window(x0, y0, w, h), src.nodata, scaling, display)
             return _window_pixels(src, Window(x0, y0, w, h), 3,
@@ -380,7 +382,8 @@ def read_label_snippets(image_path: str, centres, size_px: int) -> list:
         display = display_settings.for_image(image_path)
         with gdal_config.opened(image_path) as src:
             scaling = cached_band_scaling(src, display.stretch)
-            default = display.is_default()
+            default = (display.is_default() and
+                       display_settings.paletted_band(display, src) is None)
             order = sorted(range(len(centres)),
                            key=lambda i: (centres[i][1], centres[i][0]))
             for i in order:
@@ -415,6 +418,17 @@ def read_image_overview(image_path: str, max_side: int = 1600) -> tuple:
         factor = max(1.0, max(src.width, src.height) / float(max_side))
         out_w = max(1, int(round(src.width / factor)))
         out_h = max(1, int(round(src.height / factor)))
+        band = display_settings.paletted_band(display, src)
+        if band is not None:
+            values = src.read(band, out_shape=(out_h, out_w))
+            empty = nodata_mask(values, src.nodata)
+            values = values.astype(np.float64)
+            if empty is not None:
+                values[empty] = np.nan
+            rgb = display_settings.palette_rgb(
+                values, display_settings.colour_table(src, band))
+            rgb = display_settings.apply_lut(rgb, display.lut())
+            return np.ascontiguousarray(rgb), factor
         chosen = display.source_bands(src.count)
         unique = sorted(set(chosen))
         data = src.read(indexes=unique, out_shape=(len(unique), out_h, out_w))

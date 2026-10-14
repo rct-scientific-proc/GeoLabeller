@@ -31,6 +31,7 @@ group's settings (format 4.9).
 from __future__ import annotations
 
 import math
+import os
 import threading
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -283,6 +284,10 @@ class DisplaySettings:
     band: int = 1
     channels: tuple = field(default_factory=_identity3)
     stretch: Stretch = field(default_factory=Stretch)
+    # The file's own colour table (a palette), for a band that has one:
+    # None draws through it, as QGIS does; False draws the values as
+    # grey instead (2026-10-14, format 5.1).
+    palette: "bool | None" = None
 
     # -- what it means ------------------------------------------------------
 
@@ -295,8 +300,8 @@ class DisplaySettings:
         between them; a different stretch means the bytes held are the
         wrong ones, as different bands would."""
         if self.mode == MODE_SINGLE:
-            return (MODE_SINGLE, self.band, self.stretch)
-        return (MODE_RGB, self.bands, self.stretch)
+            return (MODE_SINGLE, self.band, self.stretch, self.palette)
+        return (MODE_RGB, self.bands, self.stretch, self.palette)
 
     def source_bands(self, count: int) -> tuple:
         """The three 1-based source bands for red, green and blue, given a
@@ -325,6 +330,10 @@ class DisplaySettings:
     def with_stretch(self, stretch: Stretch):
         return replace(self, stretch=stretch.clamped())
 
+    def with_palette(self, palette: "bool | None"):
+        return replace(self, palette=None if palette is None
+                       else bool(palette))
+
     # -- file -----------------------------------------------------------------
 
     def to_dict(self) -> dict:
@@ -340,6 +349,8 @@ class DisplaySettings:
         # before 4.9 and one that never touched it read the same.
         if not self.stretch.is_default():
             data["stretch"] = self.stretch.to_dict()
+        if self.palette is not None:
+            data["palette"] = bool(self.palette)
         return data
 
     @classmethod
@@ -368,9 +379,11 @@ class DisplaySettings:
             channels = [replace(channels[0], hidden=False), ChannelAdjust(),
                         ChannelAdjust()]
             bands = None
+        palette = data.get("palette")
         return cls(mode=mode, bands=bands, band=band,
                    channels=tuple(channels),
-                   stretch=Stretch.from_dict(data.get("stretch")))
+                   stretch=Stretch.from_dict(data.get("stretch")),
+                   palette=None if palette is None else bool(palette))
 
 
 DEFAULT = DisplaySettings()
@@ -489,6 +502,65 @@ def for_image(image_path: str) -> DisplaySettings:
     return found if isinstance(found, DisplaySettings) else DEFAULT
 
 
+# -- the file's own colour table ----------------------------------------------
+
+_table_cache: dict = {}
+_table_lock = threading.Lock()
+
+
+def colour_table(src, band: int = 1) -> "np.ndarray | None":
+    """The band's embedded colour table - GDAL's palette, a colour for
+    each pixel value, as a classified raster or an indexed-colour image
+    carries - as an (N, 3) uint8 array indexed by value, or None when
+    the band has none. Read once per file and band."""
+    key = (os.path.normcase(str(getattr(src, "name", "") or "")),
+           int(band))
+    with _table_lock:
+        if key in _table_cache:
+            return _table_cache[key]
+    table = None
+    try:
+        entries = src.colormap(band)
+    except (ValueError, IndexError, KeyError, AttributeError):
+        entries = None                  # none on this band
+    if entries:
+        top = max(int(v) for v in entries)
+        table = np.zeros((top + 1, 3), dtype=np.uint8)
+        for value, colour in entries.items():
+            if 0 <= int(value) <= top:
+                table[int(value)] = tuple(colour)[:3]
+    with _table_lock:
+        _table_cache[key] = table
+    return table
+
+
+def paletted_band(settings: DisplaySettings, src) -> "int | None":
+    """The band drawn through the file's own colour table, or None: in
+    single-band mode the band chosen, by default a one-band file's only
+    band, when it carries a table and the settings do not say no."""
+    if settings.palette is False:
+        return None
+    count = max(1, int(getattr(src, "count", 1)))
+    if settings.mode == MODE_SINGLE:
+        band = _clamp(int(settings.band), 1, count)
+    elif settings.bands is None and count == 1:
+        band = 1
+    else:
+        return None
+    return band if colour_table(src, band) is not None else None
+
+
+def palette_rgb(values, table: np.ndarray) -> np.ndarray:
+    """(H, W, 3) uint8: each pixel value's colour from the table. A
+    value the table does not reach, and NaN (nodata), draw black."""
+    index = np.rint(np.nan_to_num(np.asarray(values, dtype=np.float64),
+                                  nan=-1.0)).astype(np.int64)
+    valid = (index >= 0) & (index < len(table))
+    out = np.zeros(index.shape + (3,), dtype=np.uint8)
+    out[valid] = table[index[valid]]
+    return out
+
+
 # -- reading pixels through the settings --------------------------------------
 
 def display_rgb(src, window, nodata, scaling, settings: DisplaySettings):
@@ -500,6 +572,17 @@ def display_rgb(src, window, nodata, scaling, settings: DisplaySettings):
     """
     from .snippets import apply_band_stretch, nodata_mask
 
+    band = paletted_band(settings, src)
+    if band is not None:
+        values = src.read(band, window=window)
+        empty = nodata_mask(values, nodata)
+        if empty is not None and bool(empty.all()):
+            return None
+        values = values.astype(np.float64)
+        if empty is not None:
+            values[empty] = np.nan
+        rgb = palette_rgb(values, colour_table(src, band))
+        return np.ascontiguousarray(apply_lut(rgb, settings.lut()))
     chosen = settings.source_bands(src.count)
     unique = sorted(set(chosen))
     data = src.read(indexes=unique, window=window)

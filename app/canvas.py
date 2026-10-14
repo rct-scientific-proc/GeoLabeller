@@ -42,7 +42,8 @@ from .debug_log import debug
 from .labels import ImagePaths, canonical_path
 from .snippets import apply_band_stretch, cached_band_scaling, nodata_mask
 from . import display_settings
-from .display_settings import apply_lut
+from .display_settings import (apply_lut, colour_table, palette_rgb,
+                               paletted_band)
 from . import gdal_config
 from .tile_reader import (TILE_SIZE as DETAIL_TILE_SIZE, level_grid_for,
                           read_tile, tile_bounds, tile_span, tiles_for_bounds)
@@ -898,92 +899,126 @@ class TiledLayer:
             # below rendered e.g. negative-dB float32 sonar as solid black.
             band_scaling = cached_band_scaling(src, self.display.stretch)
 
-            # Band 1: reproject as float32 to detect nodata
-            self._checkpoint(cancel_check)
-            # The bands drawn as red, green and blue (Display Settings);
-            # by default the file's first three, or its only one.
-            chosen = self.display.source_bands(src.count)
-            first = chosen[0]
-            src_band1 = src.read(first, out_shape=(rd_h, rd_w)).astype(
-                np.float32)
-            if src.nodata is not None:
-                src_band1[src_band1 == src.nodata] = np.nan
-            src_band1 = apply_band_stretch(src_band1, band_scaling, first - 1)
-
-            self._checkpoint(cancel_check)
-            if same_grid:
-                dst_band1 = src_band1
+            band = paletted_band(self.display, src)
+            if band is not None:
+                # The file's own colour table (Display Settings): the
+                # index band, reprojected nearest - an index is a
+                # category, not a quantity - then each value's colour.
+                self._checkpoint(cancel_check)
+                src_values = src.read(band, out_shape=(rd_h, rd_w)).astype(
+                    np.float32)
+                if src.nodata is not None:
+                    src_values[src_values == src.nodata] = np.nan
+                if same_grid:
+                    dst_values = src_values
+                else:
+                    dst_values = np.full((height, width), np.nan,
+                                         dtype=np.float32)
+                    reproject(
+                        source=src_values,
+                        destination=dst_values,
+                        src_transform=src_read_transform,
+                        src_crs=src.crs,
+                        dst_transform=transform,
+                        dst_crs=dst_crs,
+                        resampling=Resampling.nearest,
+                        src_nodata=np.nan,
+                        dst_nodata=np.nan,
+                        num_threads=gdal_config.WARP_THREADS
+                    )
+                del src_values
+                nodata_mask = np.isnan(dst_values)
+                coloured = palette_rgb(dst_values, colour_table(src, band))
+                del dst_values
+                r, g, b = (coloured[:, :, 0], coloured[:, :, 1],
+                           coloured[:, :, 2])
             else:
-                dst_band1 = np.full((height, width), np.nan, dtype=np.float32)
-                reproject(
-                    source=src_band1,
-                    destination=dst_band1,
-                    src_transform=src_read_transform,
-                    src_crs=src.crs,
-                    dst_transform=transform,
-                    dst_crs=dst_crs,
-                    resampling=Resampling.bilinear,
-                    src_nodata=np.nan,
-                    dst_nodata=np.nan,
-                    num_threads=gdal_config.WARP_THREADS
-                )
-            # ~4 bytes/px of source float32 with no further use; at the
-            # 150 MP budget that is ~600 MB held across the whole of the
-            # rest of this function unless dropped now.
-            del src_band1
+                # Band 1: reproject as float32 to detect nodata
+                self._checkpoint(cancel_check)
+                # The bands drawn as red, green and blue (Display Settings);
+                # by default the file's first three, or its only one.
+                chosen = self.display.source_bands(src.count)
+                first = chosen[0]
+                src_band1 = src.read(first, out_shape=(rd_h, rd_w)).astype(
+                    np.float32)
+                if src.nodata is not None:
+                    src_band1[src_band1 == src.nodata] = np.nan
+                src_band1 = apply_band_stretch(src_band1, band_scaling, first - 1)
 
-            # Create nodata mask from band 1 only (padding is same for all
-            # bands)
-            nodata_mask = np.isnan(dst_band1)
+                self._checkpoint(cancel_check)
+                if same_grid:
+                    dst_band1 = src_band1
+                else:
+                    dst_band1 = np.full((height, width), np.nan, dtype=np.float32)
+                    reproject(
+                        source=src_band1,
+                        destination=dst_band1,
+                        src_transform=src_read_transform,
+                        src_crs=src.crs,
+                        dst_transform=transform,
+                        dst_crs=dst_crs,
+                        resampling=Resampling.bilinear,
+                        src_nodata=np.nan,
+                        dst_nodata=np.nan,
+                        num_threads=gdal_config.WARP_THREADS
+                    )
+                # ~4 bytes/px of source float32 with no further use; at the
+                # 150 MP budget that is ~600 MB held across the whole of the
+                # rest of this function unless dropped now.
+                del src_band1
 
-            # Convert band 1 to uint8
-            band1_uint8 = np.clip(
-                np.nan_to_num(
-                    dst_band1,
-                    nan=0.0),
-                0,
-                255).astype(
-                np.uint8)
-            del dst_band1  # Free memory
+                # Create nodata mask from band 1 only (padding is same for all
+                # bands)
+                nodata_mask = np.isnan(dst_band1)
 
-            # Reproject remaining bands directly as uint8 (faster)
-            planes = {first: band1_uint8}
-            extra = [b for b in dict.fromkeys(chosen) if b != first]
-            if extra:
-                for i in extra:
-                    self._checkpoint(cancel_check)
-                    src_band = src.read(i, out_shape=(rd_h, rd_w))
-                    # Nodata positions noted BEFORE the stretch (which maps
-                    # the sentinel value like any other), zeroed after the
-                    # byte conversion - 0 is the uint8 reproject's nodata.
-                    nodata_at = (src_band == src.nodata) \
-                        if src.nodata is not None else None
-                    src_band = apply_band_stretch(
-                        src_band, band_scaling, i - 1)
-                    if src_band.dtype != np.uint8:
-                        src_band = np.clip(src_band, 0, 255).astype(np.uint8)
-                    if nodata_at is not None:
-                        src_band[nodata_at] = 0
+                # Convert band 1 to uint8
+                band1_uint8 = np.clip(
+                    np.nan_to_num(
+                        dst_band1,
+                        nan=0.0),
+                    0,
+                    255).astype(
+                    np.uint8)
+                del dst_band1  # Free memory
 
-                    if same_grid:
-                        dst_band = src_band
-                    else:
-                        dst_band = np.zeros((height, width), dtype=np.uint8)
-                        reproject(
-                            source=src_band,
-                            destination=dst_band,
-                            src_transform=src_read_transform,
-                            src_crs=src.crs,
-                            dst_transform=transform,
-                            dst_crs=dst_crs,
-                            resampling=Resampling.bilinear,
-                            src_nodata=0,
-                            dst_nodata=0,
-                            num_threads=gdal_config.WARP_THREADS
-                        )
-                    planes[i] = dst_band
+                # Reproject remaining bands directly as uint8 (faster)
+                planes = {first: band1_uint8}
+                extra = [b for b in dict.fromkeys(chosen) if b != first]
+                if extra:
+                    for i in extra:
+                        self._checkpoint(cancel_check)
+                        src_band = src.read(i, out_shape=(rd_h, rd_w))
+                        # Nodata positions noted BEFORE the stretch (which maps
+                        # the sentinel value like any other), zeroed after the
+                        # byte conversion - 0 is the uint8 reproject's nodata.
+                        nodata_at = (src_band == src.nodata) \
+                            if src.nodata is not None else None
+                        src_band = apply_band_stretch(
+                            src_band, band_scaling, i - 1)
+                        if src_band.dtype != np.uint8:
+                            src_band = np.clip(src_band, 0, 255).astype(np.uint8)
+                        if nodata_at is not None:
+                            src_band[nodata_at] = 0
 
-            r, g, b = (planes[c] for c in chosen)
+                        if same_grid:
+                            dst_band = src_band
+                        else:
+                            dst_band = np.zeros((height, width), dtype=np.uint8)
+                            reproject(
+                                source=src_band,
+                                destination=dst_band,
+                                src_transform=src_read_transform,
+                                src_crs=src.crs,
+                                dst_transform=transform,
+                                dst_crs=dst_crs,
+                                resampling=Resampling.bilinear,
+                                src_nodata=0,
+                                dst_nodata=0,
+                                num_threads=gdal_config.WARP_THREADS
+                            )
+                        planes[i] = dst_band
+
+                r, g, b = (planes[c] for c in chosen)
 
             # Build RGBA array
             rgba_full = np.zeros((height, width, 4), dtype=np.uint8)
@@ -1075,26 +1110,39 @@ class TiledLayer:
 
             band_scaling = cached_band_scaling(src, self.display.stretch)
             self._checkpoint(cancel_check)
-            chosen = self.display.source_bands(src.count)
-            first = chosen[0]
-            band1 = src.read(first, out_shape=(height, width))
-            # Nodata read from the RAW band, before the stretch maps it to
-            # some ordinary-looking value. The geo path and the detail
-            # tiles have always turned nodata into transparency; this one
-            # painted it opaque - and for NaN it painted an undefined byte,
-            # so a swath exterior that is invisible on the map showed up as
-            # a black block in waterfall.
-            empty = nodata_mask(band1, src.nodata)
-            # _as_uint8 skips the copy for an already-uint8 read; nearly
-            # all supported imagery is uint8.
-            planes = {first: _as_uint8(band1, band_scaling, first - 1)}
-            for index in dict.fromkeys(chosen):
-                if index not in planes:
-                    self._checkpoint(cancel_check)
-                    planes[index] = _as_uint8(
-                        src.read(index, out_shape=(height, width)),
-                        band_scaling, index - 1)
-            r, g, b = (planes[c] for c in chosen)
+            band = paletted_band(self.display, src)
+            if band is not None:
+                # The file's own colour table: each value's colour.
+                values = src.read(band, out_shape=(height, width))
+                empty = nodata_mask(values, src.nodata)
+                values = values.astype(np.float32)
+                if empty is not None:
+                    values[empty] = np.nan
+                coloured = palette_rgb(values, colour_table(src, band))
+                del values
+                r, g, b = (coloured[:, :, 0], coloured[:, :, 1],
+                           coloured[:, :, 2])
+            else:
+                chosen = self.display.source_bands(src.count)
+                first = chosen[0]
+                band1 = src.read(first, out_shape=(height, width))
+                # Nodata read from the RAW band, before the stretch maps it to
+                # some ordinary-looking value. The geo path and the detail
+                # tiles have always turned nodata into transparency; this one
+                # painted it opaque - and for NaN it painted an undefined byte,
+                # so a swath exterior that is invisible on the map showed up as
+                # a black block in waterfall.
+                empty = nodata_mask(band1, src.nodata)
+                # _as_uint8 skips the copy for an already-uint8 read; nearly
+                # all supported imagery is uint8.
+                planes = {first: _as_uint8(band1, band_scaling, first - 1)}
+                for index in dict.fromkeys(chosen):
+                    if index not in planes:
+                        self._checkpoint(cancel_check)
+                        planes[index] = _as_uint8(
+                            src.read(index, out_shape=(height, width)),
+                            band_scaling, index - 1)
+                r, g, b = (planes[c] for c in chosen)
 
             rgba = np.zeros((height, width, 4), dtype=np.uint8)
             rgba[:, :, 0] = r
