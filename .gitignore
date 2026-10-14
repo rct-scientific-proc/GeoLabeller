@@ -56,3 +56,6 @@ test_data/
 
 # Scratch for building docs/ (page renders, drafts, generator)
 docs_workspace/
+
+# Research harnesses: cached chips and the synthetic benchmark
+research/partition/cache/

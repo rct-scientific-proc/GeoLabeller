@@ -1,0 +1,4 @@
+# Research harnesses under research/ (not the application, never frozen).
+# On top of requirements.txt and requirements-ml.txt:
+#   pip install -r requirements-research.txt
+scikit-learn>=1.5
