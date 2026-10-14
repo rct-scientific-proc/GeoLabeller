@@ -59,3 +59,6 @@ docs_workspace/
 
 # Research harnesses: cached chips and the synthetic benchmark
 research/partition/cache/
+
+# Bundles of the local-only repos (tests/, docs_workspace/) made to carry them to another machine
+*.bundle
