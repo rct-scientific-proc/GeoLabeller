@@ -82,6 +82,7 @@ class ReferencePanel(QWidget):
         title.setFont(font)
         head.addWidget(title)
         self.class_combo = QComboBox()
+        self.class_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.class_combo.setToolTip(
             "Chips already given this class - this session's verdicts, the\n"
             "newest first, then earlier rounds and the project's labels -\n"

@@ -454,6 +454,7 @@ class ModelReviewWindow(QWidget):
         second = self._titled_row("Labelling", layout)
         second.addWidget(QLabel("New label:"))
         self.label_combo = QComboBox()
+        self.label_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.label_combo.setMinimumWidth(160)
         self.label_combo.setToolTip(
             "The class a click gives a chip. Keys 1-9 pick by place in\n"
@@ -496,6 +497,9 @@ class ModelReviewWindow(QWidget):
         third = self._titled_row("View", layout)
         third.addWidget(QLabel("Predicted:"))
         self.class_filter = QComboBox()
+        # Entries come after the window is shown, and the box sized
+        # itself once, on an empty list: it cut the names (2026-10-14).
+        self.class_filter.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.class_filter.setToolTip(
             "Which of the model's calls to look at. Each list runs from\n"
             "the chip it was surest of to the one it was least.")
@@ -507,6 +511,7 @@ class ModelReviewWindow(QWidget):
         third.addWidget(self.class_filter)
         third.addWidget(QLabel("Show:"))
         self.verdict_filter = QComboBox()
+        self.verdict_filter.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         for text, data in VERDICT_FILTERS:
             self.verdict_filter.addItem(text, data)
         self.verdict_filter.setToolTip(
@@ -683,6 +688,7 @@ class ModelReviewWindow(QWidget):
         fifth.addWidget(self.order_combo)
         fifth.addWidget(QLabel("Suggested:"))
         self.suggested_filter = QComboBox()
+        self.suggested_filter.setSizeAdjustPolicy(QComboBox.AdjustToContents)
         self.suggested_filter.setToolTip(
             "Only the chips the model suggests this class for.")
         self.suggested_filter.currentIndexChanged.connect(self._on_filter)
