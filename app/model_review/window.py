@@ -95,6 +95,7 @@ _PER_PAGE_KEY = "model_review/per_page"
 _SHOW_REVIEWED_KEY = "model_review/show_reviewed"
 _TOLERANCE_KEY = "model_review/tolerance"
 _MORE_KEY = "model_review/more"
+_LEARN_KEY = "model_review/learn"
 _GEOMETRY_KEY = "model_review/geometry"
 _DETAILS_KEY = "model_review/details"
 _CONTEXT_KEY = "model_review/context"
@@ -522,8 +523,6 @@ class ModelReviewWindow(QWidget):
         self.verdict_filter.currentIndexChanged.connect(self._on_filter)
         self.verdict_filter.activated.connect(lambda _i: self.setFocus())
         third.addWidget(self.verdict_filter)
-        third.addSpacing(12)
-        third.addWidget(QLabel("Chip size"))
         self.chip_spin = QSpinBox()
         self.chip_spin.setRange(32, 2048)
         self.chip_spin.setSingleStep(32)
@@ -534,15 +533,11 @@ class ModelReviewWindow(QWidget):
             "only where the centre is.")
         self.chip_spin.setKeyboardTracking(False)
         self.chip_spin.valueChanged.connect(self._on_chip_size)
-        third.addWidget(self.chip_spin)
-        third.addWidget(QLabel("Columns"))
         self.columns_spin = QSpinBox()
         self.columns_spin.setRange(1, 16)
         self.columns_spin.setValue(DEFAULT_COLUMNS)
         self.columns_spin.setKeyboardTracking(False)
         self.columns_spin.valueChanged.connect(lambda _v: self._rebuild())
-        third.addWidget(self.columns_spin)
-        third.addWidget(QLabel("Per page"))
         self.page_spin = QSpinBox()
         self.page_spin.setRange(6, 600)
         self.page_spin.setValue(DEFAULT_PER_PAGE)
@@ -551,7 +546,6 @@ class ModelReviewWindow(QWidget):
             "turn the pages.")
         self.page_spin.setKeyboardTracking(False)
         self.page_spin.valueChanged.connect(self._on_per_page)
-        third.addWidget(self.page_spin)
         third.addSpacing(12)
         self.mark_check = QCheckBox("Centre mark")
         self.mark_check.setToolTip(
@@ -567,23 +561,34 @@ class ModelReviewWindow(QWidget):
         self.details_check.setChecked(True)
         self.details_check.toggled.connect(self._on_details)
         third.addWidget(self.details_check)
-        self.more_button = QToolButton()
-        self.more_button.setText("More")
-        self.more_button.setCheckable(True)
-        self.more_button.setArrowType(Qt.RightArrow)
-        self.more_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.more_button.setToolTip(
-            "Settings seldom changed: the chips reviewed in earlier\n"
-            "rounds, and how close a chip must lie to one to be it again.")
-        self.more_button.toggled.connect(self._on_more)
+        third.addSpacing(12)
+        self.more_button = self._fold_button(
+            "Settings",
+            "Set once: the chip size, the columns, the chips per page,\n"
+            "the chips reviewed in earlier rounds, and how close a chip\n"
+            "must lie to one to be it again.", self._on_more)
         third.addWidget(self.more_button)
+        self.learn_button = self._fold_button(
+            "Learn",
+            "A model from the verdicts, to sort what is left: the\n"
+            "training, and the suggestions it makes. Needs a source run\n"
+            "with PyTorch (requirements-ml.txt).", self._on_learn)
+        third.addWidget(self.learn_button)
         third.addStretch(1)
         for spin in (self.chip_spin, self.columns_spin, self.page_spin):
             spin.editingFinished.connect(self.setFocus)
 
         self.more_row = QWidget()
-        more = QHBoxLayout(self.more_row)
-        more.setContentsMargins(68 + 8, 0, 0, 0)
+        more_box = QVBoxLayout(self.more_row)
+        more_box.setContentsMargins(0, 0, 0, 0)
+        more = self._titled_row("Settings", more_box)
+        more.addWidget(QLabel("Chip size"))
+        more.addWidget(self.chip_spin)
+        more.addWidget(QLabel("Columns"))
+        more.addWidget(self.columns_spin)
+        more.addWidget(QLabel("Per page"))
+        more.addWidget(self.page_spin)
+        more.addSpacing(12)
         self.show_reviewed_check = QCheckBox("Show reviewed")
         self.show_reviewed_check.setToolTip(
             "Chips reviewed in an earlier round, shaded, with what they\n"
@@ -607,8 +612,13 @@ class ModelReviewWindow(QWidget):
         self.more_row.setVisible(False)
         layout.addWidget(self.more_row)
 
-        # -- Learn: a model from the verdicts, to sort what is left ------
-        fourth = self._titled_row("Learn", layout)
+        # -- Learn: a model from the verdicts, to sort what is left - two
+        # rows folded away behind the View row's Learn button (2.8.2),
+        # since the installed build has no PyTorch to use them with.
+        self.learn_rows = QWidget()
+        learn_box = QVBoxLayout(self.learn_rows)
+        learn_box.setContentsMargins(0, 0, 0, 0)
+        fourth = self._titled_row("Learn", learn_box)
         self.train_button = QPushButton("Train on verdicts")
         self.train_button.setToolTip(
             "A small classifier trained on the verdicts given here, the\n"
@@ -675,7 +685,7 @@ class ModelReviewWindow(QWidget):
         fourth.addWidget(self.learn_label, 1)
 
         # -- Suggestions: what the model thinks, on the grid -------------
-        fifth = self._titled_row("Suggestions", layout)
+        fifth = self._titled_row("Suggestions", learn_box)
         fifth.addWidget(QLabel("Order by:"))
         self.order_combo = QComboBox()
         for text, data in ORDERS:
@@ -717,16 +727,18 @@ class ModelReviewWindow(QWidget):
         self.accept_spin.editingFinished.connect(self.setFocus)
         fifth.addWidget(self.accept_spin)
         fifth.addStretch(1)
+        self.learn_rows.setVisible(False)
+        layout.addWidget(self.learn_rows)
         self._fill_suggested_filter()
         self._show_learning()
 
         self.hint = QLabel(
             "Click a chip, or press its label's number with the cursor on "
-            "it, to label it; the arrow keys move the cursor, Enter labels "
-            "and moves on, I ignores the rest of the page. Double-click the "
-            "object to put the centre there; M shows the chip in hand on "
-            "its whole image. F1 lists every key.")
+            "it, to label it; arrows move the cursor, Enter labels and "
+            "moves on, I ignores the rest of the page, M shows the chip on "
+            "its image. F1 lists every key.")
         self.hint.setWordWrap(True)
+        self.hint.setEnabled(False)          # a hint, in grey
         layout.addWidget(self.hint)
 
         self.scroll = QScrollArea()
@@ -787,9 +799,26 @@ class ModelReviewWindow(QWidget):
         layout.addLayout(bottom)
         self._show_counts()
 
+    @staticmethod
+    def _fold_button(text: str, tip: str, slot) -> QToolButton:
+        """A checkable arrow button that folds a row out below."""
+        button = QToolButton()
+        button.setText(text)
+        button.setCheckable(True)
+        button.setArrowType(Qt.RightArrow)
+        button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        button.setToolTip(tip)
+        button.toggled.connect(slot)
+        return button
+
     def _on_more(self, on: bool):
         self.more_row.setVisible(bool(on))
         self.more_button.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
+
+    def _on_learn(self, on: bool):
+        self.learn_rows.setVisible(bool(on))
+        self.learn_button.setArrowType(Qt.DownArrow if on
+                                       else Qt.RightArrow)
 
     def _on_details(self, on: bool):
         self.right.setVisible(bool(on))
@@ -2406,6 +2435,8 @@ class ModelReviewWindow(QWidget):
             str(settings.value(_MARK_KEY, "true")).lower() != "false")
         self.more_button.setChecked(
             str(settings.value(_MORE_KEY, "false")).lower() == "true")
+        self.learn_button.setChecked(
+            str(settings.value(_LEARN_KEY, "false")).lower() == "true")
         self.details_check.setChecked(
             str(settings.value(_DETAILS_KEY, "true")).lower() != "false")
         self.detail.setVisible(self.details_check.isChecked())
@@ -2476,6 +2507,7 @@ class ModelReviewWindow(QWidget):
                           self.show_reviewed_check.isChecked())
         settings.setValue(_MARK_KEY, self.mark_check.isChecked())
         settings.setValue(_MORE_KEY, self.more_button.isChecked())
+        settings.setValue(_LEARN_KEY, self.learn_button.isChecked())
         settings.setValue(_DETAILS_KEY, self.details_check.isChecked())
         settings.setValue(_CONTEXT_KEY, self.detail.context_spin.value())
         settings.setValue(_SPLITTER_KEY, self.splitter.saveState())

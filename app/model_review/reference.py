@@ -22,7 +22,7 @@ from .learner import name_of
 from .ledger import IGNORE
 
 MAX_SHOWN = 60                  # examples at most, the newest first
-COLUMNS = 3
+COLUMNS = 1         # one long column, each chip the strip's width (2.8.2)
 SPACING = 4
 NONE_YET = "No chips of this class yet."
 
