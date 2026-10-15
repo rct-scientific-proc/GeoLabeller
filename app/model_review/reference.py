@@ -16,13 +16,15 @@ from __future__ import annotations
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (QComboBox, QGridLayout, QHBoxLayout, QLabel,
-                             QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
+                             QScrollArea, QSizePolicy, QSpinBox,
+                             QVBoxLayout, QWidget)
 
 from .learner import name_of
 from .ledger import IGNORE
 
 MAX_SHOWN = 60                  # examples at most, the newest first
-COLUMNS = 1         # one long column, each chip the strip's width (2.8.2)
+DEFAULT_COLUMNS = 2             # chips to a row; the head sets 1 to 6
+MAX_COLUMNS = 6                 # (one is a single column of big chips)
 SPACING = 4
 NONE_YET = "No chips of this class yet."
 
@@ -68,11 +70,13 @@ class ReferencePanel(QWidget):
     """See the module."""
 
     class_changed = pyqtSignal()
+    columns_changed = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._examples: list = []
         self._tiles: list = []
+        self.columns = DEFAULT_COLUMNS
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         head = QHBoxLayout()
@@ -90,6 +94,16 @@ class ReferencePanel(QWidget):
         self.class_combo.currentIndexChanged.connect(
             lambda _i: self.class_changed.emit())
         head.addWidget(self.class_combo, 1)
+        self.columns_spin = QSpinBox()
+        self.columns_spin.setRange(1, MAX_COLUMNS)
+        self.columns_spin.setValue(DEFAULT_COLUMNS)
+        self.columns_spin.setSuffix(" per row")
+        self.columns_spin.setToolTip(
+            "Chips to a row: 1 for a single column of big chips, up to\n"
+            f"{MAX_COLUMNS} small ones. Remembered.")
+        self.columns_spin.setKeyboardTracking(False)
+        self.columns_spin.valueChanged.connect(self.set_columns)
+        head.addWidget(self.columns_spin)
         layout.addLayout(head)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -120,6 +134,24 @@ class ReferencePanel(QWidget):
         index = combo.findData(current) if current is not None else -1
         combo.setCurrentIndex(index if index >= 0 else 0)
         combo.blockSignals(False)
+
+    def set_columns(self, columns: int):
+        """Chips to a row, 1 to MAX_COLUMNS; the tiles there are move
+        and resize, their pictures kept (2.8.3)."""
+        columns = max(1, min(MAX_COLUMNS, int(columns)))
+        if columns == self.columns:
+            return
+        self.columns = columns
+        self.columns_spin.blockSignals(True)
+        self.columns_spin.setValue(columns)
+        self.columns_spin.blockSignals(False)
+        for tile in self._tiles:
+            self._grid.removeWidget(tile)
+        side = self.tile_px()
+        for i, tile in enumerate(self._tiles):
+            tile.set_side(side)
+            self._grid.addWidget(tile, i // columns, i % columns)
+        self.columns_changed.emit(columns)
 
     def chosen(self):
         """The class picked, or None when there is none to pick."""
@@ -154,7 +186,7 @@ class ReferencePanel(QWidget):
             tile.setToolTip(f"{example.image_name if hasattr(example, 'image_name') else example.image_path}"
                             f"  ({example.pixel_x:.0f}, {example.pixel_y:.0f})"
                             f"\n{self._origin_text(example.origin)}")
-            self._grid.addWidget(tile, i // COLUMNS, i % COLUMNS)
+            self._grid.addWidget(tile, i // self.columns, i % self.columns)
             self._tiles.append(tile)
         self.count_label.setText(description or (NONE_YET if not examples
                                                  else ""))
@@ -184,7 +216,8 @@ class ReferencePanel(QWidget):
 
     def tile_px(self) -> int:
         width = self.scroll.viewport().width() or self.width() or 240
-        return max(24, (width - SPACING * (COLUMNS - 1) - 2) // COLUMNS)
+        return max(24, (width - SPACING * (self.columns - 1) - 2)
+                   // self.columns)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

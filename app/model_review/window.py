@@ -48,6 +48,7 @@ from .learner import (BACKBONES, RESNET18, Learner,
                       available as learning_available, backbone_reason,
                       checked as learning_checked, gather_examples,
                       name_of, readiness)
+from .reference import DEFAULT_COLUMNS as DEFAULT_REF_COLUMNS
 from .reference import MAX_SHOWN, ReferencePanel
 from .snippet_store import SnippetStore
 from .training import LearnThread, save_job, suggest_job, train_job
@@ -96,6 +97,7 @@ _SHOW_REVIEWED_KEY = "model_review/show_reviewed"
 _TOLERANCE_KEY = "model_review/tolerance"
 _MORE_KEY = "model_review/more"
 _LEARN_KEY = "model_review/learn"
+_REF_COLUMNS_KEY = "model_review/reference_columns"
 _GEOMETRY_KEY = "model_review/geometry"
 _DETAILS_KEY = "model_review/details"
 _CONTEXT_KEY = "model_review/context"
@@ -757,6 +759,7 @@ class ModelReviewWindow(QWidget):
         self.reference = ReferencePanel()
         self.reference.class_changed.connect(
             lambda: self._refresh_reference(force=True))
+        self.reference.columns_spin.editingFinished.connect(self.setFocus)
         self.right = QSplitter(Qt.Vertical)
         self.right.addWidget(self.detail)
         self.right.addWidget(self.reference)
@@ -2437,6 +2440,12 @@ class ModelReviewWindow(QWidget):
             str(settings.value(_MORE_KEY, "false")).lower() == "true")
         self.learn_button.setChecked(
             str(settings.value(_LEARN_KEY, "false")).lower() == "true")
+        try:
+            columns = int(settings.value(_REF_COLUMNS_KEY,
+                                         DEFAULT_REF_COLUMNS))
+        except (TypeError, ValueError):
+            columns = DEFAULT_REF_COLUMNS
+        self.reference.set_columns(columns)
         self.details_check.setChecked(
             str(settings.value(_DETAILS_KEY, "true")).lower() != "false")
         self.detail.setVisible(self.details_check.isChecked())
@@ -2508,6 +2517,7 @@ class ModelReviewWindow(QWidget):
         settings.setValue(_MARK_KEY, self.mark_check.isChecked())
         settings.setValue(_MORE_KEY, self.more_button.isChecked())
         settings.setValue(_LEARN_KEY, self.learn_button.isChecked())
+        settings.setValue(_REF_COLUMNS_KEY, self.reference.columns)
         settings.setValue(_DETAILS_KEY, self.details_check.isChecked())
         settings.setValue(_CONTEXT_KEY, self.detail.context_spin.value())
         settings.setValue(_SPLITTER_KEY, self.splitter.saveState())
