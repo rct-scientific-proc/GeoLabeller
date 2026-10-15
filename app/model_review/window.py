@@ -330,8 +330,11 @@ def _swatch(colour: QColor) -> QIcon:
 
 def _passes(chip, standing: str) -> bool:
     """Does the chip belong on the Show: list? A chip reviewed in an
-    earlier round counts by what it became."""
-    verdict = chip.earlier.became if chip.reviewed_before() else chip.verdict
+    earlier round counts by what it became - unless given a new
+    verdict here (2.8.5)."""
+    verdict = chip.verdict
+    if verdict is None and chip.reviewed_before():
+        verdict = chip.earlier.became
     if standing and standing.startswith("labelled:"):
         return verdict == standing[len("labelled:"):]
     if standing == "todo":
@@ -610,7 +613,8 @@ class ModelReviewWindow(QWidget):
         self.show_reviewed_check = QCheckBox("Show reviewed")
         self.show_reviewed_check.setToolTip(
             "Chips reviewed in an earlier round, shaded, with what they\n"
-            "became. Kept off the grid otherwise.")
+            "became. Kept off the grid otherwise. Give one a new verdict -\n"
+            "a click, a number - and Import changes the label it made.")
         self.show_reviewed_check.toggled.connect(self._on_show_reviewed)
         more.addWidget(self.show_reviewed_check)
         more.addWidget(QLabel("Same chip within"))
@@ -1071,10 +1075,14 @@ class ModelReviewWindow(QWidget):
         show_reviewed = self.show_reviewed_check.isChecked()
         counts: Counter = Counter()
         for chip in self._chips:
-            if chip.reviewed_before():
-                standing = chip.earlier.became if show_reviewed else None
-            else:
+            if chip.reviewed_before() and not show_reviewed:
+                standing = None
+            elif chip.verdict is not None:
                 standing = chip.verdict
+            elif chip.reviewed_before():
+                standing = chip.earlier.became
+            else:
+                standing = None
             if standing not in (None, IGNORE):
                 counts[standing] += 1
         current = combo.currentData()
@@ -1254,6 +1262,9 @@ class ModelReviewWindow(QWidget):
                 text += f" on {earlier.at[:10]}"
             if earlier.source:
                 text += f" ({earlier.source})"
+            if chip.verdict is not None:
+                text += "\nnow: " + ("Ignore" if chip.verdict == IGNORE
+                                     else chip.verdict)
         cell.setToolTip(text)
 
     def _request_pixels(self):
@@ -1447,8 +1458,7 @@ class ModelReviewWindow(QWidget):
             replaced[key] = (chip.verdict, chip.pixel_x, chip.pixel_y)
             if verdict not in (None, IGNORE) and verdict not in self._classes:
                 verdict = None              # a class the project lost
-            if not chip.reviewed_before():
-                chip.verdict = verdict
+            chip.verdict = verdict
             if (x, y) != (chip.pixel_x, chip.pixel_y):
                 chip.recenter(x, y)
                 if key in self._cells:
@@ -1504,7 +1514,7 @@ class ModelReviewWindow(QWidget):
             cell = self._cells.get(chip.key)
             if cell is None:
                 continue
-            if chip.reviewed_before():
+            if chip.reviewed_before() and chip.verdict is None:
                 became = chip.earlier.became
                 text = "earlier: " + ("Ignore" if became == IGNORE
                                       else became)
@@ -1513,6 +1523,8 @@ class ModelReviewWindow(QWidget):
                 text = ("" if chip.verdict is None
                         else "Ignore" if chip.verdict == IGNORE
                         else chip.verdict)
+                if chip.reviewed_before():
+                    text += " (changed)"
                 colour = (None if chip.verdict is None
                           else self._colour_of(chip.verdict))
             score = f"{chip.score:.2f}"
@@ -1527,7 +1539,8 @@ class ModelReviewWindow(QWidget):
                 score = (f"{name_of(suggestion.class_name)}? "
                          f"{suggestion.confidence:.2f}")
             cell.set_state(score, text, colour, chip.key in self._selected,
-                           chip.reviewed_before(), chip.key == self._cursor)
+                           chip.reviewed_before() and chip.verdict is None,
+                           chip.key == self._cursor)
         self._refresh_detail_text()
         self._refresh_image_window()
         self._refresh_reference()
@@ -1556,6 +1569,9 @@ class ModelReviewWindow(QWidget):
             text += (f"; {earlier} reviewed in an earlier round"
                      + ("" if self.show_reviewed_check.isChecked()
                         else ", hidden"))
+        changed = sum(1 for chip in verdicts if chip.reviewed_before())
+        if changed:
+            text += f"; {changed} changed from an earlier round"
         if self._below_score:
             text += (f"; {self._below_score} below the score "
                      f"{self.score_spin.value():.2f}")
@@ -1595,10 +1611,19 @@ class ModelReviewWindow(QWidget):
         """These chips get this verdict, as one thing to take back;
         returns the undo entry, or None when nothing changed. ``what``
         names it for the status line; None names it by its count."""
-        chips = [self._by_key[key] for key in keys
-                 if key in self._by_key
-                 and not self._by_key[key].reviewed_before()
-                 and self._by_key[key].verdict != verdict]
+        # A chip reviewed in an earlier round takes a new verdict too
+        # (2.8.5); given the class it already became, it has no change.
+        chips, wanted = [], {}
+        for key in keys:
+            chip = self._by_key.get(key)
+            if chip is None:
+                continue
+            new = verdict
+            if chip.reviewed_before() and chip.earlier.became == verdict:
+                new = None
+            if chip.verdict != new:
+                chips.append(chip)
+                wanted[chip.key] = new
         if not chips:
             return None
         if what is None:
@@ -1606,7 +1631,7 @@ class ModelReviewWindow(QWidget):
             what = f"{n} verdict{'' if n == 1 else 's'}"
         entry = self._remember(chips, what)
         for chip in chips:
-            chip.verdict = verdict
+            chip.verdict = wanted[chip.key]
             self._verdict_seq[chip.key] = self._next_tick()
         self._reference_dirty = True
         self._refresh_cells()
@@ -2315,6 +2340,11 @@ class ModelReviewWindow(QWidget):
         if moved:
             text += (f"\n{moved} re-centred: the label sits where the "
                      "centre was put.")
+        changed = sum(1 for chip in chips if chip.reviewed_before())
+        if changed:
+            text += (f"\n{changed} reviewed in an earlier round: the "
+                     "label changes class, goes for Ignore, or is made "
+                     "for a chip ignored before.")
         return text
 
     def _confirm_import(self, text: str) -> bool:

@@ -171,10 +171,16 @@ def gather_examples(project, chips, labels_per_class: int = LABELS_PER_CLASS,
             examples[key] = Example(path, float(x), float(y), class_name,
                                     origin)
 
+    changed: set = set()            # memory entries a new verdict outdates
     for chip in chips:
-        if chip.verdict is not None and not chip.reviewed_before():
-            add(chip.image_path, chip.pixel_x, chip.pixel_y, chip.verdict,
-                "verdict")
+        if chip.verdict is None:
+            continue
+        add(chip.image_path, chip.pixel_x, chip.pixel_y, chip.verdict,
+            "verdict")
+        if chip.reviewed_before():
+            changed.add((image_key(chip.earlier.image),
+                         int(round(chip.earlier.pixel_x)),
+                         int(round(chip.earlier.pixel_y))))
     images = getattr(project, "images", {}) or {}
     by_name: dict = {}
     for path in images:
@@ -183,6 +189,9 @@ def gather_examples(project, chips, labels_per_class: int = LABELS_PER_CLASS,
     for verdict in getattr(project, "model_review", []) or []:
         if not verdict.became:
             continue
+        if (image_key(verdict.image), int(round(verdict.pixel_x)),
+                int(round(verdict.pixel_y))) in changed:
+            continue                # given a new verdict here (2.8.5)
         classes.add(verdict.became)
         paths = by_name.get(image_key(verdict.image), [])
         if len(paths) == 1 and (verdict.became == IGNORE

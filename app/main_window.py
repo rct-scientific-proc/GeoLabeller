@@ -4561,14 +4561,23 @@ class MainWindow(QMainWindow):
         entry per chip given anything - one undo step."""
         if not chips:
             return
-        with self._recorded("Model review import",
+        # A chip reviewed before may change the label it made (2.8.5):
+        # those labels are the step's to restore.
+        touched = {chip.earlier.label_id for chip in chips
+                   if chip.earlier is not None
+                   and chip.earlier.label_id is not None}
+        with self._recorded("Model review import", labels=touched,
                             lists=("model_review", "classes")):
             result = apply_verdicts(self.project, chips, source)
         self._update_class_combo()
+        for label_id in result.changed_ids + result.removed_ids:
+            self.canvas.remove_label_marker(label_id)
         for label_id in result.label_ids:
             image, label = self.project.get_label_by_id(label_id)
             if label is not None:
                 self._add_label_marker(image, label)
+        if result.changed_ids:
+            self._update_ring_colors()
         self._schedule_refresh("labeled", "snippets")
         self._reseat_open_editors()
         self._mark_unsaved()

@@ -36,13 +36,17 @@ NOTHING = "No chip in hand: move the cursor onto one, or click one."
 def standing_of(chip) -> str:
     """What the chip is, in a few words: its verdict, what it became in
     an earlier round, or nothing yet."""
+    earlier = None
     if chip.reviewed_before():
         became = chip.earlier.became
-        return "earlier: " + ("Ignore" if became == IGNORE else became)
+        earlier = "earlier: " + ("Ignore" if became == IGNORE else became)
+        if chip.verdict is None:
+            return earlier
     if chip.verdict is None:
         return "no verdict yet"
-    return "verdict: " + ("Ignore" if chip.verdict == IGNORE
+    text = "verdict: " + ("Ignore" if chip.verdict == IGNORE
                           else chip.verdict)
+    return f"{text} ({earlier})" if earlier else text
 
 
 class ContextView(QWidget):
