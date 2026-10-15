@@ -1,6 +1,7 @@
 """Main application window."""
 import hashlib
 from collections import deque
+import html
 import json
 import os
 from contextlib import contextmanager
@@ -71,6 +72,7 @@ from .snippet_editor import SnippetEditor
 from .snippet_editor.size_section import shares_with_linked, size_text
 from .snippet_panel import SnippetPanel
 from .snippets import cached_band_scaling
+from .value_probe import ValueProbe
 from .resources import howto_path, icd_path
 from .version import app_title, app_version
 
@@ -616,7 +618,12 @@ class MainWindow(QMainWindow):
         self.statusBar.addPermanentWidget(self.progress_indicator)
 
         self.coord_label = QLabel("")
+        self.coord_label.setTextFormat(Qt.RichText)
         self.statusBar.addPermanentWidget(self.coord_label)
+        self._coord_text = ""          # where the cursor is
+        self._value_text = ""          # what is under it (2.8.1)
+        self._value_probe = ValueProbe(self)
+        self._value_probe.ready.connect(self._on_value_probed)
 
         # Selected group label for cycle mode
         self.group_label = QLabel("")
@@ -684,6 +691,7 @@ class MainWindow(QMainWindow):
             lambda object_id: self._export_object_snippets([object_id]))
         self.canvas.layer_load_failed.connect(self._on_layer_load_failed)
         self.canvas.coordinates_changed.connect(self._update_coordinates)
+        self.canvas.cursor_probe.connect(self._on_cursor_probe)
         self.canvas.label_placed.connect(self._on_label_placed)
         self.canvas.label_removed.connect(self._on_label_removed)
         self.canvas.labels_linked.connect(self._on_labels_linked)
@@ -958,6 +966,16 @@ class MainWindow(QMainWindow):
             "exports write them")
         snippet_action.toggled.connect(self._toggle_snippet_panel)
         view_menu.addAction(snippet_action)
+
+        # The pixel values under the cursor, on the status bar (2.8.1).
+        self.value_action = QAction("Pixel &Values in Status Bar", self)
+        self.value_action.setCheckable(True)
+        self.value_action.setStatusTip(
+            "Show every band's value under the cursor on the status bar "
+            "- and, through a colour table, the value's colour")
+        self.value_action.setChecked(self._pixel_values_wanted())
+        self.value_action.toggled.connect(self._on_pixel_values_toggled)
+        view_menu.addAction(self.value_action)
 
         # Remove the crosshair that Go to Coordinates leaves behind
         clear_marker_action = QAction("Clear Coordinate &Marker", self)
@@ -2876,6 +2894,7 @@ class MainWindow(QMainWindow):
         band_count = 3
         values = None
         palette_bands = []
+        legend = []
         if reference is not None:
             try:
                 with gdal_config.opened(reference) as src:
@@ -2883,6 +2902,9 @@ class MainWindow(QMainWindow):
                     palette_bands = [
                         b for b in range(1, src.count + 1)
                         if display_settings.colour_table(src, b) is not None]
+                    if palette_bands:
+                        legend = display_settings.colour_table_legend(
+                            src, palette_bands[0])
                     # What its values look like, for the stretch controls
                     # to say - from the sample the stretch is read off.
                     values = display_settings.sampled_values(src)
@@ -2902,7 +2924,7 @@ class MainWindow(QMainWindow):
             group_path, display_settings.resolve(
                 self.project.display_settings, group_path),
             band_count, histogram_for, self, values=values,
-            palette_bands=palette_bands)
+            palette_bands=palette_bands, legend=legend)
         dialog.setAttribute(Qt.WA_DeleteOnClose)
         dialog.changed.connect(
             lambda s, g=group_path: self._set_group_display(g, s))
@@ -6275,6 +6297,52 @@ class MainWindow(QMainWindow):
                             layer_name: str, group_path: str,
                             is_pixel: bool = False):
         """Update the coordinate display in the status bar."""
+        self._coord_text = self._coordinate_text(x, y, layer_name,
+                                                 group_path, is_pixel)
+        self._show_coords()
+
+    def _show_coords(self):
+        """The status bar's readout: where the cursor is, and what is
+        under it once that has been read."""
+        text = html.escape(self._coord_text)
+        if self._value_text:
+            text += "&nbsp;&nbsp;|&nbsp;&nbsp;" + self._value_text
+        self.coord_label.setText(text)
+
+    _PIXEL_VALUES_KEY = "view/pixel_values"
+
+    def _pixel_values_wanted(self) -> bool:
+        value = settings_scope.settings().value(self._PIXEL_VALUES_KEY, True)
+        return str(value).lower() in ("true", "1")
+
+    def _on_pixel_values_toggled(self, checked: bool):
+        settings_scope.settings().setValue(self._PIXEL_VALUES_KEY,
+                                           bool(checked))
+        if not checked:
+            self._value_probe.clear()
+            self._value_text = ""
+            self._show_coords()
+
+    def _on_cursor_probe(self, image_path: str, x: float, y: float,
+                         is_pixel: bool):
+        """The cursor moved: read the pixel under it, off the UI thread
+        (2.8.1). Over no image, or with the readout switched off, the
+        value goes and the coordinates stay."""
+        if not image_path or not self.value_action.isChecked():
+            self._value_probe.clear()
+            if self._value_text:
+                self._value_text = ""
+                self._show_coords()
+            return
+        self._value_probe.request(image_path, x, y, is_pixel)
+
+    def _on_value_probed(self, probe):
+        self._value_text = probe.text() if probe is not None else ""
+        self._show_coords()
+
+    def _coordinate_text(self, x: float, y: float, layer_name: str,
+                         group_path: str, is_pixel: bool = False) -> str:
+        """Where the cursor is, as the status bar says it."""
         if layer_name:
             # Build display name with group path if present
             if group_path:
@@ -6284,24 +6352,24 @@ class MainWindow(QMainWindow):
 
             if is_pixel:
                 # Non-georeferenced image: show pixel coordinates
-                self.coord_label.setText(
+                return (
                     f"Pixel: ({x:.1f}, {y:.1f})  |  Image: {display_name}")
             elif layer_name.startswith("~"):
                 # Layer name prefixed with ~ means "closest to"
-                self.coord_label.setText(
+                return (
                     f"Lon: {
                         x:.6f}°  Lat: {
                         y:.6f}°  |  Nearest: {display_name}")
             else:
-                self.coord_label.setText(
+                return (
                     f"Lon: {
                         x:.6f}°  Lat: {
                         y:.6f}°  |  Image: {display_name}")
         else:
             if is_pixel:
-                self.coord_label.setText(f"Pixel: ({x:.1f}, {y:.1f})")
+                return (f"Pixel: ({x:.1f}, {y:.1f})")
             else:
-                self.coord_label.setText(f"Lon: {x:.6f}°  Lat: {y:.6f}°")
+                return (f"Lon: {x:.6f}°  Lat: {y:.6f}°")
 
     def _on_hard_negative_toggled(self, layer_id: str):
         """Flip an image's hard-negative-source flag.

@@ -2155,6 +2155,9 @@ class MapCanvas(QGraphicsView):
     # Signal emitted when mouse moves: (longitude, latitude, layer_name,
     # group_path)
     coordinates_changed = pyqtSignal(float, float, str, str, bool)  # x, y, layer, group, is_pixel
+    # The image under the cursor ("" over none) and where, for the
+    # status bar's value readout (2.8.1): path, x, y, is_pixel.
+    cursor_probe = pyqtSignal(str, float, float, bool)
 
     # Signal emitted when a label is placed: (pixel_x, pixel_y, lon, lat,
     # image_name, image_group, image_path)
@@ -4875,16 +4878,22 @@ class MapCanvas(QGraphicsView):
         if self.is_in_pixel_zone(easting):
             if layer is not None and not layer.geo:
                 px, py = layer.scene_to_pixel(easting, northing)
-                self._queue_coords_emit(px, py, layer_name, group_path, True)
+                self._queue_coords_emit(px, py, layer_name, group_path, True,
+                                        layer.file_path)
             else:
                 self._queue_coords_emit(0.0, 0.0, layer_name, group_path, True)
         else:
             lon, lat = self._web_mercator_to_wgs84(easting, northing)
-            self._queue_coords_emit(lon, lat, layer_name, group_path, False)
+            self._queue_coords_emit(
+                lon, lat, layer_name, group_path, False,
+                layer.file_path if layer is not None and layer.geo else "")
 
     def _queue_coords_emit(self, x: float, y: float, layer_name: str,
-                           group_path: str, is_pixel: bool):
+                           group_path: str, is_pixel: bool,
+                           image_path: str = ""):
         """Coalesce coordinates_changed emissions from rapid mouse movement.
+
+        ``image_path`` is the image under the cursor, for cursor_probe.
 
         Stores the latest payload and starts a short timer; only the most
         recent payload is emitted, and only if it differs from the previously
@@ -4896,7 +4905,8 @@ class MapCanvas(QGraphicsView):
             rounded = (round(x, 1), round(y, 1))
         else:
             rounded = (round(x, 6), round(y, 6))
-        payload = (rounded[0], rounded[1], layer_name, group_path, is_pixel)
+        payload = (rounded[0], rounded[1], layer_name, group_path, is_pixel,
+                   image_path)
         self._pending_coords = payload
         if not self._coords_emit_timer.isActive():
             self._coords_emit_timer.start()
@@ -4907,7 +4917,8 @@ class MapCanvas(QGraphicsView):
         if payload is None or payload == self._last_emitted_coords:
             return
         self._last_emitted_coords = payload
-        self.coordinates_changed.emit(*payload)
+        self.coordinates_changed.emit(*payload[:5])
+        self.cursor_probe.emit(payload[5], payload[0], payload[1], payload[4])
 
     def keyPressEvent(self, event):
         """Handle key press events."""

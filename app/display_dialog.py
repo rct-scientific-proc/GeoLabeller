@@ -261,6 +261,17 @@ class ChannelPanel(QGroupBox):
         self.changed.emit()
 
 
+def legend_html(entries) -> str:
+    """The Legend row: a square in each value's colour, the value, and
+    its share of the pixels (``display_settings.colour_table_legend``)."""
+    parts = []
+    for value, (r, g, b), share in entries:
+        pct = f"{100 * share:.0f}" if share >= 0.005 else "&lt;1"
+        parts.append(f'<span style="color:#{r:02x}{g:02x}{b:02x}">&#9632;'
+                     f'</span> {value} ({pct} %)')
+    return " &nbsp; ".join(parts)
+
+
 class DisplaySettingsDialog(QDialog):
     """Edit one group's display settings, live.
 
@@ -276,9 +287,11 @@ class DisplaySettingsDialog(QDialog):
 
     def __init__(self, group_path: str, settings: DisplaySettings,
                  band_count: int, histogram_for=None, parent=None,
-                 values=None, palette_bands=()):
+                 values=None, palette_bands=(), legend=()):
         """``palette_bands`` are the bands of the group's imagery that
-        carry an embedded colour table; the tick is offered for them."""
+        carry an embedded colour table; the tick is offered for them.
+        ``legend`` is that table's values present in the imagery, as
+        ``display_settings.colour_table_legend`` gives them (2.8.1)."""
         super().__init__(parent)
         self.setWindowTitle(f"Display Settings - {group_path}")
         self.group_path = group_path
@@ -336,6 +349,14 @@ class DisplaySettingsDialog(QDialog):
         top.addRow("Bands", bands)
         if self.palette_bands:
             top.addRow("Colour table", self.palette_check)
+        self.legend_label = None
+        if self.palette_bands and legend:
+            self.legend_label = QLabel(legend_html(legend))
+            self.legend_label.setWordWrap(True)
+            self.legend_label.setToolTip(
+                "The values the imagery holds, each with its colour from "
+                "the table and its share of the pixels, from a sampled read.")
+            top.addRow("Legend", self.legend_label)
 
         # The stretch: which values are drawn black and white, for
         # imagery that is not 8-bit already (that is drawn as stored).
@@ -587,14 +608,14 @@ class DisplaySettingsDialog(QDialog):
     def _on_bands_changed(self, *_args):
         if self._loading:
             return
-        self.stretch_box.setEnabled(not self.palette_in_use())
+        self._sync_palette_widgets()
         self._refresh_histograms()
         self._schedule_emit()
 
     def _on_palette_changed(self, *_args):
         if self._loading:
             return
-        self.stretch_box.setEnabled(not self.palette_in_use())
+        self._sync_palette_widgets()
         self._schedule_emit()
 
     def _on_stretch_changed(self, *_args):
@@ -618,8 +639,16 @@ class DisplaySettingsDialog(QDialog):
         for panel in self.panels[1:]:
             panel.setVisible(not single)
         self.panels[0].set_hideable(not single)
-        # Through a colour table the stretch has nothing to do.
-        self.stretch_box.setEnabled(not self.palette_in_use())
+        self._sync_palette_widgets()
+
+    def _sync_palette_widgets(self):
+        """Through a colour table the stretch has nothing to do, and the
+        legend applies."""
+        in_use = self.palette_in_use()
+        self.stretch_box.setEnabled(not in_use)
+        legend = getattr(self, "legend_label", None)
+        if legend is not None:
+            legend.setEnabled(in_use)
 
     def _channel_bands(self) -> list:
         if self.mode() == MODE_SINGLE:

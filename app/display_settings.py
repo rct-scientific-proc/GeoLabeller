@@ -74,6 +74,9 @@ def _number(value: float) -> str:
     return f"{value:.4g}"
 
 
+format_value = _number      # the same reading for the status bar's values
+
+
 @dataclass(frozen=True)
 class ChannelAdjust:
     """Brightness, contrast and gamma for one displayed channel, or the
@@ -562,6 +565,36 @@ def palette_rgb(values, table: np.ndarray) -> np.ndarray:
 
 
 # -- reading pixels through the settings --------------------------------------
+
+def colour_table_legend(src, band: int = 1, max_side: int = 512,
+                        limit: int = 24) -> list:
+    """The values of ``band`` present in a decimated read, each with its
+    colour from the band's colour table and its share of the pixels:
+    ``[(value, (r, g, b), share), ...]``, most common first, at most
+    ``limit`` of them. Empty when the band carries no table. Nodata and
+    values the table does not reach are left out (2.8.1)."""
+    from .snippets import nodata_mask
+
+    table = colour_table(src, band)
+    if table is None:
+        return []
+    band = _clamp(int(band), 1, src.count)
+    scale = max(src.width, src.height) / max_side
+    out_w = max(1, int(src.width / max(scale, 1.0)))
+    out_h = max(1, int(src.height / max(scale, 1.0)))
+    data = src.read(band, out_shape=(out_h, out_w))
+    empty = nodata_mask(data, src.nodata)
+    values = data[~empty] if empty is not None else data.ravel()
+    values = np.rint(np.nan_to_num(values.astype(np.float64), nan=-1.0))
+    values = values[(values >= 0) & (values < len(table))].astype(np.int64)
+    if values.size == 0:
+        return []
+    unique, counts = np.unique(values, return_counts=True)
+    order = np.argsort(-counts, kind="stable")[:limit]
+    total = float(counts.sum())
+    return [(int(unique[i]), tuple(int(c) for c in table[unique[i]]),
+             float(counts[i] / total)) for i in order]
+
 
 def display_rgb(src, window, nodata, scaling, settings: DisplaySettings):
     """A window of ``src`` as (H, W, 3) uint8, drawn through ``settings``.
