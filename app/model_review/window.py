@@ -98,6 +98,7 @@ _TOLERANCE_KEY = "model_review/tolerance"
 _MORE_KEY = "model_review/more"
 _LEARN_KEY = "model_review/learn"
 _REF_COLUMNS_KEY = "model_review/reference_columns"
+_MIN_SCORE_KEY = "model_review/min_score"
 _GEOMETRY_KEY = "model_review/geometry"
 _DETAILS_KEY = "model_review/details"
 _CONTEXT_KEY = "model_review/context"
@@ -360,6 +361,7 @@ class ModelReviewWindow(QWidget):
         self._chips: list = []
         self._by_key: dict = {}
         self._listed: list = []         # the chips the filters let through
+        self._below_score = 0           # ...and how many the score floor hid
         self._visible: list = []        # the page of them on the grid
         self._page_start = 0            # the rank of the page's first chip
         self._page = 0                  # its number, from that
@@ -525,6 +527,20 @@ class ModelReviewWindow(QWidget):
         self.verdict_filter.currentIndexChanged.connect(self._on_filter)
         self.verdict_filter.activated.connect(lambda _i: self.setFocus())
         third.addWidget(self.verdict_filter)
+        third.addWidget(QLabel("Score at least"))
+        self.score_spin = QDoubleSpinBox()
+        self.score_spin.setRange(0.0, 1.0)
+        self.score_spin.setSingleStep(0.05)
+        self.score_spin.setDecimals(2)
+        self.score_spin.setValue(0.0)
+        self.score_spin.setToolTip(
+            "Only the chips the model scored at least this: 0.95 for the\n"
+            "ones it was surest of, 0 for all of them. The status bar\n"
+            "counts what it hides. Remembered.")
+        self.score_spin.setKeyboardTracking(False)
+        self.score_spin.valueChanged.connect(self._on_filter)
+        self.score_spin.editingFinished.connect(self.setFocus)
+        third.addWidget(self.score_spin)
         self.chip_spin = QSpinBox()
         self.chip_spin.setRange(32, 2048)
         self.chip_spin.setSingleStep(32)
@@ -1097,6 +1113,12 @@ class ModelReviewWindow(QWidget):
                   and _passes(chip, standing)
                   and (suggested is ANY_SUGGESTION
                        or self._suggested_class(chip.key) == suggested)]
+        # The score floor last, and counted: the status says how many
+        # it hides (2.8.4). A hair under, for a floor typed as the
+        # score was written.
+        floor = self.score_spin.value() - 1e-9
+        self._below_score = sum(1 for chip in chosen if chip.score < floor)
+        chosen = [chip for chip in chosen if chip.score >= floor]
         if self._suggestions and self.order_combo.currentData() == "suggestion":
             return sorted(chosen, key=lambda c: (-self._confidence(c.key),
                                                  -c.score, c.key))
@@ -1534,6 +1556,9 @@ class ModelReviewWindow(QWidget):
             text += (f"; {earlier} reviewed in an earlier round"
                      + ("" if self.show_reviewed_check.isChecked()
                         else ", hidden"))
+        if self._below_score:
+            text += (f"; {self._below_score} below the score "
+                     f"{self.score_spin.value():.2f}")
         if self._note:
             text += "  " + self._note
             self._note = ""
@@ -2446,6 +2471,13 @@ class ModelReviewWindow(QWidget):
         except (TypeError, ValueError):
             columns = DEFAULT_REF_COLUMNS
         self.reference.set_columns(columns)
+        try:
+            floor = float(settings.value(_MIN_SCORE_KEY, 0.0))
+        except (TypeError, ValueError):
+            floor = 0.0
+        self.score_spin.blockSignals(True)
+        self.score_spin.setValue(floor)
+        self.score_spin.blockSignals(False)
         self.details_check.setChecked(
             str(settings.value(_DETAILS_KEY, "true")).lower() != "false")
         self.detail.setVisible(self.details_check.isChecked())
@@ -2518,6 +2550,7 @@ class ModelReviewWindow(QWidget):
         settings.setValue(_MORE_KEY, self.more_button.isChecked())
         settings.setValue(_LEARN_KEY, self.learn_button.isChecked())
         settings.setValue(_REF_COLUMNS_KEY, self.reference.columns)
+        settings.setValue(_MIN_SCORE_KEY, self.score_spin.value())
         settings.setValue(_DETAILS_KEY, self.details_check.isChecked())
         settings.setValue(_CONTEXT_KEY, self.detail.context_spin.value())
         settings.setValue(_SPLITTER_KEY, self.splitter.saveState())
