@@ -247,6 +247,18 @@ def entry_to_full_image(entry: dict, image_width: int,
                            image_width, image_height)
 
 
+def shift_entry(entry: dict, dx: int, dy: int, new_width: int,
+                new_height: int) -> dict:
+    """The entry on an image cropped by ``dx`` columns on the left and
+    ``dy`` rows on the top (negative: added), ``new_width`` by
+    ``new_height`` afterwards, as a full-image entry; what leaves the
+    image is clipped (2.8.6). Span arithmetic, as the migration does."""
+    spans = ((row - dy, c0 - dx, c1 - dx)
+             for row, c0, c1 in _entry_row_spans(entry))
+    return _spans_to_entry(entry["name"], spans, int(new_width),
+                           int(new_height))
+
+
 def entry_runs(entry: dict) -> list:
     """The run list of a serialized mask (string form or legacy array)."""
     runs = entry["rle"]

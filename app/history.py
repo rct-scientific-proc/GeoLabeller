@@ -163,6 +163,15 @@ def _apply(project, labels: dict, images: dict, lists: dict, next_id: int,
             continue
         image.hard_negative_source = state.hard_negative_source
         image.location = state.location
+        # The recorded geometry too: re-seating labels on cropped
+        # imagery changes it (2.8.6). The transformer cache goes by
+        # the CRS key, so the fields can be set outright.
+        image.original_width = state.original_width
+        image.original_height = state.original_height
+        image.affine_coeffs = (list(state.affine_coeffs)
+                               if state.affine_coeffs is not None else None)
+        image.crs_epsg = state.crs_epsg
+        image.crs_wkt = state.crs_wkt
     if image_order is not None:
         _reorder_images(project, image_order)
     for name, value in lists.items():

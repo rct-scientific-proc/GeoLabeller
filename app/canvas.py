@@ -3932,6 +3932,29 @@ class MapCanvas(QGraphicsView):
             # Force viewport update to ensure cursor appears on top of tiles
             self.viewport().update()
 
+    def refresh_layer_from_file(self, layer_id: str) -> bool:
+        """The layer's file changed - cropped since the project recorded
+        it (2.8.6): its geometry read from the file again, its pixels
+        dropped, and loaded again if it is showing."""
+        layer = self._layers.get(layer_id)
+        if layer is None or not layer.geo:
+            return False
+        self._cancel_layer_load(layer)
+        self._clear_detail_tiles(layer_id, layer)
+        layer.free_data(self._scene)
+        self._warm_release(layer_id)
+        try:
+            layer._load_bounds_only()
+        except Exception as exc:  # noqa: BLE001 - the file as it is
+            debug(f"refresh layer: cannot read {layer.file_path}: "
+                  f"{type(exc).__name__}: {exc}")
+            return False
+        self._invalidate_world_rect()
+        if layer.visible:
+            self._schedule_tile_update()
+        self.viewport().update()
+        return True
+
     def update_layer_order(self, layer_order: list[str]):
         """Update the rendering order of layers."""
         self._layer_order = layer_order

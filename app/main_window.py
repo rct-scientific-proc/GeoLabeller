@@ -57,7 +57,7 @@ from .h5_export import (EXAMPLES_ALL, EXAMPLES_OBJECT,
                         estimate_export)
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
-from . import (display_settings, gdal_config, identity, recent,
+from . import (display_settings, gdal_config, identity, recent, reseat,
                settings_scope, waypoint_io)
 from .about import AboutDialog
 from .history import EditHistory
@@ -624,6 +624,10 @@ class MainWindow(QMainWindow):
         self._value_text = ""          # what is under it (2.8.1)
         self._value_probe = ValueProbe(self)
         self._value_probe.ready.connect(self._on_value_probed)
+        # Labelled images whose files changed size since the project
+        # recorded them, looked for after a project opens (2.8.6).
+        self._size_check = reseat.SizeCheck(self)
+        self._size_check.done.connect(self._on_sizes_checked)
 
         # Selected group label for cycle mode
         self.group_label = QLabel("")
@@ -801,6 +805,15 @@ class MainWindow(QMainWindow):
         remove_missing_action.triggered.connect(
             lambda: self._offer_missing_removal())
         file_menu.addAction(remove_missing_action)
+
+        # ...and for imagery cropped since it was labelled (2.8.6).
+        reseat_action = QAction("Re-seat Labels to &Imagery...", self)
+        reseat_action.setStatusTip(
+            "Put the labels right on imagery whose files were cropped "
+            "since they were labelled - by the georeferencing, one undo "
+            "step")
+        reseat_action.triggered.connect(lambda: self._reseat_labels())
+        file_menu.addAction(reseat_action)
 
         file_menu.addSeparator()
 
@@ -3953,6 +3966,7 @@ class MainWindow(QMainWindow):
             # Before clearing anything: a loader still running would
             # keep feeding the tree the user is about to replace.
             self._supersede_async_loading()
+            self._size_check.cancel()
             self.canvas.clear_label_markers()
             self.canvas.clear_layers()
             self._forget_waterfall()
@@ -5948,6 +5962,9 @@ class MainWindow(QMainWindow):
             known = self._async_missing_files
             self._async_missing_files = []  # consumed; recomputed on demand
             self._offer_relocation(known)
+        # Files cropped since they were labelled: a look at the headers
+        # of the labelled images, off the UI thread (2.8.6).
+        self._size_check.start(self.project)
 
     def _missing_project_images(self, known_paths: list | None = None) -> list:
         """The ImageData entries whose recorded paths do not exist.
@@ -6020,6 +6037,91 @@ class MainWindow(QMainWindow):
             f"Removed {len(images)} missing image(s) and {len(label_ids)} "
             "label(s) from the project - Ctrl+Z brings them back", 8000)
         return len(images), len(label_ids)
+
+    # -- labels on imagery cropped since it was labelled (2.8.6) --------
+
+    def _on_sizes_checked(self, paths):
+        """The look at the labelled images' headers found some whose
+        file differs in size from the project's record."""
+        if not paths:
+            return
+        n = len(paths)
+        if not self._confirm_reseat(
+                f"{n} image{'' if n == 1 else 's'} with labels "
+                f"{'differs' if n == 1 else 'differ'} in size from what "
+                "the project recorded - cropped since the labels were "
+                "made, perhaps. Re-seat the labels on them now?\n\nOne "
+                "undo step. File > Re-seat Labels to Imagery... does it "
+                "any time."):
+            self.statusBar.showMessage(
+                "Labels not re-seated - File > Re-seat Labels to "
+                "Imagery... any time", 8000)
+            return
+        self._reseat_images(paths)
+
+    def _confirm_reseat(self, text: str) -> bool:
+        """A question before labels move; a method so tests answer it."""
+        answer = QMessageBox.question(
+            self, "Re-seat Labels to Imagery", text,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        return answer == QMessageBox.Yes
+
+    def _say_reseat(self, text: str):
+        QMessageBox.information(self, "Re-seat Labels to Imagery", text)
+
+    def _reseat_labels(self):
+        """File > Re-seat Labels to Imagery...: every labelled image."""
+        paths = [img.path for img in self.project.images.values()
+                 if img.labels]
+        if not paths:
+            self._say_reseat("No labelled images to re-seat.")
+            return
+        self._reseat_images(paths)
+
+    def _reseat_images(self, paths: list) -> list:
+        """Labels put right on imagery whose files changed size
+        (app/reseat.py): a crop's whole-pixel shift straight away, a
+        regrid after a question naming the masks it loses; one undo
+        step; a report. Returns the plans."""
+        plans = []
+        many = len(paths) > 20
+        if many:
+            self._show_progress(len(paths), "Reading image headers")
+        for i, path in enumerate(paths):
+            image = self.project.images.get(path)
+            if image is None:
+                continue
+            plans.append((image, reseat.plan(image, reseat.read_header(path))))
+            if many and i % 20 == 0:
+                self._update_progress(i)
+                QApplication.processEvents()
+        if many:
+            self._hide_progress()
+        regrids = [p for _img, p in plans if p.kind == reseat.REGRID]
+        if regrids and not self._confirm_reseat(
+                reseat.regrid_question(regrids)):
+            for p in regrids:
+                p.decline()
+        applying = [(img, p) for img, p in plans if p.changes()]
+        if applying:
+            label_ids = [lab.id for img, _p in applying for lab in img.labels]
+            with self._recorded("Re-seat labels", labels=label_ids,
+                                images=[img.path for img, _p in applying]):
+                for img, p in applying:
+                    reseat.apply(self.project, p)
+            self._mark_unsaved()
+            for img, _p in applying:
+                layer_id = self.canvas._path_to_layer.get(img.path)
+                if layer_id is not None:
+                    self.canvas.refresh_layer_from_file(layer_id)
+            self._refresh_label_markers()
+            self._schedule_refresh("labeled", "snippets")
+            self._reseat_open_editors()
+            self._recovery_soon_timer.start()
+        only = [p for _img, p in plans]
+        self.statusBar.showMessage(reseat.summary(only), 10000)
+        self._say_reseat(reseat.report(only))
+        return only
 
     def _offer_relocation(self, known_paths: list | None = None):
         """Show the relocation dialog for whatever is currently missing.

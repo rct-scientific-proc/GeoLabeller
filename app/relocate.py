@@ -113,12 +113,15 @@ def verify_candidate(candidate: str, image) -> bool:
         return True   # nothing recorded to check against
     try:
         with rasterio.open(candidate) as src:
-            if width and src.width != width:
-                return False
-            if height and src.height != height:
-                return False
             if stored_crs is not None and src.crs != stored_crs:
                 return False
+            if (width and src.width != width) or (
+                    height and src.height != height):
+                # A cropped copy of the image is still the image
+                # (2.8.6): the same grid, lying within the recorded
+                # extent. Re-seating puts its labels right afterwards.
+                from .reseat import is_cropped_version
+                return is_cropped_version(image, src)
     except Exception:
         return False
     return True
