@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from affine import Affine
 from PyQt5 import sip
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
+from PyQt5.QtWidgets import (QApplication, QDialog, QDialogButtonBox,
+                             QLabel, QPlainTextEdit, QVBoxLayout)
 
 from . import gdal_config
 from .debug_log import debug
@@ -316,7 +318,15 @@ def regrid_question(plans: list) -> str:
 
 
 def report(plans: list) -> str:
-    return "\n".join(p.describe() for p in plans)
+    """A line per image that changed or could not be re-seated, the
+    ones that match the record folded into one line at the end: a
+    thousand-image project reads as a short list (2.8.7)."""
+    lines = [p.describe() for p in plans if p.kind != SAME]
+    same = sum(1 for p in plans if p.kind == SAME)
+    if same:
+        lines.append(f"{same} image{'' if same == 1 else 's'} match"
+                     f"{'es' if same == 1 else ''} the record.")
+    return "\n".join(lines)
 
 
 def summary(plans: list) -> str:
@@ -337,6 +347,37 @@ def summary(plans: list) -> str:
     if others:
         parts.append(f"{others} image{'' if others == 1 else 's'} unchanged")
     return "; ".join(parts) if parts else "Nothing to re-seat."
+
+
+class ReportDialog(QDialog):
+    """The report, scrolling, in a window that fits the screen: a
+    message box grows with its text, and one line per image put its
+    OK button off the screen for anyone with many images (2.8.7)."""
+
+    def __init__(self, title: str, headline: str, text: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        layout = QVBoxLayout(self)
+        self.headline = QLabel(headline)
+        self.headline.setWordWrap(True)
+        font = self.headline.font()
+        font.setBold(True)
+        self.headline.setFont(font)
+        layout.addWidget(self.headline)
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setPlainText(text)
+        layout.addWidget(self.text, 1)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+        self.buttons.accepted.connect(self.accept)
+        layout.addWidget(self.buttons)
+        width, height = 760, 520
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            width = min(width, max(320, available.width() - 80))
+            height = min(height, max(240, available.height() - 120))
+        self.resize(width, height)
 
 
 # -- the look at a project's files, off the UI thread ----------------------

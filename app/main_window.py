@@ -6066,8 +6066,11 @@ class MainWindow(QMainWindow):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
         return answer == QMessageBox.Yes
 
-    def _say_reseat(self, text: str):
-        QMessageBox.information(self, "Re-seat Labels to Imagery", text)
+    def _say_reseat(self, text: str, headline: str = ""):
+        """The report, in a window that scrolls and fits the screen."""
+        dialog = reseat.ReportDialog("Re-seat Labels to Imagery",
+                                    headline, text, self)
+        dialog.exec_()
 
     def _reseat_labels(self):
         """File > Re-seat Labels to Imagery...: every labelled image."""
@@ -6120,7 +6123,7 @@ class MainWindow(QMainWindow):
             self._recovery_soon_timer.start()
         only = [p for _img, p in plans]
         self.statusBar.showMessage(reseat.summary(only), 10000)
-        self._say_reseat(reseat.report(only))
+        self._say_reseat(reseat.report(only), reseat.summary(only))
         return only
 
     def _offer_relocation(self, known_paths: list | None = None):
