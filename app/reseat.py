@@ -32,6 +32,7 @@ from __future__ import annotations
 import math
 import statistics
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 
 from affine import Affine
 from PyQt5 import sip
@@ -82,6 +83,7 @@ class Plan:
     dropped: list = field(default_factory=list)    # label ids off the image
     masks_moved: int = 0
     masks_lost: int = 0
+    memory_moved: int = 0       # Model Review entries, counted at apply
     reason: str = ""
 
     def changes(self) -> bool:
@@ -140,6 +142,10 @@ class Plan:
         if self.dropped:
             d = len(self.dropped)
             text += f"; {d} label{'' if d == 1 else 's'} off the image dropped"
+        if self.memory_moved:
+            m = self.memory_moved
+            text += (f"; {m} review memory entr{'y' if m == 1 else 'ies'} "
+                     "moved")
         return text + "."
 
 
@@ -298,6 +304,23 @@ def apply(project, p: Plan):
     if image is None or not p.changes():
         return
     header = p.header
+    # The Model Review memory remembers chips by pixel centre on the
+    # image: they move with it (2.8.9), by the offset or through the
+    # old and new georeferencing.
+    old = image.get_affine()
+    name = _file_key(image.path)
+    for entry in getattr(project, "model_review", []) or []:
+        if _file_key(entry.image) != name:
+            continue
+        if p.kind == SHIFT:
+            entry.pixel_x -= p.dx
+            entry.pixel_y -= p.dy
+        elif old is not None and header.affine is not None:
+            x, y = ~header.affine * (old * (entry.pixel_x, entry.pixel_y))
+            entry.pixel_x, entry.pixel_y = float(x), float(y)
+        else:
+            continue
+        p.memory_moved += 1
     for label_id in p.dropped:
         project.remove_label(label_id)
     for label in image.labels:
@@ -314,6 +337,12 @@ def apply(project, p: Plan):
     image.original_height = int(header.height)
     if header.affine is not None and header.crs is not None:
         image.set_affine(header.affine, header.crs)
+
+
+def _file_key(name_or_path) -> str:
+    """A file name as the memory compares it: the last part, lower-cased."""
+    return PurePosixPath(str(name_or_path or "").replace("\\", "/")
+                         ).name.lower()
 
 
 def regrid_question(plans: list) -> str:
@@ -427,24 +456,28 @@ class _Signals(QObject):
 
 class _Runnable(QRunnable):
 
-    def __init__(self, token: int, is_current, project, signals):
+    def __init__(self, token: int, is_current, project,
+                 labelled_only: bool, signals):
         super().__init__()
         self.token, self.is_current = token, is_current
         self.project, self.signals = project, signals
+        self.labelled_only = labelled_only
 
     def run(self):
         paths = mismatched_paths(
             self.project, lambda: not self.is_current(self.token),
-            labelled_only=True)
+            labelled_only=self.labelled_only)
         self.signals.finished.emit(self.token, paths)
 
 
 class SizeCheck(QObject):
-    """Reads the headers of a project's labelled images off the UI
-    thread when a project has opened; ``done`` carries the paths whose
-    files differ in size from the record. A newer project supersedes."""
+    """Reads image headers off the UI thread: the labelled images' when
+    a project has opened, every image's after an accepted re-seat (a set
+    of files cropped together, 2.8.9). ``done`` carries the paths whose
+    files differ in size from the record, and whether the look was at
+    the labelled images only. A newer look supersedes."""
 
-    done = pyqtSignal(object)
+    done = pyqtSignal(object, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -456,16 +489,18 @@ class SizeCheck(QObject):
     def _is_current(self, token: int) -> bool:
         return token == self._token
 
-    def start(self, project):
+    def start(self, project, labelled_only: bool = True):
         self._token += 1
-        if not any(img.labels for img in project.images.values()):
+        if not project.images or (labelled_only and not any(
+                img.labels for img in project.images.values())):
             return
         signals = _Signals()
         self._alive.add(signals)
         signals.finished.connect(
-            lambda token, paths, s=signals: self._on_finished(token, paths, s))
+            lambda token, paths, s=signals, only=labelled_only:
+                self._on_finished(token, paths, only, s))
         self._pool.start(_Runnable(self._token, self._is_current, project,
-                                   signals))
+                                   labelled_only, signals))
 
     def cancel(self):
         self._token += 1
@@ -473,8 +508,8 @@ class SizeCheck(QObject):
     def wait(self, ms: int = 10000) -> bool:
         return self._pool.waitForDone(ms)
 
-    def _on_finished(self, token: int, paths, signals):
+    def _on_finished(self, token: int, paths, labelled_only: bool, signals):
         self._alive.discard(signals)
         if sip.isdeleted(self) or token != self._token:
             return
-        self.done.emit(paths)
+        self.done.emit(paths, labelled_only)

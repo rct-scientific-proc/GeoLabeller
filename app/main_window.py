@@ -6041,18 +6041,26 @@ class MainWindow(QMainWindow):
 
     # -- labels on imagery cropped since it was labelled (2.8.6) --------
 
-    def _on_sizes_checked(self, paths):
-        """The look at the labelled images' headers found some whose
-        file differs in size from the project's record."""
+    def _on_sizes_checked(self, paths, labelled_only: bool = True):
+        """The look at the images' headers found some whose file differs
+        in size from the project's record: the labelled ones, after a
+        project opens (an offer); or every image, after an accepted
+        re-seat (the rest brought up to date quietly, 2.8.9)."""
         if not paths:
+            if not labelled_only:
+                self.statusBar.showMessage(
+                    "Every other image matches the project's record", 6000)
             return
         labelled = [p for p in paths
                     if self.project.images.get(p) is not None
                     and self.project.images[p].labels]
-        if not labelled:
-            # Nothing to move: the records brought up to date with the
-            # files, said on the status bar, no question (2.8.8).
-            self._reseat_images(paths, quiet=True)
+        if not labelled or not labelled_only:
+            # Nothing to move, or the sweep after an accepted re-seat:
+            # the records brought up to date with the files, said on the
+            # status bar, no question (2.8.8).
+            rest = [p for p in paths if p not in labelled]
+            if rest:
+                self._reseat_images(rest, quiet=True)
             return
         n, k = len(paths), len(labelled)
         if not self._confirm_reseat(
@@ -6067,6 +6075,12 @@ class MainWindow(QMainWindow):
                 "Imagery... any time", 8000)
             return
         self._reseat_images(paths)
+        # A set of files cropped together: every other image's record
+        # brought up to date too, off the UI thread (2.8.9), so a project
+        # saved afterwards matches the files throughout.
+        self.statusBar.showMessage(
+            "Checking every image against the project's record...", 10000)
+        self._size_check.start(self.project, labelled_only=False)
 
     def _on_layer_read(self, path: str):
         """A layer has read its file (2.8.8): an unlabelled image whose
@@ -6140,7 +6154,8 @@ class MainWindow(QMainWindow):
         if applying:
             label_ids = [lab.id for img, _p in applying for lab in img.labels]
             with self._recorded("Re-seat labels", labels=label_ids,
-                                images=[img.path for img, _p in applying]):
+                                images=[img.path for img, _p in applying],
+                                lists=("model_review",)):
                 for img, p in applying:
                     reseat.apply(self.project, p)
             self._mark_unsaved()
