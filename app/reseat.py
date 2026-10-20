@@ -104,28 +104,39 @@ class Plan:
             return (f"{self.name}: the pixel size changed; left as it was "
                     "at your word.")
         h = self.header
+        # An image without labels: nothing to move, the record brought up
+        # to date with the file (2.8.8).
+        unlabelled = not self.moves and not self.dropped
         if self.kind == SHIFT:
             cuts = []
             right = self.old_width - h.width - self.dx
             bottom = self.old_height - h.height - self.dy
             for amount, where in ((self.dx, "the left"), (right, "the right"),
                                   (self.dy, "the top"), (bottom, "the bottom")):
+                what = "rows" if where in ("the top", "the bottom") else "columns"
                 if amount > 0:
-                    cuts.append(f"{amount} {'rows' if where in ('the top', 'the bottom') else 'columns'} cut from {where}")
+                    cuts.append(f"{amount} {what} cut from {where}")
                 elif amount < 0:
-                    cuts.append(f"{-amount} {'rows' if where in ('the top', 'the bottom') else 'columns'} added at {where}")
+                    cuts.append(f"{-amount} {what} added at {where}")
             text = f"{self.name}: " + (", ".join(cuts) or "the same extent")
-            text += f"; {labels}"
-            if self.masks_moved:
-                text += f" and {self.masks_moved} mask{'' if self.masks_moved == 1 else 's'}"
-            text += " moved"
+            if unlabelled:
+                text += "; no labels, the record updated"
+            else:
+                text += f"; {labels}"
+                if self.masks_moved:
+                    text += (f" and {self.masks_moved} mask"
+                             f"{'' if self.masks_moved == 1 else 's'}")
+                text += " moved"
         else:
             text = (f"{self.name}: the grid changed ({self.old_pixel_size:.4g} "
-                    f"to {h.pixel_size():.4g} per pixel); {labels} placed by "
-                    "latitude and longitude")
-            if self.masks_lost:
-                text += (f"; {self.masks_lost} mask"
-                         f"{'' if self.masks_lost == 1 else 's'} dropped")
+                    f"to {h.pixel_size():.4g} per pixel)")
+            if unlabelled:
+                text += "; no labels, the record updated"
+            else:
+                text += f"; {labels} placed by latitude and longitude"
+                if self.masks_lost:
+                    text += (f"; {self.masks_lost} mask"
+                             f"{'' if self.masks_lost == 1 else 's'} dropped")
         if self.dropped:
             d = len(self.dropped)
             text += f"; {d} label{'' if d == 1 else 's'} off the image dropped"
@@ -331,18 +342,23 @@ def report(plans: list) -> str:
 
 def summary(plans: list) -> str:
     """One line for the status bar."""
-    shifted = sum(1 for p in plans if p.kind == SHIFT)
-    regridded = sum(1 for p in plans if p.kind == REGRID)
-    labels = sum(len(p.moves) for p in plans if p.changes())
-    dropped = sum(len(p.dropped) for p in plans if p.changes())
-    others = len(plans) - shifted - regridded
+    changed = [p for p in plans if p.changes()]
+    labelled = [p for p in changed if p.moves or p.dropped]
+    records = len(changed) - len(labelled)     # unlabelled: the record
+    labels = sum(len(p.moves) for p in labelled)
+    dropped = sum(len(p.dropped) for p in labelled)
+    others = len(plans) - len(changed)
     parts = []
-    if shifted or regridded:
+    if labelled:
         parts.append(f"Re-seated {labels} label{'' if labels == 1 else 's'} "
-                     f"on {shifted + regridded} image"
-                     f"{'' if shifted + regridded == 1 else 's'}")
+                     f"on {len(labelled)} image"
+                     f"{'' if len(labelled) == 1 else 's'}")
         if dropped:
             parts.append(f"{dropped} dropped")
+    if records:
+        parts.append(f"{records} record{'' if records == 1 else 's'} of "
+                     "unlabelled images updated")
+    if changed:
         parts.append("Ctrl+Z takes it back")
     if others:
         parts.append(f"{others} image{'' if others == 1 else 's'} unchanged")
@@ -382,14 +398,21 @@ class ReportDialog(QDialog):
 
 # -- the look at a project's files, off the UI thread ----------------------
 
-def mismatched_paths(project, should_stop=None) -> list:
-    """The labelled images whose file's size differs from the record."""
+def mismatched_paths(project, should_stop=None,
+                     labelled_only: bool = False) -> list:
+    """The images whose file's size differs from the record: every
+    image with a recorded size (the command), or the labelled ones
+    (the look after a project opens, which must not turn a
+    metadata-only load into a read of every file; an unlabelled
+    image's record is brought up to date when its layer first reads
+    the file instead, 2.8.8)."""
     should_stop = should_stop or (lambda: False)
     paths = []
     for image in list(project.images.values()):
         if should_stop():
             break
-        if not image.labels or not image.original_width:
+        if not image.original_width or (labelled_only
+                                        and not image.labels):
             continue
         header = read_header(image.path)
         if header is not None and (header.width, header.height) != (
@@ -411,14 +434,15 @@ class _Runnable(QRunnable):
 
     def run(self):
         paths = mismatched_paths(
-            self.project, lambda: not self.is_current(self.token))
+            self.project, lambda: not self.is_current(self.token),
+            labelled_only=True)
         self.signals.finished.emit(self.token, paths)
 
 
 class SizeCheck(QObject):
-    """Reads the headers of a project's labelled images off the UI thread
-    when a project has opened; ``done`` carries the paths whose files
-    differ in size from the record. A newer project supersedes."""
+    """Reads the headers of a project's labelled images off the UI
+    thread when a project has opened; ``done`` carries the paths whose
+    files differ in size from the record. A newer project supersedes."""
 
     done = pyqtSignal(object)
 

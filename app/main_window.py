@@ -696,6 +696,7 @@ class MainWindow(QMainWindow):
         self.canvas.layer_load_failed.connect(self._on_layer_load_failed)
         self.canvas.coordinates_changed.connect(self._update_coordinates)
         self.canvas.cursor_probe.connect(self._on_cursor_probe)
+        self.canvas.layer_read.connect(self._on_layer_read)
         self.canvas.label_placed.connect(self._on_label_placed)
         self.canvas.label_removed.connect(self._on_label_removed)
         self.canvas.labels_linked.connect(self._on_labels_linked)
@@ -6045,19 +6046,43 @@ class MainWindow(QMainWindow):
         file differs in size from the project's record."""
         if not paths:
             return
-        n = len(paths)
+        labelled = [p for p in paths
+                    if self.project.images.get(p) is not None
+                    and self.project.images[p].labels]
+        if not labelled:
+            # Nothing to move: the records brought up to date with the
+            # files, said on the status bar, no question (2.8.8).
+            self._reseat_images(paths, quiet=True)
+            return
+        n, k = len(paths), len(labelled)
         if not self._confirm_reseat(
-                f"{n} image{'' if n == 1 else 's'} with labels "
+                f"{n} image{'' if n == 1 else 's'} "
                 f"{'differs' if n == 1 else 'differ'} in size from what "
-                "the project recorded - cropped since the labels were "
-                "made, perhaps. Re-seat the labels on them now?\n\nOne "
-                "undo step. File > Re-seat Labels to Imagery... does it "
-                "any time."):
+                f"the project recorded - cropped since, perhaps - {k} of "
+                "them with labels. Re-seat the labels now?\n\nOne undo "
+                "step. File > Re-seat Labels to Imagery... does it any "
+                "time."):
             self.statusBar.showMessage(
                 "Labels not re-seated - File > Re-seat Labels to "
                 "Imagery... any time", 8000)
             return
         self._reseat_images(paths)
+
+    def _on_layer_read(self, path: str):
+        """A layer has read its file (2.8.8): an unlabelled image whose
+        record differs from the file has it brought up to date -
+        nothing to move, nothing asked. A labelled one is the offer's
+        after opening, or the command's."""
+        image = self.project.images.get(path)
+        layer_id = self.canvas._path_to_layer.get(path)
+        if (image is None or layer_id is None or image.labels
+                or not image.original_width):
+            return
+        width, height = self.canvas.get_layer_source_dimensions(layer_id)
+        if not width or (width, height) == (image.original_width,
+                                            image.original_height):
+            return
+        self._reseat_images([path], quiet=True)
 
     def _confirm_reseat(self, text: str) -> bool:
         """A question before labels move; a method so tests answer it."""
@@ -6073,19 +6098,22 @@ class MainWindow(QMainWindow):
         dialog.exec_()
 
     def _reseat_labels(self):
-        """File > Re-seat Labels to Imagery...: every labelled image."""
+        """File > Re-seat Labels to Imagery...: every image with a
+        recorded size (an unlabelled one has its record checked)."""
         paths = [img.path for img in self.project.images.values()
-                 if img.labels]
+                 if img.original_width]
         if not paths:
-            self._say_reseat("No labelled images to re-seat.")
+            self._say_reseat("No images to check.")
             return
         self._reseat_images(paths)
 
-    def _reseat_images(self, paths: list) -> list:
+    def _reseat_images(self, paths: list, quiet: bool = False) -> list:
         """Labels put right on imagery whose files changed size
         (app/reseat.py): a crop's whole-pixel shift straight away, a
-        regrid after a question naming the masks it loses; one undo
-        step; a report. Returns the plans."""
+        regrid after a question naming the masks it loses; an image
+        without labels has its record updated, nothing to move; one
+        undo step; a report (``quiet``: the status bar only). Returns
+        the plans."""
         plans = []
         many = len(paths) > 20
         if many:
@@ -6100,7 +6128,10 @@ class MainWindow(QMainWindow):
                 QApplication.processEvents()
         if many:
             self._hide_progress()
-        regrids = [p for _img, p in plans if p.kind == reseat.REGRID]
+        # The question is for labels and masks; an unlabelled image's
+        # record follows the file without one.
+        regrids = [p for _img, p in plans
+                   if p.kind == reseat.REGRID and (p.moves or p.dropped)]
         if regrids and not self._confirm_reseat(
                 reseat.regrid_question(regrids)):
             for p in regrids:
@@ -6113,9 +6144,13 @@ class MainWindow(QMainWindow):
                 for img, p in applying:
                     reseat.apply(self.project, p)
             self._mark_unsaved()
-            for img, _p in applying:
+            for img, p in applying:
                 layer_id = self.canvas._path_to_layer.get(img.path)
-                if layer_id is not None:
+                if layer_id is None or p.header is None:
+                    continue
+                # A layer that has read its file already is right as it is.
+                if self.canvas.get_layer_source_dimensions(layer_id) != (
+                        p.header.width, p.header.height):
                     self.canvas.refresh_layer_from_file(layer_id)
             self._refresh_label_markers()
             self._schedule_refresh("labeled", "snippets")
@@ -6123,7 +6158,8 @@ class MainWindow(QMainWindow):
             self._recovery_soon_timer.start()
         only = [p for _img, p in plans]
         self.statusBar.showMessage(reseat.summary(only), 10000)
-        self._say_reseat(reseat.report(only), reseat.summary(only))
+        if not quiet:
+            self._say_reseat(reseat.report(only), reseat.summary(only))
         return only
 
     def _offer_relocation(self, known_paths: list | None = None):

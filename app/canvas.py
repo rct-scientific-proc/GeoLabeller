@@ -2158,6 +2158,10 @@ class MapCanvas(QGraphicsView):
     # The image under the cursor ("" over none) and where, for the
     # status bar's value readout (2.8.1): path, x, y, is_pixel.
     cursor_probe = pyqtSignal(str, float, float, bool)
+    # A layer has read its file (its first level landed): the file
+    # path. The project's record of an unlabelled image is brought up
+    # to date then, if the file was cropped meanwhile (2.8.8).
+    layer_read = pyqtSignal(str)
 
     # Signal emitted when a label is placed: (pixel_x, pixel_y, lon, lat,
     # image_name, image_group, image_path)
@@ -3792,6 +3796,7 @@ class MapCanvas(QGraphicsView):
             # Once something is displayed, a stale level is genuinely obsolete.
             if not layer.is_fully_loaded():
                 layer.apply_level_result(result)
+                self.layer_read.emit(layer.file_path)
                 debug(f"preview level {level}: {layer.name} "
                       f"{layer._width}x{layer._height} "
                       f"(target {layer._target_level})")
@@ -3809,6 +3814,7 @@ class MapCanvas(QGraphicsView):
 
         first_answer = not layer._overviews_known
         layer.apply_level_result(result)
+        self.layer_read.emit(layer.file_path)
         debug(f"applied level {level}: {layer.name} "
               f"{layer._width}x{layer._height}")
         self._clear_layer_tiles(layer)
