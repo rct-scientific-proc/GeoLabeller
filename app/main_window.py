@@ -6173,7 +6173,9 @@ class MainWindow(QMainWindow):
             self._recovery_soon_timer.start()
         only = [p for _img, p in plans]
         self.statusBar.showMessage(reseat.summary(only), 10000)
-        if not quiet:
+        # Quiet or not, an image that could not be re-seated is explained
+        # in front of the user (2.8.10).
+        if not quiet or any(p.kind == reseat.UNKNOWN for p in only):
             self._say_reseat(reseat.report(only), reseat.summary(only))
         return only
 

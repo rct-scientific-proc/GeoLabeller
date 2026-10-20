@@ -376,7 +376,12 @@ def summary(plans: list) -> str:
     records = len(changed) - len(labelled)     # unlabelled: the record
     labels = sum(len(p.moves) for p in labelled)
     dropped = sum(len(p.dropped) for p in labelled)
-    others = len(plans) - len(changed)
+    # "Unchanged" said too little (2.8.10): an image that matches the
+    # record, one that could not be re-seated and a regrid declined
+    # are three different things.
+    same = sum(1 for p in plans if p.kind == SAME)
+    unknown = sum(1 for p in plans if p.kind == UNKNOWN)
+    declined = sum(1 for p in plans if p.kind == DECLINED)
     parts = []
     if labelled:
         parts.append(f"Re-seated {labels} label{'' if labels == 1 else 's'} "
@@ -389,8 +394,14 @@ def summary(plans: list) -> str:
                      "unlabelled images updated")
     if changed:
         parts.append("Ctrl+Z takes it back")
-    if others:
-        parts.append(f"{others} image{'' if others == 1 else 's'} unchanged")
+    if same:
+        parts.append(f"{same} match{'es' if same == 1 else ''} the record")
+    if unknown:
+        parts.append(f"{unknown} could not be re-seated (the report "
+                     "says why)")
+    if declined:
+        parts.append(f"{declined} left as "
+                     f"{'it was' if declined == 1 else 'they were'}")
     return "; ".join(parts) if parts else "Nothing to re-seat."
 
 
