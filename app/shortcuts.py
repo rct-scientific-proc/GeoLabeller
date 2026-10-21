@@ -165,6 +165,9 @@ SHORTCUT_SECTIONS = [
                   "the next"),
         ("Space", "The next chip, this one left as it is"),
         ("I", "Ignore the rest of the page, then the next page"),
+        ("R", "Measure: two clicks on the Details picture give the length "
+              "between them, in metres by the image's georeferencing and "
+              "in pixels (pixels alone without); a right-click clears"),
         ("M", "Show the chip in hand on its whole image, in a window: "
               "the wheel zooms, a drag pans, F fits, Escape closes"),
         ("Train on verdicts button", "A model learned from the verdicts "

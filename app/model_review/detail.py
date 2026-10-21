@@ -14,12 +14,15 @@ decides which chip is in hand.
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QSpinBox,
                              QVBoxLayout, QWidget)
 
+from ..labels import geodesic_distance
 from .ledger import IGNORE
 
 DEFAULT_CONTEXT = 3             # the picture is this many chips across
@@ -49,8 +52,40 @@ def standing_of(chip) -> str:
     return f"{text} ({earlier})" if earlier else text
 
 
+def length_text(image, p1, p2) -> str:
+    """The length between two source-pixel points, as the Measure tool
+    says it (2.8.12): metres by the image's georeferencing and pixels,
+    or pixels alone when there is no georeferencing - or when it
+    cannot be used, which must not stop anything."""
+    px = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+    pixels = f"{px:.1f} px"
+    try:
+        if image is None or image.get_affine() is None \
+                or image.get_crs() is None:
+            raise ValueError("no georeferencing")
+        a = image.pixel_to_latlon(p1[0], p1[1])
+        b = image.pixel_to_latlon(p2[0], p2[1])
+        if a is None or b is None:
+            raise ValueError("no ground")
+        metres = geodesic_distance(a[0], a[1], b[0], b[1])
+        if not math.isfinite(metres):
+            raise ValueError("no distance")
+    except Exception:  # noqa: BLE001 - a readout, never a crash
+        return f"{pixels} (no georeferencing to give metres)"
+    if metres >= 1000:
+        ground = f"{metres / 1000:.2f} km"
+    elif metres >= 10:
+        ground = f"{metres:.1f} m"
+    else:
+        ground = f"{metres:.2f} m"
+    return f"{ground} ({pixels})"
+
+
 class ContextView(QWidget):
-    """The context picture, the chip's box on it, and the centre mark."""
+    """The context picture, the chip's box on it, and the centre mark -
+    and, measuring, the line between two clicks (2.8.12)."""
+
+    measured = pyqtSignal(object)   # (p1, p2) in picture pixels, or None
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -59,12 +94,18 @@ class ContextView(QWidget):
         self._centre: tuple | None = None   # (column, row) in picture pixels
         self._moved = False
         self._reading = False
+        self._measuring = False
+        self._measure: list = []            # 0, 1 or 2 picture points
+        self._measure_text = ""
+        self._hover: tuple | None = None    # the cursor, while measuring
         self.setMinimumSize(120, 100)
+        self.setMouseTracking(True)
 
     def clear(self):
         self._pixmap = None
         self._box = self._centre = None
         self._reading = False
+        self._drop_measure()
         self.update()
 
     def set_reading(self):
@@ -72,7 +113,113 @@ class ContextView(QWidget):
         self._pixmap = None
         self._box = self._centre = None
         self._reading = True
+        self._drop_measure()
         self.update()
+
+    # -- measuring (2.8.12) ------------------------------------------------
+
+    def measuring(self) -> bool:
+        return self._measuring
+
+    def set_measuring(self, on: bool):
+        """Two clicks on the picture then give the length between them;
+        a right-click clears. Off, the line goes."""
+        self._measuring = bool(on)
+        self.setCursor(Qt.CrossCursor if self._measuring
+                       else Qt.ArrowCursor)
+        if not self._measuring:
+            self._drop_measure()
+        self.update()
+
+    def clear_measure(self):
+        self._drop_measure()
+        self.update()
+        self.measured.emit(None)
+
+    def _drop_measure(self):
+        self._measure = []
+        self._measure_text = ""
+        self._hover = None
+
+    def set_measure_text(self, text: str):
+        self._measure_text = text
+        self.update()
+
+    def picture_point(self, pos) -> "tuple | None":
+        """The picture pixel under a widget position, or None off it."""
+        geometry = self._geometry()
+        if geometry is None:
+            return None
+        off_x, off_y, scale = geometry
+        col = (pos.x() - off_x) / scale
+        row = (pos.y() - off_y) / scale
+        if not (0 <= col < self._pixmap.width()
+                and 0 <= row < self._pixmap.height()):
+            return None
+        return (col, row)
+
+    def mousePressEvent(self, event):
+        if not self._measuring:
+            super().mousePressEvent(event)
+            return
+        if event.button() == Qt.RightButton:
+            self.clear_measure()
+            return
+        if event.button() != Qt.LeftButton:
+            return
+        point = self.picture_point(event.localPos())   # to the fraction
+        if point is None:
+            return
+        if len(self._measure) == 1:
+            self._measure.append(point)
+            self._hover = None
+            self.update()
+            self.measured.emit(tuple(self._measure))
+        else:
+            self._measure = [point]        # a new line starts
+            self._measure_text = ""
+            self.update()
+            self.measured.emit(None)
+
+    def mouseMoveEvent(self, event):
+        if self._measuring and len(self._measure) == 1:
+            self._hover = self.picture_point(event.localPos())
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def _paint_measure(self, painter, geometry):
+        if not self._measuring or not self._measure:
+            return
+        off_x, off_y, scale = geometry
+
+        def at(point):
+            return QPointF(off_x + (point[0] + 0.5) * scale,
+                           off_y + (point[1] + 0.5) * scale)
+        start = at(self._measure[0])
+        end = at(self._measure[1]) if len(self._measure) == 2 else (
+            at(self._hover) if self._hover is not None else None)
+        for colour, width in ((QColor(0, 0, 0, 210), 4), (MARK_COLOR, 2)):
+            pen = QPen(colour, width)
+            if end is not None and len(self._measure) < 2:
+                pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            painter.drawEllipse(start, 3, 3)
+            if end is not None:
+                painter.drawLine(start, end)
+                painter.drawEllipse(end, 3, 3)
+        if self._measure_text and end is not None:
+            middle = QPointF((start.x() + end.x()) / 2,
+                             (start.y() + end.y()) / 2)
+            metrics = painter.fontMetrics()
+            box = QRectF(middle.x() + 8, middle.y() - metrics.height() - 4,
+                         metrics.horizontalAdvance(self._measure_text) + 8,
+                         metrics.height() + 4)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 170))
+            painter.drawRect(box)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(MARK_COLOR)
+            painter.drawText(box, Qt.AlignCenter, self._measure_text)
 
     def has_picture(self) -> bool:
         return self._pixmap is not None
@@ -86,6 +233,7 @@ class ContextView(QWidget):
         self._centre = (float(centre[0]), float(centre[1]))
         self._moved = bool(moved)
         self._reading = False
+        self._drop_measure()        # a new picture: the line meant the old
         self.update()
 
     def _geometry(self) -> "tuple | None":
@@ -135,6 +283,7 @@ class ContextView(QWidget):
                         QPointF(cx + dx * MARK_GAP_PX, cy + dy * MARK_GAP_PX),
                         QPointF(cx + dx * (MARK_GAP_PX + MARK_PX),
                                 cy + dy * (MARK_GAP_PX + MARK_PX)))
+        self._paint_measure(painter, (off_x, off_y, scale))
         painter.end()
 
 
@@ -147,6 +296,8 @@ class DetailPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._chip = None
+        self._image = None              # the project's entry, for metres
+        self._picture_frame = None      # the picture's top-left source pixel
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         title = QLabel("Details")
@@ -160,6 +311,11 @@ class DetailPanel(QWidget):
         self.info.setWordWrap(True)
         self.info.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.info)
+        self.measure_info = QLabel("")
+        self.measure_info.setWordWrap(True)
+        self.measure_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.measure_info)
+        self.view.measured.connect(self._on_measured)
         row = QHBoxLayout()
         row.addWidget(QLabel("Context"))
         self.context_spin = QSpinBox()
@@ -173,6 +329,15 @@ class DetailPanel(QWidget):
         self.context_spin.valueChanged.connect(self.context_changed)
         row.addWidget(self.context_spin)
         row.addStretch(1)
+        self.measure_button = QPushButton("Measure (R)")
+        self.measure_button.setCheckable(True)
+        self.measure_button.setToolTip(
+            "Two clicks on the picture give the length between them: in\n"
+            "metres, by the image's georeferencing, and in pixels - pixels\n"
+            "alone for an image without georeferencing. A right-click\n"
+            "clears; press again to stop.")
+        self.measure_button.toggled.connect(self._on_measure_toggled)
+        row.addWidget(self.measure_button)
         self.image_button = QPushButton("Show on image (M)")
         self.image_button.setToolTip(
             "The whole image in a window of its own, with a box where\n"
@@ -195,17 +360,44 @@ class DetailPanel(QWidget):
 
     def clear(self):
         self._chip = None
+        self._image = None
+        self._picture_frame = None
         self.view.clear()
         self.info.setText(NOTHING)
+        self.measure_info.setText("")
         self.image_button.setEnabled(False)
 
-    def show_chip(self, chip, latlon: "tuple | None", suggestion=None):
+    # -- measuring (2.8.12) ------------------------------------------------
+
+    def _on_measure_toggled(self, on: bool):
+        self.view.set_measuring(on)
+        if not on:
+            self.measure_info.setText("")
+
+    def _on_measured(self, points):
+        """The view's two points, in picture pixels, or None."""
+        if points is None or self._picture_frame is None:
+            self.measure_info.setText("")
+            self.view.set_measure_text("")
+            return
+        px0, py0 = self._picture_frame
+        (c1, r1), (c2, r2) = points
+        text = length_text(self._image, (px0 + c1, py0 + r1),
+                           (px0 + c2, py0 + r2))
+        self.measure_info.setText("Measured: " + text)
+        self.view.set_measure_text(text.split(" (")[0])
+
+    def show_chip(self, chip, latlon: "tuple | None", suggestion=None,
+                  image=None):
         """Everything known of the chip; the picture follows when read.
         ``latlon`` is (lat, lon), or None for imagery without ground;
-        ``suggestion`` what the model learned here thinks, if trained."""
+        ``suggestion`` what the model learned here thinks, if trained;
+        ``image`` the project's entry, which gives Measure its metres."""
         if chip is not self._chip:
             self.view.set_reading()
+            self.measure_info.setText("")
         self._chip = chip
+        self._image = image
         self.image_button.setEnabled(True)
         lines = [f"<b>{chip.image_name}</b>  ({chip.pixel_x:.1f}, "
                  f"{chip.pixel_y:.1f})"]
@@ -238,6 +430,8 @@ class DetailPanel(QWidget):
         chip's own window in source pixels. The window hands over only
         the chip in hand's."""
         px0, py0 = picture_frame
+        self._picture_frame = (float(px0), float(py0))
+        self.measure_info.setText("")
         x0, y0, w, h = chip_frame
         self.view.set_picture(arr, (x0 - px0, y0 - py0, w, h),
                               (chip.pixel_x - px0, chip.pixel_y - py0),

@@ -1882,13 +1882,18 @@ class ModelReviewWindow(QWidget):
         changed = key != self._detail_key
         self._detail_key = key
         self.detail.show_chip(chip, self._latlon_of(chip),
-                              self._suggestions.get(chip.key))
+                              self._suggestions.get(chip.key),
+                              image=self._image_of(chip))
         if changed:
             self._request_detail()
 
-    def _latlon_of(self, chip) -> "tuple | None":
+    def _image_of(self, chip):
+        """The project's entry for the chip's image, or None."""
         images = getattr(self._project(), "images", {}) or {}
-        image = images.get(chip.image_path)
+        return images.get(chip.image_path)
+
+    def _latlon_of(self, chip) -> "tuple | None":
+        image = self._image_of(chip)
         if image is None:
             return None
         return image.pixel_to_latlon(chip.pixel_x, chip.pixel_y)
@@ -1897,7 +1902,8 @@ class ModelReviewWindow(QWidget):
         chip = self._by_key.get(self._detail_key)
         if chip is not None:
             self.detail.show_chip(chip, self._latlon_of(chip),
-                                  self._suggestions.get(chip.key))
+                                  self._suggestions.get(chip.key),
+                                  image=self._image_of(chip))
 
     def _request_detail(self):
         """The surroundings of the chip in hand, read at the context
@@ -2487,6 +2493,9 @@ class ModelReviewWindow(QWidget):
                 return
             if key == Qt.Key_M:
                 self.show_on_image()
+                return
+            if key == Qt.Key_R:
+                self.detail.measure_button.toggle()
                 return
             if key == Qt.Key_S:
                 self.accept_suggestions()
