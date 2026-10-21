@@ -173,6 +173,7 @@ class ImportResult:
     classes_added: list = field(default_factory=list)
     rescaled_images: int = 0     # matched at another resolution
     masks_left_out: int = 0      # painted at the GT's resolution
+    label_ids: list = field(default_factory=list)   # the labels added
 
 
 def _name_key(path: str) -> str:
@@ -408,6 +409,7 @@ def apply_import(current, plan: ImportPlan) -> ImportResult:
             next_id += 1
             local.labels.append(placed)
             current._index_label(placed, match.local_path)
+            result.label_ids.append(placed.id)
             here.add(placed.unique_id)
             used.setdefault(placed.class_name, None)
             result.labels_added += 1

@@ -328,6 +328,24 @@ def _swatch(colour: QColor) -> QIcon:
     return QIcon(pixmap)
 
 
+def pending(chip) -> bool:
+    """Has an import something to do for the chip: a verdict given
+    here, or a chip reviewed before re-centred (2.8.11) - the label it
+    made moves. One that made no label has nothing to move."""
+    if chip.verdict is not None:
+        return True
+    return (chip.reviewed_before() and chip.moved_since_import()
+            and chip.earlier.became != IGNORE)
+
+
+def effective_verdict(chip):
+    """The class an import gives the chip: its verdict, or what it
+    became in an earlier round."""
+    if chip.verdict is not None:
+        return chip.verdict
+    return chip.earlier.became if chip.reviewed_before() else None
+
+
 def _passes(chip, standing: str) -> bool:
     """Does the chip belong on the Show: list? A chip reviewed in an
     earlier round counts by what it became - unless given a new
@@ -1038,7 +1056,8 @@ class ModelReviewWindow(QWidget):
         return self._active
 
     def with_verdicts(self) -> list:
-        return [chip for chip in self._chips if chip.verdict is not None]
+        """The chips an import has something to do for (``pending``)."""
+        return [chip for chip in self._chips if pending(chip)]
 
     def predicted_class(self):
         return self.class_filter.currentData()
@@ -1368,8 +1387,8 @@ class ModelReviewWindow(QWidget):
         _on_cell_double_clicked.)"""
         chip = self._by_key.get(key)
         cell = self._cells.get(key)
-        if chip is None or chip.reviewed_before() or cell is None \
-                or cell.frame is None:
+        # A chip reviewed before moves too (2.8.11): its label follows.
+        if chip is None or cell is None or cell.frame is None:
             return
         # Through the frame of the picture clicked on, whatever the chip
         # size has become since it was read.
@@ -1395,8 +1414,9 @@ class ModelReviewWindow(QWidget):
             chip = self._by_key.get(key)
             arr = self._pixels.get(key)
             frame = self._frames.get(key)
-            if chip is None or chip.reviewed_before():
-                continue
+            if chip is None or (chip.reviewed_before()
+                                and not self._selected):
+                continue        # a reviewed chip moves only when picked
             if arr is None or frame is None:
                 waiting += 1
                 continue
@@ -1518,6 +1538,8 @@ class ModelReviewWindow(QWidget):
                 became = chip.earlier.became
                 text = "earlier: " + ("Ignore" if became == IGNORE
                                       else became)
+                if pending(chip):
+                    text += " (moved)"
                 colour = self._colour_of(became)
             else:
                 text = ("" if chip.verdict is None
@@ -1539,7 +1561,7 @@ class ModelReviewWindow(QWidget):
                 score = (f"{name_of(suggestion.class_name)}? "
                          f"{suggestion.confidence:.2f}")
             cell.set_state(score, text, colour, chip.key in self._selected,
-                           chip.reviewed_before() and chip.verdict is None,
+                           chip.reviewed_before() and not pending(chip),
                            chip.key == self._cursor)
         self._refresh_detail_text()
         self._refresh_image_window()
@@ -1548,7 +1570,8 @@ class ModelReviewWindow(QWidget):
 
     def _show_counts(self):
         verdicts = self.with_verdicts()
-        labelled = sum(1 for chip in verdicts if chip.verdict != IGNORE)
+        labelled = sum(1 for chip in verdicts
+                       if effective_verdict(chip) != IGNORE)
         ignored = len(verdicts) - labelled
         n = len(verdicts)
         self.import_button.setEnabled(n > 0)
@@ -2325,10 +2348,11 @@ class ModelReviewWindow(QWidget):
         counts: dict = {}
         ignored = moved = 0
         for chip in chips:
-            if chip.verdict == IGNORE:
+            verdict = effective_verdict(chip)
+            if verdict == IGNORE:
                 ignored += 1
             else:
-                counts[chip.verdict] = counts.get(chip.verdict, 0) + 1
+                counts[verdict] = counts.get(verdict, 0) + 1
             if chip.moved():
                 moved += 1
         parts = [f"{n} {name}" for name, n in
@@ -2366,6 +2390,8 @@ class ModelReviewWindow(QWidget):
         self._undo.clear()
         self._redo.clear()
         self._last_click = None
+        for chip in chips:
+            chip.settle()       # a move from here is a new one (2.8.11)
         self.import_requested.emit(chips, self._source)
 
     # -- keys -----------------------------------------------------------------

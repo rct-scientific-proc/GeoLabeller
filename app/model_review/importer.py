@@ -33,6 +33,7 @@ class ImportResult:
     label_ids: list = field(default_factory=list)       # made or changed
     labels_changed: int = 0     # a second look (2.8.5): class changed...
     labels_removed: int = 0     # ...or the label gone, for Ignore
+    labels_moved: int = 0       # ...or moved, the chip re-centred (2.8.11)
     changed_ids: list = field(default_factory=list)
     removed_ids: list = field(default_factory=list)
 
@@ -51,6 +52,8 @@ class ImportResult:
                          "changed")
         if self.labels_removed:
             parts.append(f"{self.labels_removed} removed")
+        if self.labels_moved:
+            parts.append(f"{self.labels_moved} moved")
         if self.skipped:
             parts.append(f"{self.skipped} skipped, their image gone")
         return "; ".join(parts)
@@ -62,14 +65,15 @@ def description_for(chip, source: str) -> str:
     return f"{text}, {source}" if source else text
 
 
-def _label_for(project, image, chip, source: str, stamp):
+def _label_for(project, image, chip, source: str, stamp, verdict=None):
     """A label where the chip is, in its verdict's class."""
+    verdict = chip.verdict if verdict is None else verdict
     ground = image.pixel_to_latlon(chip.pixel_x, chip.pixel_y)
     lat, lon = ground if ground is not None else (0.0, 0.0)
-    if chip.verdict not in project.classes:
-        project.classes.append(chip.verdict)
+    if verdict not in project.classes:
+        project.classes.append(verdict)
     label = project.add_label(
-        chip.verdict, float(chip.pixel_x), float(chip.pixel_y),
+        verdict, float(chip.pixel_x), float(chip.pixel_y),
         float(lon), float(lat), image.name, image.group or "",
         image.path, description=description_for(chip, source))
     if stamp is not None:
@@ -77,7 +81,8 @@ def _label_for(project, image, chip, source: str, stamp):
     return label
 
 
-def _remember(project, chip, label_id, source: str, stamp, earlier=None):
+def _remember(project, chip, label_id, source: str, stamp, earlier=None,
+              became=None):
     """The ledger entry for the chip's verdict. The memory keeps the
     centre as the file gave it - what the next round is matched by -
     while the label sits where the chip was re-centred, if it was. In
@@ -86,7 +91,8 @@ def _remember(project, chip, label_id, source: str, stamp, earlier=None):
     entry = Verdict(
         image=chip.image_name, pixel_x=float(chip.source_x),
         pixel_y=float(chip.source_y), predicted=chip.predicted,
-        score=float(chip.score), became=chip.verdict, source=source,
+        score=float(chip.score),
+        became=chip.verdict if became is None else became, source=source,
         label_id=label_id, by=stamp["by"] if stamp else "",
         at=stamp["at"] if stamp else "")
     if earlier is not None:
@@ -100,58 +106,76 @@ def _remember(project, chip, label_id, source: str, stamp, earlier=None):
 def apply_verdicts(project, chips, source: str) -> ImportResult:
     """Add the labels and ledger entries the chips' verdicts call for.
 
-    ``chips`` with no verdict are left alone. The class of a labelled
-    chip is added to the project's classes if it is somehow not there.
-    A chip reviewed in an earlier round, given a new verdict (2.8.5):
-    the label it made changes class, is removed for Ignore, or is made
-    for a chip ignored before; its ledger entry is replaced.
+    ``chips`` with no verdict are left alone - unless reviewed before and
+    re-centred (2.8.11): the label they made moves. The class of a
+    labelled chip is added to the project's classes if it is somehow not
+    there. A chip reviewed in an earlier round, given a new verdict
+    (2.8.5): the label it made changes class, is removed for Ignore, or
+    is made for a chip ignored before; its ledger entry is replaced.
     """
     result = ImportResult()
     stamp = identity.stamp()
     for chip in chips:
-        if chip.verdict is None:
-            continue
+        earlier = chip.earlier
+        verdict = chip.verdict
+        if verdict is None:
+            if (earlier is None or not chip.moved()
+                    or earlier.became == IGNORE):
+                continue
+            verdict = earlier.became        # only the centre moved
         image = project.images.get(chip.image_path)
         if image is None:
             result.skipped += 1
             continue
-        earlier = chip.earlier
         label_id = None
         if earlier is not None:
             old = (project.get_label_by_id(earlier.label_id)[1]
                    if earlier.label_id is not None else None)
-            if chip.verdict == IGNORE:
+            if verdict == IGNORE:
                 if old is not None:
                     project.remove_label(old.id)
                     result.labels_removed += 1
                     result.removed_ids.append(old.id)
                 result.ignored += 1
             elif old is not None:
-                if chip.verdict not in project.classes:
-                    project.classes.append(chip.verdict)
-                old.class_name = chip.verdict
-                if stamp is not None:
-                    old.attribution["class"] = dict(stamp)
+                if verdict not in project.classes:
+                    project.classes.append(verdict)
+                if old.class_name != verdict:
+                    old.class_name = verdict
+                    if stamp is not None:
+                        old.attribution["class"] = dict(stamp)
+                    result.labels_changed += 1
+                    result.classes[verdict] += 1
+                if chip.moved() and (old.pixel_x, old.pixel_y) != (
+                        chip.pixel_x, chip.pixel_y):
+                    old.pixel_x = float(chip.pixel_x)
+                    old.pixel_y = float(chip.pixel_y)
+                    ground = image.pixel_to_latlon(chip.pixel_x, chip.pixel_y)
+                    if ground is not None:
+                        old.lat, old.lon = float(ground[0]), float(ground[1])
+                    if stamp is not None:
+                        old.attribution["position"] = dict(stamp)
+                    result.labels_moved += 1
                 label_id = old.id
-                result.labels_changed += 1
-                result.classes[chip.verdict] += 1
                 result.label_ids.append(old.id)
                 result.changed_ids.append(old.id)
             else:
-                label = _label_for(project, image, chip, source, stamp)
+                label = _label_for(project, image, chip, source, stamp,
+                                   verdict)
                 label_id = label.id
                 result.labels_added += 1
-                result.classes[chip.verdict] += 1
+                result.classes[verdict] += 1
                 result.label_ids.append(label.id)
-            _remember(project, chip, label_id, source, stamp, earlier)
+            _remember(project, chip, label_id, source, stamp, earlier,
+                      became=verdict)
             continue
-        if chip.verdict == IGNORE:
+        if verdict == IGNORE:
             result.ignored += 1
         else:
-            label = _label_for(project, image, chip, source, stamp)
+            label = _label_for(project, image, chip, source, stamp, verdict)
             label_id = label.id
             result.labels_added += 1
-            result.classes[chip.verdict] += 1
+            result.classes[verdict] += 1
             result.label_ids.append(label.id)
-        _remember(project, chip, label_id, source, stamp)
+        _remember(project, chip, label_id, source, stamp, became=verdict)
     return result

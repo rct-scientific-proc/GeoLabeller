@@ -95,12 +95,21 @@ class Chip:
     image_height: int = 0
     source_x: float = 0.0       # the centre as the file gave it
     source_y: float = 0.0
+    anchor_x: float = 0.0       # the centre as last imported (2.8.11):
+    anchor_y: float = 0.0       # a move since is something to import
 
     def reviewed_before(self) -> bool:
         return self.earlier is not None
 
     def moved(self) -> bool:
         return (self.pixel_x, self.pixel_y) != (self.source_x, self.source_y)
+
+    def moved_since_import(self) -> bool:
+        return (self.pixel_x, self.pixel_y) != (self.anchor_x, self.anchor_y)
+
+    def settle(self):
+        """The centre as it stands is what the project now has."""
+        self.anchor_x, self.anchor_y = self.pixel_x, self.pixel_y
 
     def offset(self) -> float:
         """How far the centre has been moved from the file's, in pixels."""
@@ -343,7 +352,8 @@ def match_candidates(candidates, project, malformed: int = 0,
                           predicted=candidate.predicted,
                           score=candidate.score, rescaled=rescaled,
                           image_width=width, image_height=height,
-                          source_x=px, source_y=py))
+                          source_x=px, source_y=py, anchor_x=px,
+                          anchor_y=py))
         report.matched += 1
     return chips, report
 

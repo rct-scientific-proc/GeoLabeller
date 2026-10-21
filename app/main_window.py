@@ -57,8 +57,8 @@ from .h5_export import (EXAMPLES_ALL, EXAMPLES_OBJECT,
                         estimate_export)
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
-from . import (display_settings, gdal_config, identity, recent, reseat,
-               settings_scope, waypoint_io)
+from . import (display_settings, duplicates, gdal_config, identity, recent,
+               reseat, settings_scope, waypoint_io)
 from .about import AboutDialog
 from .history import EditHistory
 from .orientation_math import pixel_angle_from_heading
@@ -853,6 +853,15 @@ class MainWindow(QMainWindow):
             "Add the waypoints in a GPX file or another GeoLabeller project")
         import_waypoints_action.triggered.connect(self._import_waypoints)
         file_menu.addAction(import_waypoints_action)
+
+        # What becomes of an imported label that lands on one already
+        # here (2.8.11): a setting, for every import.
+        import_options_action = QAction("Import &Options...", self)
+        import_options_action.setStatusTip(
+            "What becomes of an imported label that lands on a label "
+            "already here: keep the old, the new, both, or ask")
+        import_options_action.triggered.connect(self._import_options)
+        file_menu.addAction(import_options_action)
 
         file_menu.addSeparator()
         # Who is working - on a shared machine, each person switches in.
@@ -4419,6 +4428,15 @@ class MainWindow(QMainWindow):
             project1 = LabelProject.load(file1)
             project2 = LabelProject.load(file2)
             combined = combine_projects(project1, project2)
+            # The second project's labels that land on the first's
+            # (2.8.11): the setting decides, or the window.
+            first_ids = {label.id for image in project1.images.values()
+                         for label in image.labels}
+            second_ids = {label.id for image in combined.images.values()
+                          for label in image.labels} - first_ids
+            _old, _new, duplicates_text = self._settle_duplicates(
+                second_ids, Path(file1).name, Path(file2).name,
+                project=combined)
             combined_classes = combined.classes
 
             # Save combined project
@@ -4433,8 +4451,10 @@ class MainWindow(QMainWindow):
                 f"• Images: {len(combined.images)}\n"
                 f"• Labels: {combined.label_count}\n"
                 f"• Waypoints: {len(combined.waypoints)}\n"
-                f"• Description presets: {len(combined.descriptions)}\n\n"
-                f"Saved to: {Path(output_file).name}"
+                f"• Description presets: {len(combined.descriptions)}\n"
+                + (f"• Duplicates{duplicates_text}\n" if duplicates_text
+                   else "")
+                + f"\nSaved to: {Path(output_file).name}"
             )
 
             self.statusBar.showMessage(
@@ -4495,6 +4515,8 @@ class MainWindow(QMainWindow):
                 images=list(self.project.images),
                 lists=("classes", "descriptions", "mask_names")):
             result = apply_import(self.project, plan)
+            _old, _new, duplicates_text = self._settle_duplicates(
+                result.label_ids, "Already here", Path(path).name)
 
         self._update_class_combo()
         self._update_description_combo()
@@ -4511,6 +4533,7 @@ class MainWindow(QMainWindow):
                    f"{Path(path).name}")
         if result.duplicates:
             message += f"; {result.duplicates} already here"
+        message += duplicates_text
         if result.left_out:
             message += f"; {result.left_out} left out (images not loaded)"
         if result.rescaled_images:
@@ -4521,6 +4544,27 @@ class MainWindow(QMainWindow):
                         f"{'' if result.masks_left_out == 1 else 's'} left "
                         "out, to be redrawn")
         self.statusBar.showMessage(message, 12000)
+
+    # -- duplicate labels on import (2.8.11) -----------------------------
+
+    def _import_options(self):
+        duplicates.ImportOptionsDialog(self).exec_()
+
+    def _review_duplicates(self, overlaps, old_name: str,
+                           new_name: str) -> bool:
+        """The window deciding each pair; True when the user said OK.
+        A method of its own so tests can answer it."""
+        dialog = duplicates.DuplicateReviewDialog(overlaps, self, old_name,
+                                                  new_name)
+        return bool(dialog.exec_())
+
+    def _settle_duplicates(self, new_ids, old_name: str, new_name: str,
+                           project=None) -> tuple:
+        """Labels just imported that sit on labels already here: the
+        setting decides, or the window does (app/duplicates.py)."""
+        return duplicates.settle(project or self.project, new_ids,
+                                 ask=self._review_duplicates,
+                                 old_name=old_name, new_name=new_name)
 
     def _confirm_gt_import(self, plan, source_name: str) -> bool:
         """The preview; a method of its own so tests can answer it."""
@@ -4581,11 +4625,19 @@ class MainWindow(QMainWindow):
         touched = {chip.earlier.label_id for chip in chips
                    if chip.earlier is not None
                    and chip.earlier.label_id is not None}
+        # ...and the labels a new one may displace as a duplicate.
+        touched |= duplicates.nearby_ids(
+            self.project, [(c.image_path, c.pixel_x, c.pixel_y)
+                           for c in chips], duplicates.distance_px())
         with self._recorded("Model review import", labels=touched,
                             lists=("model_review", "classes")):
             result = apply_verdicts(self.project, chips, source)
+            added = [i for i in result.label_ids
+                     if i not in result.changed_ids]
+            removed_old, _new, duplicates_text = self._settle_duplicates(
+                added, "Already here", source)
         self._update_class_combo()
-        for label_id in result.changed_ids + result.removed_ids:
+        for label_id in result.changed_ids + result.removed_ids + removed_old:
             self.canvas.remove_label_marker(label_id)
         for label_id in result.label_ids:
             image, label = self.project.get_label_by_id(label_id)
@@ -4597,7 +4649,7 @@ class MainWindow(QMainWindow):
         self._reseat_open_editors()
         self._mark_unsaved()
         self._recovery_soon_timer.start()
-        summary = result.summary(source)
+        summary = result.summary(source) + duplicates_text
         if self._model_review is not None:
             self._model_review.refresh_earlier()
             # Where the user is looking: the window's own status line.
