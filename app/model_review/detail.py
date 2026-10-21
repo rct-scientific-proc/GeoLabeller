@@ -337,15 +337,19 @@ class DetailPanel(QWidget):
             "alone for an image without georeferencing. A right-click\n"
             "clears; press again to stop.")
         self.measure_button.toggled.connect(self._on_measure_toggled)
-        row.addWidget(self.measure_button)
         self.image_button = QPushButton("Show on image (M)")
         self.image_button.setToolTip(
             "The whole image in a window of its own, with a box where\n"
             "this chip is.")
         self.image_button.clicked.connect(self.show_on_image)
         self.image_button.setEnabled(False)
-        row.addWidget(self.image_button)
         layout.addLayout(row)
+        # The two buttons on a row of their own: beside the Context box
+        # they did not fit the panel at its default width (2.8.13).
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.measure_button)
+        buttons.addWidget(self.image_button)
+        layout.addLayout(buttons)
         self.setMinimumWidth(240)
 
     def chip(self):
