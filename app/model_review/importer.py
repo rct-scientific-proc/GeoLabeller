@@ -18,7 +18,7 @@ Qt-free.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import astuple, dataclass, field
 
 from .. import identity
 from .ledger import IGNORE, Verdict
@@ -81,13 +81,26 @@ def _label_for(project, image, chip, source: str, stamp, verdict=None):
     return label
 
 
+def _ledger_places(project) -> tuple:
+    """Where each entry sits in the ledger, by identity and by value:
+    found once, so replacing an entry costs nothing however long the
+    memory (a scan per chip froze a large round, 2.8.14)."""
+    by_id: dict = {}
+    by_value: dict = {}
+    for i, old in enumerate(project.model_review):
+        by_id[id(old)] = i
+        by_value.setdefault(astuple(old), i)
+    return by_id, by_value
+
+
 def _remember(project, chip, label_id, source: str, stamp, earlier=None,
-              became=None):
+              became=None, places=None):
     """The ledger entry for the chip's verdict. The memory keeps the
     centre as the file gave it - what the next round is matched by -
     while the label sits where the chip was re-centred, if it was. In
     place of the earlier round's entry when there is one: a new object,
-    so the project's history restores the old."""
+    so the project's history restores the old. ``places`` is
+    _ledger_places(project), built once for a whole import."""
     entry = Verdict(
         image=chip.image_name, pixel_x=float(chip.source_x),
         pixel_y=float(chip.source_y), predicted=chip.predicted,
@@ -96,10 +109,15 @@ def _remember(project, chip, label_id, source: str, stamp, earlier=None,
         label_id=label_id, by=stamp["by"] if stamp else "",
         at=stamp["at"] if stamp else "")
     if earlier is not None:
-        for i, old in enumerate(project.model_review):
-            if old is earlier or old == earlier:
-                project.model_review[i] = entry
-                return
+        by_id, by_value = (places if places is not None
+                           else _ledger_places(project))
+        i = by_id.pop(id(earlier), None)
+        if i is None:
+            i = by_value.get(astuple(earlier))
+        if i is not None and i < len(project.model_review):
+            by_value.pop(astuple(earlier), None)
+            project.model_review[i] = entry
+            return
     project.model_review.append(entry)
 
 
@@ -115,11 +133,15 @@ def apply_verdicts(project, chips, source: str) -> ImportResult:
     """
     result = ImportResult()
     stamp = identity.stamp()
+    places = _ledger_places(project)
     for chip in chips:
         earlier = chip.earlier
         verdict = chip.verdict
         if verdict is None:
-            if (earlier is None or not chip.moved()
+            # Moved since the project last had it - the window's own
+            # test (2.8.14). Against the file's centre, a chip put
+            # back on it was offered for import and imported nothing.
+            if (earlier is None or not chip.moved_since_import()
                     or earlier.became == IGNORE):
                 continue
             verdict = earlier.became        # only the centre moved
@@ -146,8 +168,9 @@ def apply_verdicts(project, chips, source: str) -> ImportResult:
                         old.attribution["class"] = dict(stamp)
                     result.labels_changed += 1
                     result.classes[verdict] += 1
-                if chip.moved() and (old.pixel_x, old.pixel_y) != (
-                        chip.pixel_x, chip.pixel_y):
+                if chip.moved_since_import() and (
+                        old.pixel_x, old.pixel_y) != (chip.pixel_x,
+                                                      chip.pixel_y):
                     old.pixel_x = float(chip.pixel_x)
                     old.pixel_y = float(chip.pixel_y)
                     ground = image.pixel_to_latlon(chip.pixel_x, chip.pixel_y)
@@ -167,7 +190,7 @@ def apply_verdicts(project, chips, source: str) -> ImportResult:
                 result.classes[verdict] += 1
                 result.label_ids.append(label.id)
             _remember(project, chip, label_id, source, stamp, earlier,
-                      became=verdict)
+                      became=verdict, places=places)
             continue
         if verdict == IGNORE:
             result.ignored += 1
@@ -177,5 +200,6 @@ def apply_verdicts(project, chips, source: str) -> ImportResult:
             result.labels_added += 1
             result.classes[verdict] += 1
             result.label_ids.append(label.id)
-        _remember(project, chip, label_id, source, stamp, became=verdict)
+        _remember(project, chip, label_id, source, stamp, became=verdict,
+                  places=places)
     return result

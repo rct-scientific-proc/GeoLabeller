@@ -163,6 +163,7 @@ class ImageWindow(QWidget):
         self._reader = reader if reader is not None else OverviewReader(self)
         self._reader.ready.connect(self._on_overview)
         self._path: str | None = None
+        self._display = None            # drawn with these settings
         self._factor = 1.0
         self._chip = None
         self._size = 0
@@ -253,7 +254,10 @@ class ImageWindow(QWidget):
         self.activateWindow()
         name = Path(chip.image_path).name
         self.setWindowTitle(f"Show on image - {name}")
-        if chip.image_path == self._path:
+        # The image up, drawn as its group is drawn now; the display
+        # settings changed since, it is read again (2.8.14).
+        if (chip.image_path == self._path and
+                display_settings.for_image(chip.image_path) == self._display):
             self._place(bring=True)
             return
         self._box.setVisible(False)
@@ -269,6 +273,7 @@ class ImageWindow(QWidget):
         self._picture.setPixmap(QPixmap.fromImage(image))
         self.view.scene().setSceneRect(0, 0, w, h)
         self._path, self._factor = path, float(factor)
+        self._display = display_settings.for_image(path)
         self.view.resetTransform()
         self.view.fit()
 

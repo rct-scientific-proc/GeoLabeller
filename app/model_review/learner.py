@@ -172,6 +172,7 @@ def gather_examples(project, chips, labels_per_class: int = LABELS_PER_CLASS,
                                     origin)
 
     changed: set = set()            # memory entries a new verdict outdates
+    outdated: set = set()           # ...and the labels those made
     for chip in chips:
         if chip.verdict is None:
             continue
@@ -181,6 +182,8 @@ def gather_examples(project, chips, labels_per_class: int = LABELS_PER_CLASS,
             changed.add((image_key(chip.earlier.image),
                          int(round(chip.earlier.pixel_x)),
                          int(round(chip.earlier.pixel_y))))
+            if chip.earlier.label_id is not None:
+                outdated.add(chip.earlier.label_id)
     images = getattr(project, "images", {}) or {}
     by_name: dict = {}
     for path in images:
@@ -203,6 +206,10 @@ def gather_examples(project, chips, labels_per_class: int = LABELS_PER_CLASS,
     pool: dict = {}
     for path, image in images.items():
         for label in getattr(image, "labels", []) or []:
+            if label.id in outdated:
+                # Still of the old class until the import: with the
+                # new verdict at the same spot, two answers (2.8.14).
+                continue
             if label.class_name in classes \
                     or label.class_name not in predicted:
                 pool.setdefault(label.class_name, []).append(

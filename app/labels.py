@@ -1486,9 +1486,16 @@ def combine_projects(project1: "LabelProject",
     # groups the first never set.
     combined.display_settings = {**project2.display_settings,
                                  **project1.display_settings}
-    # Both projects' review memories: every verdict either gave.
-    combined.model_review = copy.deepcopy(
-        list(project1.model_review) + list(project2.model_review))
+    # Both projects' review memories: every verdict either gave. The
+    # second's entries name the labels they made by id, and those ids
+    # were shifted above: left as written, a later re-review of such a
+    # chip edited whichever of the first project's labels carried the
+    # number (2.8.14).
+    combined.model_review = copy.deepcopy(list(project1.model_review))
+    for verdict in copy.deepcopy(list(project2.model_review)):
+        if verdict.label_id is not None:
+            verdict.label_id += id_offset
+        combined.model_review.append(verdict)
 
     # Both projects number waypoints from 1, so their ids collide; add
     # them through add_waypoint to renumber, keeping the names.

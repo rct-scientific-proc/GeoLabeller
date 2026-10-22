@@ -95,8 +95,9 @@ class Chip:
     image_height: int = 0
     source_x: float = 0.0       # the centre as the file gave it
     source_y: float = 0.0
-    anchor_x: float = 0.0       # the centre as last imported (2.8.11):
-    anchor_y: float = 0.0       # a move since is something to import
+    anchor_x: float = 0.0       # the centre as the project has it
+    anchor_y: float = 0.0       # (2.8.11): its label's, else the
+                                # file's; a move since is to import
 
     def reviewed_before(self) -> bool:
         return self.earlier is not None
@@ -110,6 +111,17 @@ class Chip:
     def settle(self):
         """The centre as it stands is what the project now has."""
         self.anchor_x, self.anchor_y = self.pixel_x, self.pixel_y
+
+    def seat(self, pixel_x: float, pixel_y: float):
+        """The project has the chip here - its label's place: the
+        centre and the anchor both (2.8.14)."""
+        self.recenter(pixel_x, pixel_y)
+        self.settle()
+
+    def unseat(self):
+        """The project has nothing of the chip: the file's centre
+        is the anchor again. A move staged here stays."""
+        self.anchor_x, self.anchor_y = self.source_x, self.source_y
 
     def offset(self) -> float:
         """How far the centre has been moved from the file's, in pixels."""
@@ -126,7 +138,11 @@ class Chip:
         self.pixel_x, self.pixel_y = x, y
 
     def restore_centre(self):
-        self.pixel_x, self.pixel_y = self.source_x, self.source_y
+        """The centre back to where the project has it: its
+        label's, when one was imported, else the file's. (Back to
+        the file's whatever the project had, a cleared chip read as
+        moved and importing it moved nothing, 2.8.14.)"""
+        self.pixel_x, self.pixel_y = self.anchor_x, self.anchor_y
 
 
 @dataclass

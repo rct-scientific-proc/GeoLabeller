@@ -24,6 +24,7 @@ the user decided through signals.
 from __future__ import annotations
 
 import json
+import math
 from collections import Counter
 from pathlib import Path
 
@@ -999,11 +1000,27 @@ class ModelReviewWindow(QWidget):
                           "left the project dropped.")
         index = LedgerIndex(getattr(project, "model_review", []),
                             float(self.tolerance_spin.value()))
+        previous = {chip.key: chip.earlier for chip in self._chips}
+        claimed: dict = {}              # id(entry) -> (distance, chip)
         for chip in self._chips:
             chip.earlier = index.find(chip.image_name, chip.source_x,
                                       chip.source_y)
-            if chip.earlier is not None:
-                chip.verdict = None
+            if chip.earlier is None:
+                continue
+            # One entry answers for one chip: two of the file's chips
+            # within the tolerance of it would both edit the label it
+            # made (2.8.14). The nearer keeps it.
+            distance = math.hypot(chip.earlier.pixel_x - chip.source_x,
+                                  chip.earlier.pixel_y - chip.source_y)
+            held = claimed.get(id(chip.earlier))
+            if held is not None:
+                if distance >= held[0]:
+                    chip.earlier = None
+                    continue
+                held[1].earlier = None
+            claimed[id(chip.earlier)] = (distance, chip)
+        for chip in self._chips:
+            self._seat(chip, previous[chip.key], project)
         if self._suggestions:
             self._suggestions = {key: s for key, s in self._suggestions.items()
                                  if key in self._by_key}
@@ -1011,6 +1028,36 @@ class ModelReviewWindow(QWidget):
         self._reference_dirty = True
         self._fill_filter()
         self._rebuild()
+
+    def _seat(self, chip, previous, project):
+        """The chip's verdict and centre against the memory's answer
+        (2.8.14). A verdict that is what the chip became - imported a
+        moment ago, or the same thing said again - is no verdict; one
+        that differs stays, a class change to import (2.8.5). Before,
+        every verdict on a reviewed chip went, so nudging the
+        tolerance or an undo in the project lost a round of them. A
+        newly matched entry seats the chip where its label is, the
+        anchor a move is measured from; a chip the memory no longer
+        answers for is measured from the file's centre again."""
+        earlier = chip.earlier
+        if earlier is None:
+            if previous is not None:
+                chip.unseat()
+            return
+        if chip.verdict == earlier.became:
+            chip.verdict = None
+        if earlier is previous:
+            return                  # the same answer: nothing moved
+        label = None
+        find = getattr(project, "get_label_by_id", None)
+        if earlier.label_id is not None and find is not None:
+            image, label = find(earlier.label_id)
+            if label is not None and self._image_of(chip) is not image:
+                label = None        # on another image: not this chip's
+        if label is not None:
+            chip.seat(label.pixel_x, label.pixel_y)
+        else:
+            chip.unseat()
 
     def note(self, text: str):
         """A word for the status line - what an import came to, say."""
@@ -1252,7 +1299,7 @@ class ModelReviewWindow(QWidget):
         if self._detail_key is not None \
                 and self._detail_key not in self._by_key:
             self._set_detail(None)      # imported, or its image gone
-        self._refresh_cells()
+        self._refresh_cells(reference=False)
         self._request_pixels()
         # cancel_all above dropped reads in flight for the panel and the
         # reference strip too.
@@ -1528,7 +1575,10 @@ class ModelReviewWindow(QWidget):
                                  % len(self._colours)]
         return TEXT_COLOR if class_name else None
 
-    def _refresh_cells(self):
+    def _refresh_cells(self, reference: bool = True):
+        """Every cell's words and colours again; ``reference`` False
+        leaves the strip to the caller (a rebuild refreshes it forced,
+        and twice meant every picture read twice, 2.8.14)."""
         every_class = self.class_filter.currentData() is ALL_CLASSES
         for chip in self._visible:
             cell = self._cells.get(chip.key)
@@ -1565,7 +1615,8 @@ class ModelReviewWindow(QWidget):
                            chip.key == self._cursor)
         self._refresh_detail_text()
         self._refresh_image_window()
-        self._refresh_reference()
+        if reference:
+            self._refresh_reference()
         self._fill_verdict_filter()
 
     def _show_counts(self):
@@ -1672,18 +1723,19 @@ class ModelReviewWindow(QWidget):
         return self._give(keys, self._active, None)
 
     def clear_verdicts(self, keys):
-        """Take the verdict back - and the centre, to the file's."""
+        """Take the verdict back - and the centre, to where the
+        project has it: its label's, else the file's (2.8.14)."""
         chips = [self._by_key[key] for key in list(keys)
                  if key in self._by_key
                  and (self._by_key[key].verdict is not None
-                      or self._by_key[key].moved())]
+                      or self._by_key[key].moved_since_import())]
         if not chips:
             return
         n = len(chips)
         self._remember(chips, f"{n} verdict{'' if n == 1 else 's'} cleared")
         for chip in chips:
             chip.verdict = None
-            if chip.moved():
+            if chip.moved_since_import():
                 chip.restore_centre()
                 self._reload(chip)
         self._reference_dirty = True
@@ -1740,6 +1792,9 @@ class ModelReviewWindow(QWidget):
             else:
                 self._selected.add(key)
             self._anchor = key
+            # Not a click that gave a verdict: a double-click after it
+            # took back the verdict of a plain click before (2.8.14).
+            self._last_click = None
             self._refresh_cells()
             return
         self._selected.clear()
@@ -1761,6 +1816,7 @@ class ModelReviewWindow(QWidget):
     def _on_cell_cleared(self, key):
         self.setFocus()
         self._set_detail(key)
+        self._last_click = None
         self.clear_verdicts([key])
 
     def select_all(self):
@@ -1918,7 +1974,10 @@ class ModelReviewWindow(QWidget):
 
     def _on_detail_pixels(self, key, arr):
         chip = self._by_key.get(key)
-        if chip is None or key != self._detail_key or arr is None:
+        if chip is None or key != self._detail_key:
+            return
+        if arr is None:
+            self.detail.picture_failed()    # not "Reading..." for good
             return
         # The picture's own frame, from its size (see _on_pixels).
         px0, py0, _w, _h = self._frame_of(chip, max(arr.shape[0],
@@ -2359,7 +2418,7 @@ class ModelReviewWindow(QWidget):
                 ignored += 1
             else:
                 counts[verdict] = counts.get(verdict, 0) + 1
-            if chip.moved():
+            if chip.moved_since_import():
                 moved += 1
         parts = [f"{n} {name}" for name, n in
                  sorted(counts.items(), key=lambda item: (-item[1], item[0]))]
@@ -2396,8 +2455,9 @@ class ModelReviewWindow(QWidget):
         self._undo.clear()
         self._redo.clear()
         self._last_click = None
-        for chip in chips:
-            chip.settle()       # a move from here is a new one (2.8.11)
+        # The anchors follow in refresh_earlier, once the project has
+        # the labels: settled here, before the import ran, they were
+        # wrong whenever it did not (2.8.14).
         self.import_requested.emit(chips, self._source)
 
     # -- keys -----------------------------------------------------------------
@@ -2655,6 +2715,12 @@ class ModelReviewWindow(QWidget):
                 worker.setParent(None)
                 worker.finished.connect(worker.deleteLater)
                 self._working = None
+                # Its model is still being trained on: the next Train
+                # starts a learner of its own, and the row says the
+                # window is free again (2.8.14).
+                self._learner = None
+                self._learn_progress = ""
+                self._show_learning()
         if self._learn_window is not None:
             self._learn_window.close()
         if self._probe is not None and self._probe.isRunning():
@@ -2663,6 +2729,26 @@ class ModelReviewWindow(QWidget):
             self._probe.setParent(None)
             self._probe = None
         super().closeEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Closed while its pictures were still coming, the window
+        # cancelled them (closeEvent); shown again, nothing asked for
+        # them, and the cells stayed blank (2.8.14).
+        if self._chips:
+            self._request_unread()
+
+    def _request_unread(self):
+        """The pictures the window lacks, asked for again."""
+        size = self.chip_spin.value()
+        for chip in self._visible:
+            if chip.key not in self._pixels:
+                self.loader.request(chip.key, chip.image_path,
+                                    chip.pixel_x, chip.pixel_y, size)
+        if self._detail_key is not None and not self.detail.has_picture():
+            self._request_detail()
+        if self.reference.pictures() < len(self.reference.examples()):
+            self._refresh_reference(force=True)
 
     def _say(self, text: str):
         QMessageBox.information(self, "Model Review", text)

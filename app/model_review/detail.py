@@ -34,6 +34,7 @@ MARK_RING_PX = 6
 MARK_GAP_PX = 9
 MARK_PX = 9
 NOTHING = "No chip in hand: move the cursor onto one, or click one."
+COULD_NOT_READ = "No picture: this chip could not be read."
 
 
 def standing_of(chip) -> str:
@@ -94,6 +95,7 @@ class ContextView(QWidget):
         self._centre: tuple | None = None   # (column, row) in picture pixels
         self._moved = False
         self._reading = False
+        self._failed = False            # the read came back empty
         self._measuring = False
         self._measure: list = []            # 0, 1 or 2 picture points
         self._measure_text = ""
@@ -104,7 +106,7 @@ class ContextView(QWidget):
     def clear(self):
         self._pixmap = None
         self._box = self._centre = None
-        self._reading = False
+        self._reading = self._failed = False
         self._drop_measure()
         self.update()
 
@@ -112,9 +114,25 @@ class ContextView(QWidget):
         """A chip is in hand and its picture is on its way."""
         self._pixmap = None
         self._box = self._centre = None
-        self._reading = True
+        self._reading, self._failed = True, False
         self._drop_measure()
         self.update()
+
+    def set_failed(self):
+        """The picture could not be read (an unreadable file, a
+        window of nodata): said, instead of "Reading..." for good
+        (2.8.14)."""
+        self._pixmap = None
+        self._box = self._centre = None
+        self._reading, self._failed = False, True
+        self._drop_measure()
+        self.update()
+
+    def message(self) -> str:
+        """The words shown in place of a picture, or none."""
+        if self._reading:
+            return "Reading..."
+        return COULD_NOT_READ if self._failed else ""
 
     # -- measuring (2.8.12) ------------------------------------------------
 
@@ -232,7 +250,7 @@ class ContextView(QWidget):
         self._box = tuple(float(v) for v in box)
         self._centre = (float(centre[0]), float(centre[1]))
         self._moved = bool(moved)
-        self._reading = False
+        self._reading = self._failed = False
         self._drop_measure()        # a new picture: the line meant the old
         self.update()
 
@@ -253,8 +271,7 @@ class ContextView(QWidget):
         geometry = self._geometry()
         if geometry is None:
             painter.setPen(QColor(150, 150, 150))
-            painter.drawText(self.rect(), Qt.AlignCenter,
-                             "Reading..." if self._reading else "")
+            painter.drawText(self.rect(), Qt.AlignCenter, self.message())
             painter.end()
             return
         off_x, off_y, scale = geometry
@@ -355,6 +372,12 @@ class DetailPanel(QWidget):
     def chip(self):
         """The chip in hand, or None."""
         return self._chip
+
+    def picture_failed(self):
+        """The chip in hand's picture could not be read."""
+        self._picture_frame = None
+        self.measure_info.setText("")
+        self.view.set_failed()
 
     def factor(self) -> int:
         return self.context_spin.value()
