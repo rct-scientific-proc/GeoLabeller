@@ -98,6 +98,8 @@ SHORTCUT_SECTIONS = [
         ("Double-click in panel", "Fly to that waypoint"),
         ("Show on map", "Hide or show every waypoint marker"),
         ("Export > Waypoints (GPX)...", "Write every waypoint to a GPX file"),
+        ("Export > Labels (KML)...",
+         "Write every label with ground to a KML file"),
         ("File > Import Waypoints...",
          "Add the waypoints in a GPX file or another project"),
     ]),

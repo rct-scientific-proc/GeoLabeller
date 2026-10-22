@@ -57,8 +57,8 @@ from .h5_export import (EXAMPLES_ALL, EXAMPLES_OBJECT,
                         estimate_export)
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import ShortcutsDialog
-from . import (display_settings, duplicates, gdal_config, identity, recent,
-               reseat, settings_scope, waypoint_io)
+from . import (display_settings, duplicates, gdal_config, identity,
+               kml_export, recent, reseat, settings_scope, waypoint_io)
 from .about import AboutDialog
 from .history import EditHistory
 from .orientation_math import pixel_angle_from_heading
@@ -1019,6 +1019,15 @@ class MainWindow(QMainWindow):
         export_gt_labeled_action.triggered.connect(
             self._export_ground_truth_labeled_only)
         export_menu.addAction(export_gt_labeled_action)
+
+        # Export Labels as KML - Google Earth, QGIS, ArcGIS and GDAL all
+        # read it (2.8.15)
+        export_kml_action = QAction("&Labels (KML)...", self)
+        export_kml_action.setStatusTip(
+            "Write every label with ground to a KML file for Google Earth "
+            "or a GIS")
+        export_kml_action.triggered.connect(self._export_kml)
+        export_menu.addAction(export_kml_action)
 
         # Export Sub-images
         export_subimages_action = QAction("&Sub-images...", self)
@@ -3346,6 +3355,37 @@ class MainWindow(QMainWindow):
         debug(f"waypoints exported: {count} to {file_path}")
         self.statusBar.showMessage(
             f"Exported {count} waypoint(s) to {file_path}", 5000)
+
+    def _export_kml(self):
+        """Write every label with ground to a KML file (Export > Labels
+        (KML)..., 2.8.15): what Google Earth, QGIS, ArcGIS and GDAL read.
+        A label without ground, or rejected in review, is left out and
+        counted on the status line."""
+        if self.project.label_count == 0:
+            QMessageBox.information(self, "Export Labels",
+                                    "No labels to export.")
+            return
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Labels (KML)", recent.last_dir(recent.EXPORT),
+            "KML Files (*.kml)")
+        if not file_path:
+            return
+        recent.remember_dir(recent.EXPORT, file_path)
+        if not file_path.lower().endswith(kml_export.EXTENSION):
+            file_path += kml_export.EXTENSION
+        colours = {name: self._get_class_color(name).name()
+                   for name in self.project.classes}
+        name = self._project_path.stem if self._project_path else None
+        try:
+            report = kml_export.write_kml(file_path, self.project, colours,
+                                          name=name)
+        except OSError as e:
+            QMessageBox.critical(self, "Export Labels",
+                                 f"Could not write {file_path}:\n{e}")
+            return
+        debug(f"labels exported as KML: {report.summary()} to {file_path}")
+        self.statusBar.showMessage(
+            f"Exported {report.summary()} to {file_path}", 8000)
 
     def _import_waypoints(self):
         """Add the waypoints in a GPX file or another project (File menu).
