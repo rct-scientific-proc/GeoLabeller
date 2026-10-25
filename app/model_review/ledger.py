@@ -130,25 +130,41 @@ class LedgerIndex:
     def __len__(self):
         return sum(len(bucket) for bucket in self._buckets.values())
 
-    def find(self, image, pixel_x: float, pixel_y: float) -> "Verdict | None":
+    def find(self, image, pixel_x: float, pixel_y: float,
+             predicted: "str | None" = None) -> "Verdict | None":
         """The earlier verdict on this chip, if there is one: the same
-        image by file name, and the nearest centre within the tolerance."""
+        image by file name, and the nearest centre within the tolerance.
+        Given ``predicted``, an entry the model called that class comes
+        first whatever the distance: one object flagged under two
+        classes is two chips at one centre with an entry each, and
+        by distance alone both found the same one (2.8.16)."""
+        return self.rank(image, pixel_x, pixel_y, predicted)[1]
+
+    def rank(self, image, pixel_x: float, pixel_y: float,
+             predicted: "str | None" = None) -> tuple:
+        """(how good, the entry) for the best entry on this chip - the
+        key sorts a worse answer after a better - or (None, None)."""
         name = image_key(image)
         column, row = int(pixel_x // self._cell), int(pixel_y // self._cell)
-        best, best_distance = None, None
+        best, best_key = None, None
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
                 for verdict in self._buckets.get(
                         (name, column + dx, row + dy), ()):
                     distance = math.hypot(verdict.pixel_x - pixel_x,
                                           verdict.pixel_y - pixel_y)
-                    if distance <= self.tolerance and (
-                            best is None or distance < best_distance):
-                        best, best_distance = verdict, distance
-        return best
+                    if distance > self.tolerance:
+                        continue
+                    key = (predicted is not None
+                           and verdict.predicted != predicted, distance)
+                    if best is None or key < best_key:
+                        best, best_key = verdict, key
+        return best_key, best
 
 
 def find_verdict(verdicts, image, pixel_x: float, pixel_y: float,
-                 tolerance: float = DEFAULT_TOLERANCE_PX) -> "Verdict | None":
+                 tolerance: float = DEFAULT_TOLERANCE_PX,
+                 predicted: "str | None" = None) -> "Verdict | None":
     """One lookup; for many, build a LedgerIndex once."""
-    return LedgerIndex(verdicts, tolerance).find(image, pixel_x, pixel_y)
+    return LedgerIndex(verdicts, tolerance).find(image, pixel_x, pixel_y,
+                                                predicted)

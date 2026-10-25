@@ -24,7 +24,6 @@ the user decided through signals.
 from __future__ import annotations
 
 import json
-import math
 from collections import Counter
 from pathlib import Path
 
@@ -1001,24 +1000,28 @@ class ModelReviewWindow(QWidget):
         index = LedgerIndex(getattr(project, "model_review", []),
                             float(self.tolerance_spin.value()))
         previous = {chip.key: chip.earlier for chip in self._chips}
-        claimed: dict = {}              # id(entry) -> (distance, chip)
+        claimed: dict = {}              # id(entry) -> (how good, chip)
         for chip in self._chips:
-            chip.earlier = index.find(chip.image_name, chip.source_x,
-                                      chip.source_y)
+            # The entry the model called the same class first (2.8.16):
+            # one object flagged under two classes is two chips at one
+            # centre, each with an entry of its own after an import, and
+            # by distance alone both found the first - the other lost
+            # it below, stayed pending, and was imported again and again.
+            goodness, chip.earlier = index.rank(
+                chip.image_name, chip.source_x, chip.source_y,
+                chip.predicted)
             if chip.earlier is None:
                 continue
             # One entry answers for one chip: two of the file's chips
             # within the tolerance of it would both edit the label it
-            # made (2.8.14). The nearer keeps it.
-            distance = math.hypot(chip.earlier.pixel_x - chip.source_x,
-                                  chip.earlier.pixel_y - chip.source_y)
+            # made (2.8.14). The better match keeps it.
             held = claimed.get(id(chip.earlier))
             if held is not None:
-                if distance >= held[0]:
+                if goodness >= held[0]:
                     chip.earlier = None
                     continue
                 held[1].earlier = None
-            claimed[id(chip.earlier)] = (distance, chip)
+            claimed[id(chip.earlier)] = (goodness, chip)
         for chip in self._chips:
             self._seat(chip, previous[chip.key], project)
         if self._suggestions:

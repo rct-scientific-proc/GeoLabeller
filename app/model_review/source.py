@@ -325,9 +325,13 @@ def match_candidates(candidates, project, malformed: int = 0,
             continue
         # The same chip twice - a file concatenated, a run repeated - would
         # be two labels at one spot; the first stays, the rest are counted.
-        same = (image_key(candidate.image), candidate.predicted,
-                round(candidate.x, 1), round(candidate.y, 1),
-                candidate.image_width, candidate.image_height)
+        # By the image as the record writes it: by its file name alone, a
+        # chip on each of two same-named images in two groups was one
+        # chip given twice (2.8.16).
+        same = (candidate.image.replace("\\", "/").lower(),
+                candidate.predicted, round(candidate.x, 1),
+                round(candidate.y, 1), candidate.image_width,
+                candidate.image_height)
         if same in seen:
             report.duplicates += 1
             continue
