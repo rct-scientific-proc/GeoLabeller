@@ -1000,28 +1000,29 @@ class ModelReviewWindow(QWidget):
         index = LedgerIndex(getattr(project, "model_review", []),
                             float(self.tolerance_spin.value()))
         previous = {chip.key: chip.earlier for chip in self._chips}
-        claimed: dict = {}              # id(entry) -> (how good, chip)
+        # One entry answers for one chip (two of the file's chips within
+        # the tolerance of it would both edit the label it made, 2.8.14),
+        # and the best matches are settled first: an entry of the chip's
+        # group, then of the class the model called it, then the nearest
+        # (2.8.16, 2.8.17). A chip whose best entry went to a better
+        # match takes its next: left with none, it came back as new and
+        # was imported again and again.
+        pairs = []
         for chip in self._chips:
-            # The entry the model called the same class first (2.8.16):
-            # one object flagged under two classes is two chips at one
-            # centre, each with an entry of its own after an import, and
-            # by distance alone both found the first - the other lost
-            # it below, stayed pending, and was imported again and again.
-            goodness, chip.earlier = index.rank(
-                chip.image_name, chip.source_x, chip.source_y,
-                chip.predicted)
-            if chip.earlier is None:
+            for goodness, entry in index.candidates(
+                    chip.image_name, chip.source_x, chip.source_y,
+                    chip.predicted, chip.group):
+                pairs.append((goodness, chip.key, chip, entry))
+        pairs.sort(key=lambda pair: (pair[0], pair[1]))
+        matched: dict = {}              # chip key -> entry
+        taken: set = set()              # id(entry)
+        for _goodness, key, _chip, entry in pairs:
+            if key in matched or id(entry) in taken:
                 continue
-            # One entry answers for one chip: two of the file's chips
-            # within the tolerance of it would both edit the label it
-            # made (2.8.14). The better match keeps it.
-            held = claimed.get(id(chip.earlier))
-            if held is not None:
-                if goodness >= held[0]:
-                    chip.earlier = None
-                    continue
-                held[1].earlier = None
-            claimed[id(chip.earlier)] = (goodness, chip)
+            matched[key] = entry
+            taken.add(id(entry))
+        for chip in self._chips:
+            chip.earlier = matched.get(chip.key)
         for chip in self._chips:
             self._seat(chip, previous[chip.key], project)
         if self._suggestions:
@@ -1038,10 +1039,11 @@ class ModelReviewWindow(QWidget):
         moment ago, or the same thing said again - is no verdict; one
         that differs stays, a class change to import (2.8.5). Before,
         every verdict on a reviewed chip went, so nudging the
-        tolerance or an undo in the project lost a round of them. A
-        newly matched entry seats the chip where its label is, the
-        anchor a move is measured from; a chip the memory no longer
-        answers for is measured from the file's centre again."""
+        tolerance or an undo in the project lost a round of them. The
+        chip is seated where its label is - the anchor a move is
+        measured from - when the label is not there already; a chip
+        the memory no longer answers for is measured from the file's
+        centre again."""
         earlier = chip.earlier
         if earlier is None:
             if previous is not None:
@@ -1049,18 +1051,35 @@ class ModelReviewWindow(QWidget):
             return
         if chip.verdict == earlier.became:
             chip.verdict = None
-        if earlier is previous:
-            return                  # the same answer: nothing moved
         label = None
         find = getattr(project, "get_label_by_id", None)
         if earlier.label_id is not None and find is not None:
             image, label = find(earlier.label_id)
             if label is not None and self._image_of(chip) is not image:
                 label = None        # on another image: not this chip's
-        if label is not None:
-            chip.seat(label.pixel_x, label.pixel_y)
+        if label is None:
+            if earlier.became == IGNORE:
+                chip.unseat()
+            else:
+                # Its label is gone - deleted, or dropped as a duplicate
+                # of one already there: nothing to move, nothing pending.
+                # Left measured from the file's centre, a re-centred chip
+                # stayed pending for ever, imported and dropped again each
+                # time (2.8.17).
+                chip.settle()
+            return
+        # The anchor against where the label IS - not this entry against
+        # the last: an undo in the project restores the memory as copies,
+        # and by identity every reviewed chip was re-seated, its staged
+        # move thrown away; by value, a move imported with no user name
+        # set records an entry equal in every field (2.8.17).
+        where = (float(label.pixel_x), float(label.pixel_y))
+        if where == (chip.anchor_x, chip.anchor_y):
+            return                  # nothing moved
+        if chip.moved_since_import():
+            chip.anchor_at(*where)      # a staged move stays staged
         else:
-            chip.unseat()
+            chip.seat(*where)
 
     def note(self, text: str):
         """A word for the status line - what an import came to, say."""
@@ -1646,9 +1665,13 @@ class ModelReviewWindow(QWidget):
             text += (f"; {earlier} reviewed in an earlier round"
                      + ("" if self.show_reviewed_check.isChecked()
                         else ", hidden"))
-        changed = sum(1 for chip in verdicts if chip.reviewed_before())
+        changed = sum(1 for chip in verdicts
+                      if chip.reviewed_before() and chip.verdict is not None)
         if changed:
             text += f"; {changed} changed from an earlier round"
+        moved = sum(1 for chip in verdicts if chip.verdict is None)
+        if moved:
+            text += f"; {moved} re-centred from an earlier round"
         if self._below_score:
             text += (f"; {self._below_score} below the score "
                      f"{self.score_spin.value():.2f}")
@@ -2432,7 +2455,8 @@ class ModelReviewWindow(QWidget):
         if moved:
             text += (f"\n{moved} re-centred: the label sits where the "
                      "centre was put.")
-        changed = sum(1 for chip in chips if chip.reviewed_before())
+        changed = sum(1 for chip in chips
+                      if chip.reviewed_before() and chip.verdict is not None)
         if changed:
             text += (f"\n{changed} reviewed in an earlier round: the "
                      "label changes class, goes for Ignore, or is made "

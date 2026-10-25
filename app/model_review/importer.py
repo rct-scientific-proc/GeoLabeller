@@ -34,6 +34,7 @@ class ImportResult:
     labels_changed: int = 0     # a second look (2.8.5): class changed...
     labels_removed: int = 0     # ...or the label gone, for Ignore
     labels_moved: int = 0       # ...or moved, the chip re-centred (2.8.11)
+    nothing_to_move: int = 0    # ...or re-centred with its label gone
     changed_ids: list = field(default_factory=list)
     removed_ids: list = field(default_factory=list)
 
@@ -54,6 +55,9 @@ class ImportResult:
             parts.append(f"{self.labels_removed} removed")
         if self.labels_moved:
             parts.append(f"{self.labels_moved} moved")
+        if self.nothing_to_move:
+            parts.append(f"{self.nothing_to_move} with no label left to "
+                         "move")
         if self.skipped:
             parts.append(f"{self.skipped} skipped, their image gone")
         return "; ".join(parts)
@@ -107,7 +111,7 @@ def _remember(project, chip, label_id, source: str, stamp, earlier=None,
         score=float(chip.score),
         became=chip.verdict if became is None else became, source=source,
         label_id=label_id, by=stamp["by"] if stamp else "",
-        at=stamp["at"] if stamp else "")
+        at=stamp["at"] if stamp else "", group=chip.group or "")
     if earlier is not None:
         by_id, by_value = (places if places is not None
                            else _ledger_places(project))
@@ -151,8 +155,23 @@ def apply_verdicts(project, chips, source: str) -> ImportResult:
             continue
         label_id = None
         if earlier is not None:
-            old = (project.get_label_by_id(earlier.label_id)[1]
-                   if earlier.label_id is not None else None)
+            old = None
+            if earlier.label_id is not None:
+                old_image, old = project.get_label_by_id(earlier.label_id)
+                if old is not None and old_image is not image:
+                    # The entry names a label on another image of the
+                    # same name (the memory goes by file name): neither
+                    # the label nor the entry is this chip's (2.8.17).
+                    old, earlier = None, None
+            if chip.verdict is None and old is None:
+                # Only the centre moved, and there is no label left to
+                # move: a move is not a verdict, so nothing is made;
+                # the entry is recorded again, so the chip settles
+                # (2.8.17).
+                result.nothing_to_move += 1
+                _remember(project, chip, None, source, stamp, earlier,
+                          became=verdict, places=places)
+                continue
             if verdict == IGNORE:
                 if old is not None:
                     project.remove_label(old.id)

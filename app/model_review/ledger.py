@@ -9,7 +9,10 @@ what a person made of it.
 
 A chip is named by its image's FILE NAME, not its path: that is how the
 team's file names it, and it is what survives a project whose imagery
-was moved (Locate Missing Images) or passed to another machine.
+was moved (Locate Missing Images) or passed to another machine. Since
+2.8.17 an entry also carries the image's group in the project, so two
+same-named images in two groups keep their own entries: a preference
+when several entries lie within reach, never a bar to matching.
 
 Qt-free; the window and the importer use it, tests exercise it alone.
 """
@@ -45,6 +48,7 @@ class Verdict:
     label_id: int | None = None   # the label it made, when it made one
     by: str = ""
     at: str = ""
+    group: str = ""         # the image's group in the project (2.8.17)
 
     def ignored(self) -> bool:
         return self.became == IGNORE
@@ -61,6 +65,8 @@ class Verdict:
             data["by"] = self.by
             if self.at:
                 data["at"] = self.at
+        if self.group:
+            data["group"] = self.group
         return data
 
     @classmethod
@@ -91,7 +97,8 @@ class Verdict:
                    score=score if math.isfinite(score) else 0.0,
                    became=became, source=str(data.get("source") or ""),
                    label_id=label_id, by=str(data.get("by") or ""),
-                   at=str(data.get("at") or ""))
+                   at=str(data.get("at") or ""),
+                   group=str(data.get("group") or ""))
 
 
 def verdicts_from_project_data(data) -> list:
@@ -131,22 +138,37 @@ class LedgerIndex:
         return sum(len(bucket) for bucket in self._buckets.values())
 
     def find(self, image, pixel_x: float, pixel_y: float,
-             predicted: "str | None" = None) -> "Verdict | None":
+             predicted: "str | None" = None,
+             group: "str | None" = None) -> "Verdict | None":
         """The earlier verdict on this chip, if there is one: the same
         image by file name, and the nearest centre within the tolerance.
-        Given ``predicted``, an entry the model called that class comes
-        first whatever the distance: one object flagged under two
-        classes is two chips at one centre with an entry each, and
-        by distance alone both found the same one (2.8.16)."""
-        return self.rank(image, pixel_x, pixel_y, predicted)[1]
+        Given ``group`` or ``predicted``, an entry of the same group,
+        then one the model called that class, comes first whatever the
+        distance: one object flagged under two classes is two chips at
+        one centre with an entry each (2.8.16), and a same-named image
+        in another group has entries of its own (2.8.17); by distance
+        alone they all found the same one."""
+        return self.rank(image, pixel_x, pixel_y, predicted, group)[1]
 
     def rank(self, image, pixel_x: float, pixel_y: float,
-             predicted: "str | None" = None) -> tuple:
+             predicted: "str | None" = None,
+             group: "str | None" = None) -> tuple:
         """(how good, the entry) for the best entry on this chip - the
         key sorts a worse answer after a better - or (None, None)."""
+        found = self.candidates(image, pixel_x, pixel_y, predicted, group)
+        return found[0] if found else (None, None)
+
+    def candidates(self, image, pixel_x: float, pixel_y: float,
+                   predicted: "str | None" = None,
+                   group: "str | None" = None) -> list:
+        """Every entry within the tolerance of this chip as (how good,
+        the entry), the best first: the chip's own group, then an entry
+        of no group (from before 2.8.17: any group's), then another
+        group's; within those the same predicted class, then the
+        nearest."""
         name = image_key(image)
         column, row = int(pixel_x // self._cell), int(pixel_y // self._cell)
-        best, best_key = None, None
+        found = []
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
                 for verdict in self._buckets.get(
@@ -155,16 +177,23 @@ class LedgerIndex:
                                           verdict.pixel_y - pixel_y)
                     if distance > self.tolerance:
                         continue
-                    key = (predicted is not None
+                    if group is not None and verdict.group == group:
+                        own = 0             # the chip's own group
+                    elif not verdict.group or group is None:
+                        own = 1             # no group known: any group's
+                    else:
+                        own = 2             # another group's
+                    key = (own, predicted is not None
                            and verdict.predicted != predicted, distance)
-                    if best is None or key < best_key:
-                        best, best_key = verdict, key
-        return best_key, best
+                    found.append((key, verdict))
+        found.sort(key=lambda item: item[0])
+        return found
 
 
 def find_verdict(verdicts, image, pixel_x: float, pixel_y: float,
                  tolerance: float = DEFAULT_TOLERANCE_PX,
-                 predicted: "str | None" = None) -> "Verdict | None":
+                 predicted: "str | None" = None,
+                 group: "str | None" = None) -> "Verdict | None":
     """One lookup; for many, build a LedgerIndex once."""
     return LedgerIndex(verdicts, tolerance).find(image, pixel_x, pixel_y,
-                                                predicted)
+                                                predicted, group)

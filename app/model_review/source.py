@@ -118,6 +118,11 @@ class Chip:
         self.recenter(pixel_x, pixel_y)
         self.settle()
 
+    def anchor_at(self, pixel_x: float, pixel_y: float):
+        """The project has the chip here, and a move staged from its
+        old place stays staged: the anchor alone (2.8.17)."""
+        self.anchor_x, self.anchor_y = float(pixel_x), float(pixel_y)
+
     def unseat(self):
         """The project has nothing of the chip: the file's centre
         is the anchor again. A move staged here stays."""
