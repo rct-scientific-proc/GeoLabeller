@@ -16,8 +16,8 @@ from __future__ import annotations
 import numpy as np
 
 from . import filters
-from .base import (BRIGHT, DARK, POLARITY, Candidate, Detector, Parameter,
-                   one_per_patch, patch_of)
+from .base import (BOTH, BRIGHT, DARK, POLARITY, Candidate, Detector,
+                   Parameter, one_per_patch, patch_of)
 
 
 class Contrast(Detector):
@@ -64,22 +64,32 @@ class Contrast(Detector):
         if sigma >= 0.5:
             z = filters.gaussian_blur(z, sigma, mask)
         polarity = self.params["polarity"]
-        if polarity == BRIGHT:
-            response = z
-        elif polarity == DARK:
-            response = -z
-        else:
-            response = np.abs(z)
         radius = max(1, int(round(smallest / 2.0)))
-        # A box blur normalised by its count does not ring at a nodata
-        # edge, so peaks may lie right up to one (unlike blob.py's).
-        rows, cols = filters.local_maxima(response, radius, floor)
-        above = response >= floor / 2.0
         limit = max(2, int(round(largest)))
         found = []
-        for row, col in zip(rows.tolist(), cols.tolist()):
-            strength = float(response[row, col])
-            x, y, size, box = patch_of(above, row, col, limit)
-            sign = BRIGHT if z[row, col] >= 0 else DARK
-            found.append(Candidate(x, y, strength, size, sign, box))
+        # Each sign on its own: its peaks among its own pixels, its patch
+        # of its own sign. Looking for both on one |z| map, a highlight's
+        # patch ran on into the shadow touching it, and a shadow's own
+        # maximum lost to a slightly brighter neighbour's within the
+        # window and was never a candidate at all (2.9.1). A box blur
+        # normalised by its count does not ring at a nodata edge, so
+        # peaks may lie right up to one (unlike blob.py's).
+        for sign, response in _by_sign(z, polarity):
+            with np.errstate(invalid="ignore"):
+                own = np.where(response > 0, response, np.nan)
+                above = response >= floor / 2.0
+            rows, cols = filters.local_maxima(own, radius, floor)
+            for row, col in zip(rows.tolist(), cols.tolist()):
+                x, y, size, box = patch_of(above, row, col, limit)
+                found.append(Candidate(x, y, float(response[row, col]), size,
+                                       sign, box))
         return one_per_patch(found)
+
+
+def _by_sign(z, polarity):
+    """(sign, response) for each polarity looked for: the deviation
+    itself for bright, its negative for dark."""
+    if polarity in (BRIGHT, BOTH):
+        yield BRIGHT, z
+    if polarity in (DARK, BOTH):
+        yield DARK, -z

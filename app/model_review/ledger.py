@@ -190,6 +190,30 @@ class LedgerIndex:
         return found
 
 
+    def within(self, image, pixel_x: float, pixel_y: float, radius: float,
+               group: "str | None" = None) -> list:
+        """Every entry within ``radius`` of this place on this image -
+        any radius, not only the tolerance - leaving out entries of
+        another group when ``group`` is given (a same-named image
+        elsewhere is not this one). For Find Candidates' skip (2.9.1)."""
+        name = image_key(image)
+        radius = max(0.0, float(radius))
+        column, row = int(pixel_x // self._cell), int(pixel_y // self._cell)
+        reach = int(radius // self._cell) + 1
+        found = []
+        for dx in range(-reach, reach + 1):
+            for dy in range(-reach, reach + 1):
+                for verdict in self._buckets.get(
+                        (name, column + dx, row + dy), ()):
+                    if group is not None and verdict.group \
+                            and verdict.group != group:
+                        continue
+                    if math.hypot(verdict.pixel_x - pixel_x,
+                                  verdict.pixel_y - pixel_y) <= radius:
+                        found.append(verdict)
+        return found
+
+
 def find_verdict(verdicts, image, pixel_x: float, pixel_y: float,
                  tolerance: float = DEFAULT_TOLERANCE_PX,
                  predicted: "str | None" = None,

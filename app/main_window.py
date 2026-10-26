@@ -3930,6 +3930,7 @@ class MainWindow(QMainWindow):
         # Clear project state
         self._close_display_dialog()
         self._close_model_review()
+        self._close_detector()
         self._history.clear()
         self.project = LabelProject()
         self._project_path = None
@@ -4035,6 +4036,7 @@ class MainWindow(QMainWindow):
 
             self._close_display_dialog()
             self._close_model_review()
+            self._close_detector()
             self._history.clear()
             self.project = LabelProject.load(file_path)
             self._project_path = Path(file_path)
@@ -4688,6 +4690,15 @@ class MainWindow(QMainWindow):
         self._model_review.show()
         self._model_review.raise_()
         self._model_review.activateWindow()
+
+    def _close_detector(self):
+        """The project is being replaced, or the window closed: the
+        detector's window goes with it, its run stopped (a run left
+        running at exit aborted the process, 2.9.1)."""
+        dialog, self._detect_dialog = self._detect_dialog, None
+        if dialog is not None:
+            dialog.close()
+            dialog.deleteLater()
 
     def _close_model_review(self):
         """The project is being replaced: the window's chips were matched
@@ -6822,6 +6833,7 @@ class MainWindow(QMainWindow):
             editor.close()
         # So would the Model Review window, with verdicts nobody can import.
         self._close_model_review()
+        self._close_detector()
 
         # Clean up crash detection and recovery
         self._clean_exit()

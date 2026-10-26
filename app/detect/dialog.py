@@ -25,6 +25,7 @@ from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
                              QSpinBox, QTableWidget, QTableWidgetItem,
                              QVBoxLayout)
 
+from ..model_review.ledger import DEFAULT_TOLERANCE_PX
 from ..settings_scope import settings as app_settings
 from . import DETECTORS, by_key
 from .evaluate import DEFAULT_SWEEP, check
@@ -34,6 +35,7 @@ from .run import (METRES, PIXELS, Settings, candidates_path, run,
 _SETTINGS_KEY = "detect/settings"
 _IMAGES_KEY = "detect/images"
 SELECTED, VISIBLE, EVERY = "selected", "visible", "all"
+CLOSE_WAIT_MS = 5000            # closing waits this long for the work
 IMAGE_CHOICES = ((SELECTED, "The selected group"),
                  (VISIBLE, "The images shown on the map"),
                  (EVERY, "Every image in the project"))
@@ -53,7 +55,20 @@ COMMON_DOC = (
     "Zero keeps them all.\n\n"
     "Skip within a distance of a label - a candidate on an object you "
     "have labelled already teaches nothing; nor does one where the memory "
-    "already holds an answer, if Skip what was reviewed is on.")
+    "already holds an answer within Model Review's Same chip within "
+    "distance (or half the candidate's size, if that is more), if Skip "
+    "what was reviewed is on.\n\n"
+    "Check against my labels counts a label as found when it lies within "
+    "a candidate's own patch, or the smallest size, whichever is larger.")
+
+
+def review_tolerance() -> float:
+    """Model Review's Same chip within, as it stands."""
+    try:
+        return float(app_settings().value("model_review/tolerance",
+                                          DEFAULT_TOLERANCE_PX))
+    except (TypeError, ValueError):
+        return float(DEFAULT_TOLERANCE_PX)
 
 
 class Worker(QThread):
@@ -96,6 +111,9 @@ class DetectDialog(QDialog):
         self._images_for = images_for
         self._path = path_getter
         self._worker: Worker | None = None
+        self._closing = False           # a close cancels the work's result
+        self._target = None             # where the run's file goes
+        self._run_settings = None
         self._param_widgets: dict = {}
         self._build()
         self._restore()
@@ -177,7 +195,8 @@ class DetectDialog(QDialog):
         self.skip_reviewed = QCheckBox("and what was reviewed before")
         self.skip_reviewed.setToolTip(
             "No candidate where Model Review's memory already holds an\n"
-            "answer, within its Same chip within distance.")
+            "answer, within its Same chip within distance or half the\n"
+            "candidate's size, whichever is more.")
         skip.addWidget(self.skip_labels)
         skip.addWidget(self.skip_reviewed)
         skip.addStretch(1)
@@ -284,7 +303,8 @@ class DetectDialog(QDialog):
             smallest=self.smallest.value(), largest=self.largest.value(),
             unit=self.unit.currentData(), per_image=self.per_image.value(),
             skip_labels_px=self.skip_labels.value(),
-            skip_reviewed=self.skip_reviewed.isChecked())
+            skip_reviewed=self.skip_reviewed.isChecked(),
+            tolerance_px=review_tolerance())
         if out.largest < out.smallest:
             out.largest = out.smallest
         return out
@@ -400,12 +420,14 @@ class DetectDialog(QDialog):
             should_stop=should_stop), self._on_checked)
 
     def _on_checked(self, result):
+        if self._closing:
+            return
         self.table.setRowCount(len(result.points))
         for row, point in enumerate(result.points):
             recall = f"{point.recall:.0%}" if point.labels else "-"
             cells = (f"{point.sensitivity:g}",
                      f"{recall} of {point.labels}",
-                     f"{point.per_image:.1f}")
+                     f"{point.per_image:.1f}" if point.images else "-")
             for column, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignCenter)
@@ -427,7 +449,8 @@ class DetectDialog(QDialog):
         self.status.setText(
             f"Checked against the labels on {result.images} image"
             f"{'' if result.images == 1 else 's'}. Double-click a row to "
-            "take its sensitivity." + ("; ".join([""] + extra)))
+            "take its sensitivity."
+            + (" " + "; ".join(extra) + "." if extra else ""))
 
     def _take_row(self, row, _column):
         item = self.table.item(row, 0)
@@ -449,12 +472,13 @@ class DetectDialog(QDialog):
         self.save_settings()
         settings = self.settings()
         project = self._project()
+        self._target, self._run_settings = target, settings
 
         def job(progress, should_stop):
-            records, report = run(project, images, settings, progress,
-                                  should_stop)
-            write_candidates(target, records, settings, report)
-            return str(target), report
+            # The file is written here, on the window's thread, once the
+            # result is wanted: a run cut short by a close wrote a partial
+            # file over the last one and opened it (2.9.1).
+            return run(project, images, settings, progress, should_stop)
         self._start(job, self._on_ran)
 
     def _target_path(self) -> "Path | None":
@@ -468,13 +492,44 @@ class DetectDialog(QDialog):
         return candidates_path(project_path)
 
     def _on_ran(self, result):
-        path, report = result
+        if self._closing or self._target is None:
+            return
+        records, report = result
+        try:
+            write_candidates(self._target, records, self._run_settings,
+                             report)
+        except OSError as exc:
+            self.status.setText(f"Could not write {self._target}: {exc}")
+            return
         self.status.setText(f"Written: {report.summary()}.")
-        self.finished_run.emit(path, report)
+        self.finished_run.emit(str(self._target), report)
+
+    def showEvent(self, event):
+        self._closing = False
+        super().showEvent(event)
 
     def closeEvent(self, event):
         self.save_settings()
+        self._closing = True            # whatever ends now is not wanted
         if self._worker is not None:
             self._worker.stop()
-            self._worker.wait(5000)
+            if not self._worker.wait(CLOSE_WAIT_MS):
+                # Still reading: a QThread destroyed while running
+                # aborts the whole process. It goes on alone, its
+                # result unheard, and deletes itself when done (2.9.1).
+                worker = self._worker
+                for signal, slot in ((worker.progress, self._on_progress),
+                                     (worker.failed, self._on_failed),
+                                     (worker.finished, self._on_finished)):
+                    signal.disconnect(slot)
+                try:
+                    worker.done.disconnect()
+                except TypeError:
+                    pass
+                worker.setParent(None)
+                worker.finished.connect(worker.deleteLater)
+                self._worker = None
+                self._busy(False)
+                self.status.setText("Stopped; the run is finishing on "
+                                    "its own.")
         super().closeEvent(event)

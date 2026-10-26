@@ -11,6 +11,7 @@ would add forty megabytes to the installer for four functions.
 from __future__ import annotations
 
 import math
+import warnings
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
@@ -77,18 +78,26 @@ def _fast_size(n: int) -> int:
 
 
 def gaussian_bank(values: np.ndarray, mask: np.ndarray, sigmas) -> dict:
+    """{sigma: blurred} for every sigma given: gaussian_blurs held at
+    once. For a few; a ladder of many goes through gaussian_blurs one
+    at a time (2.9.1: a bank of fifteen at 3000 px held 600 MB)."""
+    return dict(gaussian_blurs(values, mask, sigmas))
+
+
+def gaussian_blurs(values: np.ndarray, mask: np.ndarray, sigmas):
     """Gaussian blurs of ``values`` at several sigmas from one forward
-    FFT: {sigma: blurred float32}. Pixels without data count for
-    nothing (the blur is normalised by the blurred mask, so a patch by
-    a nodata edge or the image's own edge keeps its height), and the
-    image is zero-padded by three of the widest sigma so nothing wraps
-    round. True Gaussians, and the forward transform shared, which is
-    what makes a bank of a dozen sizes affordable."""
-    sigmas = sorted({float(s) for s in sigmas})
+    FFT, yielded (sigma, blurred float32) in the order given. Pixels
+    without data count for nothing (the blur is normalised by the
+    blurred mask, so a patch by a nodata edge or the image's own edge
+    keeps its height), and the image is zero-padded by three of the
+    widest sigma so nothing wraps round. True Gaussians, and the
+    forward transform shared, which is what makes a ladder of a
+    dozen sizes affordable."""
+    sigmas = [float(s) for s in sigmas]
     if not sigmas:
-        return {}
+        return
     h, w = values.shape
-    pad = int(math.ceil(3.0 * sigmas[-1]))
+    pad = int(math.ceil(3.0 * max(sigmas)))
     big_h, big_w = _fast_size(h + 2 * pad), _fast_size(w + 2 * pad)
     canvas = np.zeros((big_h, big_w), dtype=np.float64)
     weight = np.zeros((big_h, big_w), dtype=np.float64)
@@ -99,7 +108,6 @@ def gaussian_bank(values: np.ndarray, mask: np.ndarray, sigmas) -> dict:
     fy = np.fft.fftfreq(big_h)[:, None]
     fx = np.fft.rfftfreq(big_w)[None, :]
     freq2 = fx * fx + fy * fy
-    out = {}
     for sigma in sigmas:
         kernel = np.exp(-2.0 * math.pi * math.pi * sigma * sigma * freq2)
         blurred = np.fft.irfft2(spectrum * kernel, s=(big_h, big_w))
@@ -110,8 +118,7 @@ def gaussian_bank(values: np.ndarray, mask: np.ndarray, sigmas) -> dict:
             result = np.where(seen > 1e-3, blurred / np.maximum(seen, 1e-3),
                               np.nan)
         result[~mask] = np.nan
-        out[sigma] = result.astype(np.float32)
-    return out
+        yield sigma, result.astype(np.float32)
 
 
 def block_median_mad(values: np.ndarray, mask: np.ndarray,
@@ -127,7 +134,10 @@ def block_median_mad(values: np.ndarray, mask: np.ndarray,
     padded = np.full((nh * b, nw * b), np.nan, dtype=np.float32)
     padded[:h, :w] = np.where(mask, values, np.nan)
     tiles = padded.reshape(nh, b, nw, b)
-    with np.errstate(all="ignore"):
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        # A tile of nothing but nodata is an empty slice: its median
+        # is NaN, filled below, and not a warning on the console.
+        warnings.simplefilter("ignore", RuntimeWarning)
         med = np.nanmedian(tiles, axis=(1, 3))
         dev = np.abs(tiles - med[:, None, :, None])
         mad = np.nanmedian(dev, axis=(1, 3)) * MAD_TO_SIGMA
@@ -144,9 +154,15 @@ def block_median_mad(values: np.ndarray, mask: np.ndarray,
     mad = np.maximum(mad, floor)
     background = np.repeat(np.repeat(med, b, axis=0), b, axis=1)[:h, :w]
     spread = np.repeat(np.repeat(mad, b, axis=0), b, axis=1)[:h, :w]
-    # Across the tile edges: a box blur half a tile wide.
-    background = box_blur(background.astype(np.float32), b // 2)
-    spread = box_blur(spread.astype(np.float32), b // 2)
+    background = background.astype(np.float32)
+    spread = spread.astype(np.float32)
+    if nh * nw > 1:
+        # Across the tile edges: a box blur half a tile wide - and no
+        # wider than a quarter of the image, whose padding is what a
+        # huge tile cost (2.9.1). One tile is one value: nothing to blur.
+        radius = min(b // 2, max(h, w) // 4)
+        background = box_blur(background, radius)
+        spread = box_blur(spread, radius)
     return background, np.maximum(spread, floor)
 
 

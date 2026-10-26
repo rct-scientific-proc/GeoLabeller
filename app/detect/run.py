@@ -120,10 +120,13 @@ class Report:
 
 # -- sizes -------------------------------------------------------------------
 
-def metres_per_pixel(image) -> "float | None":
+def metres_per_pixel(image, width: "int | None" = None) -> "float | None":
     """Metres one source pixel spans, by the image's geodesic width, or
-    None without ground."""
-    width = int(getattr(image, "original_width", 0) or 0)
+    None without ground. ``width`` is the raster's when the record
+    has none (2.9.1: without it, a georeferenced image whose size was
+    never recorded took its metres as pixels)."""
+    if not width:
+        width = int(getattr(image, "original_width", 0) or 0)
     if width <= 0 or image.get_affine() is None or image.get_crs() is None:
         return None
     try:
@@ -139,12 +142,13 @@ def metres_per_pixel(image) -> "float | None":
     return metres / width
 
 
-def sizes_in_pixels(image, settings: Settings) -> tuple:
+def sizes_in_pixels(image, settings: Settings,
+                    width: "int | None" = None) -> tuple:
     """(smallest px, largest px, ground): the size range in source pixels,
-    and whether metres could be used."""
+    and whether metres could be used. ``width`` as metres_per_pixel."""
     if settings.unit == PIXELS:
         return float(settings.smallest), float(settings.largest), True
-    mpp = metres_per_pixel(image)
+    mpp = metres_per_pixel(image, width)
     if mpp is None:
         return float(settings.smallest), float(settings.largest), False
     return settings.smallest / mpp, settings.largest / mpp, True
@@ -162,6 +166,12 @@ def working_factor(smallest_px: float, width: int, height: int) -> float:
 
 
 # -- reading -----------------------------------------------------------------
+
+def read_size(path: str) -> tuple:
+    """(width, height) from the raster's header."""
+    with gdal_config.opened(path) as src:
+        return int(src.width), int(src.height)
+
 
 def read_values(path: str, factor: float) -> tuple:
     """(values, mask, width, height): the mean of the bands the display
@@ -197,16 +207,16 @@ def detect_image(image, project, settings: Settings, detector=None,
     path = image.path
     stats = ImageStats(path=path)
     detector = detector or by_key(settings.detector)(**settings.params)
-    smallest_px, largest_px, ground = sizes_in_pixels(image, settings)
-    stats.ground = ground
     try:
         width0 = int(getattr(image, "original_width", 0) or 0)
         height0 = int(getattr(image, "original_height", 0) or 0)
-        factor = working_factor(smallest_px, width0 or 1, height0 or 1)
-        values, mask, width, height = read_values(path, factor)
         if not (width0 and height0):
-            factor = working_factor(smallest_px, width, height)
-            values, mask, width, height = read_values(path, factor)
+            width0, height0 = read_size(path)   # not on record: the header
+        smallest_px, largest_px, ground = sizes_in_pixels(image, settings,
+                                                          width0)
+        stats.ground = ground
+        factor = working_factor(smallest_px, width0, height0)
+        values, mask, width, height = read_values(path, factor)
     except Exception as exc:  # noqa: BLE001 - said in the report
         stats.error = f"{type(exc).__name__}: {exc}"
         return [], stats
@@ -214,8 +224,17 @@ def detect_image(image, project, settings: Settings, detector=None,
     if not mask.any():
         return [], stats
     level = settings.sensitivity if floor is None else floor
-    found = detector.detect(values, mask, smallest_px / factor,
-                            largest_px / factor, level)
+    # At the working scale, and no object wider than a quarter of the
+    # image: a background is judged over several objects, and a
+    # largest size of half the image cost gigabytes (2.9.1).
+    smallest_w = smallest_px / factor
+    largest_w = max(smallest_w, min(largest_px / factor,
+                                    max(values.shape) / 4.0))
+    try:
+        found = detector.detect(values, mask, smallest_w, largest_w, level)
+    except Exception as exc:  # noqa: BLE001 - MemoryError among them
+        stats.error = f"{type(exc).__name__}: {exc}"
+        return [], stats
     stats.seen = len(found)
     # Back to source pixels, inside the image.
     scaled = []
@@ -249,10 +268,16 @@ def detect_image(image, project, settings: Settings, detector=None,
             kept, near = _drop_near(kept, lx, ly, settings.skip_labels_px)
             stats.near_label = near
     if settings.skip_reviewed and memory is not None:
+        # Within Model Review's own distance, or half the candidate's
+        # size if that is more (a re-run lands a big object's middle a
+        # few pixels over); entries of another group's same-named image
+        # are not this one's (2.9.1).
         name = Path(str(path).replace("\\", "/")).name
+        group = getattr(image, "group", None) or ""
         still = []
         for item in kept:
-            if memory.find(name, item[0], item[1]) is not None:
+            reach = max(settings.tolerance_px, item[3] / 2.0)
+            if memory.within(name, item[0], item[1], reach, group):
                 stats.reviewed += 1
             else:
                 still.append(item)
@@ -275,19 +300,16 @@ def merge_overlapping(items: list) -> list:
     """(x, y, strength, size, polarity, box) tuples, the strongest
     kept of any two whose middles lie in each other's patch: a long
     object gives a peak at each end, and both patches are the object.
-    The kept one takes the middle of what merged into it."""
+    The kept one stays where it is: given the middle of the two
+    patches together, a small strong object in a long weak one's box
+    was reported far from itself (2.9.1)."""
     kept: list = []
     for item in sorted(items, key=lambda it: -it[2]):
-        x, y, _strength, size, _polarity, box = item
-        for i, (kx, ky, ks, ksize, kp, kbox) in enumerate(kept):
-            if _inside(x, y, kbox) or _inside(kx, ky, box):
-                x0, y0 = min(box[0], kbox[0]), min(box[1], kbox[1])
-                x1, y1 = max(box[2], kbox[2]), max(box[3], kbox[3])
-                kept[i] = ((x0 + x1) / 2.0, (y0 + y1) / 2.0, ks,
-                           max(ksize, size), kp, (x0, y0, x1, y1))
-                break
-        else:
-            kept.append(item)
+        x, y, _strength, _size, _polarity, box = item
+        if any(_inside(x, y, kbox) or _inside(kx, ky, box)
+               for kx, ky, _ks, _ksize, _kp, kbox in kept):
+            continue
+        kept.append(item)
     return kept
 
 

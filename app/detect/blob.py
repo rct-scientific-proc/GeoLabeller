@@ -20,11 +20,12 @@ import math
 import numpy as np
 
 from . import filters
-from .base import (BRIGHT, DARK, POLARITY, Candidate, Detector, Parameter,
-                   one_per_patch, patch_of)
+from .base import (BOTH, BRIGHT, DARK, POLARITY, Candidate, Detector,
+                   Parameter, one_per_patch, patch_of)
 
 DOG_RATIO = 1.6                 # the wider Gaussian, about: Lowe's ratio
 DISC_TO_SIGMA = 2.0 * math.sqrt(2.0)   # a disc's diameter in DoG sigmas
+NORM_SIGMA = 8.0                # the response is one shape past this
 _NORM: dict = {}                # (sigma, ratio) -> the response to a unit disc
 
 
@@ -53,7 +54,11 @@ def ladder(smallest: float, largest: float, steps: int) -> tuple:
 def _norm(sigma: float, ratio: float) -> float:
     """What the difference of Gaussians makes of a disc one unit above
     zero, at the disc's centre: found once per sigma on a synthetic
-    disc, through the same blurs, so the two agree."""
+    disc, through the same blurs, so the two agree. The response is
+    the same shape at every sigma past a few pixels, so a wide one is
+    measured at NORM_SIGMA: measured at its own, a 500 px sigma took
+    a 50,000 px canvas (2.9.1)."""
+    sigma = min(float(sigma), NORM_SIGMA)
     key = (round(sigma, 3), round(ratio, 3))
     if key not in _NORM:
         radius = sigma * DISC_TO_SIGMA / 2.0
@@ -101,41 +106,51 @@ class Blob(Detector):
         z = np.where(mask, z, np.nan).astype(np.float32)
         sizes, sigmas, wider = ladder(smallest, largest,
                                       int(self.params["steps"]))
-        bank = filters.gaussian_bank(z, mask, sigmas)
         polarity = self.params["polarity"]
-        best = np.full(values.shape, -np.inf, dtype=np.float32)
-        signs = np.zeros(values.shape, dtype=np.int8)
-        for i, _size in enumerate(sizes):
-            narrow, wide = sigmas[i], sigmas[i + wider]
-            response = (bank[narrow] - bank[wide]) / _norm(narrow,
-                                                           wide / narrow)
-            if polarity == BRIGHT:
-                signed = response
-            elif polarity == DARK:
-                signed = -response
-            else:
-                signed = np.abs(response)
-            signed = np.where(mask & np.isfinite(signed), signed, -np.inf)
-            better = signed > best
-            best = np.where(better, signed, best)
-            signs = np.where(better, np.where(response >= 0, 1, -1), signs)
-        best = np.where(np.isfinite(best), best, np.nan).astype(np.float32)
+        signs = [s for s in (BRIGHT, DARK)
+                 if polarity == BOTH or polarity == s]
+        # The strongest response over the sizes, per sign: looking for
+        # both on one map, a shadow's maximum lost to a brighter
+        # neighbour's within the window (2.9.1).
+        best = {s: np.full(values.shape, -np.inf, dtype=np.float32)
+                for s in signs}
+        # The blurs come one at a time, each the narrow of one size and
+        # the wide of the size ``wider`` rungs below, so only that many
+        # are held: a whole bank at 3000 px was 600 MB.
+        held: dict = {}
+        smooth = None
+        for j, (wide_sigma, blurred) in enumerate(
+                filters.gaussian_blurs(z, mask, sigmas)):
+            held[j] = blurred
+            if smooth is None:
+                smooth = blurred            # the narrowest, for the patch
+            if j < wider:
+                continue
+            i = j - wider
+            narrow = sigmas[i]
+            response = (held.pop(i) - blurred) / _norm(narrow,
+                                                       wide_sigma / narrow)
+            for sign in signs:
+                signed = response if sign == BRIGHT else -response
+                signed = np.where(mask & np.isfinite(signed), signed, -np.inf)
+                best[sign] = np.maximum(best[sign], signed)
         radius = max(1, int(round(smallest / 2.0)))
-        # No peak within the narrowest blur of a nodata edge, where
-        # the two blurs' normalisations disagree and ring.
+        # No peak within the narrowest blur of a nodata edge, where the
+        # two blurs' normalisations disagree and ring.
         inside = filters.erode(mask, max(1, int(round(sigmas[0]))))
-        peaks = np.where(inside, best, np.nan)
-        rows, cols = filters.local_maxima(peaks, radius, floor)
-        # The size and the middle from the patch itself: the smoothed
-        # deviation above half the threshold round the peak, on the
-        # narrowest blur.
-        smooth = bank[sigmas[0]]
         limit = max(2, int(round(largest)))
         found = []
-        for row, col in zip(rows.tolist(), cols.tolist()):
-            sign = 1 if signs[row, col] >= 0 else -1
-            above = (smooth * sign) >= floor / 2.0
-            x, y, size, box = patch_of(above, row, col, limit)
-            found.append(Candidate(x, y, float(best[row, col]), size,
-                                   BRIGHT if sign > 0 else DARK, box))
+        for sign in signs:
+            own = np.where(inside & np.isfinite(best[sign]) & (best[sign] > 0),
+                           best[sign], np.nan).astype(np.float32)
+            rows, cols = filters.local_maxima(own, radius, floor)
+            # The size and the middle from the patch itself: the smoothed
+            # deviation of the peak's sign above half the threshold round
+            # it, on the narrowest blur; the mask made once per sign.
+            with np.errstate(invalid="ignore"):
+                above = (smooth if sign == BRIGHT else -smooth) >= floor / 2.0
+            for row, col in zip(rows.tolist(), cols.tolist()):
+                x, y, size, box = patch_of(above, row, col, limit)
+                found.append(Candidate(x, y, float(best[sign][row, col]), size,
+                                       sign, box))
         return one_per_patch(found)

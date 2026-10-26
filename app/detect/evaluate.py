@@ -42,8 +42,9 @@ class Point:
 
     def describe(self) -> str:
         recall = f"{self.recall:.0%}" if self.labels else "-"
+        per_image = f"{self.per_image:.1f}" if self.images else "-"
         return (f"{self.sensitivity:g} sigma: {recall} of {self.labels} "
-                f"labels found, {self.per_image:.1f} candidates per image")
+                f"labels found, {per_image} candidates per image")
 
 
 @dataclass
@@ -68,9 +69,10 @@ def check(project, images, settings: Settings, sweep=DEFAULT_SWEEP,
           reach: "float | None" = None, progress=None,
           should_stop=None) -> Check:
     """The sweep over the labelled images among ``images``. A label is
-    found when a candidate lies within ``reach`` of it - half the largest
-    size, in the settings' unit, unless given. Labels already there are
-    not skipped here, whatever the settings say: they are the test."""
+    found when it lies within a candidate's own patch (or the smallest
+    size, if that is more) - or within ``reach`` of one, in the
+    settings' unit, when given. Labels already there are not skipped
+    here, whatever the settings say: they are the test."""
     progress = progress or (lambda text, done, total: None)
     should_stop = should_stop or (lambda: False)
     sweep = sorted(float(s) for s in sweep)
@@ -95,9 +97,15 @@ def check(project, images, settings: Settings, sweep=DEFAULT_SWEEP,
             out.unreadable += 1
             continue
         out.images += 1
-        smallest_px, largest_px, _ground = sizes_in_pixels(image, settings)
+        smallest_px, largest_px, _ground = sizes_in_pixels(
+            image, settings, records[0]["image_width"] if records else None)
+        # A label is found by a candidate it lies within: the candidate's
+        # own patch, or the smallest size, whichever is larger - not
+        # half the largest size, which found labels 25 m off (2.9.1).
+        # ``reach``, when given, is a fixed radius in the settings' unit.
         if reach is None:
-            radius = max(4.0, largest_px / 2.0)
+            radius = None
+            floor_px = max(4.0, smallest_px)
         else:
             radius = reach * (largest_px / settings.largest
                               if settings.largest else 1.0)
@@ -106,6 +114,7 @@ def check(project, images, settings: Settings, sweep=DEFAULT_SWEEP,
         strengths = np.array([r["strength"] for r in records], dtype=float)
         xs = np.array([r["x"] for r in records], dtype=float)
         ys = np.array([r["y"] for r in records], dtype=float)
+        sizes = np.array([r["size_px"] for r in records], dtype=float)
         for point in out.points:
             take = strengths >= point.sensitivity
             if settings.per_image > 0 and take.sum() > settings.per_image:
@@ -114,11 +123,13 @@ def check(project, images, settings: Settings, sweep=DEFAULT_SWEEP,
                 chosen[order[:settings.per_image]] = True
                 take &= chosen
             cx, cy = xs[take], ys[take]
+            within = (np.full(cx.shape, radius) if radius is not None
+                      else np.maximum(floor_px, sizes[take] / 2.0))
             point.images += 1
             point.candidates += int(take.sum())
             point.labels += len(labels)
             for lx, ly in labels:
-                if cx.size and float(np.hypot(cx - lx, cy - ly).min()) <= radius:
+                if cx.size and bool((np.hypot(cx - lx, cy - ly) <= within).any()):
                     point.found += 1
     progress("Done", total, total)
     return out
