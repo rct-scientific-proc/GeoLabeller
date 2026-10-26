@@ -66,6 +66,7 @@ from .display_dialog import DisplaySettingsDialog
 from .gt_import import apply_import, confirm_import, plan_import
 from .model_review.importer import apply_verdicts
 from .model_review.window import ModelReviewWindow
+from .detect.dialog import EVERY, SELECTED, DetectDialog
 from .relocate import (RelocateImagesDialog, RemoveMissingImagesDialog,
                        missing_images, silently_resolve)
 from .snippet_editor import SnippetEditor
@@ -442,6 +443,7 @@ class MainWindow(QMainWindow):
         # mistakes, labelled and imported. Created on first open, closed
         # when the project is replaced.
         self._model_review = None
+        self._detect_dialog = None      # Labels > Find Candidates...
         # Last-used export settings, so a re-export doesn't start from scratch.
         # An existing target file's own settings still take precedence.
         self._h5_last_options: dict = {}
@@ -929,6 +931,15 @@ class MainWindow(QMainWindow):
             "a JSON file, imported as labels")
         review_action.triggered.connect(self._open_model_review)
         labels_menu.addAction(review_action)
+
+        # Find Candidates: a detector proposes places that stand out,
+        # Model Review checks them (app/detect, 2.9.0)
+        detect_action = QAction("&Find Candidates...", self)
+        detect_action.setStatusTip(
+            "A detector proposes places that stand out on the imagery, "
+            "to check and label in Model Review")
+        detect_action.triggered.connect(self._open_detector)
+        labels_menu.addAction(detect_action)
 
         labels_menu.addSeparator()
 
@@ -4616,6 +4627,50 @@ class MainWindow(QMainWindow):
 
     def _class_colours(self) -> list:
         return [self._get_class_color(name) for name in self.project.classes]
+
+    # ------------------------------------------------------------------
+    # Find Candidates (app/detect): a detector proposes, Model Review
+    # checks (2.9.0)
+    # ------------------------------------------------------------------
+
+    def _open_detector(self):
+        """Labels > Find Candidates...: the detector's window."""
+        if self._detect_dialog is None:
+            dialog = self._detect_dialog = DetectDialog(
+                lambda: self.project, self._images_for_detector,
+                lambda: self._project_path, self)
+            dialog.finished_run.connect(self._on_candidates_found)
+        self._detect_dialog.show()
+        self._detect_dialog.raise_()
+        self._detect_dialog.activateWindow()
+
+    def _images_for_detector(self, choice: str) -> list:
+        """The project images a Find Candidates choice names: every
+        image, the selected group's, or those shown on the map."""
+        if choice == EVERY:
+            return list(self.project.images.values())
+        if choice == SELECTED:
+            layer_ids = self.layer_panel.get_all_layers_in_selected_group()
+        else:
+            layer_ids = [layer_id for layer_id, layer
+                         in self.canvas._layers.items() if layer.visible]
+        images = []
+        for layer_id in layer_ids:
+            layer = self.canvas.get_layer(layer_id)
+            image = (self._project_image_for(layer.file_path)
+                     if layer is not None else None)
+            if image is not None and image not in images:
+                images.append(image)
+        return images
+
+    def _on_candidates_found(self, path: str, report):
+        """The detector's file is written: Model Review opens it."""
+        self.statusBar.showMessage("Find Candidates: " + report.summary(),
+                                   12000)
+        if not report.found:
+            return                      # nothing to review
+        self._open_model_review()
+        self._model_review.open_file(path)
 
     def _open_model_review(self):
         """Labels > Model Review...: a file of the model's mistakes, each

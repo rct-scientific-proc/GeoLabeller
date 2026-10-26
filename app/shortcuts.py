@@ -152,6 +152,17 @@ SHORTCUT_SECTIONS = [
         ("Ctrl+Y", "Redo"),
         ("Ctrl+S", "Save Project"),
     ]),
+    ("Find Candidates (Labels > Find Candidates...)", [
+        ("Labels > Find Candidates...",
+         "A detector proposes places that stand out, to check in Model "
+         "Review"),
+        ("Check against my labels",
+         "What each sensitivity would have found of the labels, and how "
+         "many candidates an image gets"),
+        ("Run", "Write the candidates file beside the project and open "
+         "it in Model Review"),
+        ("Double-click a row", "Take that sensitivity"),
+    ]),
     ("Model Review (Labels > Model Review...)", [
         ("Ctrl+O", "Open a file of the model's mistakes"),
         ("Left-click chip", "Give it the active label"),
