@@ -40,6 +40,7 @@ from .canvas import (MapCanvas, CanvasMode, CYCLE_MODES, STEP_CYCLE_MODES,
                      _emit_safely)
 from .class_editor import (ClassEditorDialog, DescriptionEditorDialog,
                            MaskNameEditorDialog, RenameClassDialog)
+from .close_labels import CloseLabelsWindow
 from .goto_location import (GoToLocationDialog, WaypointDialog,
                             format_lat_lon)
 from .labels import (CONFIDENCE_UNSET, REVIEW_ACCEPTED, REVIEW_RECHECK,
@@ -444,6 +445,7 @@ class MainWindow(QMainWindow):
         # when the project is replaced.
         self._model_review = None
         self._detect_dialog = None      # Labels > Find Candidates...
+        self._cleaner = None            # Labels > Clean Close Labels...
         # Last-used export settings, so a re-export doesn't start from scratch.
         # An existing target file's own settings still take precedence.
         self._h5_last_options: dict = {}
@@ -948,6 +950,15 @@ class MainWindow(QMainWindow):
             "to check and label in Model Review")
         detect_action.triggered.connect(self._open_detector)
         labels_menu.addAction(detect_action)
+
+        # Two labels within a few pixels on one image, looked at side by
+        # side and thinned (app/close_labels, 2.9.2)
+        clean_action = QAction("Clean C&lose Labels...", self)
+        clean_action.setStatusTip(
+            "Look at every two labels within a distance of each other on "
+            "one image, side by side, and remove one, both or neither")
+        clean_action.triggered.connect(self._open_cleaner)
+        labels_menu.addAction(clean_action)
 
         labels_menu.addSeparator()
 
@@ -3700,6 +3711,10 @@ class MainWindow(QMainWindow):
         if self._model_review is not None and "model_review" in lists:
             # An import undone: its chips are back to be looked at.
             self._model_review.refresh_earlier()
+        if self._cleaner is not None and self._cleaner.isVisible():
+            # A removal undone brings its pairs back only on the next
+            # Find; what it shows must at least exist.
+            self._cleaner.refresh()
         self.setWindowModified(self._has_unsaved_changes())
         self._push_save_state()
         self._recovery_soon_timer.start()
@@ -3993,6 +4008,7 @@ class MainWindow(QMainWindow):
         self._close_display_dialog()
         self._close_model_review()
         self._close_detector()
+        self._close_cleaner()
         self._history.clear()
         self.project = LabelProject()
         self._project_path = None
@@ -4099,6 +4115,7 @@ class MainWindow(QMainWindow):
             self._close_display_dialog()
             self._close_model_review()
             self._close_detector()
+            self._close_cleaner()
             self._history.clear()
             self.project = LabelProject.load(file_path)
             self._project_path = Path(file_path)
@@ -4761,6 +4778,51 @@ class MainWindow(QMainWindow):
         if dialog is not None:
             dialog.close()
             dialog.deleteLater()
+
+    # ------------------------------------------------------------------
+    # Clean Close Labels (app/close_labels, 2.9.2)
+    # ------------------------------------------------------------------
+
+    def _open_cleaner(self):
+        """Labels > Clean Close Labels...: the window of pairs."""
+        if self._cleaner is None:
+            window = self._cleaner = CloseLabelsWindow(
+                lambda: self.project, self)
+            window.remove_requested.connect(self._remove_close_labels)
+            window.reveal_requested.connect(self._reveal_label)
+        self._cleaner.show()
+        self._cleaner.raise_()
+        self._cleaner.activateWindow()
+
+    def _close_cleaner(self):
+        """With the project replaced or the window closed: its pairs
+        were the old project's."""
+        window, self._cleaner = self._cleaner, None
+        if window is not None:
+            window.close()
+            window.deleteLater()
+
+    def _remove_close_labels(self, label_ids: list):
+        """The cleaner's decision: these labels go, as one undo step."""
+        ids = [label_id for label_id in label_ids
+               if self.project.get_label_by_id(label_id)[1] is not None]
+        if not ids:
+            return
+        with self._recorded("Remove close labels", labels=ids):
+            for label_id in ids:
+                self.project.remove_label(label_id)
+        self._mark_unsaved()
+        for label_id in ids:
+            self.canvas.remove_label_marker(label_id)
+            self.layer_panel.remove_label_from_panel(label_id)
+        # A survivor's group may have shrunk to one label: its halo goes.
+        self._update_ring_colors()
+        self._update_waterfall_projections()
+        self._editor_follows()
+        self._refresh_snippet_panel()
+        n = len(ids)
+        self.statusBar.showMessage(
+            f"Removed {n} close label{'' if n == 1 else 's'}", 3000)
 
     def _close_model_review(self):
         """The project is being replaced: the window's chips were matched
@@ -6896,6 +6958,7 @@ class MainWindow(QMainWindow):
         # So would the Model Review window, with verdicts nobody can import.
         self._close_model_review()
         self._close_detector()
+        self._close_cleaner()
 
         # Clean up crash detection and recovery
         self._clean_exit()

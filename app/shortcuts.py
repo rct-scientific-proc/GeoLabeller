@@ -156,6 +156,13 @@ SHORTCUT_SECTIONS = [
         ("Labels > Rename Class...",
          "A new name for a class on every label that has it; a name "
          "already there merges the two"),
+        ("Labels > Clean Close Labels...",
+         "Every two labels within a distance on one image, side by side: "
+         "keep both, remove one, or both"),
+        ("Left / Right", "Clean Close Labels: the previous / next pair"),
+        ("K", "Clean Close Labels: keep both, then the next pair"),
+        ("1 / 2 / 3", "Clean Close Labels: remove the left / the right / "
+                      "both (one undo step each)"),
     ]),
     ("Find Candidates (Labels > Find Candidates...)", [
         ("Labels > Find Candidates...",
