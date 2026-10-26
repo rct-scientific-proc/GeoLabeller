@@ -412,6 +412,13 @@ class DetectDialog(QDialog):
                 self.table.setItem(row, column, item)
         self.table.setVisible(True)
         self.table.resizeColumnsToContents()
+        # Every row in view: a sweep is a handful of rows, and a scrolled
+        # table hides the figure the user is looking for.
+        rows = self.table.rowCount()
+        if rows:
+            self.table.setMinimumHeight(
+                self.table.horizontalHeader().height()
+                + self.table.rowHeight(0) * rows + 4)
         extra = []
         if result.unreadable:
             extra.append(f"{result.unreadable} could not be read")
