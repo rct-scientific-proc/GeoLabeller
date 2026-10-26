@@ -71,11 +71,9 @@ class Contrast(Detector):
         else:
             response = np.abs(z)
         radius = max(1, int(round(smallest / 2.0)))
-        # No peak within a smoothing width of a nodata edge, where the
-        # blur's normalisation rings.
-        inside = filters.erode(mask, max(1, int(round(sigma))))
-        peaks = np.where(inside, response, np.nan)
-        rows, cols = filters.local_maxima(peaks, radius, floor)
+        # A box blur normalised by its count does not ring at a nodata
+        # edge, so peaks may lie right up to one (unlike blob.py's).
+        rows, cols = filters.local_maxima(response, radius, floor)
         above = response >= floor / 2.0
         limit = max(2, int(round(largest)))
         found = []
