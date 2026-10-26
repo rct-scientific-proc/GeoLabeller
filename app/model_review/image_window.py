@@ -30,6 +30,7 @@ from PyQt5.QtWidgets import (QGraphicsItem, QGraphicsItemGroup,
 
 from .. import display_settings
 from ..snippets import read_image_overview, snippet_frame
+from .source import called
 
 BOX_COLOR = QColor(255, 200, 0)
 MARK_COLOR = QColor(255, 255, 255)
@@ -304,7 +305,7 @@ class ImageWindow(QWidget):
         self._mark.setVisible(True)
         text = (f"{Path(chip.image_path).name}: chip at "
                 f"({chip.pixel_x:.1f}, {chip.pixel_y:.1f}), "
-                f"model {chip.predicted} {chip.score:.2f}")
+                + called(chip))
         if self._standing:
             text += f"; {self._standing}"
         self.info.setText(text)

@@ -24,6 +24,7 @@ from PyQt5.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QSpinBox,
 
 from ..labels import geodesic_distance
 from .ledger import IGNORE
+from .source import called
 
 DEFAULT_CONTEXT = 3             # the picture is this many chips across
 MIN_CONTEXT, MAX_CONTEXT = 2, 8
@@ -430,7 +431,7 @@ class DetailPanel(QWidget):
                  f"{chip.pixel_y:.1f})"]
         if latlon is not None:
             lines.append(f"lat {latlon[0]:.6f}, lon {latlon[1]:.6f}")
-        lines.append(f"model: {chip.predicted} {chip.score:.2f}")
+        lines.append(called(chip))
         standing = standing_of(chip)
         if chip.reviewed_before():
             earlier = chip.earlier

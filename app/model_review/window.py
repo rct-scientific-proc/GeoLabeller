@@ -53,7 +53,8 @@ from .reference import MAX_SHOWN, ReferencePanel
 from .snippet_store import SnippetStore
 from .training import LearnThread, save_job, suggest_job, train_job
 from .ledger import DEFAULT_TOLERANCE_PX, IGNORE, LedgerIndex
-from .source import by_class, match_candidates, read_candidates
+from .source import (CANDIDATE,
+                     by_class, called, match_candidates, read_candidates)
 
 CAPTION_PX = 20                 # the strip under each chip's picture
 GRID_SPACING = 8
@@ -945,7 +946,8 @@ class ModelReviewWindow(QWidget):
                       f"{type(exc).__name__}: {exc}")
             return False
         chips, report = match_candidates(candidates, self._project(),
-                                         malformed)
+                                         malformed,
+                                         extra_classes=(CANDIDATE,))
         if not chips:
             self._say(f"Nothing in {name} could be matched to this "
                       f"project.\n\n{report.summary()}.")
@@ -1331,7 +1333,7 @@ class ModelReviewWindow(QWidget):
 
     def _set_tooltip(self, cell, chip):
         text = (f"{chip.image_name}  ({chip.pixel_x:.1f}, {chip.pixel_y:.1f})"
-                f"\nmodel: {chip.predicted} {chip.score:.2f}")
+                f"\n{called(chip)}")
         suggestion = self._suggestions.get(chip.key)
         if suggestion is not None:
             text += "\nsuggested: " + suggestion.describe()

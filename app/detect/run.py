@@ -28,12 +28,13 @@ import numpy as np
 from .. import gdal_config, display_settings
 from ..labels import geodesic_distance
 from ..model_review.ledger import DEFAULT_TOLERANCE_PX, LedgerIndex
+from ..model_review.source import CANDIDATE
 from ..snippets import nodata_mask
 from ..version import app_version
 from . import by_key
 from .base import score_of
 
-CLASS = "candidate"             # what the review grid calls them
+CLASS = CANDIDATE               # what the review grid calls them
 METRES, PIXELS = "m", "px"
 SMALLEST_WORKING_PX = 6.0       # the smallest object, at the working scale
 MAX_WORKING_SIDE = 3000         # and the image no larger than this a side

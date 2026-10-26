@@ -50,6 +50,9 @@ _HEIGHT_KEYS = ("image_height", "height", "h")
 _CLASS_KEYS = ("class", "predicted", "class_name", "label", "prediction")
 _SCORE_KEYS = ("score", "confidence", "probability", "prob", "p")
 _LIST_KEYS = ("chips", "items", "records", "mistakes", "predictions")
+# A chip no model called anything: a detector's (app/detect, 2.9.0).
+# Not a class of the project's, and the one such name a file may use.
+CANDIDATE = "candidate"
 
 
 @dataclass(frozen=True)
@@ -312,12 +315,13 @@ def _image_size(image, size_of) -> tuple | None:
 
 
 def match_candidates(candidates, project, malformed: int = 0,
-                     size_of=file_size) -> tuple:
+                     size_of=file_size, extra_classes=()) -> tuple:
     """(chips, report): every candidate the project can take, placed on
     its image at that image's resolution. ``size_of(path)`` reads a
-    raster's size when the project did not record it."""
+    raster's size when the project did not record it; ``extra_classes``
+    are taken besides the project's (CANDIDATE, for the window)."""
     report = MatchReport(total=len(candidates), malformed=malformed)
-    classes = set(project.classes)
+    classes = set(project.classes) | set(extra_classes)
     by_name: dict = {}
     for path, image in project.images.items():
         by_name.setdefault(image_key(image.path or path), []).append(
@@ -381,6 +385,15 @@ def match_candidates(candidates, project, malformed: int = 0,
                           anchor_y=py))
         report.matched += 1
     return chips, report
+
+
+def called(chip) -> str:
+    """What the file said of the chip, in a few words: "model: vessel
+    0.97", or for a detector's candidate "found: 0.33", its score
+    being how far it stood out, not a class's likelihood."""
+    if chip.predicted == CANDIDATE:
+        return f"found: {chip.score:.2f}"
+    return f"model: {chip.predicted} {chip.score:.2f}"
 
 
 def by_class(chips) -> dict:

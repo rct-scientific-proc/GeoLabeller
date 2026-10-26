@@ -22,6 +22,7 @@ from dataclasses import astuple, dataclass, field
 
 from .. import identity
 from .ledger import IGNORE, Verdict
+from .source import called
 
 
 @dataclass
@@ -64,8 +65,9 @@ class ImportResult:
 
 
 def description_for(chip, source: str) -> str:
-    """What the model said, as the label's description."""
-    text = f"model: {chip.predicted} {chip.score:.2f}"
+    """What the model said, as the label's description - or, for a
+    detector's candidate, that it was found and how strongly."""
+    text = called(chip)
     return f"{text}, {source}" if source else text
 
 
