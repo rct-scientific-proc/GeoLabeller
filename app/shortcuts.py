@@ -152,6 +152,11 @@ SHORTCUT_SECTIONS = [
         ("Ctrl+Y", "Redo"),
         ("Ctrl+S", "Save Project"),
     ]),
+    ("Keeping Labels Tidy", [
+        ("Labels > Rename Class...",
+         "A new name for a class on every label that has it; a name "
+         "already there merges the two"),
+    ]),
     ("Find Candidates (Labels > Find Candidates...)", [
         ("Labels > Find Candidates...",
          "A detector proposes places that stand out, to check in Model "

@@ -867,6 +867,32 @@ class LabelProject:
                 image.labels = [
                     l for l in image.labels if l.class_name != class_name]
 
+    def rename_class(self, old: str, new: str) -> int:
+        """Give the class ``old`` the name ``new`` everywhere it is said:
+        the class list, every label of the class on every image, and
+        Model Review's memory of what a chip became (what the model
+        called it is the model's own word and stays). When ``new`` is a
+        class already the two merge under it: ``old`` leaves the list and
+        ``new`` keeps its place, and so its colour. Returns how many
+        labels changed; nothing changes, and 0, for a class not in the
+        list, an empty name or the same name (2.9.2)."""
+        if old not in self.classes or not new or new == old:
+            return 0
+        if new in self.classes:
+            self.classes.remove(old)
+        else:
+            self.classes[self.classes.index(old)] = new
+        count = 0
+        for image in self.images.values():
+            for label in image.labels:
+                if label.class_name == old:
+                    label.class_name = new
+                    count += 1
+        for verdict in self.model_review:
+            if verdict.became == old:
+                verdict.became = new
+        return count
+
     def add_image(self, path: str, name: str, group: str = "",
                   original_width: int = 0, original_height: int = 0,
                   reader: dict[str, str] | None = None,

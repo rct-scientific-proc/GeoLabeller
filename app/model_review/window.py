@@ -978,6 +978,14 @@ class ModelReviewWindow(QWidget):
         self._show_learning()
         return True
 
+    def rename_verdicts(self, old: str, new: str):
+        """The project renamed a class (2.9.2): the verdicts in hand
+        that say ``old`` say ``new``, before set_classes would take them
+        back as a class the project lost."""
+        for chip in self._chips:
+            if chip.verdict == old:
+                chip.verdict = new
+
     def refresh_earlier(self):
         """Ask the project's memory which chips were reviewed before.
 

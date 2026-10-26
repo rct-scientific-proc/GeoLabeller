@@ -39,7 +39,7 @@ from .canvas import (MapCanvas, CanvasMode, CYCLE_MODES, STEP_CYCLE_MODES,
                      AsyncFileLoaderThread, LoadCancelled, TiledLayer,
                      _emit_safely)
 from .class_editor import (ClassEditorDialog, DescriptionEditorDialog,
-                           MaskNameEditorDialog)
+                           MaskNameEditorDialog, RenameClassDialog)
 from .goto_location import (GoToLocationDialog, WaypointDialog,
                             format_lat_lon)
 from .labels import (CONFIDENCE_UNSET, REVIEW_ACCEPTED, REVIEW_RECHECK,
@@ -903,6 +903,14 @@ class MainWindow(QMainWindow):
         edit_classes_action = QAction("Edit &Classes...", self)
         edit_classes_action.triggered.connect(self._edit_classes)
         labels_menu.addAction(edit_classes_action)
+
+        # A class's name changed everywhere, its labels kept (2.9.2).
+        rename_class_action = QAction("&Rename Class...", self)
+        rename_class_action.setStatusTip(
+            "Give a class a new name on every label that has it, keeping "
+            "the labels")
+        rename_class_action.triggered.connect(self._rename_class)
+        labels_menu.addAction(rename_class_action)
 
         edit_descriptions_action = QAction("Edit &Descriptions...", self)
         edit_descriptions_action.setStatusTip(
@@ -3758,6 +3766,60 @@ class MainWindow(QMainWindow):
 
             self._update_class_combo()
             self._refresh_label_markers()
+
+    def _rename_class(self):
+        """Labels > Rename Class...: every label of the class, and Model
+        Review's memory, takes the new name, in one undo step. A name the
+        project has already merges the two classes, after a question."""
+        if not self.project.classes:
+            QMessageBox.information(
+                self, "Rename Class",
+                "The project has no classes yet; Labels > Edit Classes... "
+                "adds them.")
+            return
+        dialog = RenameClassDialog(self.project.classes, self,
+                                   current=self.class_combo.currentText())
+        if not dialog.exec_():
+            return
+        old, new = dialog.chosen()
+        if old not in self.project.classes or not new or new == old:
+            return
+        ids = [label.id for _image, label in self.project.get_all_labels()
+               if label.class_name == old]
+        if new in self.project.classes:
+            n = len(ids)
+            m = sum(1 for _image, label in self.project.get_all_labels()
+                    if label.class_name == new)
+            text = (f"'{new}' is a class already. The {n} {old} "
+                    f"label{'' if n == 1 else 's'} will become {new}, "
+                    f"beside the {m} it has, and the project will have one "
+                    f"class, {new}. Merge them?")
+            if not self._confirm_class_merge(text):
+                return
+        was_current = self.class_combo.currentText() == old
+        if self._model_review is not None:
+            # Its verdicts not yet imported say the old name; set_classes
+            # below would take them back as a class the project lost.
+            self._model_review.rename_verdicts(old, new)
+        with self._recorded("Rename class", labels=ids,
+                            lists=("classes", "model_review")):
+            self._mark_unsaved()
+            count = self.project.rename_class(old, new)
+        self._update_class_combo()
+        if was_current:
+            self.class_combo.setCurrentText(new)
+        self._refresh_label_markers()
+        self._reseat_open_editors()
+        if self._model_review is not None:
+            self._model_review.refresh_earlier()
+        self.statusBar.showMessage(
+            f"Renamed {old} to {new}: {count} label"
+            f"{'' if count == 1 else 's'}", 5000)
+
+    def _confirm_class_merge(self, text: str) -> bool:
+        return QMessageBox.question(
+            self, "Merge Classes", text,
+            QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
 
     def _describe_layer_removal(self, entries: list,
                                 group_paths: list = ()) -> "str | None":

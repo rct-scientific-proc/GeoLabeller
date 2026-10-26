@@ -1,7 +1,7 @@
 """Dialog for managing label classes."""
 from PyQt5.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QMessageBox,
-    QPlainTextEdit, QPushButton
+    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel,
+    QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QVBoxLayout
 )
 
 # The H5 export appends its own class of this name for the sliding-window
@@ -32,7 +32,9 @@ class ClassEditorDialog(QDialog):
         # Instructions
         instructions = QLabel(
             "Enter class names, one per line.\n"
-            "Removing a class will delete all its labels."
+            "Removing a class will delete all its labels. A changed line "
+            "is a class removed and another added: to rename a class and "
+            "keep its labels, use Labels > Rename Class..."
         )
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
@@ -86,6 +88,94 @@ class ClassEditorDialog(QDialog):
                 seen.add(c)
                 unique_classes.append(c)
         return unique_classes
+
+
+def reserved_name_warning(parent):
+    """The one message for a class named after the export's negatives."""
+    QMessageBox.warning(
+        parent, "Reserved class name",
+        f"'{RESERVED_CLASS}' is reserved: the HDF5 export writes its "
+        "sliding-window negatives under that name, and a label class "
+        "with the same name would appear as a second, ambiguous "
+        "'hard_negative' in every exported dataset.\n\n"
+        "To give the model confusers, flag whole images instead: "
+        "right click an image on the canvas and choose "
+        "\"Hard negative source\".")
+
+
+class RenameClassDialog(QDialog):
+    """Labels > Rename Class... (2.9.2): a class, and its new name.
+
+    Edit Classes reads a changed line as one class removed and another
+    added, which deletes the labels; this keeps them. The dialog only
+    collects the two names and says when the new one is a class already
+    (a merge); the window asks about the merge, with the counts, and
+    makes the change.
+    """
+
+    def __init__(self, current_classes: list[str], parent=None,
+                 current: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Rename Class")
+        self._classes = list(current_classes)
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            "Every label of the class takes the new name, on every image, "
+            "and so does what Model Review remembers a chip became. The "
+            "class keeps its place in the list, and so its colour. A name "
+            "the project already has merges the two classes under it.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        form = QFormLayout()
+        self.class_combo = QComboBox()
+        self.class_combo.addItems(self._classes)
+        if current in self._classes:
+            self.class_combo.setCurrentText(current)
+        form.addRow("Class:", self.class_combo)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("the new name")
+        form.addRow("New name:", self.name_edit)
+        layout.addLayout(form)
+        self.hint = QLabel("")
+        self.hint.setWordWrap(True)
+        layout.addWidget(self.hint)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok
+                                        | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self._accept_if_valid)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self.name_edit.textChanged.connect(self._update_hint)
+        self.class_combo.currentTextChanged.connect(self._update_hint)
+        self._update_hint()
+        self.name_edit.setFocus()
+
+    def chosen(self) -> tuple[str, str]:
+        """(the class, its new name), the name stripped."""
+        return self.class_combo.currentText(), self.name_edit.text().strip()
+
+    def _update_hint(self):
+        old, new = self.chosen()
+        ok = self.buttons.button(QDialogButtonBox.Ok)
+        if not new or new == old:
+            self.hint.setText("")
+            ok.setEnabled(False)
+            return
+        ok.setEnabled(True)
+        if new in self._classes:
+            self.hint.setText(
+                f"'{new}' is a class already: the {old} labels will join "
+                f"it, and the project will have one class, {new}.")
+        else:
+            self.hint.setText("")
+
+    def _accept_if_valid(self):
+        old, new = self.chosen()
+        if not new or new == old:
+            return
+        if new == RESERVED_CLASS:
+            reserved_name_warning(self)
+            return
+        self.accept()
 
 
 class DescriptionEditorDialog(QDialog):
