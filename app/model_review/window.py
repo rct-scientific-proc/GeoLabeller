@@ -412,6 +412,7 @@ class ModelReviewWindow(QWidget):
         self._source = ""
         self._path = ""                 # the file, to write its notes
         self._write_failed = False      # said once per file
+        self._stale = False             # the labels changed while hidden
         self._report = None
         self._classes: list = []
         self._colours: list = []
@@ -1113,10 +1114,17 @@ class ModelReviewWindow(QWidget):
     def rename_verdicts(self, old: str, new: str):
         """The project renamed a class (2.9.2): the verdicts in hand
         that say ``old`` say ``new``, before set_classes would take them
-        back as a class the project lost."""
+        back as a class the project lost - and the file's notes that
+        say it (2.9.5), written back."""
+        renamed: dict = {}
         for chip in self._chips:
             if chip.verdict == old:
                 chip.verdict = new
+            if chip.earlier is not None and chip.earlier.became == old:
+                chip.earlier.became = new
+                renamed[chip.key] = chip.earlier
+        if renamed:
+            self._write_outcomes(renamed)
 
     def refresh_earlier(self, rebuild: bool = True):
         """The chips against the project as it stands (2.9.4): a note's
@@ -1162,8 +1170,12 @@ class ModelReviewWindow(QWidget):
 
     def refresh_labels(self):
         """The project's labels changed: the grid follows, rebuilt only
-        if a chip's standing did."""
-        self.refresh_earlier(rebuild=False)
+        if a chip's standing did; a hidden window catches up when
+        shown."""
+        if self.isVisible():
+            self.refresh_earlier(rebuild=False)
+        else:
+            self._stale = True
 
     def _seat(self, chip, project):
         """The chip against the file's note on it (2.9.4; the memory's
@@ -2972,6 +2984,11 @@ class ModelReviewWindow(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        if self._stale:
+            # The labels changed while the window was hidden (2.9.5).
+            self._stale = False
+            self.refresh_earlier()
+            return                      # which asked for every picture
         # Closed while its pictures were still coming, the window
         # cancelled them (closeEvent); shown again, nothing asked for
         # them, and the cells stayed blank (2.8.14).

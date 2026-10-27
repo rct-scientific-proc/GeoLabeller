@@ -2964,8 +2964,10 @@ class MainWindow(QMainWindow):
             self._snippet_editor.set_labels(self._label_entries())
         self._refresh_snippet_panel()
         # The cleaner holds pairs of the project's labels, as the editor
-        # holds entries: re-seated with it (2.9.3).
+        # holds entries: re-seated with it (2.9.3); the review window's
+        # chips are compared with the labels again (2.9.5).
         self._refresh_cleaner()
+        self._refresh_review()
 
     # ------------------------------------------------------------------
     # Display Settings: how each group's imagery is drawn
@@ -3600,6 +3602,7 @@ class MainWindow(QMainWindow):
         self.layer_panel.refresh_labeled_panel(self.project)
         self._refresh_snippet_panel()
         self._refresh_cleaner()
+        self._refresh_review()
 
     def _add_label_marker(self, image, label):
         """Draw one label with everything its marker shows."""
@@ -3781,10 +3784,11 @@ class MainWindow(QMainWindow):
         if "waypoints" in lists:
             self._refresh_waypoints()
         self._reseat_open_editors()
-        if self._model_review is not None:
-            # The labels changed under the window: a chip's label gone
-            # (an import undone) or back, and what is labelled already.
-            self._model_review.refresh_earlier()
+        # The labels changed under the review window: a chip's label
+        # gone (an import undone) or back, and what is labelled already
+        # (2.9.5: hidden, it was refreshed on every undo and never when
+        # shown again).
+        self._refresh_review()
         # A removal undone brings its pairs back only on the next Find;
         # what it shows must at least exist.
         self._refresh_cleaner()
@@ -4894,8 +4898,8 @@ class MainWindow(QMainWindow):
     def _refresh_review(self):
         """The labels changed: the Model Review window's chips are
         compared with them again (2.9.4), its grid rebuilt only where
-        a chip's standing changed."""
-        if self._model_review is not None and self._model_review.isVisible():
+        a chip's standing changed; hidden, it catches up when shown."""
+        if self._model_review is not None:
             self._model_review.refresh_labels()
 
     def _refresh_cleaner(self):
