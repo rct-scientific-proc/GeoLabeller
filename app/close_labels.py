@@ -527,8 +527,9 @@ class CloseLabelsWindow(QDialog):
         if made:
             lines.append(f"Labelled by {made['by']}")
         if label.length_m is not None or label.width_m is not None:
-            lines.append(f"Size {label.length_m or '?'} × "
-                         f"{label.width_m or '?'} m")
+            length = "?" if label.length_m is None else f"{label.length_m:.1f}"
+            width = "?" if label.width_m is None else f"{label.width_m:.1f}"
+            lines.append(f"Size {length} × {width} m")
         return "<br>".join(lines)
 
     def _on_snippet(self, key, arr):
