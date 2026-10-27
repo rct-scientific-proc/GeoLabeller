@@ -304,7 +304,6 @@ class CloseLabelsWindow(QDialog):
             lambda _i: self._show_pair())
         row.addWidget(self.chip_combo)
         self.find_button = QPushButton("Find")
-        self.find_button.setDefault(True)
         self.find_button.clicked.connect(self.find)
         row.addWidget(self.find_button)
         layout.addLayout(row)
@@ -363,9 +362,12 @@ class CloseLabelsWindow(QDialog):
         close_button.clicked.connect(self.close)
         row.addWidget(close_button)
         layout.addLayout(row)
-        for button in (self.previous_button, self.keep_button,
-                       self.both_button, self.next_button, close_button,
-                       *self.show_buttons, *self.remove_buttons):
+        # No default button: Enter, pressed while deciding, restarted the
+        # search from the first pair (2.9.3).
+        for button in (self.find_button, self.previous_button,
+                       self.keep_button, self.both_button, self.next_button,
+                       close_button, *self.show_buttons,
+                       *self.remove_buttons):
             button.setAutoDefault(False)
         self.resize(760, 560)
 
@@ -414,6 +416,14 @@ class CloseLabelsWindow(QDialog):
     def refresh(self):
         """The project changed under the window (a removal, an undo):
         pairs with a label gone are dropped, the rest re-read."""
+        self._prune()
+        self._show_pair()
+
+    def _prune(self):
+        """Drop the pairs with a label gone, re-read the rest (a label
+        moved, linked or unlinked since the search), and keep the index
+        on a pair. Every showing goes through this (2.9.3), so a pair
+        the window shows always exists."""
         project = self._project()
         kept = []
         for pair in self._pairs:
@@ -422,6 +432,9 @@ class CloseLabelsWindow(QDialog):
             if a is None or b is None:
                 continue
             pair.a, pair.b = a, b
+            pair.distance = math.hypot(a.pixel_x - b.pixel_x,
+                                       a.pixel_y - b.pixel_y)
+            pair.linked = bool(a.object_id) and a.object_id == b.object_id
             kept.append(pair)
         if len(kept) != len(self._pairs):
             self._pairs = kept
@@ -429,7 +442,6 @@ class CloseLabelsWindow(QDialog):
                 describe(self._pairs) + " (after removals)"
                 if self._pairs else "Every pair found has been dealt with.")
         self._index = min(self._index, max(0, len(self._pairs) - 1))
-        self._show_pair()
 
     # -- the decisions ------------------------------------------------------------
 
@@ -487,6 +499,7 @@ class CloseLabelsWindow(QDialog):
     # -- showing a pair -----------------------------------------------------------
 
     def _show_pair(self):
+        self._prune()
         pair = self.current()
         have = pair is not None
         for button in (self.keep_button, self.both_button,

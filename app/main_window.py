@@ -2334,6 +2334,7 @@ class MainWindow(QMainWindow):
         # Projections may reference the removed label.
         self._update_waterfall_projections()
         self._editor_follows()
+        self._refresh_cleaner()
 
         self.statusBar.showMessage("Removed label", 3000)
 
@@ -2907,6 +2908,7 @@ class MainWindow(QMainWindow):
         kinds, self._pending_refreshes = self._pending_refreshes, set()
         if "labeled" in kinds:
             self.layer_panel.refresh_labeled_panel(self.project)
+            self._refresh_cleaner()
         if "editors" in kinds:
             self._reseat_open_editors()         # the sidebar panel too
         elif "snippets" in kinds:
@@ -2956,6 +2958,9 @@ class MainWindow(QMainWindow):
         if self._snippet_editor is not None:
             self._snippet_editor.set_labels(self._label_entries())
         self._refresh_snippet_panel()
+        # The cleaner holds pairs of the project's labels, as the editor
+        # holds entries: re-seated with it (2.9.3).
+        self._refresh_cleaner()
 
     # ------------------------------------------------------------------
     # Display Settings: how each group's imagery is drawn
@@ -3589,6 +3594,7 @@ class MainWindow(QMainWindow):
         # Refresh labeled images panel
         self.layer_panel.refresh_labeled_panel(self.project)
         self._refresh_snippet_panel()
+        self._refresh_cleaner()
 
     def _add_label_marker(self, image, label):
         """Draw one label with everything its marker shows."""
@@ -3763,6 +3769,7 @@ class MainWindow(QMainWindow):
         if step.images_before or step.images_after:
             self._refresh_hard_negative_panel()
         if "classes" in lists:
+            self._rename_verdicts_after(step, verb)
             self._update_class_combo()
         if "descriptions" in lists:
             self._update_description_combo()
@@ -3772,10 +3779,9 @@ class MainWindow(QMainWindow):
         if self._model_review is not None and "model_review" in lists:
             # An import undone: its chips are back to be looked at.
             self._model_review.refresh_earlier()
-        if self._cleaner is not None and self._cleaner.isVisible():
-            # A removal undone brings its pairs back only on the next
-            # Find; what it shows must at least exist.
-            self._cleaner.refresh()
+        # A removal undone brings its pairs back only on the next Find;
+        # what it shows must at least exist.
+        self._refresh_cleaner()
         self.setWindowModified(self._has_unsaved_changes())
         self._push_save_state()
         self._recovery_soon_timer.start()
@@ -3784,6 +3790,22 @@ class MainWindow(QMainWindow):
         debug(f"history: {verb.lower()} '{step.name}' "
               f"({len(ids)} label(s))")
         self.statusBar.showMessage(f"{verb}: {step.name}", 4000)
+
+    def _rename_verdicts_after(self, step, verb: str):
+        """A rename undone or redone (2.9.3): the Model Review window's
+        verdicts in hand follow the name, before set_classes would take
+        them back as a class the project lost. A rename is the one step
+        that changes a single name of the class list in place."""
+        if self._model_review is None:
+            return
+        before = step.lists_after if verb == "Undid" else step.lists_before
+        was = before.get("classes")
+        now = self.project.classes
+        if was is None or len(was) != len(now):
+            return
+        changed = [(a, b) for a, b in zip(was, now) if a != b]
+        if len(changed) == 1:
+            self._model_review.rename_verdicts(*changed[0])
 
     def _bring_into_view(self, label_id: int):
         """Centre an undone or redone label if it is off screen, so the
@@ -4862,6 +4884,13 @@ class MainWindow(QMainWindow):
         if window is not None:
             window.close()
             window.deleteLater()
+
+    def _refresh_cleaner(self):
+        """The labels changed under the cleaner (a removal on the map, a
+        link, Clear All Labels, an undo): its pairs are checked against
+        the project (2.9.3)."""
+        if self._cleaner is not None and self._cleaner.isVisible():
+            self._cleaner.refresh()
 
     def _remove_close_labels(self, label_ids: list):
         """The cleaner's decision: these labels go, as one undo step."""
@@ -6841,6 +6870,7 @@ class MainWindow(QMainWindow):
     def _set_hover_px(self, size: int):
         hover_snippet.set_hover_px(int(size))
         self.canvas.set_hover_enabled(size > 0)
+        self.canvas.end_hover()         # the one up is the old size
         for action in self.hover_actions.actions():
             if action.data() == size and not action.isChecked():
                 action.setChecked(True)
@@ -7076,6 +7106,11 @@ class MainWindow(QMainWindow):
         self._close_model_review()
         self._close_detector()
         self._close_cleaner()
+        # The hover snippet is a window of its own too; and a read for
+        # it still going has nobody to tell.
+        self.canvas.end_hover()
+        if self._hover_loader is not None:
+            self._hover_loader.cancel_all()
 
         # Clean up crash detection and recovery
         self._clean_exit()

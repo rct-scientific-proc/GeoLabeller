@@ -2422,7 +2422,7 @@ class MapCanvas(QGraphicsView):
         self._hover_timer.setSingleShot(True)
         self._hover_timer.setInterval(HOVER_REST_MS)
         self._hover_timer.timeout.connect(self._hover_fire)
-        self._hover_pending: tuple = (None, None)
+        self._hover_at = None           # where the mouse came to rest
         self._hover_shown: int | None = None
         # The label being moved (right-click > Move), waiting for the click
         # that says where to; and its marker's pen, to put back.
@@ -2518,6 +2518,7 @@ class MapCanvas(QGraphicsView):
         # Projected label markers (labels shown on other images that contain
         # them): list of (label_id, ellipse_item, text_item).
         self._waterfall_projection_items: list = []
+        self._waterfall_infos: list = []     # what they were made from
         # Hold-to-glide navigation timer. Direction: -1 glides up, +1 down.
         self._waterfall_glide_dir = 0
         # Glide speed multiplier on WATERFALL_GLIDE_PX, stepped x2 with the
@@ -5351,16 +5352,21 @@ class MapCanvas(QGraphicsView):
                     wanted[label_id] = ((ROLE_FULL, len(ids))
                                         if label_id == primary
                                         else (other, 0))
+        changed = False
         for label_id in set(self._marker_role) | set(wanted):
             state = wanted.get(label_id, (ROLE_FULL, 0))
             if self._marker_role.get(label_id, (ROLE_FULL, 0)) == state:
                 continue
+            changed = True
             if label_id in self._label_items:
                 self._apply_role(label_id, *state)
             if state == (ROLE_FULL, 0):
                 self._marker_role.pop(label_id, None)
             else:
                 self._marker_role[label_id] = state
+        if changed and self._waterfall_active and self._waterfall_infos:
+            # The projections follow the roles (2.9.3).
+            self.set_waterfall_projections(self._waterfall_infos)
 
     def _apply_role(self, label_id: int, role: str, count: int):
         ellipse, text = self._label_items[label_id]
@@ -5425,34 +5431,47 @@ class MapCanvas(QGraphicsView):
         if not on:
             self._hover_end()
 
+    def end_hover(self):
+        """Take the hover snippet down, whatever the mouse is doing."""
+        self._hover_end()
+
     def _hover_track(self, event):
         if not self._hover_enabled:
             return
         if event.buttons() or not (event.modifiers() & Qt.ControlModifier):
             self._hover_end()
             return
-        label_id, image_path = self._get_label_at_position(event.pos())
-        if label_id is None:
-            self._hover_end()
-            return
-        if label_id == self._hover_shown:
-            return
+        pos = event.pos()
         if self._hover_shown is not None:
-            self._hover_end()           # another marker: the first goes
-        if label_id != self._hover_pending[0]:
-            self._hover_pending = (label_id, image_path)
-            self._hover_timer.start()
+            if self._on_marker(self._hover_shown, pos):
+                return                  # still on it
+            self._hover_end()           # off it: the snippet goes
+        # A rest is HOVER_REST_MS without motion: every move restarts the
+        # clock, and the markers are searched once, when it fires - not
+        # on every move, which over twenty thousand markers was a scan
+        # per pixel of motion with Ctrl held (2.9.3).
+        self._hover_at = pos
+        self._hover_timer.start()
+
+    def _on_marker(self, label_id: int, view_pos) -> bool:
+        """Is this view position on the label's marker (its hit area)?"""
+        item = self._label_items.get(label_id)
+        if item is None or not item[0].isVisible():
+            return False
+        return self._hit_rect(item[0]).contains(self.mapToScene(view_pos))
 
     def _hover_fire(self):
-        label_id, image_path = self._hover_pending
-        if label_id is None or label_id not in self._label_items:
+        if self._hover_at is None:
+            return
+        label_id, image_path = self._get_label_at_position(self._hover_at)
+        if label_id is None:
             return
         self._hover_shown = label_id
         self.label_hover_requested.emit(label_id, image_path)
 
     def _hover_end(self):
         self._hover_timer.stop()
-        self._hover_pending = (None, None)
+        self._hover_at = None
         if self._hover_shown is not None:
             self._hover_shown = None
             self.label_hover_ended.emit()
@@ -5622,8 +5641,15 @@ class MapCanvas(QGraphicsView):
 
         label_infos: list of (label_id, lon, lat, class_name, color,
         source_image_path, ring_color) tuples.
+
+        A label View > Label Markers does not draw (another view of an
+        object stands for it) is not projected either (2.9.3): the
+        projections of a dozen views piled up on each stacked image just
+        as their markers had. The infos are kept, so a change of role
+        redraws the projections from them.
         """
         self.clear_waterfall_projections()
+        self._waterfall_infos = list(label_infos)
         if not self._waterfall_active:
             return
         # One lat/lon bounding box per stacked layer, computed once from its
@@ -5660,6 +5686,8 @@ class MapCanvas(QGraphicsView):
 
         for (label_id, lon, lat, class_name, color, source_path,
              ring_color) in label_infos:
+            if self.marker_role(label_id) != ROLE_FULL:
+                continue
             for layer, box in candidates:
                 if layer.file_path == source_path:
                     continue
@@ -5691,6 +5719,7 @@ class MapCanvas(QGraphicsView):
             self._scene.removeItem(ellipse)
             self._scene.removeItem(text)
         self._waterfall_projection_items = []
+        self._waterfall_infos = []
 
     def remove_label_marker(self, label_id: int):
         """Remove a label marker from the canvas."""
@@ -5770,15 +5799,7 @@ class MapCanvas(QGraphicsView):
                 # markers meant Remove Label deleting a label the user
                 # could not see.
                 continue
-            # Bounding rect in scene coordinates (sceneBoundingRect accounts for
-            # the floating-origin parent transform).
-            scene_rect = ellipse.sceneBoundingRect()
-
-            # Expand hit area slightly for easier clicking
-            hit_margin = scene_rect.width() * 0.5
-            scene_rect.adjust(-hit_margin, -hit_margin, hit_margin, hit_margin)
-
-            if scene_rect.contains(scene_pos):
+            if self._hit_rect(ellipse).contains(scene_pos):
                 # Found a label - now find the image_path
                 # We need to look up which image this label belongs to
                 # The label stores its position in scene coords, we need to find
@@ -5799,6 +5820,16 @@ class MapCanvas(QGraphicsView):
                 return label_id, ellipse.data(0)
 
         return None, None
+
+    def _hit_rect(self, ellipse) -> QRectF:
+        """A marker's hit area, in scene coordinates: twice the marker,
+        so it is easy to click - and no smaller for a dot (View > Label
+        Markers), which is as easy to hit as a full marker (2.9.3)."""
+        # sceneBoundingRect accounts for the floating-origin parent.
+        rect = ellipse.sceneBoundingRect()
+        half = max(rect.width(), self._marker_px())
+        centre = rect.center()
+        return QRectF(centre.x() - half, centre.y() - half, 2 * half, 2 * half)
 
     def _show_label_context_menu(self, view_pos):
         """Show context menu for label under cursor.
