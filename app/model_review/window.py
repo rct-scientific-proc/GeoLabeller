@@ -8,9 +8,15 @@ run of them, Ctrl-click picks several for a key to label at once. Or
 without the mouse: the arrow keys move a cursor from chip to chip, a
 number key or Enter labels the chip under it and moves on, I ignores the
 rest of the page. Import to project (Ctrl+Enter) hands the verdicts to
-the main window, which makes the labels and the ledger entries in one
-undo step; the chips then leave the grid, and stay off it in later rounds
-(ledger.py), unless Show reviewed.
+the main window, which makes the labels in one undo step; what each
+chip became is written into the review file itself (outcomes.py), and
+the chips then leave the grid, and stay off it when the file is opened
+again, unless Show reviewed. A chip whose centre lies within a distance
+of a label the project already has - on its image, not its own - is
+labelled already (labelled.py): shown apart, off the grid unless Show
+labelled already, the labels marked in Details, and a verdict on it
+goes onto that label unless the user asks for a new one beside it. The
+comparison is made again whenever the project's labels change.
 
 Ctrl+Z here takes back the last thing done in this window - a verdict, a
 run of them, a centre move - and only then reaches the project's
@@ -52,7 +58,8 @@ from .reference import DEFAULT_COLUMNS as DEFAULT_REF_COLUMNS
 from .reference import MAX_SHOWN, ReferencePanel
 from .snippet_store import SnippetStore
 from .training import LearnThread, save_job, suggest_job, train_job
-from .ledger import DEFAULT_TOLERANCE_PX, IGNORE, LedgerIndex
+from .ledger import DEFAULT_TOLERANCE_PX, IGNORE, LedgerIndex, Verdict
+from . import labelled, outcomes
 from .source import (CANDIDATE,
                      by_class, called, match_candidates, read_candidates)
 
@@ -74,6 +81,9 @@ CURSOR_COLOR = QColor(255, 200, 0)
 HOVER_COLOR = QColor(255, 255, 255, 110)
 IGNORE_COLOR = QColor(150, 150, 150)
 EARLIER_SHADE = QColor(0, 0, 0, 150)
+# A chip labelled already (2.9.4): its frame and caption, unlike any
+# class's colour and unlike the shade of a chip reviewed before.
+LABELLED_COLOR = QColor(80, 200, 255)
 TEXT_COLOR = QColor(220, 220, 220)
 # The centre mark: where the label will go. Cyan once the centre has been
 # moved from the file's, as the Snippet Editor colours what was measured.
@@ -96,6 +106,8 @@ _COLUMNS_KEY = "model_review/columns"
 _PER_PAGE_KEY = "model_review/per_page"
 _SHOW_REVIEWED_KEY = "model_review/show_reviewed"
 _TOLERANCE_KEY = "model_review/tolerance"
+_SHOW_LABELLED_KEY = "model_review/show_labelled"
+_LABELLED_KEY = "model_review/labelled_px"
 _MORE_KEY = "model_review/more"
 _LEARN_KEY = "model_review/learn"
 _REF_COLUMNS_KEY = "model_review/reference_columns"
@@ -143,6 +155,7 @@ class ChipCell(QWidget):
         self._cursor = False
         self._hover = False
         self._earlier = False
+        self._labelled = False          # labelled already (2.9.4)
         self._pressed = None
         self._centre: tuple | None = None   # (column, row) in the picture
         self._moved = False
@@ -207,10 +220,12 @@ class ChipCell(QWidget):
         self.update()
 
     def set_state(self, score: str, verdict: str, colour: QColor | None,
-                  selected: bool, earlier: bool, cursor: bool = False):
+                  selected: bool, earlier: bool, cursor: bool = False,
+                  labelled: bool = False):
         self._score, self._verdict, self._colour = score, verdict, colour
         self._selected, self._earlier = selected, earlier
         self._cursor = cursor
+        self._labelled = labelled
         self.update()
 
     def paintEvent(self, _event):
@@ -230,12 +245,19 @@ class ChipCell(QWidget):
         if self._mark and self._centre is not None:
             self._paint_mark(painter)
         border = SELECTED_COLOR if self._selected else self._colour
+        if border is None and self._labelled:
+            border = LABELLED_COLOR
         if border is not None:
             painter.setPen(QPen(border, 3))
             painter.drawRect(picture.adjusted(1, 1, -2, -2))
         elif self._hover:
             painter.setPen(QPen(HOVER_COLOR, 1))
             painter.drawRect(picture.adjusted(0, 0, -1, -1))
+        if self._labelled and border is not LABELLED_COLOR:
+            # Given a verdict, or picked: the frame is the verdict's,
+            # and a line inside it still says labelled already.
+            painter.setPen(QPen(LABELLED_COLOR, 2))
+            painter.drawRect(picture.adjusted(5, 5, -6, -6))
         if self._cursor:
             # The keyboard's chip: a dashed line just inside the edge, on
             # top of whatever frame the chip wears.
@@ -388,6 +410,8 @@ class ModelReviewWindow(QWidget):
         self._page_start = 0            # the rank of the page's first chip
         self._page = 0                  # its number, from that
         self._source = ""
+        self._path = ""                 # the file, to write its notes
+        self._write_failed = False      # said once per file
         self._report = None
         self._classes: list = []
         self._colours: list = []
@@ -605,8 +629,9 @@ class ModelReviewWindow(QWidget):
         self.more_button = self._fold_button(
             "Settings",
             "Set once: the chip size, the columns, the chips per page,\n"
-            "the chips reviewed in earlier rounds, and how close a chip\n"
-            "must lie to one to be it again.", self._on_more)
+            "the chips reviewed before and those labelled already, and\n"
+            "how close a chip must lie to a label to be labelled already.",
+            self._on_more)
         third.addWidget(self.more_button)
         self.learn_button = self._fold_button(
             "Learn",
@@ -631,22 +656,48 @@ class ModelReviewWindow(QWidget):
         more.addSpacing(12)
         self.show_reviewed_check = QCheckBox("Show reviewed")
         self.show_reviewed_check.setToolTip(
-            "Chips reviewed in an earlier round, shaded, with what they\n"
-            "became. Kept off the grid otherwise. Give one a new verdict -\n"
-            "a click, a number - and Import changes the label it made.")
+            "Chips the file says were reviewed - imported, or ignored -\n"
+            "shaded, with what they became. Kept off the grid otherwise.\n"
+            "Give one a new verdict - a click, a number - and Import\n"
+            "changes the label it made.")
         self.show_reviewed_check.toggled.connect(self._on_show_reviewed)
         more.addWidget(self.show_reviewed_check)
+        # Labelled already (2.9.4): a label on the image within this
+        # distance of the chip's centre, not the chip's own.
+        self.show_labelled_check = QCheckBox("Show labelled already")
+        self.show_labelled_check.setToolTip(
+            "Chips with a label already on their image within the\n"
+            "distance - something labelled by hand, or by another round.\n"
+            "Framed in blue, with the label's class and how far off it\n"
+            "is; Details marks the labels. Kept off the grid otherwise.\n"
+            "A verdict on one goes onto that label, or makes a new one\n"
+            "beside it when Details says so; Ignore leaves it alone.")
+        self.show_labelled_check.toggled.connect(self._on_show_labelled)
+        more.addWidget(self.show_labelled_check)
+        more.addWidget(QLabel("Labelled within"))
+        self.labelled_spin = QSpinBox()
+        self.labelled_spin.setRange(1, 500)
+        self.labelled_spin.setValue(int(round(labelled.default_distance())))
+        self.labelled_spin.setSuffix(" px")
+        self.labelled_spin.setToolTip(
+            "A chip whose centre lies this close to a label on its image\n"
+            "is labelled already. The Import Options distance to start\n"
+            "with; remembered.")
+        self.labelled_spin.setKeyboardTracking(False)
+        self.labelled_spin.valueChanged.connect(
+            lambda _v: self.refresh_earlier())
+        self.labelled_spin.editingFinished.connect(self.setFocus)
+        more.addWidget(self.labelled_spin)
         more.addWidget(QLabel("Same chip within"))
         self.tolerance_spin = QSpinBox()
         self.tolerance_spin.setRange(1, 500)
         self.tolerance_spin.setValue(int(DEFAULT_TOLERANCE_PX))
         self.tolerance_spin.setSuffix(" px")
         self.tolerance_spin.setToolTip(
-            "A chip whose centre lies this close to one reviewed earlier,\n"
-            "on the same image, is that chip again.")
+            "How close a candidate of a new detector run must lie to one\n"
+            "of the last run's to be it again, and how close a chip to an\n"
+            "entry of a project's old memory (before 2.9.4) to take it.")
         self.tolerance_spin.setKeyboardTracking(False)
-        self.tolerance_spin.valueChanged.connect(
-            lambda _v: self.refresh_earlier())
         self.tolerance_spin.editingFinished.connect(self.setFocus)
         more.addWidget(self.tolerance_spin)
         more.addStretch(1)
@@ -792,6 +843,7 @@ class ModelReviewWindow(QWidget):
         self.scroll.viewport().installEventFilter(self)
         self.detail = DetailPanel()
         self.detail.show_on_image.connect(self.show_on_image)
+        self.detail.as_new_changed.connect(self._on_as_new)
         self.detail.context_changed.connect(
             lambda _v: self._request_detail())
         self.detail.context_spin.editingFinished.connect(self.setFocus)
@@ -953,7 +1005,12 @@ class ModelReviewWindow(QWidget):
                       f"project.\n\n{report.summary()}.")
             return False
         self._source, self._chips, self._report = name, chips, report
+        self._path = str(path)
+        self._write_failed = False
         self._by_key = {chip.key: chip for chip in chips}
+        # A project of before 2.9.4 holds its own memory: its notes on
+        # this file's chips go into the file, once, and count from now.
+        moved = self._migrate_memory(chips, self._project())
         self._selected.clear()
         self._anchor = None
         self._cursor = None
@@ -974,9 +1031,84 @@ class ModelReviewWindow(QWidget):
         self._fill_suggested_filter()
         self.setWindowTitle(f"Model Review - {name}")
         self.file_label.setText(f"{name}: {report.summary()}")
+        if moved:
+            written = self._write_outcomes(moved)
+            n = len(moved)
+            self._note = (f"{n} note{'' if n == 1 else 's'} moved from the "
+                          f"project's memory into {name}"
+                          + ("." if written else " - for this session only, "
+                             "the file could not be written."))
         self.refresh_earlier()          # which also fills the grid
         self._show_learning()
         return True
+
+    def _migrate_memory(self, chips, project) -> dict:
+        """The project's old memory (formats 5.0 to 5.2) answering for
+        chips the file has no note on: each takes the entry's note, the
+        best matches first - the chip's group, then the class the model
+        called it, then the nearest - and one entry answers for one
+        chip (2.8.14). {chip key: the note} for the file."""
+        memory = getattr(project, "model_review", None) or []
+        if not memory:
+            return {}
+        index = LedgerIndex(memory, float(self.tolerance_spin.value()))
+        pairs = []
+        for chip in chips:
+            if chip.earlier is not None:
+                continue
+            for goodness, entry in index.candidates(
+                    chip.image_name, chip.source_x, chip.source_y,
+                    chip.predicted, chip.group):
+                pairs.append((goodness, chip.key, chip, entry))
+        pairs.sort(key=lambda pair: (pair[0], pair[1]))
+        moved: dict = {}
+        taken: set = set()
+        for _goodness, key, chip, entry in pairs:
+            if key in moved or id(entry) in taken:
+                continue
+            taken.add(id(entry))
+            chip.earlier = Verdict(
+                image=chip.image_name, pixel_x=chip.source_x,
+                pixel_y=chip.source_y, predicted=chip.predicted,
+                score=float(chip.score), became=entry.became,
+                label_id=entry.label_id, by=entry.by, at=entry.at,
+                group=chip.group or "")
+            moved[key] = chip.earlier
+        return moved
+
+    def file_path(self) -> str:
+        """The file open, as a path; empty with none."""
+        return self._path
+
+    def _write_outcomes(self, notes: dict) -> bool:
+        """``notes`` (chip key -> Verdict, or None to take one away)
+        into the file; False, said once, when it cannot be written."""
+        if not self._path or not notes:
+            return False
+        try:
+            outcomes.write_outcomes(self._path, notes)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            if not self._write_failed:
+                self._write_failed = True
+                self._say(f"The verdicts could not be noted in "
+                          f"{self._source}: {exc}\n\nThey hold for this "
+                          "session; the file keeps no memory of them.")
+            return False
+        return True
+
+    def record_outcomes(self, notes: dict) -> bool:
+        """An import went through (main window): each chip takes its
+        note - it is reviewed now, its verdict spent - and the file is
+        written. The memory of what was done lives there (2.9.4)."""
+        for key, verdict in notes.items():
+            chip = self._by_key.get(key)
+            if chip is None:
+                continue
+            chip.earlier = verdict
+            chip.label_gone = False
+            chip.verdict = None
+            chip.as_new = False
+        return self._write_outcomes(notes)
 
     def rename_verdicts(self, old: str, new: str):
         """The project renamed a class (2.9.2): the verdicts in hand
@@ -986,15 +1118,13 @@ class ModelReviewWindow(QWidget):
             if chip.verdict == old:
                 chip.verdict = new
 
-    def refresh_earlier(self):
-        """Ask the project's memory which chips were reviewed before.
-
-        By the centre the file gave, which is what the memory records -
-        not the centre the user may have moved it to. Looked up by the
-        moved centre, a chip re-centred further than the tolerance was
-        not known after its own import: it stayed on the grid with its
-        verdict, and the next import made its label again (2026-10-08).
-        """
+    def refresh_earlier(self, rebuild: bool = True):
+        """The chips against the project as it stands (2.9.4): a note's
+        label found, or gone; and the labels within the distance of
+        each chip, which make it labelled already. Called whenever the
+        project's labels change; with ``rebuild`` False the grid is
+        rebuilt only when a chip's standing changed, else its cells are
+        refreshed where they are."""
         project = self._project()
         images = getattr(project, "images", {}) or {}
         gone = [chip for chip in self._chips if chip.image_path not in images]
@@ -1007,60 +1137,54 @@ class ModelReviewWindow(QWidget):
             n = len(gone)
             self._note = (f"{n} chip{'' if n == 1 else 's'} whose image "
                           "left the project dropped.")
-        index = LedgerIndex(getattr(project, "model_review", []),
-                            float(self.tolerance_spin.value()))
-        previous = {chip.key: chip.earlier for chip in self._chips}
-        # One entry answers for one chip (two of the file's chips within
-        # the tolerance of it would both edit the label it made, 2.8.14),
-        # and the best matches are settled first: an entry of the chip's
-        # group, then of the class the model called it, then the nearest
-        # (2.8.16, 2.8.17). A chip whose best entry went to a better
-        # match takes its next: left with none, it came back as new and
-        # was imported again and again.
-        pairs = []
+        before = [(chip.key, chip.reviewed_before(), chip.verdict)
+                  for chip in self._chips]
         for chip in self._chips:
-            for goodness, entry in index.candidates(
-                    chip.image_name, chip.source_x, chip.source_y,
-                    chip.predicted, chip.group):
-                pairs.append((goodness, chip.key, chip, entry))
-        pairs.sort(key=lambda pair: (pair[0], pair[1]))
-        matched: dict = {}              # chip key -> entry
-        taken: set = set()              # id(entry)
-        for _goodness, key, _chip, entry in pairs:
-            if key in matched or id(entry) in taken:
-                continue
-            matched[key] = entry
-            taken.add(id(entry))
-        for chip in self._chips:
-            chip.earlier = matched.get(chip.key)
-        for chip in self._chips:
-            self._seat(chip, previous[chip.key], project)
+            self._seat(chip, project)
+        changed = labelled.mark_near(self._chips, project,
+                                     float(self.labelled_spin.value()))
+        after = [(chip.key, chip.reviewed_before(), chip.verdict)
+                 for chip in self._chips]
         if self._suggestions:
             self._suggestions = {key: s for key, s in self._suggestions.items()
                                  if key in self._by_key}
             self._fill_suggested_filter()
         self._reference_dirty = True
-        self._fill_filter()
-        self._rebuild()
+        if (rebuild or gone or changed or before != after
+                or [c.key for c in self._listed_chips()] != self.listed_keys()):
+            # ...or the list would not be what the grid shows: a chip
+            # cleared of its verdict since, labelled already, leaves it.
+            self._fill_filter()
+            self._rebuild()
+        else:
+            self._refresh_cells()
+            self._show_counts()
 
-    def _seat(self, chip, previous, project):
-        """The chip's verdict and centre against the memory's answer
-        (2.8.14). A verdict that is what the chip became - imported a
-        moment ago, or the same thing said again - is no verdict; one
-        that differs stays, a class change to import (2.8.5). Before,
-        every verdict on a reviewed chip went, so nudging the
-        tolerance or an undo in the project lost a round of them. The
-        chip is seated where its label is - the anchor a move is
-        measured from - when the label is not there already; a chip
-        the memory no longer answers for is measured from the file's
-        centre again."""
+    def refresh_labels(self):
+        """The project's labels changed: the grid follows, rebuilt only
+        if a chip's standing did."""
+        self.refresh_earlier(rebuild=False)
+
+    def _seat(self, chip, project):
+        """The chip against the file's note on it (2.9.4; the memory's
+        answer before). A verdict that is what the chip became - imported
+        a moment ago, or the same thing said again - is no verdict; one
+        that differs stays, a class change to import (2.8.5). The chip
+        is seated where its label is - the anchor a move is measured
+        from - when the label is not there already. A note whose label
+        is gone - removed by hand, an import undone - no longer stands:
+        the labels are the truth, and the chip is plain again, measured
+        from the file's centre."""
         earlier = chip.earlier
         if earlier is None:
-            if previous is not None:
-                chip.unseat()
+            chip.label_gone = False
             return
-        if chip.verdict == earlier.became:
-            chip.verdict = None
+        if earlier.became == IGNORE:
+            chip.label_gone = False
+            if chip.verdict == earlier.became:
+                chip.verdict = None
+            chip.unseat()
+            return
         label = None
         find = getattr(project, "get_label_by_id", None)
         if earlier.label_id is not None and find is not None:
@@ -1068,16 +1192,14 @@ class ModelReviewWindow(QWidget):
             if label is not None and self._image_of(chip) is not image:
                 label = None        # on another image: not this chip's
         if label is None:
-            if earlier.became == IGNORE:
+            if not chip.label_gone:
+                chip.label_gone = True
                 chip.unseat()
-            else:
-                # Its label is gone - deleted, or dropped as a duplicate
-                # of one already there: nothing to move, nothing pending.
-                # Left measured from the file's centre, a re-centred chip
-                # stayed pending for ever, imported and dropped again each
-                # time (2.8.17).
-                chip.settle()
             return
+        if chip.label_gone:
+            chip.label_gone = False     # back (an undo undone)
+        if chip.verdict == earlier.became:
+            chip.verdict = None
         # The anchor against where the label IS - not this entry against
         # the last: an undo in the project restores the memory as copies,
         # and by identity every reviewed chip was re-seated, its staged
@@ -1149,14 +1271,37 @@ class ModelReviewWindow(QWidget):
     def set_show_reviewed(self, on: bool):
         self.show_reviewed_check.setChecked(bool(on))
 
+    def set_show_labelled(self, on: bool):
+        self.show_labelled_check.setChecked(bool(on))
+
+    def _kept(self, chip) -> bool:
+        """Is the chip one the grid lists at all: not reviewed before,
+        nor labelled already, unless those are shown. A chip labelled
+        already under a verdict in hand - labelled by hand on the map
+        meanwhile - stays listed: the work on it is not hidden."""
+        if chip.reviewed_before() and not self.show_reviewed_check.isChecked():
+            return False
+        if chip.labelled_already() \
+                and not self.show_labelled_check.isChecked() \
+                and not pending(chip):
+            return False
+        return True
+
+    def _mark_near_one(self, chip):
+        """The chip's centre moved: the labels within the distance of
+        it again, at once, so a chip put onto a label is labelled
+        already before any import."""
+        own = chip.earlier.label_id if chip.earlier is not None else None
+        chip.near = labelled.near_labels(
+            self._project(), chip.image_path, chip.pixel_x, chip.pixel_y,
+            float(self.labelled_spin.value()), exclude=own)
+
     def _fill_filter(self):
         combo = self.class_filter
         current = combo.currentData()
         combo.blockSignals(True)
         combo.clear()
-        show_reviewed = self.show_reviewed_check.isChecked()
-        pool = [chip for chip in self._chips
-                if show_reviewed or not chip.reviewed_before()]
+        pool = [chip for chip in self._chips if self._kept(chip)]
         grouped = by_class(pool)
         combo.addItem(f"All classes ({len(pool)})", ALL_CLASSES)
         for name in sorted(grouped):
@@ -1209,13 +1354,12 @@ class ModelReviewWindow(QWidget):
 
     def _listed_chips(self) -> list:
         wanted = self.class_filter.currentData()
-        show_reviewed = self.show_reviewed_check.isChecked()
         standing = self.verdict_filter.currentData()
         suggested = (self.suggested_filter.currentData()
                      if self._suggestions else ANY_SUGGESTION)
         chosen = [chip for chip in self._chips
                   if (wanted is ALL_CLASSES or chip.predicted == wanted)
-                  and (show_reviewed or not chip.reviewed_before())
+                  and self._kept(chip)
                   and _passes(chip, standing)
                   and (suggested is ANY_SUGGESTION
                        or self._suggested_class(chip.key) == suggested)]
@@ -1273,6 +1417,21 @@ class ModelReviewWindow(QWidget):
         self._page_start = 0
         self._fill_filter()             # its counts change with it
         self._rebuild()
+
+    def _on_show_labelled(self, _on):
+        self._page_start = 0
+        self._fill_filter()
+        self._rebuild()
+
+    def _on_as_new(self, on: bool):
+        """Details' tick: the chip in hand wants a new label beside the
+        one already there, not its verdict onto it."""
+        chip = self._by_key.get(self._detail_key)
+        if chip is None or chip.as_new == bool(on):
+            return
+        chip.as_new = bool(on)
+        self._refresh_cells()
+        self._show_counts()
 
     def _cell_px(self) -> int:
         """The cells share the viewport's width, margins and all, so the
@@ -1350,6 +1509,12 @@ class ModelReviewWindow(QWidget):
         if chip.moved():
             text += (f"\ncentre moved {chip.offset():.0f} px from the "
                      f"file's ({chip.source_x:.1f}, {chip.source_y:.1f})")
+        if chip.labelled_already():
+            text += "\nlabelled already: " + ", ".join(
+                near.describe() for near in chip.near[:3])
+            if chip.verdict is not None:
+                text += ("\nas a new label beside it" if chip.as_new
+                         else "\nthe verdict goes onto that label")
         if chip.reviewed_before():
             earlier = chip.earlier
             became = "Ignore" if earlier.became == IGNORE else earlier.became
@@ -1474,6 +1639,7 @@ class ModelReviewWindow(QWidget):
         x0, y0 = cell.frame
         self._remember([chip], "a centre move")
         chip.recenter(x0 + col, y0 + row)
+        self._mark_near_one(chip)
         self._reload(chip)
         self._refresh_cells()
         self._note = f"Centre moved {chip.offset():.0f} px."
@@ -1518,6 +1684,7 @@ class ModelReviewWindow(QWidget):
                            f"{n} centre move{'' if n == 1 else 's'}")
             for chip, new_x, new_y in moves:
                 chip.recenter(new_x, new_y)
+                self._mark_near_one(chip)
                 self._reload(chip)
         moved = len(moves)
         parts = [f"Auto-center: {moved} chip{'' if moved == 1 else 's'} "
@@ -1560,6 +1727,7 @@ class ModelReviewWindow(QWidget):
             chip.verdict = verdict
             if (x, y) != (chip.pixel_x, chip.pixel_y):
                 chip.recenter(x, y)
+                self._mark_near_one(chip)
                 if key in self._cells:
                     self._reload(chip)
                 elif key == self._detail_key:
@@ -1623,12 +1791,19 @@ class ModelReviewWindow(QWidget):
                 if pending(chip):
                     text += " (moved)"
                 colour = self._colour_of(became)
+            elif chip.labelled_already() and chip.verdict is None:
+                near = chip.nearest()
+                text = f"labelled: {near.class_name} {near.distance:.0f}px"
+                colour = LABELLED_COLOR
             else:
                 text = ("" if chip.verdict is None
                         else "Ignore" if chip.verdict == IGNORE
                         else chip.verdict)
                 if chip.reviewed_before():
                     text += " (changed)"
+                elif chip.labelled_already() and chip.verdict not in (
+                        None, IGNORE):
+                    text += " (new)" if chip.as_new else " (on label)"
                 colour = (None if chip.verdict is None
                           else self._colour_of(chip.verdict))
             score = f"{chip.score:.2f}"
@@ -1644,7 +1819,8 @@ class ModelReviewWindow(QWidget):
                          f"{suggestion.confidence:.2f}")
             cell.set_state(score, text, colour, chip.key in self._selected,
                            chip.reviewed_before() and not pending(chip),
-                           chip.key == self._cursor)
+                           chip.key == self._cursor,
+                           labelled=chip.labelled_already())
         self._refresh_detail_text()
         self._refresh_image_window()
         if reference:
@@ -1672,8 +1848,13 @@ class ModelReviewWindow(QWidget):
                 f"{len(self._visible)} on this page: {left} to look at, "
                 f"{labelled} labelled, {ignored} to ignore")
         if earlier:
-            text += (f"; {earlier} reviewed in an earlier round"
+            text += (f"; {earlier} reviewed before"
                      + ("" if self.show_reviewed_check.isChecked()
+                        else ", hidden"))
+        already = sum(1 for chip in self._chips if chip.labelled_already())
+        if already:
+            text += (f"; {already} labelled already"
+                     + ("" if self.show_labelled_check.isChecked()
                         else ", hidden"))
         changed = sum(1 for chip in verdicts
                       if chip.reviewed_before() and chip.verdict is not None)
@@ -1773,6 +1954,7 @@ class ModelReviewWindow(QWidget):
             chip.verdict = None
             if chip.moved_since_import():
                 chip.restore_centre()
+                self._mark_near_one(chip)
                 self._reload(chip)
         self._reference_dirty = True
         self._refresh_cells()
@@ -1975,7 +2157,7 @@ class ModelReviewWindow(QWidget):
         self._detail_key = key
         self.detail.show_chip(chip, self._latlon_of(chip),
                               self._suggestions.get(chip.key),
-                              image=self._image_of(chip))
+                              image=self._image_of(chip), near=chip.near)
         if changed:
             self._request_detail()
 
@@ -1995,7 +2177,7 @@ class ModelReviewWindow(QWidget):
         if chip is not None:
             self.detail.show_chip(chip, self._latlon_of(chip),
                                   self._suggestions.get(chip.key),
-                                  image=self._image_of(chip))
+                                  image=self._image_of(chip), near=chip.near)
 
     def _request_detail(self):
         """The surroundings of the chip in hand, read at the context
@@ -2468,9 +2650,19 @@ class ModelReviewWindow(QWidget):
         changed = sum(1 for chip in chips
                       if chip.reviewed_before() and chip.verdict is not None)
         if changed:
-            text += (f"\n{changed} reviewed in an earlier round: the "
-                     "label changes class, goes for Ignore, or is made "
-                     "for a chip ignored before.")
+            text += (f"\n{changed} reviewed before: the label changes "
+                     "class, goes for Ignore, or is made for a chip "
+                     "ignored before.")
+        onto = sum(1 for chip in chips if chip.labelled_already()
+                   and chip.verdict not in (None, IGNORE) and not chip.as_new)
+        beside = sum(1 for chip in chips if chip.labelled_already()
+                     and chip.verdict not in (None, IGNORE) and chip.as_new)
+        if onto:
+            text += (f"\n{onto} labelled already: the verdict goes onto "
+                     "the label there, which takes the class.")
+        if beside:
+            text += (f"\n{beside} labelled already: a new label beside "
+                     "the one there.")
         return text
 
     def _confirm_import(self, text: str) -> bool:
@@ -2608,7 +2800,9 @@ class ModelReviewWindow(QWidget):
                 (self.columns_spin, _COLUMNS_KEY, DEFAULT_COLUMNS),
                 (self.page_spin, _PER_PAGE_KEY, DEFAULT_PER_PAGE),
                 (self.tolerance_spin, _TOLERANCE_KEY,
-                 int(DEFAULT_TOLERANCE_PX))):
+                 int(DEFAULT_TOLERANCE_PX)),
+                (self.labelled_spin, _LABELLED_KEY,
+                 int(round(labelled.default_distance())))):
             try:
                 value = int(settings.value(key, fallback))
             except (TypeError, ValueError):
@@ -2621,6 +2815,11 @@ class ModelReviewWindow(QWidget):
             str(settings.value(_SHOW_REVIEWED_KEY, "false")).lower()
             == "true")
         self.show_reviewed_check.blockSignals(False)
+        self.show_labelled_check.blockSignals(True)
+        self.show_labelled_check.setChecked(
+            str(settings.value(_SHOW_LABELLED_KEY, "false")).lower()
+            == "true")
+        self.show_labelled_check.blockSignals(False)
         self.mark_check.setChecked(
             str(settings.value(_MARK_KEY, "true")).lower() != "false")
         self.more_button.setChecked(
@@ -2706,6 +2905,10 @@ class ModelReviewWindow(QWidget):
         settings.setValue(_COLUMNS_KEY, self.columns_spin.value())
         settings.setValue(_PER_PAGE_KEY, self.page_spin.value())
         settings.setValue(_TOLERANCE_KEY, self.tolerance_spin.value())
+        settings.setValue(_LABELLED_KEY, self.labelled_spin.value())
+        settings.setValue(_SHOW_LABELLED_KEY,
+                          "true" if self.show_labelled_check.isChecked()
+                          else "false")
         settings.setValue(_SHOW_REVIEWED_KEY,
                           self.show_reviewed_check.isChecked())
         settings.setValue(_MARK_KEY, self.mark_check.isChecked())

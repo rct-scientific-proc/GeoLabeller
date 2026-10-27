@@ -217,7 +217,14 @@ SHORTCUT_SECTIONS = [
                                  "it"),
         ("Escape / Ctrl+A", "Pick none / every chip on the page"),
         ("PageDown / PageUp", "Next / previous page of chips"),
-        ("Ctrl+Enter", "Import to project"),
+        ("Show labelled already", "Chips with a label on their image "
+                                  "within Labelled within (blue frame); "
+                                  "Details marks the labels, and ticks a "
+                                  "new label beside them"),
+        ("Show reviewed", "Chips the file notes as imported or ignored, "
+                          "shaded"),
+        ("Ctrl+Enter", "Import to project: the labels, and each chip's "
+                       "note into the file"),
         ("Ctrl+Z", "Take back the last thing done here - a verdict, a run, "
                    "a centre move; then undo in the main window's history"),
         ("Ctrl+Y", "Redo, likewise"),

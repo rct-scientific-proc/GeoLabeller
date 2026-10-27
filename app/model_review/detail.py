@@ -19,8 +19,8 @@ import math
 import numpy as np
 from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
-from PyQt5.QtWidgets import (QHBoxLayout, QLabel, QPushButton, QSpinBox,
-                             QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QPushButton,
+                             QSpinBox, QVBoxLayout, QWidget)
 
 from ..labels import geodesic_distance
 from .ledger import IGNORE
@@ -30,6 +30,8 @@ DEFAULT_CONTEXT = 3             # the picture is this many chips across
 MIN_CONTEXT, MAX_CONTEXT = 2, 8
 BOX_COLOR = QColor(255, 200, 0)
 MARK_COLOR = QColor(255, 255, 255, 230)
+NEAR_COLOR = QColor(80, 200, 255)       # a label already there (2.9.4)
+NEAR_RING_PX = 8
 MOVED_MARK_COLOR = QColor(0, 220, 255, 240)
 MARK_RING_PX = 6
 MARK_GAP_PX = 9
@@ -39,8 +41,8 @@ COULD_NOT_READ = "No picture: this chip could not be read."
 
 
 def standing_of(chip) -> str:
-    """What the chip is, in a few words: its verdict, what it became in
-    an earlier round, or nothing yet."""
+    """What the chip is, in a few words: its verdict, what it became
+    before, that it is labelled already, or nothing yet."""
     earlier = None
     if chip.reviewed_before():
         became = chip.earlier.became
@@ -48,10 +50,17 @@ def standing_of(chip) -> str:
         if chip.verdict is None:
             return earlier
     if chip.verdict is None:
+        if chip.labelled_already():
+            return "labelled already: " + chip.nearest().describe()
         return "no verdict yet"
     text = "verdict: " + ("Ignore" if chip.verdict == IGNORE
                           else chip.verdict)
-    return f"{text} ({earlier})" if earlier else text
+    if earlier:
+        return f"{text} ({earlier})"
+    if chip.labelled_already() and chip.verdict != IGNORE:
+        return text + (" (as a new label beside the one there)"
+                       if chip.as_new else " (onto the label there)")
+    return text
 
 
 def length_text(image, p1, p2) -> str:
@@ -95,6 +104,7 @@ class ContextView(QWidget):
         self._box: tuple | None = None      # (x, y, w, h) in picture pixels
         self._centre: tuple | None = None   # (column, row) in picture pixels
         self._moved = False
+        self._marks: list = []          # (column, row, text): labels near
         self._reading = False
         self._failed = False            # the read came back empty
         self._measuring = False
@@ -243,6 +253,12 @@ class ContextView(QWidget):
     def has_picture(self) -> bool:
         return self._pixmap is not None
 
+    def set_marks(self, marks: list):
+        """Rings with a word at these (column, row) of the picture: the
+        labels already there (2.9.4)."""
+        self._marks = [(float(c), float(r), str(text)) for c, r, text in marks]
+        self.update()
+
     def set_picture(self, arr: np.ndarray, box: tuple, centre: tuple,
                     moved: bool):
         h, w = arr.shape[:2]
@@ -301,6 +317,26 @@ class ContextView(QWidget):
                         QPointF(cx + dx * MARK_GAP_PX, cy + dy * MARK_GAP_PX),
                         QPointF(cx + dx * (MARK_GAP_PX + MARK_PX),
                                 cy + dy * (MARK_GAP_PX + MARK_PX)))
+        for col, row, text in self._marks:
+            mx = off_x + (col + 0.5) * scale
+            my = off_y + (row + 0.5) * scale
+            if not target.contains(QPointF(mx, my)):
+                continue
+            for colour, width in ((QColor(0, 0, 0, 210), 4),
+                                  (NEAR_COLOR, 2)):
+                painter.setPen(QPen(colour, width))
+                painter.drawEllipse(QPointF(mx, my), NEAR_RING_PX,
+                                    NEAR_RING_PX)
+            metrics = painter.fontMetrics()
+            box = QRectF(mx + NEAR_RING_PX + 3, my - metrics.height() / 2,
+                         metrics.horizontalAdvance(text) + 6,
+                         metrics.height())
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 170))
+            painter.drawRect(box)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(NEAR_COLOR)
+            painter.drawText(box, Qt.AlignCenter, text)
         self._paint_measure(painter, (off_x, off_y, scale))
         painter.end()
 
@@ -310,12 +346,14 @@ class DetailPanel(QWidget):
 
     show_on_image = pyqtSignal()
     context_changed = pyqtSignal(int)
+    as_new_changed = pyqtSignal(bool)   # the tick below, for the chip in hand
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._chip = None
         self._image = None              # the project's entry, for metres
         self._picture_frame = None      # the picture's top-left source pixel
+        self._near: list = []           # the labels already there (2.9.4)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         title = QLabel("Details")
@@ -333,6 +371,16 @@ class DetailPanel(QWidget):
         self.measure_info.setWordWrap(True)
         self.measure_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.measure_info)
+        # For a chip labelled already: its verdict goes onto the label
+        # there unless this is ticked (2.9.4).
+        self.as_new_check = QCheckBox("Add as a new label here")
+        self.as_new_check.setToolTip(
+            "Two objects close together: the verdict makes a new label at\n"
+            "the chip's centre, beside the one already there, instead of\n"
+            "going onto that label. Not dropped as a duplicate.")
+        self.as_new_check.toggled.connect(self.as_new_changed)
+        self.as_new_check.setVisible(False)
+        layout.addWidget(self.as_new_check)
         self.view.measured.connect(self._on_measured)
         row = QHBoxLayout()
         row.addWidget(QLabel("Context"))
@@ -390,10 +438,26 @@ class DetailPanel(QWidget):
         self._chip = None
         self._image = None
         self._picture_frame = None
+        self._near = []
         self.view.clear()
+        self.view.set_marks([])
         self.info.setText(NOTHING)
         self.measure_info.setText("")
         self.image_button.setEnabled(False)
+        self.as_new_check.setVisible(False)
+
+    def near(self) -> list:
+        """The labels already there, as last shown."""
+        return list(self._near)
+
+    def _update_marks(self):
+        """The labels already there, on the picture, once there is one."""
+        if self._picture_frame is None or not self._near:
+            self.view.set_marks([])
+            return
+        px0, py0 = self._picture_frame
+        self.view.set_marks([(n.pixel_x - px0, n.pixel_y - py0,
+                              n.class_name) for n in self._near])
 
     # -- measuring (2.8.12) ------------------------------------------------
 
@@ -416,17 +480,27 @@ class DetailPanel(QWidget):
         self.view.set_measure_text(text.split(" (")[0])
 
     def show_chip(self, chip, latlon: "tuple | None", suggestion=None,
-                  image=None):
+                  image=None, near=()):
         """Everything known of the chip; the picture follows when read.
         ``latlon`` is (lat, lon), or None for imagery without ground;
         ``suggestion`` what the model learned here thinks, if trained;
-        ``image`` the project's entry, which gives Measure its metres."""
+        ``image`` the project's entry, which gives Measure its metres;
+        ``near`` the labels already there (labelled.Near), marked on
+        the picture and listed."""
         if chip is not self._chip:
             self.view.set_reading()
             self.measure_info.setText("")
+            self._picture_frame = None
         self._chip = chip
         self._image = image
+        self._near = list(near)
         self.image_button.setEnabled(True)
+        labelled = chip.labelled_already()
+        self.as_new_check.blockSignals(True)
+        self.as_new_check.setChecked(bool(chip.as_new))
+        self.as_new_check.blockSignals(False)
+        self.as_new_check.setVisible(labelled)
+        self._update_marks()
         lines = [f"<b>{chip.image_name}</b>  ({chip.pixel_x:.1f}, "
                  f"{chip.pixel_y:.1f})"]
         if latlon is not None:
@@ -449,6 +523,22 @@ class DetailPanel(QWidget):
                          f"file's ({chip.source_x:.1f}, {chip.source_y:.1f})")
         if chip.rescaled:
             lines.append("scaled from the size the file stated")
+        if self._near:
+            shown = self._near[:4]
+            lines.append("<b>Labels already there:</b> " + "; ".join(
+                f"{n.class_name} at ({n.pixel_x:.0f}, {n.pixel_y:.0f}), "
+                f"{n.distance:.0f} px off" for n in shown)
+                + (f"; and {len(self._near) - len(shown)} more"
+                   if len(self._near) > len(shown) else ""))
+            if chip.reviewed_before():
+                pass                    # its own is the note's; these are others
+            elif chip.verdict == IGNORE:
+                lines.append("Ignored: the label there stays as it is.")
+            elif chip.as_new:
+                lines.append("A verdict makes a new label here, beside it.")
+            else:
+                lines.append("A verdict goes onto the nearest of them; tick "
+                             "below for a new label here instead.")
         self.info.setText("<br>".join(lines))
 
     def set_picture(self, chip, arr: np.ndarray, picture_frame: tuple,
@@ -464,3 +554,4 @@ class DetailPanel(QWidget):
         self.view.set_picture(arr, (x0 - px0, y0 - py0, w, h),
                               (chip.pixel_x - px0, chip.pixel_y - py0),
                               chip.moved())
+        self._update_marks()

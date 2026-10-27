@@ -797,10 +797,12 @@ class LabelProject:
     # that set their own; sub-groups inherit (display_settings.resolve).
     display_settings: dict = field(default_factory=dict)
 
-    # Model Review's memory (format 5.0, app/model_review/ledger.py): one
-    # Verdict per chip of the model team's mistakes that a person looked
-    # at - what the model called it, what it became (a class, or ignored),
-    # the label it made. Keeps reviewed chips off the grid next round.
+    # Model Review's memory as projects of formats 5.0 to 5.2 kept it
+    # (app/model_review/ledger.py): one Verdict per chip of the model
+    # team's mistakes that a person looked at. Read for the window to
+    # move into the review file as that file is opened (2.9.4); never
+    # written again - the labels say what is labelled, the file what was
+    # ignored - so it goes at the next save.
     model_review: list = field(default_factory=list)
 
     # Auto-increment ID counter for labels
@@ -1243,7 +1245,7 @@ class LabelProject:
         return {
             # Single-digit minors only ("4.0" came after "3.9", never
             # "3.10"): the ICD pins readers to STRING comparison.
-            "version": "5.2",
+            "version": "5.3",
             # Copied, not referenced: the recovery snapshot is handed to a
             # background writer and the user carries on editing meanwhile.
             # The image and waypoint entries are freshly built dictionaries,
@@ -1266,9 +1268,8 @@ class LabelProject:
                 group: settings.to_dict()
                 for group, settings in sorted(self.display_settings.items())}}
                if self.display_settings else {}),
-            # Model Review verdicts, added at 5.0: only when any were given.
-            **({"model_review": [v.to_dict() for v in self.model_review]}
-               if self.model_review else {})
+            # Model Review verdicts, 5.0 to 5.2, are no longer written
+            # (2.9.4): the review file carries its own notes.
         }
 
     def save(self, file_path: str | Path):
@@ -1340,7 +1341,8 @@ class LabelProject:
         # Display settings arrived in 4.6, likewise.
         project.display_settings = settings_from_project_data(
             data.get("display_settings"))
-        # Model Review verdicts arrived in 5.0, likewise.
+        # Model Review verdicts, 5.0 to 5.2: read to be moved into the
+        # review file they belong to (2.9.4), never written again.
         project.model_review = verdicts_from_project_data(
             data.get("model_review"))
         project._next_id = data.get("_next_id", 1)

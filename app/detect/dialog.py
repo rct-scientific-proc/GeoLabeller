@@ -25,7 +25,8 @@ from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
                              QSpinBox, QTableWidget, QTableWidgetItem,
                              QVBoxLayout)
 
-from ..model_review.ledger import DEFAULT_TOLERANCE_PX
+from ..model_review.ledger import DEFAULT_TOLERANCE_PX, LedgerIndex
+from ..model_review.outcomes import read_outcomes
 from ..settings_scope import settings as app_settings
 from . import DETECTORS, by_key
 from .evaluate import DEFAULT_SWEEP, check
@@ -54,10 +55,11 @@ COMMON_DOC = (
     "Candidates per image at most - the budget: the strongest are kept. "
     "Zero keeps them all.\n\n"
     "Skip within a distance of a label - a candidate on an object you "
-    "have labelled already teaches nothing; nor does one where the memory "
-    "already holds an answer within Model Review's Same chip within "
-    "distance (or half the candidate's size, if that is more), if Skip "
-    "what was reviewed is on.\n\n"
+    "have labelled already teaches nothing; nor does one the last run's "
+    "candidates file already holds an answer for - ignored, or imported "
+    "- within Model Review's Same chip within distance (or half the "
+    "candidate's size, if that is more), if Skip what was reviewed is "
+    "on. The new file keeps those answers.\n\n"
     "Check against my labels counts a label as found when it lies within "
     "a candidate's own patch, or the smallest size, whichever is larger.")
 
@@ -114,6 +116,7 @@ class DetectDialog(QDialog):
         self._closing = False           # a close cancels the work's result
         self._target = None             # where the run's file goes
         self._run_settings = None
+        self._previous: list = []       # the last file's notes
         self._param_widgets: dict = {}
         self._build()
         self._restore()
@@ -194,7 +197,7 @@ class DetectDialog(QDialog):
             "the project. 0 switches it off.")
         self.skip_reviewed = QCheckBox("and what was reviewed before")
         self.skip_reviewed.setToolTip(
-            "No candidate where Model Review's memory already holds an\n"
+            "No candidate where the last run's file already holds an\n"
             "answer, within its Same chip within distance or half the\n"
             "candidate's size, whichever is more.")
         skip.addWidget(self.skip_labels)
@@ -473,12 +476,18 @@ class DetectDialog(QDialog):
         settings = self.settings()
         project = self._project()
         self._target, self._run_settings = target, settings
+        # The last run's file is the memory (2.9.4): what it says was
+        # ignored or imported is skipped, and carried onto what is found
+        # again.
+        self._previous = read_outcomes(target)
+        memory = LedgerIndex(self._previous, settings.tolerance_px)
 
         def job(progress, should_stop):
             # The file is written here, on the window's thread, once the
             # result is wanted: a run cut short by a close wrote a partial
             # file over the last one and opened it (2.9.1).
-            return run(project, images, settings, progress, should_stop)
+            return run(project, images, settings, progress, should_stop,
+                       memory=memory)
         self._start(job, self._on_ran)
 
     def _target_path(self) -> "Path | None":
@@ -497,7 +506,7 @@ class DetectDialog(QDialog):
         records, report = result
         try:
             write_candidates(self._target, records, self._run_settings,
-                             report)
+                             report, previous=self._previous)
         except OSError as exc:
             self.status.setText(f"Could not write {self._target}: {exc}")
             return

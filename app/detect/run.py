@@ -27,7 +27,9 @@ import numpy as np
 
 from .. import gdal_config, display_settings
 from ..labels import geodesic_distance
-from ..model_review.ledger import DEFAULT_TOLERANCE_PX, LedgerIndex
+from ..model_review.ledger import (DEFAULT_TOLERANCE_PX, OUTCOME_KEY,
+                                   LedgerIndex, outcome_to_dict)
+from ..model_review.outcomes import carry_over
 from ..model_review.source import CANDIDATE
 from ..snippets import nodata_mask
 from ..version import app_version
@@ -52,7 +54,8 @@ class Settings:
     unit: str = METRES
     per_image: int = 10         # candidates per image at most
     skip_labels_px: float = 10.0    # none within this of a label (full px)
-    skip_reviewed: bool = True      # none within the tolerance of the memory
+    skip_reviewed: bool = True      # none within the tolerance of the last
+                                    # run's file's notes (2.9.4)
     tolerance_px: float = DEFAULT_TOLERANCE_PX
 
     def to_dict(self) -> dict:
@@ -106,7 +109,7 @@ class Report:
             parts.append(f"{self.near_label} on labels already there left "
                          "out")
         if self.reviewed:
-            parts.append(f"{self.reviewed} reviewed before left out")
+            parts.append(f"{self.reviewed} reviewed before kept aside")
         if self.no_ground:
             parts.append(f"{self.no_ground} image"
                          f"{'' if self.no_ground == 1 else 's'} without "
@@ -267,18 +270,23 @@ def detect_image(image, project, settings: Settings, detector=None,
             ly = np.array([p[1] for p in places])
             kept, near = _drop_near(kept, lx, ly, settings.skip_labels_px)
             stats.near_label = near
+    noted: list = []            # (candidate, the last file's answer)
     if settings.skip_reviewed and memory is not None:
         # Within Model Review's own distance, or half the candidate's
         # size if that is more (a re-run lands a big object's middle a
         # few pixels over); entries of another group's same-named image
-        # are not this one's (2.9.1).
+        # are not this one's (2.9.1). The candidate is kept, with the
+        # answer on it (2.9.4): dropped, the answer was lost with the
+        # first run that skipped it, and the spot came back the next.
         name = Path(str(path).replace("\\", "/")).name
         group = getattr(image, "group", None) or ""
         still = []
         for item in kept:
             reach = max(settings.tolerance_px, item[3] / 2.0)
-            if memory.within(name, item[0], item[1], reach, group):
+            answers = memory.within(name, item[0], item[1], reach, group)
+            if answers:
                 stats.reviewed += 1
+                noted.append((item, answers[0]))
             else:
                 still.append(item)
         kept = still
@@ -286,13 +294,20 @@ def detect_image(image, project, settings: Settings, detector=None,
     if settings.per_image > 0 and len(kept) > settings.per_image:
         stats.capped = len(kept) - settings.per_image
         kept = kept[:settings.per_image]
-    records = [{"image": path, "image_width": width, "image_height": height,
-                "x": round(x, 2), "y": round(y, 2), "class": CLASS,
-                "score": round(score_of(strength), 4),
-                "strength": round(strength, 2), "size_px": round(size, 1),
-                "polarity": polarity}
-               for x, y, strength, size, polarity, _box in kept]
+
+    def record(item, note=None):
+        x, y, strength, size, polarity, _box = item
+        out = {"image": path, "image_width": width, "image_height": height,
+               "x": round(x, 2), "y": round(y, 2), "class": CLASS,
+               "score": round(score_of(strength), 4),
+               "strength": round(strength, 2), "size_px": round(size, 1),
+               "polarity": polarity}
+        if note is not None:
+            out[OUTCOME_KEY] = outcome_to_dict(note)
+        return out
+    records = [record(item) for item in kept]
     stats.found = len(records)
+    records += [record(item, note) for item, note in noted]
     return records, stats
 
 
@@ -332,17 +347,16 @@ def _drop_near(items: list, lx: np.ndarray, ly: np.ndarray,
 # -- the run and the file -------------------------------------------------------
 
 def run(project, images, settings: Settings, progress=None,
-        should_stop=None) -> tuple:
+        should_stop=None, memory=None) -> tuple:
     """(records, report) over ``images`` (project entries). ``progress``
     takes (text, done, total); ``should_stop()`` True ends the run with
-    what there is."""
+    what there is; ``memory`` is a LedgerIndex of the last run's notes
+    (outcomes.read_outcomes), skipped when the settings say so."""
     progress = progress or (lambda text, done, total: None)
     should_stop = should_stop or (lambda: False)
     detector = by_key(settings.detector)(**settings.params)
-    memory = None
-    if settings.skip_reviewed:
-        memory = LedgerIndex(getattr(project, "model_review", []) or [],
-                             settings.tolerance_px)
+    if not settings.skip_reviewed:
+        memory = None
     records: list = []
     report = Report()
     images = list(images)
@@ -376,10 +390,14 @@ def candidates_path(project_path) -> Path:
 
 
 def write_candidates(path, records: list, settings: Settings,
-                     report: "Report | None" = None) -> int:
+                     report: "Report | None" = None, previous=()) -> int:
     """The Model Review file: a {"chips": [...]} wrapper with how it was
-    made, so a reader can tell one run from another."""
+    made, so a reader can tell one run from another. ``previous`` are
+    the last file's notes (outcomes.read_outcomes): a candidate found
+    again within the tolerance keeps its note - ignored stays ignored,
+    imported stays imported (2.9.4)."""
     detector = by_key(settings.detector)
+    carry_over(records, list(previous or ()), settings.tolerance_px)
     data = {
         "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "creator": f"GeoLabeller {app_version()}",

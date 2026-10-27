@@ -42,7 +42,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .ledger import IGNORE, image_key
+from .ledger import IGNORE
 from .snippet_store import INPUT_PX, Cancelled, SnippetStore
 
 MIN_CLASSES = 2
@@ -156,13 +156,13 @@ class Example:
 def gather_examples(project, chips, labels_per_class: int = LABELS_PER_CLASS,
                     seed: int = 0) -> list:
     """Everything there is to learn from, one example per place and
-    class: the chips given a verdict here, the memory's chips (an ignored
-    one at the file's centre; a labelled one through its label, where
-    the user put it), and the project's labels - of the classes seen in
-    verdicts, and of every class that is not one the file's model
-    predicts (its chips are never that: the labels of a predicted class
-    would teach a verdict no chip can take) - at most
-    ``labels_per_class`` of each, drawn at random."""
+    class: the chips given a verdict here, the chips the file's notes
+    say were reviewed before (an ignored one at the file's centre; a
+    labelled one through its label, where the user put it), and the
+    project's labels - of the classes seen in verdicts, and of every
+    class that is not one the file's model predicts (its chips are never
+    that: the labels of a predicted class would teach a verdict no chip
+    can take) - at most ``labels_per_class`` of each, drawn at random."""
     examples: dict = {}
 
     def add(path, x, y, class_name, origin):
@@ -171,35 +171,23 @@ def gather_examples(project, chips, labels_per_class: int = LABELS_PER_CLASS,
             examples[key] = Example(path, float(x), float(y), class_name,
                                     origin)
 
-    changed: set = set()            # memory entries a new verdict outdates
-    outdated: set = set()           # ...and the labels those made
+    outdated: set = set()           # labels a new verdict here outdates
     for chip in chips:
         if chip.verdict is None:
             continue
         add(chip.image_path, chip.pixel_x, chip.pixel_y, chip.verdict,
             "verdict")
-        if chip.reviewed_before():
-            changed.add((image_key(chip.earlier.image),
-                         int(round(chip.earlier.pixel_x)),
-                         int(round(chip.earlier.pixel_y))))
-            if chip.earlier.label_id is not None:
-                outdated.add(chip.earlier.label_id)
+        if chip.reviewed_before() and chip.earlier.label_id is not None:
+            outdated.add(chip.earlier.label_id)
     images = getattr(project, "images", {}) or {}
-    by_name: dict = {}
-    for path in images:
-        by_name.setdefault(image_key(path), []).append(path)
     classes = {example.class_name for example in examples.values()}
-    for verdict in getattr(project, "model_review", []) or []:
-        if not verdict.became:
-            continue
-        if (image_key(verdict.image), int(round(verdict.pixel_x)),
-                int(round(verdict.pixel_y))) in changed:
+    for chip in chips:
+        if chip.verdict is not None or not chip.reviewed_before():
             continue                # given a new verdict here (2.8.5)
-        classes.add(verdict.became)
-        paths = by_name.get(image_key(verdict.image), [])
-        if len(paths) == 1 and (verdict.became == IGNORE
-                                or verdict.label_id is None):
-            add(paths[0], verdict.pixel_x, verdict.pixel_y, verdict.became,
+        became = chip.earlier.became
+        classes.add(became)
+        if became == IGNORE or chip.earlier.label_id is None:
+            add(chip.image_path, chip.source_x, chip.source_y, became,
                 "memory")
     classes.discard(IGNORE)
     predicted = {chip.predicted for chip in chips}

@@ -1,11 +1,14 @@
 """The review memory: what the model called each chip, and what it became.
 
-Kept in the project file (format 5.0, top-level "model_review"), one
-record per verdict given in the Model Review window and imported. It is
-what makes the loop iterative: when the next round's file comes in, a
-chip already reviewed - same image, centre within a few pixels - is kept
-off the grid, and anyone can read what the model said of a label and
-what a person made of it.
+Since 2.9.4 the memory lives in the review file itself, a note per
+chip record (outcomes.py); the project's labels say what is labelled
+(labelled.py). Until then it was kept in the project file (format 5.0
+to 5.2, top-level "model_review"), one record per verdict given in the
+Model Review window and imported, and a chip reviewed before - same
+image, centre within a few pixels - was kept off the grid by it. That
+list is still read, once, to move its notes into a file as it is
+opened, and the index below still serves a detector run's skip of what
+an earlier run's file holds.
 
 A chip is named by its image's FILE NAME, not its path: that is how the
 team's file names it, and it is what survives a project whose imagery
@@ -26,6 +29,42 @@ from pathlib import PurePosixPath
 IGNORE = "ignore"
 # Two centres this close on the same image are the same chip.
 DEFAULT_TOLERANCE_PX = 8.0
+# The note on a chip's record in the review file (2.9.4).
+OUTCOME_KEY = "review"
+
+
+def outcome_from_record(record) -> "dict | None":
+    """The note a file record carries, checked: {"became", "label_id",
+    "by", "at"} with became a class or IGNORE; None for none, or one
+    that cannot be read."""
+    if not isinstance(record, dict):
+        return None
+    note = record.get(OUTCOME_KEY)
+    if not isinstance(note, dict):
+        return None
+    became = note.get("became")
+    if not isinstance(became, str) or not became.strip():
+        return None
+    label_id = note.get("label_id")
+    try:
+        label_id = None if label_id is None else int(label_id)
+    except (TypeError, ValueError):
+        label_id = None
+    return {"became": became.strip(), "label_id": label_id,
+            "by": str(note.get("by") or ""), "at": str(note.get("at") or "")}
+
+
+def outcome_to_dict(verdict) -> dict:
+    """The note as written: what the chip became, the label it made or
+    took over, who and when."""
+    note = {"became": verdict.became}
+    if verdict.label_id is not None:
+        note["label_id"] = int(verdict.label_id)
+    if verdict.by:
+        note["by"] = verdict.by
+        if verdict.at:
+            note["at"] = verdict.at
+    return note
 
 
 def image_key(name_or_path) -> str:

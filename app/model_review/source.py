@@ -40,7 +40,7 @@ from pathlib import Path
 
 from .. import gdal_config
 from ..debug_log import debug
-from .ledger import Verdict, image_key
+from .ledger import Verdict, image_key, outcome_from_record
 
 _IMAGE_KEYS = ("image", "file", "filename", "path", "image_path")
 _X_KEYS = ("x", "pixel_x", "col", "column")
@@ -66,6 +66,7 @@ class Candidate:
     image_height: int | None
     predicted: str
     score: float
+    review: dict | None = None  # the record's note (ledger.OUTCOME_KEY)
 
     @property
     def name(self) -> str:
@@ -93,7 +94,14 @@ class Chip:
     score: float
     rescaled: bool = False      # the file stated another size
     verdict: str | None = None  # a class, ledger.IGNORE, or not yet
-    earlier: Verdict | None = None   # reviewed in an earlier round
+    earlier: Verdict | None = None   # the file's note: reviewed before
+    label_gone: bool = False    # ...but the label it names is gone
+    # Labels already on the image within the distance (labelled.py),
+    # nearest first - the chip's own label, the note's, left out.
+    near: list = field(default_factory=list)
+    # A verdict on a chip labelled already goes onto that label; this
+    # asks for a new label beside it instead (2.9.4).
+    as_new: bool = False
     image_width: int = 0        # the image's size, for the chip's frame
     image_height: int = 0
     source_x: float = 0.0       # the centre as the file gave it
@@ -103,7 +111,20 @@ class Chip:
                                 # file's; a move since is to import
 
     def reviewed_before(self) -> bool:
-        return self.earlier is not None
+        """Has the file a note on the chip that still stands: ignored,
+        or a label that is still there. A note whose label went - by
+        hand, or an import undone - no longer counts: the labels are
+        the truth, and the chip is plain again."""
+        return self.earlier is not None and not self.label_gone
+
+    def labelled_already(self) -> bool:
+        """Is there a label on the image within the distance that is
+        not the chip's own (2.9.4)."""
+        return not self.reviewed_before() and bool(self.near)
+
+    def nearest(self):
+        """The nearest such label (labelled.Near), or None."""
+        return self.near[0] if self.near else None
 
     def moved(self) -> bool:
         return (self.pixel_x, self.pixel_y) != (self.source_x, self.source_y)
@@ -266,7 +287,8 @@ def parse_candidates(data) -> tuple:
             image_width=_whole(_first(record, _WIDTH_KEYS)),
             image_height=_whole(_first(record, _HEIGHT_KEYS)),
             predicted=predicted.strip(),
-            score=0.0 if score is None else score))
+            score=0.0 if score is None else score,
+            review=outcome_from_record(record)))
     return candidates, malformed
 
 
@@ -374,15 +396,23 @@ def match_candidates(candidates, project, malformed: int = 0,
         # Inside the image: 0 <= x < width is what every reader needs.
         px = min(max(px, 0.0), width - 1e-6)
         py = min(max(py, 0.0), height - 1e-6)
-        chips.append(Chip(key=candidate.index, image_path=path,
-                          image_name=Path(str(image.path or path).replace(
-                              "\\", "/")).name,
-                          group=image.group or "", pixel_x=px, pixel_y=py,
-                          predicted=candidate.predicted,
-                          score=candidate.score, rescaled=rescaled,
-                          image_width=width, image_height=height,
-                          source_x=px, source_y=py, anchor_x=px,
-                          anchor_y=py))
+        chip = Chip(key=candidate.index, image_path=path,
+                    image_name=Path(str(image.path or path).replace(
+                        "\\", "/")).name,
+                    group=image.group or "", pixel_x=px, pixel_y=py,
+                    predicted=candidate.predicted,
+                    score=candidate.score, rescaled=rescaled,
+                    image_width=width, image_height=height,
+                    source_x=px, source_y=py, anchor_x=px, anchor_y=py)
+        if candidate.review is not None:
+            # The file's note (2.9.4): the chip was reviewed before.
+            note = candidate.review
+            chip.earlier = Verdict(
+                image=chip.image_name, pixel_x=px, pixel_y=py,
+                predicted=candidate.predicted, score=float(candidate.score),
+                became=note["became"], label_id=note["label_id"],
+                by=note["by"], at=note["at"], group=chip.group)
+        chips.append(chip)
         report.matched += 1
     return chips, report
 

@@ -2297,6 +2297,7 @@ class MainWindow(QMainWindow):
         # In waterfall, show this label on the other images that contain it.
         self._update_waterfall_projections()
         self._editor_follows()
+        self._schedule_refresh("review")
 
         # Show appropriate message for geo vs pixel layers
         layer = self.canvas.get_layer(self.canvas._path_to_layer.get(image_path, ""))
@@ -2335,6 +2336,7 @@ class MainWindow(QMainWindow):
         self._update_waterfall_projections()
         self._editor_follows()
         self._refresh_cleaner()
+        self._schedule_refresh("review")
 
         self.statusBar.showMessage("Removed label", 3000)
 
@@ -2469,6 +2471,7 @@ class MainWindow(QMainWindow):
         self._update_waterfall_projections()
         # Its snippet is cut around the label: every view of it is stale.
         self._reseat_open_editors()
+        self._schedule_refresh("review")
         self.statusBar.showMessage(
             f"Moved label #{label_id} to {image.name}"
             + (f" - without {' and '.join(lost)}" if lost else "")
@@ -2909,6 +2912,8 @@ class MainWindow(QMainWindow):
         if "labeled" in kinds:
             self.layer_panel.refresh_labeled_panel(self.project)
             self._refresh_cleaner()
+        if "labeled" in kinds or "review" in kinds:
+            self._refresh_review()
         if "editors" in kinds:
             self._reseat_open_editors()         # the sidebar panel too
         elif "snippets" in kinds:
@@ -3776,8 +3781,9 @@ class MainWindow(QMainWindow):
         if "waypoints" in lists:
             self._refresh_waypoints()
         self._reseat_open_editors()
-        if self._model_review is not None and "model_review" in lists:
-            # An import undone: its chips are back to be looked at.
+        if self._model_review is not None:
+            # The labels changed under the window: a chip's label gone
+            # (an import undone) or back, and what is labelled already.
             self._model_review.refresh_earlier()
         # A removal undone brings its pairs back only on the next Find;
         # what it shows must at least exist.
@@ -4885,6 +4891,13 @@ class MainWindow(QMainWindow):
             window.close()
             window.deleteLater()
 
+    def _refresh_review(self):
+        """The labels changed: the Model Review window's chips are
+        compared with them again (2.9.4), its grid rebuilt only where
+        a chip's standing changed."""
+        if self._model_review is not None and self._model_review.isVisible():
+            self._model_review.refresh_labels()
+
     def _refresh_cleaner(self):
         """The labels changed under the cleaner (a removal on the map, a
         link, Clear All Labels, an undo): its pairs are checked against
@@ -4910,6 +4923,7 @@ class MainWindow(QMainWindow):
         self._update_waterfall_projections()
         self._editor_follows()
         self._refresh_snippet_panel()
+        self._schedule_refresh("review")
         n = len(ids)
         self.statusBar.showMessage(
             f"Removed {n} close label{'' if n == 1 else 's'}", 3000)
@@ -4936,26 +4950,34 @@ class MainWindow(QMainWindow):
         self._update_class_combo()
 
     def _import_model_review(self, chips: list, source: str):
-        """The window's verdicts: a label per chip given a class, a ledger
-        entry per chip given anything - one undo step."""
+        """The window's verdicts: a label per chip given a class, or the
+        class onto a label already there - one undo step; what each
+        chip became noted in the review file (2.9.4)."""
         if not chips:
             return
-        # A chip reviewed before may change the label it made (2.8.5):
-        # those labels are the step's to restore.
+        # A chip reviewed before may change the label it made (2.8.5),
+        # and one labelled already the label it is near (2.9.4): those
+        # labels are the step's to restore.
         touched = {chip.earlier.label_id for chip in chips
                    if chip.earlier is not None
                    and chip.earlier.label_id is not None}
+        touched |= {near.label_id for chip in chips for near in chip.near}
         # ...and the labels a new one may displace as a duplicate.
         touched |= duplicates.nearby_ids(
             self.project, [(c.image_path, c.pixel_x, c.pixel_y)
                            for c in chips], duplicates.distance_px())
         with self._recorded("Model review import", labels=touched,
-                            lists=("model_review", "classes")):
+                            lists=("classes",)):
             result = apply_verdicts(self.project, chips, source)
+            # A label asked for beside one already there is not a
+            # duplicate of it: the user said so.
             added = [i for i in result.label_ids
-                     if i not in result.changed_ids]
+                     if i not in result.changed_ids
+                     and i not in result.as_new_ids]
             removed_old, _new, duplicates_text = self._settle_duplicates(
                 added, "Already here", source)
+        if self._model_review is not None:
+            self._model_review.record_outcomes(result.outcomes)
         self._update_class_combo()
         for label_id in result.changed_ids + result.removed_ids + removed_old:
             self.canvas.remove_label_marker(label_id)
