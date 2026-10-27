@@ -17,6 +17,20 @@ from PyQt5.QtWidgets import (
     QScrollArea, QVBoxLayout, QWidget,
 )
 
+# With Shift held, the number row reports the SHIFTED symbol as the key
+# on most layouts (Shift+1 arrives as Key_Exclam on US keyboards), so
+# both spellings map to their digit. Layout-specific beyond US symbols
+# is not attempted; the dropdowns always work. Shared by the main window
+# (description presets) and Model Review (the tenth class on, 2.9.8).
+SHIFTED_DIGITS = {
+    Qt.Key_0: 0, Qt.Key_1: 1, Qt.Key_2: 2, Qt.Key_3: 3, Qt.Key_4: 4,
+    Qt.Key_5: 5, Qt.Key_6: 6, Qt.Key_7: 7, Qt.Key_8: 8, Qt.Key_9: 9,
+    Qt.Key_ParenRight: 0, Qt.Key_Exclam: 1, Qt.Key_At: 2,
+    Qt.Key_NumberSign: 3, Qt.Key_Dollar: 4, Qt.Key_Percent: 5,
+    Qt.Key_AsciiCircum: 6, Qt.Key_Ampersand: 7, Qt.Key_Asterisk: 8,
+    Qt.Key_ParenLeft: 9,
+}
+
 # (heading, [(keys, what it does), ...]) - rendered as a small table each.
 SHORTCUT_SECTIONS = [
     ("File Operations", [
@@ -188,11 +202,15 @@ SHORTCUT_SECTIONS = [
                                 "the picked chips or the cursor's; type "
                                 "in its box to shorten the list, Enter "
                                 "takes the first"),
+        ("Drag a class (Labels panel)", "Put it under the key you want; "
+                                        "Ignore stays on top, and the "
+                                        "order is yours from then on"),
         ("Shift+Left-click", "Label every chip from the last click to this"),
         ("Ctrl+Left-click", "Pick a chip without labelling; a key then "
                             "labels the picked"),
         ("1-9", "The class at that place in the list: onto the picked "
                 "chips, or the chip under the cursor (then the next)"),
+        ("Shift+1-9", "The tenth to the eighteenth class, the same way"),
         ("0", "Ignore: looked at, nothing to label"),
         ("Arrows / Home / End", "Move the cursor from chip to chip; past the "
                                 "page's end it turns the page"),

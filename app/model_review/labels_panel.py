@@ -4,30 +4,49 @@ one click away.
 Asked for 2026-10-27: picking a class from the New label dropdown -
 open it, scroll, find the one - was slow with many classes, and the
 users wanted them laid out to pick with the mouse. The panel lists
-Ignore and then every class in the project's order, each with its
-colour, its key number for the first nine, and how many chips an
-import gives it. A click makes the class active and, as the dropdown
-does, gives it to the picked chips or the chip under the cursor. A
-filter box narrows the list as you type; Enter takes the first class
-left, Escape clears the box. Nothing here keeps the keyboard from the
-grid: the list and the button never take focus, and the box hands it
-back on Enter or Escape.
+Ignore and then every class in the window's order, each with its
+colour, the key that picks it - 1 to 9, then Shift+1 to Shift+9 for
+the tenth to the eighteenth (2.9.8) - and how many chips an import
+gives it. A click makes the class active and, as the dropdown does,
+gives it to the picked chips or the chip under the cursor. A filter
+box narrows the list as you type; Enter takes the first class left,
+Escape clears the box. Nothing here keeps the keyboard from the grid:
+the list and the button never take focus, and the box hands it back
+on Enter or Escape.
 
-The window owns the classes, the colours and the verdicts; the panel
-shows them and reports a pick.
+A class dragged up or down the list (2.9.8) moves under another key:
+the panel reports the new order and the window keeps it (class_order
+.py). Ignore is not dragged and stays on top whatever is dropped
+above it; while the filter shortens the list nothing is dragged, so
+the order a drop makes is always the whole list's.
+
+The window owns the classes, the colours, the order and the verdicts;
+the panel shows them and reports a pick or a move.
 """
 from __future__ import annotations
 
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
-from PyQt5.QtWidgets import (QLabel, QLineEdit, QListWidget, QListWidgetItem,
-                             QPushButton, QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QAbstractItemView, QLabel, QLineEdit,
+                             QListWidget, QListWidgetItem, QPushButton,
+                             QVBoxLayout, QWidget)
 
 from .ledger import IGNORE
 
 IGNORE_COLOR = QColor(150, 150, 150)    # the window's shade of Ignore
 MIN_WIDTH = 150
 PREFERRED_WIDTH = 200                   # to start with; the handle moves
+SHIFT = "⇧"                        # the key hint for Shift+1..9
+
+
+def key_hint(index: int) -> str:
+    """What picks the class at this place: 1-9, Shift+1-9 shown as an
+    arrow and a digit, nothing beyond the eighteenth."""
+    if index < 9:
+        return str(index + 1)
+    if index < 18:
+        return SHIFT + str(index - 8)
+    return " "
 
 
 def swatch(colour: QColor) -> QIcon:
@@ -55,6 +74,40 @@ class FilterEdit(QLineEdit):
         super().keyPressEvent(event)
 
 
+class ClassList(QListWidget):
+    """The stacked classes: a drag moves one, Ignore stays on top."""
+
+    reordered = pyqtSignal(list)        # the classes, top to bottom
+    drag_done = pyqtSignal()            # a drag over, dropped or not
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setDropIndicatorShown(True)
+
+    def names(self) -> list:
+        return [self.item(i).data(Qt.UserRole) for i in range(self.count())]
+
+    def dropEvent(self, event):
+        super().dropEvent(event)        # Qt moves the row (InternalMove)
+        if event.isAccepted():
+            self._after_drop()
+
+    def startDrag(self, actions):
+        super().startDrag(actions)
+        self.drag_done.emit()
+
+    def _after_drop(self):
+        """Ignore back on top if something was dropped above it; then
+        the classes' order, top to bottom, reported."""
+        names = self.names()
+        if IGNORE in names and names.index(IGNORE) != 0:
+            self.insertItem(0, self.takeItem(names.index(IGNORE)))
+        self.reordered.emit([name for name in self.names() if name != IGNORE])
+
+
 class LabelsPanel(QWidget):
     """See the module."""
 
@@ -62,6 +115,7 @@ class LabelsPanel(QWidget):
     picked = pyqtSignal(object)         # a class name, or IGNORE
     add_requested = pyqtSignal()        # Add class...
     released = pyqtSignal()             # the keyboard is the grid's again
+    reordered = pyqtSignal(list)        # the classes dragged into this order
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -87,13 +141,17 @@ class LabelsPanel(QWidget):
         self.filter.returnPressed.connect(self._pick_first)
         self.filter.escaped.connect(self.released)
         layout.addWidget(self.filter)
-        self.list = QListWidget()
-        self.list.setFocusPolicy(Qt.NoFocus)
+        self.list = ClassList()
         self.list.setToolTip(
             "Click a class: it is the active label, and the picked chips\n"
             "- or the chip under the cursor - take it. The number is the\n"
-            "key that picks it; the count is the chips an import gives it.")
+            "key that picks it (an arrow means Shift held); the count is\n"
+            "the chips an import gives it. Drag a class up or down to put\n"
+            "it under the key you want - Ignore stays on top, and the\n"
+            "order is yours from then on. Clear the filter box to drag.")
         self.list.itemClicked.connect(self._on_item)
+        self.list.reordered.connect(self.reordered)
+        self.list.drag_done.connect(self._highlight)
         layout.addWidget(self.list, 1)
         self.add_button = QPushButton("Add class...")
         self.add_button.setFocusPolicy(Qt.NoFocus)
@@ -143,8 +201,10 @@ class LabelsPanel(QWidget):
     def _rebuild(self):
         needle = self.filter.text().strip().lower()
         self.list.clear()
+        # A drag while the list is shortened would order a part of it.
+        self.list.setDragEnabled(not needle)
         entries = [(IGNORE, "Ignore", "0")]
-        entries += [(name, name, str(i + 1) if i < 9 else " ")
+        entries += [(name, name, key_hint(i))
                     for i, name in enumerate(self._classes)]
         for verdict, name, key in entries:
             if needle and needle not in name.lower():
@@ -155,6 +215,11 @@ class LabelsPanel(QWidget):
                 text += f"  ({count})"
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, verdict)
+            # Dragged, never dropped onto: a drop lands between rows.
+            flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+            if verdict != IGNORE:
+                flags |= Qt.ItemIsDragEnabled
+            item.setFlags(flags)
             colour = self._colour_of(verdict)
             if colour is not None:
                 item.setIcon(swatch(colour))

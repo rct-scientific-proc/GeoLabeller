@@ -60,7 +60,7 @@ from .h5_export import (EXAMPLES_ALL, EXAMPLES_OBJECT,
                         NEGATIVES_SAME, NEGATIVES_VISIBLE, centered_window,
                         estimate_export)
 from .debug_log import debug, debug_log, DebugConsole
-from .shortcuts import ShortcutsDialog
+from .shortcuts import SHIFTED_DIGITS, ShortcutsDialog
 from . import (display_settings, duplicates, gdal_config, identity,
                kml_export, recent, reseat, settings_scope, waypoint_io)
 from .about import AboutDialog
@@ -1302,7 +1302,7 @@ class MainWindow(QMainWindow):
         # Shift+1-9 switch the active description preset; Shift+0 clears it.
         # Checked before the plain digits, which switch classes.
         if event.modifiers() & Qt.ShiftModifier:
-            number = self._SHIFTED_DIGITS.get(event.key())
+            number = SHIFTED_DIGITS.get(event.key())
             if number is not None and self._select_description(number):
                 event.accept()
                 return
@@ -2213,19 +2213,6 @@ class MainWindow(QMainWindow):
         self.statusBar.showMessage(text, 2000)
         self.canvas.show_notice(text)
         return True
-
-    # With Shift held, the number row reports the SHIFTED symbol as the key
-    # on most layouts (Shift+1 arrives as Key_Exclam on US keyboards), so
-    # both spellings map to their digit. Layout-specific beyond US symbols
-    # is not attempted; the toolbar dropdown always works.
-    _SHIFTED_DIGITS = {
-        Qt.Key_0: 0, Qt.Key_1: 1, Qt.Key_2: 2, Qt.Key_3: 3, Qt.Key_4: 4,
-        Qt.Key_5: 5, Qt.Key_6: 6, Qt.Key_7: 7, Qt.Key_8: 8, Qt.Key_9: 9,
-        Qt.Key_ParenRight: 0, Qt.Key_Exclam: 1, Qt.Key_At: 2,
-        Qt.Key_NumberSign: 3, Qt.Key_Dollar: 4, Qt.Key_Percent: 5,
-        Qt.Key_AsciiCircum: 6, Qt.Key_Ampersand: 7, Qt.Key_Asterisk: 8,
-        Qt.Key_ParenLeft: 9,
-    }
 
     def _get_class_color(self, class_name: str) -> QColor:
         """Get the color for a class."""

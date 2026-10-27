@@ -45,8 +45,10 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox,
 
 from .. import identity, recent
 from ..settings_scope import settings as app_settings
+from ..shortcuts import SHIFTED_DIGITS
 from ..snippets import SnippetLoader, snippet_frame
 from .centering import find_centre
+from .class_order import load_order, ordered, save_order, with_rename
 from .detail import DEFAULT_CONTEXT, DetailPanel, standing_of
 from .image_window import ImageWindow
 from .labels_panel import IGNORE_COLOR, LabelsPanel
@@ -420,7 +422,9 @@ class ModelReviewWindow(QWidget):
         self._stale = False             # the labels changed while hidden
         self._report = None
         self._classes: list = []
-        self._colours: list = []
+        self._colours: list = []            # by the project's order
+        self._project_classes: list = []
+        self._colour_by_name: dict = {}
         self._selected: set = set()
         self._anchor: int | None = None
         self._cursor: int | None = None  # the keyboard's chip, on the page
@@ -636,7 +640,8 @@ class ModelReviewWindow(QWidget):
             "A panel on the left of the grid with every class stacked:\n"
             "click one and it is the active label, onto the picked chips\n"
             "or the chip under the cursor. Type in its box to shorten the\n"
-            "list; Enter takes the first match.")
+            "list; Enter takes the first match. Drag a class up or down\n"
+            "to put it under the key you want.")
         self.labels_check.setChecked(True)
         self.labels_check.toggled.connect(self._on_labels_panel)
         third.addWidget(self.labels_check)
@@ -876,6 +881,7 @@ class ModelReviewWindow(QWidget):
         self.labels_panel = LabelsPanel()
         self.labels_panel.picked.connect(self._on_panel_pick)
         self.labels_panel.released.connect(self.setFocus)
+        self.labels_panel.reordered.connect(self._on_panel_reordered)
         self.labels_panel.add_requested.connect(self._add_class)
         self.splitter = QSplitter(Qt.Horizontal)
         self.splitter.addWidget(self.labels_panel)
@@ -947,6 +953,39 @@ class ModelReviewWindow(QWidget):
         self.setFocus()
         self.set_active(verdict)
 
+    def _on_panel_reordered(self, names):
+        """A class dragged into place in the Labels panel (2.9.8): the
+        order is the user's from here, kept by name - other projects'
+        names behind, where they were - and the keys follow it."""
+        settings = app_settings()
+        save_order(settings, list(names) + [name for name
+                                            in load_order(settings)
+                                            if name not in names])
+        self._apply_order()
+        self._show_active()
+        self.setFocus()
+
+    def _apply_order(self):
+        """The window's order of the classes - the user's where they
+        dragged one into place (class_order.py), the project's for the
+        rest - into the dropdown and the panel; the keys go by it, the
+        colours by the project's places."""
+        self._classes = ordered(self._project_classes,
+                                load_order(app_settings()))
+        combo = self.label_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for index, name in enumerate(self._classes):
+            combo.addItem(name)
+            colour = self._colour_of(name)
+            if colour is not None and self._colours:
+                combo.setItemIcon(index, _swatch(colour))
+        combo.blockSignals(False)
+        self.labels_panel.set_classes(
+            self._classes,
+            [self._colour_by_name[name] for name in self._classes]
+            if self._colours else [])
+
     def _on_details(self, on: bool):
         self.right.setVisible(bool(on))
         self.detail.setVisible(bool(on))
@@ -962,18 +1001,13 @@ class ModelReviewWindow(QWidget):
 
         A verdict naming a class the project no longer has is taken
         back: importing it would quietly put the class back."""
-        self._classes = list(names)
+        self._project_classes = list(names)
         self._colours = list(colours or [])
-        combo = self.label_combo
-        combo.blockSignals(True)
-        combo.clear()
-        for index, name in enumerate(self._classes):
-            combo.addItem(name)
-            colour = self._colour_of(name)
-            if colour is not None and self._colours:
-                combo.setItemIcon(index, _swatch(colour))
-        combo.blockSignals(False)
-        self.labels_panel.set_classes(self._classes, self._colours)
+        self._colour_by_name = {
+            name: self._colours[i % len(self._colours)]
+            for i, name in enumerate(self._project_classes)
+        } if self._colours else {}
+        self._apply_order()
         if self._active not in self._classes and self._active != IGNORE:
             self._active = self._classes[0] if self._classes else None
         self._show_active()
@@ -1170,6 +1204,10 @@ class ModelReviewWindow(QWidget):
                 renamed[chip.key] = chip.earlier
         if renamed:
             self._write_outcomes(renamed)
+        settings = app_settings()
+        order = load_order(settings)
+        if old in order:
+            save_order(settings, with_rename(order, old, new))
 
     def refresh_earlier(self, rebuild: bool = True):
         """The chips against the project as it stands (2.9.4): a note's
@@ -1843,9 +1881,9 @@ class ModelReviewWindow(QWidget):
     def _colour_of(self, class_name) -> QColor | None:
         if class_name == IGNORE:
             return IGNORE_COLOR
-        if class_name in self._classes and self._colours:
-            return self._colours[self._classes.index(class_name)
-                                 % len(self._colours)]
+        colour = self._colour_by_name.get(class_name)
+        if colour is not None:
+            return colour
         return TEXT_COLOR if class_name else None
 
     def _refresh_cells(self, reference: bool = True):
@@ -2795,6 +2833,15 @@ class ModelReviewWindow(QWidget):
             if not self.redo():
                 self.redo_requested.emit()
             return
+        if mods == Qt.ShiftModifier:
+            # The tenth to the eighteenth class (2.9.8); the shifted
+            # symbol or the digit, whichever the layout reports.
+            digit = SHIFTED_DIGITS.get(key)
+            if digit:
+                index = 8 + digit
+                if index < len(self._classes):
+                    self.set_active(self._classes[index])
+                return
         if mods == Qt.NoModifier:
             if Qt.Key_1 <= key <= Qt.Key_9:
                 index = key - Qt.Key_1
