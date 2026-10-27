@@ -49,6 +49,7 @@ from ..snippets import SnippetLoader, snippet_frame
 from .centering import find_centre
 from .detail import DEFAULT_CONTEXT, DetailPanel, standing_of
 from .image_window import ImageWindow
+from .labels_panel import IGNORE_COLOR, LabelsPanel
 from .learn_window import LearnWindow
 from .learner import (BACKBONES, RESNET18, Learner,
                       available as learning_available, backbone_reason,
@@ -79,7 +80,6 @@ UNDO_LIMIT = 200
 SELECTED_COLOR = QColor(255, 255, 255)
 CURSOR_COLOR = QColor(255, 200, 0)
 HOVER_COLOR = QColor(255, 255, 255, 110)
-IGNORE_COLOR = QColor(150, 150, 150)
 EARLIER_SHADE = QColor(0, 0, 0, 150)
 # A chip labelled already (2.9.4): its frame and caption, unlike any
 # class's colour and unlike the shade of a chip reviewed before.
@@ -115,7 +115,11 @@ _MIN_SCORE_KEY = "model_review/min_score"
 _GEOMETRY_KEY = "model_review/geometry"
 _DETAILS_KEY = "model_review/details"
 _CONTEXT_KEY = "model_review/context"
-_SPLITTER_KEY = "model_review/splitter"
+# Three panes since the Labels panel (2.9.7): a state saved for two
+# would hand the panel the grid's old width, so the old key is dropped.
+_SPLITTER_KEY = "model_review/splitter3"
+_OLD_SPLITTER_KEY = "model_review/splitter"
+_LABELS_KEY = "model_review/labels_panel"
 HOVER_MS = 250                  # the mouse rests on a chip this long
                                 # before the panel turns to it
 VERDICT_FILTERS = (("All", "all"), ("To look at", "todo"),
@@ -627,6 +631,15 @@ class ModelReviewWindow(QWidget):
         self.details_check.setChecked(True)
         self.details_check.toggled.connect(self._on_details)
         third.addWidget(self.details_check)
+        self.labels_check = QCheckBox("Labels")
+        self.labels_check.setToolTip(
+            "A panel on the left of the grid with every class stacked:\n"
+            "click one and it is the active label, onto the picked chips\n"
+            "or the chip under the cursor. Type in its box to shorten the\n"
+            "list; Enter takes the first match.")
+        self.labels_check.setChecked(True)
+        self.labels_check.toggled.connect(self._on_labels_panel)
+        third.addWidget(self.labels_check)
         third.addSpacing(12)
         self.more_button = self._fold_button(
             "Settings",
@@ -671,9 +684,9 @@ class ModelReviewWindow(QWidget):
             "Chips with a label already on their image within the\n"
             "distance - something labelled by hand, or by another round.\n"
             "Framed in blue, with the label's class and how far off it\n"
-            "is; Details marks the labels. Kept off the grid otherwise.\n"
-            "A verdict on one goes onto that label, or makes a new one\n"
-            "beside it when Details says so; Ignore leaves it alone.")
+            "is; Details marks the labels. Untick to clear them off the\n"
+            "grid. A verdict on one goes onto that label, or makes a new\n"
+            "one beside it when Details says so; Ignore leaves it alone.")
         self.show_labelled_check.toggled.connect(self._on_show_labelled)
         more.addWidget(self.show_labelled_check)
         more.addWidget(QLabel("Labelled within"))
@@ -858,13 +871,21 @@ class ModelReviewWindow(QWidget):
         self.right.addWidget(self.reference)
         self.right.setStretchFactor(0, 3)
         self.right.setStretchFactor(1, 2)
+        # The Labels panel (labels_panel.py, 2.9.7): every class
+        # stacked on the left, a click away.
+        self.labels_panel = LabelsPanel()
+        self.labels_panel.picked.connect(self._on_panel_pick)
+        self.labels_panel.released.connect(self.setFocus)
+        self.labels_panel.add_requested.connect(self._add_class)
         self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.addWidget(self.labels_panel)
         self.splitter.addWidget(self.scroll)
         self.splitter.addWidget(self.right)
-        self.splitter.setStretchFactor(0, 1)
-        self.splitter.setStretchFactor(1, 0)
-        self.splitter.setCollapsible(0, False)
-        self.splitter.setCollapsible(1, False)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setStretchFactor(2, 0)
+        for i in range(3):
+            self.splitter.setCollapsible(i, False)
         layout.addWidget(self.splitter, 1)
 
         bottom = QHBoxLayout()
@@ -916,6 +937,16 @@ class ModelReviewWindow(QWidget):
         self.learn_button.setArrowType(Qt.DownArrow if on
                                        else Qt.RightArrow)
 
+    def _on_labels_panel(self, on: bool):
+        self.labels_panel.setVisible(bool(on))
+
+    def _on_panel_pick(self, verdict):
+        """A class clicked in the Labels panel: the keys are the grid's
+        again, and the class is the active label - onto the picked
+        chips, or the chip under the cursor, as the dropdown does."""
+        self.setFocus()
+        self.set_active(verdict)
+
     def _on_details(self, on: bool):
         self.right.setVisible(bool(on))
         self.detail.setVisible(bool(on))
@@ -942,6 +973,7 @@ class ModelReviewWindow(QWidget):
             if colour is not None and self._colours:
                 combo.setItemIcon(index, _swatch(colour))
         combo.blockSignals(False)
+        self.labels_panel.set_classes(self._classes, self._colours)
         if self._active not in self._classes and self._active != IGNORE:
             self._active = self._classes[0] if self._classes else None
         self._show_active()
@@ -1314,14 +1346,17 @@ class ModelReviewWindow(QWidget):
 
     def _kept(self, chip) -> bool:
         """Is the chip one the grid lists at all: not reviewed before,
-        nor labelled already, unless those are shown. A chip labelled
-        already under a verdict in hand - labelled by hand on the map
-        meanwhile - stays listed: the work on it is not hidden."""
+        nor labelled already, unless those are shown - but one with a
+        verdict in hand, whatever its standing, is always listed: a
+        second look given with Show reviewed on and then the box off
+        left the Import button counting chips nobody could see (2.9.7).
+        """
+        if pending(chip):
+            return True
         if chip.reviewed_before() and not self.show_reviewed_check.isChecked():
             return False
         if chip.labelled_already() \
-                and not self.show_labelled_check.isChecked() \
-                and not pending(chip):
+                and not self.show_labelled_check.isChecked():
             return False
         return True
 
@@ -1874,6 +1909,8 @@ class ModelReviewWindow(QWidget):
         self.import_button.setEnabled(n > 0)
         self.import_button.setText(
             f"Import {n} to project" if n else "Import to project")
+        self.labels_panel.set_counts(Counter(effective_verdict(chip)
+                                             for chip in verdicts))
         if not self._chips:
             self.status.setText("Open a file of the model's mistakes to "
                                 "begin.")
@@ -1935,6 +1972,7 @@ class ModelReviewWindow(QWidget):
             combo.setCurrentIndex(self._classes.index(self._active))
         combo.blockSignals(False)
         self.ignore_button.setChecked(self._active == IGNORE)
+        self.labels_panel.set_active(self._active)
 
     def _give(self, keys, verdict, what: "str | None") -> "dict | None":
         """These chips get this verdict, as one thing to take back;
@@ -2854,10 +2892,14 @@ class ModelReviewWindow(QWidget):
             == "true")
         self.show_reviewed_check.blockSignals(False)
         self.show_labelled_check.blockSignals(True)
+        # On to start with (2.9.7): the users asked for these chips to
+        # be told apart, not taken away.
         self.show_labelled_check.setChecked(
-            str(settings.value(_SHOW_LABELLED_KEY, "false")).lower()
-            == "true")
+            str(settings.value(_SHOW_LABELLED_KEY, "true")).lower()
+            != "false")
         self.show_labelled_check.blockSignals(False)
+        self.labels_check.setChecked(          # off: toggled hides the panel
+            str(settings.value(_LABELS_KEY, "true")).lower() != "false")
         self.mark_check.setChecked(
             str(settings.value(_MARK_KEY, "true")).lower() != "false")
         self.more_button.setChecked(
@@ -2955,8 +2997,10 @@ class ModelReviewWindow(QWidget):
         settings.setValue(_REF_COLUMNS_KEY, self.reference.columns)
         settings.setValue(_MIN_SCORE_KEY, self.score_spin.value())
         settings.setValue(_DETAILS_KEY, self.details_check.isChecked())
+        settings.setValue(_LABELS_KEY, self.labels_check.isChecked())
         settings.setValue(_CONTEXT_KEY, self.detail.context_spin.value())
         settings.setValue(_SPLITTER_KEY, self.splitter.saveState())
+        settings.remove(_OLD_SPLITTER_KEY)
         settings.setValue(_RIGHT_KEY, self.right.saveState())
         settings.setValue(_ACCEPT_KEY, self.accept_spin.value())
         settings.setValue(_BACKBONE_KEY, self.backbone_combo.currentData())

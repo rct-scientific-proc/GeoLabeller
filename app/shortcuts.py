@@ -184,6 +184,10 @@ SHORTCUT_SECTIONS = [
     ("Model Review (Labels > Model Review...)", [
         ("Ctrl+O", "Open a file of the model's mistakes"),
         ("Left-click chip", "Give it the active label"),
+        ("Labels panel (left)", "Click a class: the active label, onto "
+                                "the picked chips or the cursor's; type "
+                                "in its box to shorten the list, Enter "
+                                "takes the first"),
         ("Shift+Left-click", "Label every chip from the last click to this"),
         ("Ctrl+Left-click", "Pick a chip without labelling; a key then "
                             "labels the picked"),
