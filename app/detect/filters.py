@@ -100,20 +100,47 @@ def gaussian_blurs(values: np.ndarray, mask: np.ndarray, sigmas):
     pad = int(math.ceil(3.0 * max(sigmas)))
     big_h, big_w = _fast_size(h + 2 * pad), _fast_size(w + 2 * pad)
     canvas = np.zeros((big_h, big_w), dtype=np.float64)
-    weight = np.zeros((big_h, big_w), dtype=np.float64)
     canvas[pad:pad + h, pad:pad + w] = np.where(mask, values, 0.0)
-    weight[pad:pad + h, pad:pad + w] = mask
     spectrum = np.fft.rfft2(canvas)
-    weight_spectrum = np.fft.rfft2(weight)
-    fy = np.fft.fftfreq(big_h)[:, None]
-    fx = np.fft.rfftfreq(big_w)[None, :]
-    freq2 = fx * fx + fy * fy
+    # The weight's blur - what normalises a patch by an edge - cost a
+    # second inverse transform per sigma, half the ladder's time. An
+    # image with no holes has a weight that is a plain rectangle, and
+    # a Gaussian separates: its blur is the outer product of the blurs
+    # of the rows' and the columns' indicators, two one-dimensional
+    # transforms each (2.9.4). An image with nodata inside keeps the
+    # full transform.
+    whole = bool(mask.all())
+    if whole:
+        rows = np.zeros(big_h, dtype=np.float64)
+        rows[pad:pad + h] = 1.0
+        cols = np.zeros(big_w, dtype=np.float64)
+        cols[pad:pad + w] = 1.0
+        rows_spectrum = np.fft.rfft(rows)
+        cols_spectrum = np.fft.rfft(cols)
+        fy_r = np.fft.rfftfreq(big_h)
+    else:
+        weight = np.zeros((big_h, big_w), dtype=np.float64)
+        weight[pad:pad + h, pad:pad + w] = mask
+        weight_spectrum = np.fft.rfft2(weight)
+    fy = np.fft.fftfreq(big_h)
+    fx = np.fft.rfftfreq(big_w)
     for sigma in sigmas:
-        kernel = np.exp(-2.0 * math.pi * math.pi * sigma * sigma * freq2)
+        c = -2.0 * math.pi * math.pi * sigma * sigma
+        # The Gaussian separates in frequency too: two short exponentials
+        # and a product, not an exponential per cell of the grid.
+        ky = np.exp(c * fy * fy)
+        kx = np.exp(c * fx * fx)
+        kernel = ky[:, None] * kx[None, :]
         blurred = np.fft.irfft2(spectrum * kernel, s=(big_h, big_w))
-        seen = np.fft.irfft2(weight_spectrum * kernel, s=(big_h, big_w))
         blurred = blurred[pad:pad + h, pad:pad + w]
-        seen = seen[pad:pad + h, pad:pad + w]
+        if whole:
+            seen_y = np.fft.irfft(rows_spectrum * np.exp(c * fy_r * fy_r),
+                                  n=big_h)[pad:pad + h]
+            seen_x = np.fft.irfft(cols_spectrum * kx, n=big_w)[pad:pad + w]
+            seen = seen_y[:, None] * seen_x[None, :]
+        else:
+            seen = np.fft.irfft2(weight_spectrum * kernel, s=(big_h, big_w))
+            seen = seen[pad:pad + h, pad:pad + w]
         with np.errstate(invalid="ignore", divide="ignore"):
             result = np.where(seen > 1e-3, blurred / np.maximum(seen, 1e-3),
                               np.nan)
@@ -133,14 +160,20 @@ def block_median_mad(values: np.ndarray, mask: np.ndarray,
     nh, nw = -(-h // b), -(-w // b)
     padded = np.full((nh * b, nw * b), np.nan, dtype=np.float32)
     padded[:h, :w] = np.where(mask, values, np.nan)
-    tiles = padded.reshape(nh, b, nw, b)
+    # One row per tile, its pixels along it: a median over one axis.
+    # Over two axes at once numpy's nanmedian takes a path six times
+    # slower, 1.2 s of every image's time (2.9.4).
+    tiles = (padded.reshape(nh, b, nw, b).transpose(0, 2, 1, 3)
+             .reshape(nh * nw, b * b))
     with np.errstate(all="ignore"), warnings.catch_warnings():
         # A tile of nothing but nodata is an empty slice: its median
         # is NaN, filled below, and not a warning on the console.
         warnings.simplefilter("ignore", RuntimeWarning)
-        med = np.nanmedian(tiles, axis=(1, 3))
-        dev = np.abs(tiles - med[:, None, :, None])
-        mad = np.nanmedian(dev, axis=(1, 3)) * MAD_TO_SIGMA
+        med = np.nanmedian(tiles, axis=1)
+        dev = np.abs(tiles - med[:, None])
+        mad = np.nanmedian(dev, axis=1) * MAD_TO_SIGMA
+        med = med.reshape(nh, nw)
+        mad = mad.reshape(nh, nw)
         whole = np.nanmedian(padded)
         whole_mad = np.nanmedian(np.abs(padded - whole)) * MAD_TO_SIGMA
     if not np.isfinite(whole):
@@ -152,18 +185,43 @@ def block_median_mad(values: np.ndarray, mask: np.ndarray,
     floor = max(whole_mad * 0.25, 1e-6)
     mad = np.where(np.isfinite(mad) & (mad > 0), mad, whole_mad)
     mad = np.maximum(mad, floor)
-    background = np.repeat(np.repeat(med, b, axis=0), b, axis=1)[:h, :w]
-    spread = np.repeat(np.repeat(mad, b, axis=0), b, axis=1)[:h, :w]
-    background = background.astype(np.float32)
-    spread = spread.astype(np.float32)
-    if nh * nw > 1:
-        # Across the tile edges: a box blur half a tile wide - and no
-        # wider than a quarter of the image, whose padding is what a
-        # huge tile cost (2.9.1). One tile is one value: nothing to blur.
-        radius = min(b // 2, max(h, w) // 4)
-        background = box_blur(background, radius)
-        spread = box_blur(spread, radius)
+    # Across the tile edges: a box blur half a tile wide - and no wider
+    # than a quarter of the image (2.9.1). One tile is one value:
+    # nothing to blur.
+    radius = min(b // 2, max(h, w) // 4) if nh * nw > 1 else 0
+    background = tile_blur(med, b, h, w, radius)
+    spread = tile_blur(mad, b, h, w, radius)
     return background, np.maximum(spread, floor)
+
+
+def _tile_overlaps(n: int, b: int, count: int, radius: int) -> np.ndarray:
+    """(n, count): for each pixel along one axis, the share of its
+    window - ``radius`` each way, cut at the image - that lies in each
+    of the ``count`` tiles of ``b`` pixels (the last cut at the image).
+    The rows sum to one."""
+    pixels = np.arange(n)
+    lo = np.maximum(pixels - radius, 0)[:, None]
+    hi = np.minimum(pixels + radius, n - 1)[:, None]
+    tiles = np.arange(count)
+    tile_lo = (tiles * b)[None, :]
+    tile_hi = np.minimum((tiles + 1) * b, n)[None, :] - 1
+    overlap = np.clip(np.minimum(hi, tile_hi) - np.maximum(lo, tile_lo) + 1,
+                      0, None).astype(np.float64)
+    return overlap / overlap.sum(axis=1, keepdims=True)
+
+
+def tile_blur(tiles: np.ndarray, b: int, h: int, w: int,
+              radius: int) -> np.ndarray:
+    """The (h, w) map that is ``tiles`` spread over its ``b``-pixel
+    tiles and box-blurred ``radius`` each way (the window cut at the
+    image's edges, as box_blur cuts it): exactly that, found as a
+    weighted sum of the few tiles each window overlaps instead of a
+    blur over the full-size map (2.9.4)."""
+    tiles = np.asarray(tiles, dtype=np.float64)
+    nh, nw = tiles.shape
+    rows = _tile_overlaps(h, b, nh, max(0, int(radius)))
+    cols = _tile_overlaps(w, b, nw, max(0, int(radius)))
+    return ((rows @ tiles) @ cols.T).astype(np.float32)
 
 
 def local_maxima(values: np.ndarray, radius: int, floor: float) -> tuple:
