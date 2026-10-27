@@ -412,6 +412,7 @@ class ModelReviewWindow(QWidget):
         self._source = ""
         self._path = ""                 # the file, to write its notes
         self._write_failed = False      # said once per file
+        self._misplaced_said = False    # likewise, records that changed
         self._stale = False             # the labels changed while hidden
         self._report = None
         self._classes: list = []
@@ -1008,6 +1009,8 @@ class ModelReviewWindow(QWidget):
         self._source, self._chips, self._report = name, chips, report
         self._path = str(path)
         self._write_failed = False
+        self._misplaced_said = False
+        self._stale = False
         self._by_key = {chip.key: chip for chip in chips}
         # A project of before 2.9.4 holds its own memory: its notes on
         # this file's chips go into the file, once, and count from now.
@@ -1086,8 +1089,9 @@ class ModelReviewWindow(QWidget):
         into the file; False, said once, when it cannot be written."""
         if not self._path or not notes:
             return False
+        misplaced: list = []
         try:
-            outcomes.write_outcomes(self._path, notes)
+            outcomes.write_outcomes(self._path, notes, misplaced)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             if not self._write_failed:
                 self._write_failed = True
@@ -1095,7 +1099,16 @@ class ModelReviewWindow(QWidget):
                           f"{self._source}: {exc}\n\nThey hold for this "
                           "session; the file keeps no memory of them.")
             return False
-        return True
+        if misplaced and not self._misplaced_said:
+            # The file is not the one opened: its records moved (2.9.6).
+            self._misplaced_said = True
+            n = len(misplaced)
+            self._say(f"{n} note{'' if n == 1 else 's'} could not be placed "
+                      f"in {self._source}: the file has changed since it was "
+                      "opened, and those records are not the chips they "
+                      "were. They hold for this session. Open the file "
+                      "again to review it as it is now.")
+        return not misplaced
 
     def record_outcomes(self, notes: dict) -> bool:
         """An import went through (main window): each chip takes its
@@ -1147,8 +1160,12 @@ class ModelReviewWindow(QWidget):
                           "left the project dropped.")
         before = [(chip.key, chip.reviewed_before(), chip.verdict)
                   for chip in self._chips]
+        placed = {chip.key: (chip.pixel_x, chip.pixel_y)
+                  for chip in self._chips}
         for chip in self._chips:
             self._seat(chip, project)
+        moved = [chip for chip in self._chips
+                 if (chip.pixel_x, chip.pixel_y) != placed[chip.key]]
         changed = labelled.mark_near(self._chips, project,
                                      float(self.labelled_spin.value()))
         after = [(chip.key, chip.reviewed_before(), chip.verdict)
@@ -1165,6 +1182,10 @@ class ModelReviewWindow(QWidget):
             self._fill_filter()
             self._rebuild()
         else:
+            for chip in moved:
+                # Seated where its label went (moved on the map): its
+                # picture read again around it (2.9.6).
+                self._reload(chip)
             self._refresh_cells()
             self._show_counts()
 
@@ -1203,6 +1224,11 @@ class ModelReviewWindow(QWidget):
             image, label = find(earlier.label_id)
             if label is not None and self._image_of(chip) is not image:
                 label = None        # on another image: not this chip's
+            if label is not None and label.class_name != earlier.became:
+                # Given another class since - by hand on the map, or an
+                # import onto it undone: the note is stale, and the chip
+                # is labelled already by that label (2.9.6).
+                label = None
         if label is None:
             if not chip.label_gone:
                 chip.label_gone = True
@@ -1303,7 +1329,7 @@ class ModelReviewWindow(QWidget):
         """The chip's centre moved: the labels within the distance of
         it again, at once, so a chip put onto a label is labelled
         already before any import."""
-        own = chip.earlier.label_id if chip.earlier is not None else None
+        own = chip.earlier.label_id if chip.reviewed_before() else None
         chip.near = labelled.near_labels(
             self._project(), chip.image_path, chip.pixel_x, chip.pixel_y,
             float(self.labelled_spin.value()), exclude=own)

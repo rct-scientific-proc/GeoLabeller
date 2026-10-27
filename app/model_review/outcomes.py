@@ -27,12 +27,13 @@ Qt-free.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 
 from .ledger import (OUTCOME_KEY, LedgerIndex, Verdict, image_key,
                      outcome_to_dict)
-from .source import _LIST_KEYS, parse_candidates
+from .source import _IMAGE_KEYS, _LIST_KEYS, parse_candidates
 
 
 def _records_of(data):
@@ -48,11 +49,14 @@ def _records_of(data):
     return data
 
 
-def write_outcomes(path, outcomes: dict) -> int:
+def write_outcomes(path, outcomes: dict, misplaced=None) -> int:
     """Write ``outcomes`` - record index -> Verdict, or None to take a
     note away - into the file at ``path``, every other field kept, and
     atomically: the file is whole or untouched. Returns how many
-    records changed. OSError when the file cannot be written."""
+    records changed. OSError when the file cannot be written. A record
+    that is no longer the chip's - the file replaced since it was
+    opened, its image another - takes no note; its index goes into
+    ``misplaced`` when a list is given (2.9.6)."""
     path = Path(path)
     with open(path, "r", encoding="utf-8") as handle:
         data = json.load(handle)
@@ -61,20 +65,40 @@ def write_outcomes(path, outcomes: dict) -> int:
     for index, verdict in outcomes.items():
         if not (0 <= index < len(records)) or not isinstance(records[index],
                                                               dict):
+            if misplaced is not None:
+                misplaced.append(index)
+            continue
+        record = records[index]
+        if verdict is not None and not _same_image(record, verdict):
+            if misplaced is not None:
+                misplaced.append(index)
             continue
         if verdict is None:
-            if records[index].pop(OUTCOME_KEY, None) is not None:
+            if record.pop(OUTCOME_KEY, None) is not None:
                 changed += 1
         else:
-            records[index][OUTCOME_KEY] = outcome_to_dict(verdict)
+            record[OUTCOME_KEY] = outcome_to_dict(verdict)
             changed += 1
     if not changed:
         return 0
     temp = path.with_name(path.name + ".tmp")
     with open(temp, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=1)
+        # The team's own characters kept, not escaped: the file stays
+        # theirs to read (2.9.6).
+        json.dump(data, handle, indent=1, ensure_ascii=False)
     os.replace(temp, path)
     return changed
+
+
+def _same_image(record: dict, verdict) -> bool:
+    """Is the record's image the note's, by file name - the one thing
+    both are sure to agree on when the record is the chip's."""
+    name = None
+    for key in _IMAGE_KEYS:
+        if isinstance(record.get(key), str):
+            name = record[key]
+            break
+    return name is None or image_key(name) == image_key(verdict.image)
 
 
 def read_outcomes(path) -> list:
@@ -120,24 +144,31 @@ def carry_over(records: list, previous: list, tolerance: float) -> int:
     taken: set = set()
     given = 0
     records = [r for r in records if isinstance(r, dict)]
+
+    def answers(record):
+        """The old notes within reach of the record, nearest first:
+        the tolerance, or half the candidate's size if that is more -
+        the reach the skip has (2.9.6: a big object found a few pixels
+        further off kept its note with the skip on and lost it off)."""
+        x, y = float(record["x"]), float(record["y"])
+        reach = max(float(tolerance), float(record.get("size_px") or 0) / 2)
+        found = index.within(image_key(record.get("image", "")), x, y, reach)
+        return sorted(found, key=lambda v: math.hypot(v.pixel_x - x,
+                                                      v.pixel_y - y))
     # A record written with its note already (a run that kept a
     # reviewed spot aside) holds its own; the note it carries is spent.
     for record in records:
         note = record.get(OUTCOME_KEY)
         if note is None:
             continue
-        for _goodness, verdict in index.candidates(
-                image_key(record.get("image", "")), float(record["x"]),
-                float(record["y"]), record.get("class")):
+        for verdict in answers(record):
             if id(verdict) not in taken and outcome_to_dict(verdict) == note:
                 taken.add(id(verdict))
                 break
     for record in records:
         if record.get(OUTCOME_KEY) is not None:
             continue
-        for _goodness, verdict in index.candidates(
-                image_key(record.get("image", "")), float(record["x"]),
-                float(record["y"]), record.get("class")):
+        for verdict in answers(record):
             if id(verdict) in taken:
                 continue
             taken.add(id(verdict))

@@ -104,7 +104,10 @@ def mark_near(chips, project, radius: float) -> bool:
     index = LabelIndex(project, radius)
     changed = False
     for chip in chips:
-        own = chip.earlier.label_id if chip.earlier is not None else None
+        # The chip's own label is left out while the note stands; a note
+        # that does not - its label gone, or of another class now - is
+        # no claim on the label there (2.9.6).
+        own = chip.earlier.label_id if chip.reviewed_before() else None
         before = chip.labelled_already()
         chip.near = index.near(chip.image_path, chip.pixel_x, chip.pixel_y,
                                exclude=own)
