@@ -211,6 +211,10 @@ SHORTCUT_SECTIONS = [
         ("1-9", "The class at that place in the list: onto the picked "
                 "chips, or the chip under the cursor (then the next)"),
         ("Shift+1-9", "The tenth to the eighteenth class, the same way"),
+        ("Show: list", "All, To look at, Labelled, Ignored; Reviewed "
+                       "before, Changed, Labelled already - those three "
+                       "whatever the Show boxes say; one entry per "
+                       "labelled class"),
         ("0", "Ignore: looked at, nothing to label"),
         ("Arrows / Home / End", "Move the cursor from chip to chip; past the "
                                 "page's end it turns the page"),

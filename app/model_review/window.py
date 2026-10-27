@@ -126,6 +126,14 @@ HOVER_MS = 250                  # the mouse rests on a chip this long
                                 # before the panel turns to it
 VERDICT_FILTERS = (("All", "all"), ("To look at", "todo"),
                    ("Labelled", "labelled"), ("Ignored", "ignored"))
+# The Show: list's standings (2.9.9): each lists exactly those chips,
+# whatever the Show reviewed / Show labelled already boxes say - a
+# view of the done pile, or of what matches a label already there,
+# must not come up empty because a box is off.
+STANDING_FILTERS = (("Reviewed before", "reviewed"),
+                    ("Changed", "changed"),
+                    ("Labelled already", "already"))
+STANDINGS = tuple(data for _text, data in STANDING_FILTERS)
 ORDERS = (("Model score", "score"), ("Suggestion", "suggestion"))
 ANY_SUGGESTION = None           # the Suggested box's first entry
 DEFAULT_ACCEPT = 0.90           # a suggestion at least this sure is taken
@@ -379,6 +387,12 @@ def _passes(chip, standing: str) -> bool:
     """Does the chip belong on the Show: list? A chip reviewed in an
     earlier round counts by what it became - unless given a new
     verdict here (2.8.5)."""
+    if standing == "reviewed":
+        return chip.reviewed_before()
+    if standing == "changed":
+        return chip.reviewed_before() and chip.verdict is not None
+    if standing == "already":
+        return chip.labelled_already()
     verdict = chip.verdict
     if verdict is None and chip.reviewed_before():
         verdict = chip.earlier.became
@@ -577,9 +591,13 @@ class ModelReviewWindow(QWidget):
             self.verdict_filter.addItem(text, data)
         self.verdict_filter.setToolTip(
             "Which chips the grid lists: all of them, the ones still to\n"
-            "look at, the labelled - all, or one class - or the ignored.\n"
-            "The list settles at the next page turn, so a chip just\n"
-            "labelled stays put till then.")
+            "look at, the labelled - all, or one class - or the ignored;\n"
+            "or one standing: Reviewed before (the done pile, with a note\n"
+            "from an earlier import), Changed (an earlier answer with a\n"
+            "new verdict in hand), Labelled already (a label within the\n"
+            "distance on the image) - those three whatever the Show\n"
+            "boxes say. The list settles at the next page turn, so a chip\n"
+            "just labelled stays put till then.")
         self.verdict_filter.currentIndexChanged.connect(self._on_filter)
         self.verdict_filter.activated.connect(lambda _i: self.setFocus())
         third.addWidget(self.verdict_filter)
@@ -1388,6 +1406,8 @@ class ModelReviewWindow(QWidget):
         verdict in hand, whatever its standing, is always listed: a
         second look given with Show reviewed on and then the box off
         left the Import button counting chips nobody could see (2.9.7).
+        Not asked for the Show: list's standings (2.9.9), which list
+        exactly those chips whatever the boxes say.
         """
         if pending(chip):
             return True
@@ -1422,11 +1442,25 @@ class ModelReviewWindow(QWidget):
         combo.blockSignals(False)
 
     def _fill_verdict_filter(self):
-        """The Show: list's entries: the four, then one per class with
-        chips labelled that class - this session's verdicts, and earlier
+        """The Show: list's entries: the four; the standings with their
+        counts, greyed at none (2.9.9); then one per class with chips
+        labelled that class - this session's verdicts, and earlier
         rounds' when they are shown - the choice kept."""
         combo = self.verdict_filter
         show_reviewed = self.show_reviewed_check.isChecked()
+        current = combo.currentData()
+        standings = Counter()
+        for chip in self._chips:
+            if chip.reviewed_before():
+                standings["reviewed"] += 1
+                if chip.verdict is not None:
+                    standings["changed"] += 1
+            if chip.labelled_already():
+                standings["already"] += 1
+        # (text, data, enabled): the choice stays while it is the choice.
+        wanted = [(f"{text} ({standings[data]})", data,
+                   standings[data] > 0 or data == current)
+                  for text, data in STANDING_FILTERS]
         counts: Counter = Counter()
         for chip in self._chips:
             if chip.reviewed_before() and not show_reviewed:
@@ -1439,26 +1473,28 @@ class ModelReviewWindow(QWidget):
                 standing = None
             if standing not in (None, IGNORE):
                 counts[standing] += 1
-        current = combo.currentData()
         if (isinstance(current, str) and current.startswith("labelled:")
                 and current[len("labelled:"):] not in counts):
             # The choice stays while it is the choice: the list settles
             # at a page turn, not under the cursor.
             counts[current[len("labelled:"):]] = 0
-        wanted = [(f"Labelled {name} ({counts[name]})", "labelled:" + name)
-                  for name in sorted(counts)]
-        have = [(combo.itemText(i), combo.itemData(i))
+        classes = [(f"Labelled {name} ({counts[name]})", "labelled:" + name,
+                    True) for name in sorted(counts)]
+        have = [(combo.itemText(i), combo.itemData(i),
+                 combo.model().item(i).isEnabled())
                 for i in range(len(VERDICT_FILTERS), combo.count())
                 if combo.itemData(i) is not None]
-        if have == wanted:
+        if have == wanted + classes:
             return
         combo.blockSignals(True)
         while combo.count() > len(VERDICT_FILTERS):
             combo.removeItem(combo.count() - 1)
-        if wanted:
-            combo.insertSeparator(combo.count())
-            for text, data in wanted:
+        for group in (wanted, classes):
+            if group:
+                combo.insertSeparator(combo.count())
+            for text, data, enabled in group:
                 combo.addItem(text, data)
+                combo.model().item(combo.count() - 1).setEnabled(enabled)
         index = combo.findData(current) if current is not None else -1
         combo.setCurrentIndex(index if index >= 0 else 0)
         combo.blockSignals(False)
@@ -1470,7 +1506,7 @@ class ModelReviewWindow(QWidget):
                      if self._suggestions else ANY_SUGGESTION)
         chosen = [chip for chip in self._chips
                   if (wanted is ALL_CLASSES or chip.predicted == wanted)
-                  and self._kept(chip)
+                  and (standing in STANDINGS or self._kept(chip))
                   and _passes(chip, standing)
                   and (suggested is ANY_SUGGESTION
                        or self._suggested_class(chip.key) == suggested)]
