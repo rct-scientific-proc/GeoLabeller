@@ -163,6 +163,12 @@ SHORTCUT_SECTIONS = [
         ("K", "Clean Close Labels: keep both, then the next pair"),
         ("1 / 2 / 3", "Clean Close Labels: remove the left / the right / "
                       "both (one undo step each)"),
+        ("View > Label Markers",
+         "A linked object as one marker (counting its views), the other "
+         "views as dots or not drawn; or every label"),
+        ("Ctrl + rest on a label",
+         "Its snippet beside the cursor (View > Hover Snippet sets the "
+         "size, or Off)"),
     ]),
     ("Find Candidates (Labels > Find Candidates...)", [
         ("Labels > Find Candidates...",

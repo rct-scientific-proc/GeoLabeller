@@ -155,6 +155,22 @@ def _rgba_pixmap(rgba: np.ndarray) -> QPixmap:
 # A marker rejected in review is drawn at this opacity.
 REJECTED_OPACITY = 0.3
 
+# View > Label Markers (2.9.2): how the labels of one linked object are
+# drawn. A dozen views of one wreck were a dozen circles over it, and
+# the users had to zoom in to find the wreck. Every label as its own
+# marker (as before); one marker per object with the other views as
+# small dots, still there to click; or one marker per object alone.
+MARKERS_EVERY = "every"
+MARKERS_DOTS = "dots"
+MARKERS_ONE = "one"
+MARKER_MODES = (MARKERS_EVERY, MARKERS_DOTS, MARKERS_ONE)
+DOT_FACTOR = 0.4                # a dot's size as a fraction of a marker's
+ROLE_FULL, ROLE_DOT, ROLE_HIDDEN = "full", "dot", "hidden"
+
+# View > Hover Snippet (2.9.2): the mouse rested this long on a marker,
+# Ctrl held, asks for the label's snippet.
+HOVER_REST_MS = 350
+
 class _ActiveBrackets(QGraphicsPathItem):
     """Four corner brackets around a label marker: "this label is on the
     image being shown".
@@ -2180,6 +2196,12 @@ class MapCanvas(QGraphicsView):
 
     label_removed = pyqtSignal(int, str)
 
+    # View > Hover Snippet (2.9.2): the mouse rested on a label's marker
+    # with Ctrl held, (label_id, image_path); and left it, or the user
+    # did something else - the snippet shown for it goes.
+    label_hover_requested = pyqtSignal(int, str)
+    label_hover_ended = pyqtSignal()
+
     # Signal emitted when two labels are linked: (label_id1, label_id2)
     labels_linked = pyqtSignal(int, int)
 
@@ -2377,6 +2399,31 @@ class MapCanvas(QGraphicsView):
         # two images rather than every marker in the project.
         self._active_image_key: str | None = None
         self._labels_by_image: dict[str, set] = {}
+        # View > Label Markers (2.9.2): label id -> object id and object
+        # id -> label ids, for one marker per linked object; which label
+        # of an object the user asked to see (a reveal); each marker's
+        # (role, count) as last applied; the images whose markers a
+        # layer toggle hid. The pass that applies the mode runs once per
+        # event-loop turn, however many changes asked for it.
+        self._marker_mode = MARKERS_EVERY
+        self._object_of: dict[int, str] = {}
+        self._labels_of_object: dict[str, set] = {}
+        self._preferred: dict[str, int] = {}
+        self._marker_role: dict[int, tuple] = {}
+        self._hidden_image_keys: set = set()
+        self._marker_pass_timer = QTimer(self)
+        self._marker_pass_timer.setSingleShot(True)
+        self._marker_pass_timer.setInterval(0)
+        self._marker_pass_timer.timeout.connect(self._apply_marker_mode)
+        # View > Hover Snippet (2.9.2): on, the label under the resting
+        # mouse, and the one whose snippet is up.
+        self._hover_enabled = False
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.setInterval(HOVER_REST_MS)
+        self._hover_timer.timeout.connect(self._hover_fire)
+        self._hover_pending: tuple = (None, None)
+        self._hover_shown: int | None = None
         # The label being moved (right-click > Move), waiting for the click
         # that says where to; and its marker's pen, to put back.
         self._move_label_id: int | None = None
@@ -3935,6 +3982,8 @@ class MapCanvas(QGraphicsView):
             # For non-geo layers, toggle associated label markers
             if not layer.geo:
                 self._set_label_visibility_for_image(layer.file_path, visible)
+            # Which of an object's labels is drawn may follow (2.9.2).
+            self._schedule_marker_pass()
             # Force viewport update to ensure cursor appears on top of tiles
             self.viewport().update()
 
@@ -4068,6 +4117,7 @@ class MapCanvas(QGraphicsView):
         self._tile_build_timer.stop()
         self._layers.clear()
         self._active_image_key = None
+        self._hidden_image_keys.clear()
         self._visible_layer_ids.clear()
         self._empty_tiles.clear()
         self._world_rect_cache = None
@@ -4355,6 +4405,7 @@ class MapCanvas(QGraphicsView):
         so centerOn never clamps and this stays accurate at any zoom. Done in
         scene coordinates, so it is unaffected by view rotation.
         """
+        self._hover_end()
         factor = 1.15
         dy = event.angleDelta().y()
         if dy == 0:
@@ -4675,6 +4726,7 @@ class MapCanvas(QGraphicsView):
 
     def mousePressEvent(self, event):
         """Handle mouse press for labeling."""
+        self._hover_end()
         # Box-link mode intercepts clicks the same way: left press starts
         # (or restarts) the box, right click cancels the mode.
         if self._box_link_anchor is not None:
@@ -4916,6 +4968,7 @@ class MapCanvas(QGraphicsView):
             self._queue_coords_emit(
                 lon, lat, layer_name, group_path, False,
                 layer.file_path if layer is not None and layer.geo else "")
+        self._hover_track(event)
 
     def _queue_coords_emit(self, x: float, y: float, layer_name: str,
                            group_path: str, is_pixel: bool,
@@ -4995,6 +5048,8 @@ class MapCanvas(QGraphicsView):
 
     def keyReleaseEvent(self, event):
         """Stop the waterfall glide when the Space key is physically released."""
+        if event.key() == Qt.Key_Control:
+            self._hover_end()           # the hover snippet needs Ctrl held
         if (self._mode == CanvasMode.WATERFALL
                 and event.key() == Qt.Key_Space
                 and not event.isAutoRepeat()):
@@ -5140,7 +5195,7 @@ class MapCanvas(QGraphicsView):
                          image_name: str, image_group: str, image_path: str,
                          class_name: str, color: QColor = None,
                          pixel_x: float = None, pixel_y: float = None,
-                         ring_color: QColor = None):
+                         ring_color: QColor = None, object_id: str = ""):
         """Add a visual marker for a label on the canvas.
 
         Args:
@@ -5154,6 +5209,7 @@ class MapCanvas(QGraphicsView):
             color: Optional color for the marker
             pixel_x: Pixel X coord — for non-geo layers, used to position marker
             pixel_y: Pixel Y coord — for non-geo layers, used to position marker
+            object_id: The label's object, for View > Label Markers
         """
         if color is None:
             color = QColor(255, 50, 50)  # Default red
@@ -5193,6 +5249,217 @@ class MapCanvas(QGraphicsView):
         self._labels_by_image.setdefault(key, set()).add(label_id)
         if key == self._active_image_key:
             self._set_brackets(ellipse, True)
+        self._register_object(label_id, object_id)
+        self._schedule_marker_pass()
+
+    # ------------------------------------------------------------------
+    # View > Label Markers (2.9.2): one marker per linked object
+    # ------------------------------------------------------------------
+
+    def marker_mode(self) -> str:
+        return self._marker_mode
+
+    def set_marker_mode(self, mode: str):
+        """MARKERS_EVERY, MARKERS_DOTS or MARKERS_ONE; applied at once."""
+        if mode not in MARKER_MODES:
+            mode = MARKERS_EVERY
+        if mode == self._marker_mode:
+            return
+        self._marker_mode = mode
+        self._apply_marker_mode()
+
+    def set_label_object(self, label_id: int, object_id: str):
+        """The label's object changed (a link, an unlink)."""
+        if label_id in self._label_items \
+                and self._object_of.get(label_id, "") != (object_id or ""):
+            self._register_object(label_id, object_id)
+            self._schedule_marker_pass()
+
+    def prefer_label(self, label_id: int):
+        """The user asked to see this label (a reveal): it is the one of
+        its object drawn, unless the image being shown has one."""
+        object_id = self._object_of.get(label_id)
+        if object_id is not None:
+            self._preferred[object_id] = label_id
+            self._schedule_marker_pass()
+
+    def marker_role(self, label_id: int) -> str:
+        """ROLE_FULL, ROLE_DOT or ROLE_HIDDEN, as drawn."""
+        return self._marker_role.get(label_id, (ROLE_FULL, 0))[0]
+
+    def _register_object(self, label_id: int, object_id: str):
+        old = self._object_of.pop(label_id, None)
+        if old is not None:
+            group = self._labels_of_object.get(old)
+            if group is not None:
+                group.discard(label_id)
+                if not group:
+                    del self._labels_of_object[old]
+                    self._preferred.pop(old, None)
+        if object_id:
+            self._object_of[label_id] = object_id
+            self._labels_of_object.setdefault(object_id, set()).add(label_id)
+
+    def _schedule_marker_pass(self):
+        if self._marker_mode != MARKERS_EVERY \
+                and not self._marker_pass_timer.isActive():
+            self._marker_pass_timer.start()
+
+    def _primary_of(self, object_id: str, ids: set) -> int:
+        """Which of an object's labels is drawn in full: the one on the
+        image being shown; else the one the user asked to see; else the
+        one on the topmost shown layer (an image not loaded counts
+        between a shown layer and a hidden one); else the lowest id."""
+        if self._active_image_key is not None:
+            on_active = self._labels_by_image.get(self._active_image_key, ())
+            for label_id in sorted(ids):
+                if label_id in on_active:
+                    return label_id
+        preferred = self._preferred.get(object_id)
+        if preferred in ids:
+            return preferred
+        best, best_rank = None, None
+        for label_id in sorted(ids):
+            item = self._label_items.get(label_id)
+            if item is None:
+                continue
+            layer_id = self._path_to_layer.get(item[0].data(0))
+            layer = self._layers.get(layer_id) if layer_id else None
+            if layer is None:
+                rank = (1, 0)
+            elif layer_id in self._visible_layer_ids:
+                rank = (2, layer.z_value)
+            else:
+                rank = (0, 0)
+            if best_rank is None or rank > best_rank:
+                best, best_rank = label_id, rank
+        return best if best is not None else min(ids)
+
+    def _apply_marker_mode(self):
+        """Give every marker the role the mode says, changing only those
+        whose role or count differs from what was last applied."""
+        self._marker_pass_timer.stop()
+        wanted: dict = {}
+        if self._marker_mode != MARKERS_EVERY:
+            other = ROLE_DOT if self._marker_mode == MARKERS_DOTS \
+                else ROLE_HIDDEN
+            for object_id, ids in self._labels_of_object.items():
+                if len(ids) < 2:
+                    continue
+                primary = self._primary_of(object_id, ids)
+                for label_id in ids:
+                    wanted[label_id] = ((ROLE_FULL, len(ids))
+                                        if label_id == primary
+                                        else (other, 0))
+        for label_id in set(self._marker_role) | set(wanted):
+            state = wanted.get(label_id, (ROLE_FULL, 0))
+            if self._marker_role.get(label_id, (ROLE_FULL, 0)) == state:
+                continue
+            if label_id in self._label_items:
+                self._apply_role(label_id, *state)
+            if state == (ROLE_FULL, 0):
+                self._marker_role.pop(label_id, None)
+            else:
+                self._marker_role[label_id] = state
+
+    def _apply_role(self, label_id: int, role: str, count: int):
+        ellipse, text = self._label_items[label_id]
+        shown = self._image_key(ellipse.data(0)) not in self._hidden_image_keys
+        full = role == ROLE_FULL
+        ellipse.setVisible(shown and role != ROLE_HIDDEN)
+        text.setVisible(shown and full)
+        ring = self._ring_of(ellipse)
+        if ring is not None:
+            ring.setVisible(full)
+        ellipse.setData(8, DOT_FACTOR if role == ROLE_DOT else 1.0)
+        self._size_marker(ellipse, text, self._marker_px())
+        text.setData(2, f" \u00d7{count}" if count > 1 else "")
+        self._set_caption(text)
+        if role == ROLE_HIDDEN and label_id == self._hover_shown:
+            self._hover_end()
+
+    def _marker_px(self) -> float:
+        """A marker's size in scene units: about ten pixels on screen."""
+        view_scale = self._view_scale()
+        return 10 / view_scale if view_scale > 0 else 10
+
+    def _size_marker(self, ellipse, text, marker_size: float):
+        """Size one marker's parts for ``marker_size`` (a full marker's);
+        a dot takes its fraction of it."""
+        size = marker_size * (ellipse.data(8) or 1.0)
+        ellipse.setRect(-size / 2, -size / 2, size, size)
+        pen = ellipse.pen()
+        pen.setWidthF(size / 5)
+        ellipse.setPen(pen)
+        # The linked-group halo scales with its marker.
+        ring = self._ring_of(ellipse)
+        if ring is not None:
+            ring_size = marker_size * self._RING_FACTOR
+            ring.setRect(-ring_size / 2, -ring_size / 2,
+                         ring_size, ring_size)
+            ring_pen = ring.pen()
+            ring_pen.setWidthF(marker_size / 4)
+            ring.setPen(ring_pen)
+        brackets = self._brackets_of(ellipse)
+        if brackets is not None:
+            brackets.resize(marker_size)
+        # Text ignores the view transform (constant size / upright), so it
+        # only needs repositioning as the marker size changes.
+        pos = ellipse.pos()
+        text.setPos(pos.x() + size / 2, pos.y() - size / 2)
+
+    @staticmethod
+    def _set_caption(text):
+        """The caption from its parts: the class, the size measured, and
+        in View > Label Markers how many views the marker stands for."""
+        text.setPlainText((text.data(0) or "") + (text.data(1) or "")
+                          + (text.data(2) or ""))
+
+    # ------------------------------------------------------------------
+    # View > Hover Snippet (2.9.2): Ctrl held, the mouse at rest on a
+    # marker, asks the main window for that label's snippet
+    # ------------------------------------------------------------------
+
+    def set_hover_enabled(self, on: bool):
+        self._hover_enabled = bool(on)
+        if not on:
+            self._hover_end()
+
+    def _hover_track(self, event):
+        if not self._hover_enabled:
+            return
+        if event.buttons() or not (event.modifiers() & Qt.ControlModifier):
+            self._hover_end()
+            return
+        label_id, image_path = self._get_label_at_position(event.pos())
+        if label_id is None:
+            self._hover_end()
+            return
+        if label_id == self._hover_shown:
+            return
+        if self._hover_shown is not None:
+            self._hover_end()           # another marker: the first goes
+        if label_id != self._hover_pending[0]:
+            self._hover_pending = (label_id, image_path)
+            self._hover_timer.start()
+
+    def _hover_fire(self):
+        label_id, image_path = self._hover_pending
+        if label_id is None or label_id not in self._label_items:
+            return
+        self._hover_shown = label_id
+        self.label_hover_requested.emit(label_id, image_path)
+
+    def _hover_end(self):
+        self._hover_timer.stop()
+        self._hover_pending = (None, None)
+        if self._hover_shown is not None:
+            self._hover_shown = None
+            self.label_hover_ended.emit()
+
+    def leaveEvent(self, event):
+        self._hover_end()
+        super().leaveEvent(event)
 
     # ------------------------------------------------------------------
     # The labels of the image being shown. Asked for 2026-10-02: stepping
@@ -5236,6 +5503,7 @@ class MapCanvas(QGraphicsView):
             item = self._label_items.get(new_id)
             if item is not None:
                 self._set_brackets(item[0], True)
+        self._schedule_marker_pass()
 
     def active_image_labels(self) -> set:
         """The ids of the labels now wearing the brackets."""
@@ -5258,11 +5526,8 @@ class MapCanvas(QGraphicsView):
         ``ring_color`` adds the linked-group halo: an outer circle in the
         group's colour (see set_label_ring).
         """
-        # Get current view scale to size markers appropriately
-        view_scale = self._view_scale()
-
         # Marker size in scene coordinates (appears ~10 pixels on screen)
-        marker_size = 10 / view_scale if view_scale > 0 else 10
+        marker_size = self._marker_px()
 
         # Create ellipse marker
         ellipse = QGraphicsEllipseItem(
@@ -5438,6 +5703,11 @@ class MapCanvas(QGraphicsView):
             self._scene.removeItem(ellipse)
             self._scene.removeItem(text)
             del self._label_items[label_id]
+            self._register_object(label_id, "")
+            self._marker_role.pop(label_id, None)
+            self._schedule_marker_pass()
+        if label_id == self._hover_shown:
+            self._hover_end()
         if label_id == self._move_label_id:
             # Its marker is being rebuilt under a pending move: the pen
             # kept for it belongs to the one just removed.
@@ -5454,10 +5724,16 @@ class MapCanvas(QGraphicsView):
 
     def _set_label_visibility_for_image(self, image_path: str, visible: bool):
         """Show or hide all label markers belonging to a specific image."""
-        for ellipse, text in self._label_items.values():
+        key = self._image_key(image_path)
+        if visible:
+            self._hidden_image_keys.discard(key)
+        else:
+            self._hidden_image_keys.add(key)
+        for label_id, (ellipse, text) in self._label_items.items():
             if ellipse.data(0) == image_path:
-                ellipse.setVisible(visible)
-                text.setVisible(visible)
+                role = self.marker_role(label_id)
+                ellipse.setVisible(visible and role != ROLE_HIDDEN)
+                text.setVisible(visible and role == ROLE_FULL)
 
     def update_label_markers_scale(self):
         """Update label marker sizes based on current zoom level."""
@@ -5472,32 +5748,7 @@ class MapCanvas(QGraphicsView):
         markers.extend((ellipse, text) for _lid, ellipse, text
                        in self._waterfall_projection_items)
         for ellipse, text in markers:
-            # Update ellipse size
-            ellipse.setRect(
-                -marker_size / 2, -marker_size / 2,
-                marker_size, marker_size
-            )
-            pen = ellipse.pen()
-            pen.setWidthF(marker_size / 5)
-            ellipse.setPen(pen)
-
-            # The linked-group halo scales with its marker.
-            ring = self._ring_of(ellipse)
-            if ring is not None:
-                ring_size = marker_size * self._RING_FACTOR
-                ring.setRect(-ring_size / 2, -ring_size / 2,
-                             ring_size, ring_size)
-                ring_pen = ring.pen()
-                ring_pen.setWidthF(marker_size / 4)
-                ring.setPen(ring_pen)
-            brackets = self._brackets_of(ellipse)
-            if brackets is not None:
-                brackets.resize(marker_size)
-
-            # Text ignores the view transform (constant size / upright), so it
-            # only needs repositioning as the marker size changes.
-            pos = ellipse.pos()
-            text.setPos(pos.x() + marker_size / 2, pos.y() - marker_size / 2)
+            self._size_marker(ellipse, text, marker_size)
 
         # Keep the ruler readout a constant on-screen size across zoom changes.
         self._rescale_ruler_text()
@@ -6370,13 +6621,13 @@ class MapCanvas(QGraphicsView):
             pen.setColor(ellipse.brush().color().darker(150))
         ellipse.setPen(pen)
 
-        base = text.data(0) or text.toPlainText()
         if measured and (length_m is not None or width_m is not None):
             length_s = f"{length_m:.1f}" if length_m is not None else "?"
             width_s = f"{width_m:.1f}" if width_m is not None else "?"
-            text.setPlainText(f"{base} ({length_s}×{width_s} m)")
+            text.setData(1, f" ({length_s}×{width_s} m)")
         else:
-            text.setPlainText(base)
+            text.setData(1, "")
+        self._set_caption(text)
 
     def set_label_rejected(self, label_id: int, rejected: bool):
         """Draw a label rejected in review dimmed, so it stays visible

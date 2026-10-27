@@ -17,11 +17,12 @@ import rasterio
 from pyproj import Transformer
 from PyQt5.QtCore import (Qt, Qt as QtCore_Qt, QTimer, QEvent, QThread,
                           QObject, QUrl, pyqtSignal)
-from PyQt5.QtGui import QColor, QDesktopServices, QKeyEvent
+from PyQt5.QtGui import QColor, QCursor, QDesktopServices, QKeyEvent
 from PyQt5.QtWidgets import (
     QMainWindow,
     QSplitter,
     QAction,
+    QActionGroup,
     QFileDialog,
     QStatusBar,
     QLabel,
@@ -37,10 +38,12 @@ from PyQt5.QtWidgets import (
 from .axis_ruler import MapCanvasWithAxes
 from .canvas import (MapCanvas, CanvasMode, CYCLE_MODES, STEP_CYCLE_MODES,
                      AsyncFileLoaderThread, LoadCancelled, TiledLayer,
+                     MARKERS_DOTS, MARKERS_EVERY, MARKERS_ONE, MARKER_MODES,
                      _emit_safely)
 from .class_editor import (ClassEditorDialog, DescriptionEditorDialog,
                            MaskNameEditorDialog, RenameClassDialog)
 from .close_labels import CloseLabelsWindow
+from . import hover_snippet
 from .goto_location import (GoToLocationDialog, WaypointDialog,
                             format_lat_lon)
 from .labels import (CONFIDENCE_UNSET, REVIEW_ACCEPTED, REVIEW_RECHECK,
@@ -73,7 +76,7 @@ from .relocate import (RelocateImagesDialog, RemoveMissingImagesDialog,
 from .snippet_editor import SnippetEditor
 from .snippet_editor.size_section import shares_with_linked, size_text
 from .snippet_panel import SnippetPanel
-from .snippets import cached_band_scaling
+from .snippets import SnippetLoader, cached_band_scaling
 from .value_probe import ValueProbe
 from .resources import howto_path, icd_path
 from .version import app_title, app_version
@@ -446,6 +449,11 @@ class MainWindow(QMainWindow):
         self._model_review = None
         self._detect_dialog = None      # Labels > Find Candidates...
         self._cleaner = None            # Labels > Clean Close Labels...
+        # View > Hover Snippet (app/hover_snippet, 2.9.2): the window,
+        # the loader that reads for it, and the label it is wanted for.
+        self._hover_popup = None
+        self._hover_loader = None
+        self._hover_wanted = None
         # Last-used export settings, so a re-export doesn't start from scratch.
         # An existing target file's own settings still take precedence.
         self._h5_last_options: dict = {}
@@ -703,6 +711,8 @@ class MainWindow(QMainWindow):
         self.canvas.layer_read.connect(self._on_layer_read)
         self.canvas.label_placed.connect(self._on_label_placed)
         self.canvas.label_removed.connect(self._on_label_removed)
+        self.canvas.label_hover_requested.connect(self._on_label_hover)
+        self.canvas.label_hover_ended.connect(self._on_label_hover_ended)
         self.canvas.labels_linked.connect(self._on_labels_linked)
         self.canvas.label_unlinked.connect(self._on_label_unlinked)
         self.canvas.label_describe_requested.connect(self._describe_label)
@@ -1029,6 +1039,51 @@ class MainWindow(QMainWindow):
         self.value_action.setChecked(self._pixel_values_wanted())
         self.value_action.toggled.connect(self._on_pixel_values_toggled)
         view_menu.addAction(self.value_action)
+
+        # How a linked object's labels are drawn (2.9.2): a dozen views
+        # of one wreck were a dozen circles hiding it.
+        markers_menu = view_menu.addMenu("Label &Markers")
+        self.marker_actions = QActionGroup(self)
+        wanted = self._marker_mode_wanted()
+        for mode, text, tip in (
+                (MARKERS_EVERY, "&Every Label",
+                 "Every label as its own marker, linked or not"),
+                (MARKERS_DOTS, "One per Object, the Rest as &Dots",
+                 "A linked object is one marker, counting its views; its "
+                 "other labels are small dots, still there to click"),
+                (MARKERS_ONE, "&One per Object",
+                 "A linked object is one marker, counting its views; its "
+                 "other labels are not drawn until their image is the "
+                 "one shown, or one is picked from a panel")):
+            action = QAction(text, self)
+            action.setCheckable(True)
+            action.setData(mode)
+            action.setStatusTip(tip)
+            action.setChecked(mode == wanted)
+            self.marker_actions.addAction(action)
+            markers_menu.addAction(action)
+        self.marker_actions.triggered.connect(
+            lambda action: self._set_marker_mode(action.data()))
+        self.canvas.set_marker_mode(wanted)
+
+        # A label's snippet beside the cursor, Ctrl held (2.9.2).
+        hover_menu = view_menu.addMenu("Hover &Snippet (hold Ctrl)")
+        self.hover_actions = QActionGroup(self)
+        chosen = hover_snippet.hover_px()
+        for size in hover_snippet.HOVER_SIZES:
+            action = QAction("&Off" if size == 0 else f"{size} px", self)
+            action.setCheckable(True)
+            action.setData(size)
+            action.setStatusTip(
+                "No snippet on hovering" if size == 0 else
+                f"Hold Ctrl and rest the mouse on a label: its snippet, "
+                f"{size} pixels across, beside the cursor")
+            action.setChecked(size == chosen)
+            self.hover_actions.addAction(action)
+            hover_menu.addAction(action)
+        self.hover_actions.triggered.connect(
+            lambda action: self._set_hover_px(action.data()))
+        self.canvas.set_hover_enabled(chosen > 0)
 
         # Remove the crosshair that Go to Coordinates leaves behind
         clear_marker_action = QAction("Clear Coordinate &Marker", self)
@@ -2737,6 +2792,9 @@ class MainWindow(QMainWindow):
             if layer_id is None:
                 return
         self.layer_panel.check_layers([layer_id])
+        # With one marker per object, this is the one of its object to
+        # draw (2.9.2).
+        self.canvas.prefer_label(label_id)
         layer = self.canvas.get_layer(layer_id)
         if layer is not None and layer.geo:
             self.canvas.zoom_to_point(label.lon, label.lat, size_meters=10.0)
@@ -3519,6 +3577,8 @@ class MainWindow(QMainWindow):
         for _image, label in self.project.get_all_labels():
             self.canvas.set_label_ring(
                 label.id, self._label_ring_color(label))
+            # ...and its object, for one marker per object (2.9.2).
+            self.canvas.set_label_object(label.id, label.object_id)
 
     def _refresh_label_markers(self):
         """Refresh all label markers on the canvas."""
@@ -3538,7 +3598,8 @@ class MainWindow(QMainWindow):
             image.name, image.group, image.path,
             label.class_name, color,
             pixel_x=label.pixel_x, pixel_y=label.pixel_y,
-            ring_color=self._label_ring_color(label)
+            ring_color=self._label_ring_color(label),
+            object_id=label.object_id,
         )
         # Check if label is linked to others
         linked_labels = self.project.get_linked_labels(label.id)
@@ -6757,6 +6818,62 @@ class MainWindow(QMainWindow):
         if self._value_text:
             text += "&nbsp;&nbsp;|&nbsp;&nbsp;" + self._value_text
         self.coord_label.setText(text)
+
+    # View > Label Markers (2.9.2)
+    _MARKERS_KEY = "view/label_markers"
+
+    def _marker_mode_wanted(self) -> str:
+        value = str(settings_scope.settings().value(self._MARKERS_KEY,
+                                                    MARKERS_EVERY))
+        return value if value in MARKER_MODES else MARKERS_EVERY
+
+    def _set_marker_mode(self, mode: str):
+        if mode not in MARKER_MODES:
+            return
+        settings_scope.settings().setValue(self._MARKERS_KEY, mode)
+        self.canvas.set_marker_mode(mode)
+        for action in self.marker_actions.actions():
+            if action.data() == mode and not action.isChecked():
+                action.setChecked(True)
+
+    # View > Hover Snippet (app/hover_snippet, 2.9.2)
+
+    def _set_hover_px(self, size: int):
+        hover_snippet.set_hover_px(int(size))
+        self.canvas.set_hover_enabled(size > 0)
+        for action in self.hover_actions.actions():
+            if action.data() == size and not action.isChecked():
+                action.setChecked(True)
+
+    def _on_label_hover(self, label_id: int, _image_path: str):
+        """The canvas: Ctrl held, the mouse at rest on this label."""
+        size = hover_snippet.hover_px()
+        image, label = self.project.get_label_by_id(label_id)
+        if size <= 0 or label is None:
+            return
+        if self._hover_loader is None:
+            self._hover_loader = SnippetLoader(self)
+            self._hover_loader.ready.connect(self._on_hover_snippet)
+            self._hover_popup = hover_snippet.HoverSnippet(self)
+        self._hover_wanted = label_id
+        self._hover_loader.request(label_id, image.path, label.pixel_x,
+                                   label.pixel_y, size)
+
+    def _on_hover_snippet(self, key, arr):
+        if key != self._hover_wanted or arr is None:
+            return
+        image, label = self.project.get_label_by_id(key)
+        if label is None:
+            return
+        caption = f"{label.class_name} on {image.name}"
+        if label.description:
+            caption += f"\n{label.description}"
+        self._hover_popup.show_at(QCursor.pos(), arr, caption, key)
+
+    def _on_label_hover_ended(self):
+        self._hover_wanted = None
+        if self._hover_popup is not None:
+            self._hover_popup.hide()
 
     _PIXEL_VALUES_KEY = "view/pixel_values"
 
