@@ -96,12 +96,22 @@ def _label_state(project, label_id):
     return (path, index, copy.deepcopy(label))
 
 
+# What an ImageData keeps for itself and a snapshot must not copy: the
+# pyproj transformers (deep-copying one builds a new PROJ object - two per
+# image, 9 s and a gigabyte held for a 13,000-image step, audit 2026-10-28
+# H7) and the derived corners, which rebuild on demand from the fields.
+_IMAGE_CACHES = ("_to_wgs84_transformer", "_from_wgs84_transformer",
+                 "_cached_transformer_epsg", "_derived_cache")
+
+
 def _image_state(project, path):
     image = project.images.get(path)
     if image is None:
         return None
     stub = copy.copy(image)
     stub.labels = []
+    for name in _IMAGE_CACHES:
+        stub.__dict__.pop(name, None)
     return copy.deepcopy(stub)
 
 

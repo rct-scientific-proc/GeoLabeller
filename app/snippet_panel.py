@@ -118,6 +118,10 @@ class SnippetPanel(QWidget):
 
     # -- Data in ------------------------------------------------------------
 
+    def shutdown(self):
+        """Nothing more will be read or delivered (the window is going)."""
+        self._loader.shutdown()
+
     def set_labels(self, entries: list):
         """Feed the current project labels.
 

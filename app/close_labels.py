@@ -575,6 +575,6 @@ class CloseLabelsWindow(QDialog):
 
     def closeEvent(self, event):
         self.save_settings()
-        self.loader.cancel_all()
+        self.loader.shutdown()
         super().closeEvent(event)
 

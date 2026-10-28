@@ -766,4 +766,9 @@ class SnippetEditor(QWidget):
     def closeEvent(self, event):
         self.grid.flush_review()
         self.save_settings()
+        # Nothing read for a closed window (2.9.13); the pools serve
+        # again when it is shown again.
+        for loader in (self.strip.loader, self.grid._loader,
+                       self.linked_row.loader):
+            loader.shutdown()
         super().closeEvent(event)

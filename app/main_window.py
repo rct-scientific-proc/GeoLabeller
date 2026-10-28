@@ -4738,7 +4738,9 @@ class MainWindow(QMainWindow):
             return
         with self._recorded(
                 "Import ground truth", all_labels=True,
-                images=list(self.project.images),
+                # The matched images only: apply_import touches no other
+                # (every image was snapshotted twice, 2.9.13).
+                images=[match.local_path for match in plan.matched],
                 lists=("classes", "descriptions", "mask_names")):
             result = apply_import(self.project, plan)
             _old, _new, duplicates_text = self._settle_duplicates(
@@ -5146,6 +5148,9 @@ class MainWindow(QMainWindow):
             self._optimize_thread.quit()
 
         msg = f"Optimized {done} image(s)."
+        worker = self._optimize_worker
+        if worker is not None and worker._cancelled:
+            msg = "Export cancelled. " + msg
         if skipped:
             msg += f"\nSkipped {skipped} (output already existed)."
         if errors:
@@ -7137,7 +7142,30 @@ class MainWindow(QMainWindow):
         # it still going has nobody to tell.
         self.canvas.end_hover()
         if self._hover_loader is not None:
-            self._hover_loader.cancel_all()
+            self._hover_loader.shutdown()
+        # Every reader whose pool is a child of this window: destroying
+        # a QThreadPool waits for its whole queue, and the sidebar's could
+        # hold thousands of reads at close (audit 2026-10-28 H6, 2.9.13).
+        self.snippet_panel.shutdown()
+        self._value_probe.clear()
+        self._value_probe.wait()
+        # The header sweep after an open (M10): cancelled, waited for.
+        self._size_check.cancel()
+        self._size_check.wait()
+        # An export still running (M11): a QThread destroyed while running
+        # aborts the process and leaves a half-written file. The worker is
+        # told to stop and waited for - its stage in progress cannot be
+        # interrupted, so the wait is as long as that stage.
+        for name in ("_optimize", "_h5"):
+            thread = getattr(self, name + "_thread", None)
+            worker = getattr(self, name + "_worker", None)
+            if thread is not None and thread.isRunning():
+                if worker is not None:
+                    worker.cancel()
+                self.statusBar.showMessage(
+                    "Finishing the export before closing...")
+                thread.quit()
+                thread.wait()
 
         # Clean up crash detection and recovery
         self._clean_exit()

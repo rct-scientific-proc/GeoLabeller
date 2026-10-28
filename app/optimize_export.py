@@ -200,6 +200,11 @@ def optimize_geotiff(src_path, dst_path, overviews=DEFAULT_OVERVIEWS,
                 if any(u for u in src.units):
                     dst.units = src.units
 
+                # Cancel is honoured between the stages too (audit
+                # 2026-10-28 M11, 2.9.13): pressed after the last block,
+                # it used to be followed by the overviews and the commit.
+                if cancel_check and cancel_check():
+                    raise _Cancelled()
                 # Build the internal pyramid overviews.
                 dst.build_overviews(list(overviews), overview_resampling)
                 dst.update_tags(ns="rio_overview",
@@ -217,6 +222,12 @@ def optimize_geotiff(src_path, dst_path, overviews=DEFAULT_OVERVIEWS,
                 pass
             raise
 
+    if cancel_check and cancel_check():
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return "cancelled"
     os.replace(tmp_path, dst_path)
     return "done"
 

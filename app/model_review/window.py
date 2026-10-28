@@ -3173,7 +3173,7 @@ class ModelReviewWindow(QWidget):
             event.ignore()
             return
         self.save_settings()
-        self.loader.cancel_all()
+        self.loader.shutdown()
         self._hover_timer.stop()
         if self._image_window is not None:
             self._image_window.close()

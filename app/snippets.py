@@ -340,7 +340,7 @@ def read_label_window_raw(image_path: str, pixel_x: float, pixel_y: float,
 
 
 def read_label_snippet(image_path: str, pixel_x: float, pixel_y: float,
-                       size_px: int) -> np.ndarray | None:
+                       size_px: int, display=None) -> np.ndarray | None:
     """The un-warped RGB pixels around one label, export-identical framing.
 
     Returns an (H, W, 3) uint8 array, clamped to the raster for images
@@ -349,7 +349,8 @@ def read_label_snippet(image_path: str, pixel_x: float, pixel_y: float,
     entirely nodata or the file cannot be read.
     """
     try:
-        display = display_settings.for_image(image_path)
+        if display is None:
+            display = display_settings.for_image(image_path)
         with gdal_config.opened(image_path) as src:
             scaling = cached_band_scaling(src, display.stretch)
             x0, y0, w, h = snippet_frame(pixel_x, pixel_y, size_px,
@@ -369,7 +370,8 @@ def read_label_snippet(image_path: str, pixel_x: float, pixel_y: float,
         return None
 
 
-def read_label_snippets(image_path: str, centres, size_px: int) -> list:
+def read_label_snippets(image_path: str, centres, size_px: int,
+                        display=None) -> list:
     """read_label_snippet for many (x, y) centres of one image, the file
     opened once and the windows read in row order: the same bytes, at
     a fraction of the cost (one open per chip was most of the time of
@@ -379,7 +381,12 @@ def read_label_snippets(image_path: str, centres, size_px: int) -> list:
     if not centres:
         return out
     try:
-        display = display_settings.for_image(image_path)
+        if display is None:
+            # The settings in force now; a loader passes the ones its
+            # request was made under, so a change between the request
+            # and the read cannot cache one look under the other's key
+            # (audit 2026-10-28 M3, 2.9.13).
+            display = display_settings.for_image(image_path)
         with gdal_config.opened(image_path) as src:
             scaling = cached_band_scaling(src, display.stretch)
             default = (display.is_default() and
@@ -458,9 +465,10 @@ class _SnippetRunnable(QRunnable):
     """One windowed read on the pool."""
 
     def __init__(self, key, image_path, px, py, size, token, signals,
-                 loader):
+                 loader, display=None):
         super().__init__()
         self._args = (key, image_path, px, py, size, token)
+        self._display = display
         self._signals = signals
         self._loader = loader
         self._cancelled = False
@@ -480,7 +488,8 @@ class _SnippetRunnable(QRunnable):
             if self._cancelled or not self._loader.is_current(key, token):
                 arr = None
             else:
-                arr = read_label_snippet(image_path, px, py, size)
+                arr = read_label_snippet(image_path, px, py, size,
+                                         display=self._display)
             self._signals.finished.emit(key, arr, token)
         except Exception:  # noqa: BLE001 - never die silently in a worker
             try:
@@ -501,12 +510,14 @@ class _ChunkRunnable(QRunnable):
     page turn in Model Review, and the UI thread starved meanwhile.
     Chips whose request was superseded before the read are left out."""
 
-    def __init__(self, image_path, items, size, signals, loader):
+    def __init__(self, image_path, items, size, signals, loader,
+                 display=None):
         super().__init__()
         self.setAutoDelete(False)       # the loader owns it: tryTake is safe
         self._image_path = image_path
         self._items = list(items)       # (key, px, py, token)
         self._size = size
+        self._display = display
         self._signals = signals
         self._loader = loader
 
@@ -521,7 +532,8 @@ class _ChunkRunnable(QRunnable):
             if live:
                 arrays = read_label_snippets(
                     self._image_path,
-                    [(px, py) for _key, px, py, _token in live], self._size)
+                    [(px, py) for _key, px, py, _token in live], self._size,
+                    display=self._display)
                 for (key, _px, _py, token), arr in zip(live, arrays):
                     self._signals.finished.emit(key, arr, token)
         except Exception:  # noqa: BLE001 - never die silently in a worker
@@ -579,6 +591,10 @@ class SnippetLoader(QObject):
         cached = self._cache.get(content)
         if cached is not None:
             self._cache.move_to_end(content)
+            # An older read of this key still in flight is superseded:
+            # left current, it landed later and replaced the right
+            # picture with a stale one (audit 2026-10-28 M2, 2.9.13).
+            self._tokens.pop(key, None)
             self.ready.emit(key, cached)
             return
         self._counter += 1
@@ -590,7 +606,8 @@ class SnippetLoader(QObject):
             lambda k, arr, t, s=signals, c=content:
                 self._on_finished(k, arr, t, s, c))
         runnable = _SnippetRunnable(key, image_path, pixel_x, pixel_y,
-                                    size_px, token, signals, self)
+                                    size_px, token, signals, self,
+                                    display=content[4])
         self._pool.start(runnable)
 
     def request_many(self, items, size_px: int):
@@ -606,6 +623,7 @@ class SnippetLoader(QObject):
             cached = self._cache.get(content)
             if cached is not None:
                 self._cache.move_to_end(content)
+                self._tokens.pop(key, None)     # as in request()
                 self.ready.emit(key, cached)
                 continue
             self._counter += 1
@@ -631,7 +649,7 @@ class SnippetLoader(QObject):
         signals.done.connect(self._chunk_done)
         runnable = _ChunkRunnable(
             image_path, [(k, px, py, t) for k, _p, px, py, _c, t in group],
-            size_px, signals, self)
+            size_px, signals, self, display=group[0][4][4])
         self._chunks[id(runnable)] = (runnable, signals)
         self._pool.start(runnable, priority)
 
@@ -708,6 +726,17 @@ class SnippetLoader(QObject):
             if self._pool.tryTake(runnable):
                 self._chunks.pop(id(runnable), None)
                 self._signals_alive.discard(signals)
+
+    def shutdown(self, wait_ms: int = 5000) -> bool:
+        """Nothing more will be read or delivered: every outstanding
+        request forgotten, the queued reads taken off the pool, the ones
+        running waited for (bounded). For a window going away - its
+        pool's destructor would otherwise wait for the whole queue,
+        thousands of reads for a big sidebar (audit 2026-10-28 H6,
+        2.9.13). The pool serves again afterwards."""
+        self.cancel_all()
+        self._pool.clear()
+        return self._pool.waitForDone(wait_ms)
 
     def clear_cache(self):
         """Drop cached pixels (e.g. when snippet size changes everywhere)."""
