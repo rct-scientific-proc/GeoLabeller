@@ -489,6 +489,53 @@ class _SnippetRunnable(QRunnable):
                 pass   # loader torn down mid-read
 
 
+class _ChunkSignals(QObject):
+    """A chunk's signals: one delivery per chip, then done."""
+    finished = pyqtSignal(object, object, int)   # key, array-or-None, token
+    done = pyqtSignal(object)                    # the runnable, finished
+
+
+class _ChunkRunnable(QRunnable):
+    """Many windowed reads of one image, the file opened once (2.9.10):
+    a page of hundreds of chips at one open per chip was most of a
+    page turn in Model Review, and the UI thread starved meanwhile.
+    Chips whose request was superseded before the read are left out."""
+
+    def __init__(self, image_path, items, size, signals, loader):
+        super().__init__()
+        self.setAutoDelete(False)       # the loader owns it: tryTake is safe
+        self._image_path = image_path
+        self._items = list(items)       # (key, px, py, token)
+        self._size = size
+        self._signals = signals
+        self._loader = loader
+
+    def keys(self) -> list:
+        return [item[0] for item in self._items]
+
+    def run(self):
+        live = []
+        try:
+            live = [item for item in self._items
+                    if self._loader.is_current(item[0], item[3])]
+            if live:
+                arrays = read_label_snippets(
+                    self._image_path,
+                    [(px, py) for _key, px, py, _token in live], self._size)
+                for (key, _px, _py, token), arr in zip(live, arrays):
+                    self._signals.finished.emit(key, arr, token)
+        except Exception:  # noqa: BLE001 - never die silently in a worker
+            try:
+                for key, _px, _py, token in live:
+                    self._signals.finished.emit(key, None, token)
+            except RuntimeError:
+                pass
+        try:
+            self._signals.done.emit(self)
+        except RuntimeError:
+            pass   # loader torn down mid-read
+
+
 class SnippetLoader(QObject):
     """Reads label snippets off the UI thread, newest request wins per key.
 
@@ -507,6 +554,8 @@ class SnippetLoader(QObject):
     # snippets, so a panel rebuild over a few thousand labels re-serves
     # from memory instead of re-reading every file.
     _CACHE_BYTES = 64 * 1024 * 1024
+    CHUNK = 16                  # chips per read of one file (request_many)
+    BAND = 48                   # ...grouped by image within this many
 
     def __init__(self, parent=None, max_workers: int = 4):
         super().__init__(parent)
@@ -516,6 +565,7 @@ class SnippetLoader(QObject):
         self._tokens: dict = {}          # key -> latest token issued
         self._counter = 0
         self._signals_alive: set = set()
+        self._chunks: dict = {}          # id(runnable) -> (runnable, signals)
         self._cache: OrderedDict = OrderedDict()   # content key -> array
         self._cache_bytes = 0
 
@@ -543,8 +593,66 @@ class SnippetLoader(QObject):
                                     size_px, token, signals, self)
         self._pool.start(runnable)
 
+    def request_many(self, items, size_px: int):
+        """Pictures for many chips at once, in the order given - the
+        rows in view first (Model Review, 2.9.10). Cache hits are served
+        now; the rest are read grouped by image, a chunk of chips per
+        open of its file (read_label_snippets), earlier items first.
+        ``items`` are (key, image_path, pixel_x, pixel_y)."""
+        pending = []
+        for key, image_path, pixel_x, pixel_y in items:
+            content = (image_path, int(round(pixel_x)), int(round(pixel_y)),
+                       int(size_px), display_settings.for_image(image_path))
+            cached = self._cache.get(content)
+            if cached is not None:
+                self._cache.move_to_end(content)
+                self.ready.emit(key, cached)
+                continue
+            self._counter += 1
+            token = self._counter
+            self._tokens[key] = token
+            pending.append((key, image_path, pixel_x, pixel_y, content,
+                            token))
+        for band, start in enumerate(range(0, len(pending), self.BAND)):
+            by_image: dict = {}
+            for item in pending[start:start + self.BAND]:
+                by_image.setdefault(item[1], []).append(item)
+            for image_path, group in by_image.items():
+                for i in range(0, len(group), self.CHUNK):
+                    self._start_chunk(image_path, group[i:i + self.CHUNK],
+                                      size_px, -band)
+
+    def _start_chunk(self, image_path, group, size_px, priority: int):
+        signals = _ChunkSignals()
+        self._signals_alive.add(signals)
+        contents = {item[0]: item[4] for item in group}
+        signals.finished.connect(
+            lambda k, arr, t, c=contents: self._deliver(k, arr, t, c[k]))
+        signals.done.connect(self._chunk_done)
+        runnable = _ChunkRunnable(
+            image_path, [(k, px, py, t) for k, _p, px, py, _c, t in group],
+            size_px, signals, self)
+        self._chunks[id(runnable)] = (runnable, signals)
+        self._pool.start(runnable, priority)
+
+    def _chunk_done(self, runnable):
+        _r, signals = self._chunks.pop(id(runnable), (None, None))
+        self._signals_alive.discard(signals)
+
+    def reprioritise(self, rank):
+        """The queued chunks in a new order: ``rank(key)`` is how far a
+        chip is from what is in view, and the nearest chunk reads first
+        (a scroll, 2.9.10). A chunk already reading is left alone."""
+        for runnable, _signals in list(self._chunks.values()):
+            if self._pool.tryTake(runnable):
+                nearest = min(rank(key) for key in runnable.keys())
+                self._pool.start(runnable, -int(nearest))
+
     def _on_finished(self, key, arr, token, signals, content):
         self._signals_alive.discard(signals)
+        self._deliver(key, arr, token, content)
+
+    def _deliver(self, key, arr, token, content):
         if sip.isdeleted(self):
             # The read finished after the loader - with the widget that
             # owned it - was destroyed. There is nobody to tell, and
@@ -593,8 +701,13 @@ class SnippetLoader(QObject):
         Clearing the tokens also disarms whatever is still queued: each
         runnable checks is_current() before opening its file, so cancelled
         work costs a dictionary lookup instead of a windowed raster read.
+        A chunk not yet started is taken off the pool outright.
         """
         self._tokens.clear()
+        for runnable, signals in list(self._chunks.values()):
+            if self._pool.tryTake(runnable):
+                self._chunks.pop(id(runnable), None)
+                self._signals_alive.discard(signals)
 
     def clear_cache(self):
         """Drop cached pixels (e.g. when snippet size changes everywhere)."""

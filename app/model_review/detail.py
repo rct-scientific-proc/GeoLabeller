@@ -51,7 +51,7 @@ def standing_of(chip) -> str:
             return earlier
     if chip.verdict is None:
         if chip.labelled_already():
-            return "labelled already: " + chip.nearest().describe()
+            return "already in project: " + chip.nearest().describe()
         return "no verdict yet"
     text = "verdict: " + ("Ignore" if chip.verdict == IGNORE
                           else chip.verdict)

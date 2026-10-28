@@ -212,7 +212,7 @@ SHORTCUT_SECTIONS = [
                 "chips, or the chip under the cursor (then the next)"),
         ("Shift+1-9", "The tenth to the eighteenth class, the same way"),
         ("Show: list", "All, To look at, Labelled, Ignored; Reviewed "
-                       "before, Changed, Labelled already - those three "
+                       "before, Changed, Already in project - those three "
                        "whatever the Show boxes say; one entry per "
                        "labelled class"),
         ("0", "Ignore: looked at, nothing to label"),
@@ -243,7 +243,7 @@ SHORTCUT_SECTIONS = [
                                  "it"),
         ("Escape / Ctrl+A", "Pick none / every chip on the page"),
         ("PageDown / PageUp", "Next / previous page of chips"),
-        ("Show labelled already", "Chips with a label on their image "
+        ("Show already in project", "Chips with a label on their image "
                                   "within Labelled within (blue frame); "
                                   "Details marks the labels, and ticks a "
                                   "new label beside them"),

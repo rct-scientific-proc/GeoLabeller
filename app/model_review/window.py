@@ -124,6 +124,8 @@ _OLD_SPLITTER_KEY = "model_review/splitter"
 _LABELS_KEY = "model_review/labels_panel"
 HOVER_MS = 250                  # the mouse rests on a chip this long
                                 # before the panel turns to it
+SCROLL_MS = 120                 # a scroll settles this long before the
+                                # queued reads are put in its order
 VERDICT_FILTERS = (("All", "all"), ("To look at", "todo"),
                    ("Labelled", "labelled"), ("Ignored", "ignored"))
 # The Show: list's standings (2.9.9): each lists exactly those chips,
@@ -132,7 +134,7 @@ VERDICT_FILTERS = (("All", "all"), ("To look at", "todo"),
 # must not come up empty because a box is off.
 STANDING_FILTERS = (("Reviewed before", "reviewed"),
                     ("Changed", "changed"),
-                    ("Labelled already", "already"))
+                    ("Already in project", "already"))
 STANDINGS = tuple(data for _text, data in STANDING_FILTERS)
 ORDERS = (("Model score", "score"), ("Suggestion", "suggestion"))
 ANY_SUGGESTION = None           # the Suggested box's first entry
@@ -594,7 +596,7 @@ class ModelReviewWindow(QWidget):
             "look at, the labelled - all, or one class - or the ignored;\n"
             "or one standing: Reviewed before (the done pile, with a note\n"
             "from an earlier import), Changed (an earlier answer with a\n"
-            "new verdict in hand), Labelled already (a label within the\n"
+            "new verdict in hand), Already in project (a label within the\n"
             "distance on the image) - those three whatever the Show\n"
             "boxes say. The list settles at the next page turn, so a chip\n"
             "just labelled stays put till then.")
@@ -667,8 +669,9 @@ class ModelReviewWindow(QWidget):
         self.more_button = self._fold_button(
             "Settings",
             "Set once: the chip size, the columns, the chips per page,\n"
-            "the chips reviewed before and those labelled already, and\n"
-            "how close a chip must lie to a label to be labelled already.",
+            "the chips reviewed before and those already in project, and\n"
+            "how close a chip must lie to a label to count as already in\n"
+            "project.",
             self._on_more)
         third.addWidget(self.more_button)
         self.learn_button = self._fold_button(
@@ -702,14 +705,14 @@ class ModelReviewWindow(QWidget):
         more.addWidget(self.show_reviewed_check)
         # Labelled already (2.9.4): a label on the image within this
         # distance of the chip's centre, not the chip's own.
-        self.show_labelled_check = QCheckBox("Show labelled already")
+        self.show_labelled_check = QCheckBox("Show already in project")
         self.show_labelled_check.setToolTip(
-            "Chips with a label already on their image within the\n"
-            "distance - something labelled by hand, or by another round.\n"
-            "Framed in blue, with the label's class and how far off it\n"
-            "is; Details marks the labels. Untick to clear them off the\n"
-            "grid. A verdict on one goes onto that label, or makes a new\n"
-            "one beside it when Details says so; Ignore leaves it alone.")
+            "Chips already in the project: a label on their image within\n"
+            "the distance - placed by hand, or by another round. Framed\n"
+            "in blue, with the label's class and how far off it is;\n"
+            "Details marks the labels. Untick to clear them off the grid.\n"
+            "A verdict on one goes onto that label, or makes a new one\n"
+            "beside it when Details says so; Ignore leaves it alone.")
         self.show_labelled_check.toggled.connect(self._on_show_labelled)
         more.addWidget(self.show_labelled_check)
         more.addWidget(QLabel("Labelled within"))
@@ -719,7 +722,7 @@ class ModelReviewWindow(QWidget):
         self.labelled_spin.setSuffix(" px")
         self.labelled_spin.setToolTip(
             "A chip whose centre lies this close to a label on its image\n"
-            "is labelled already. The Import Options distance to start\n"
+            "is already in project. The Import Options distance to start\n"
             "with; remembered.")
         self.labelled_spin.setKeyboardTracking(False)
         self.labelled_spin.valueChanged.connect(
@@ -878,6 +881,14 @@ class ModelReviewWindow(QWidget):
         self._grid.setSpacing(GRID_SPACING)
         self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.scroll.setWidget(self._grid_host)
+        # A scroll brings other rows into view: the reads still queued
+        # for the page go on in the new order (2.9.10).
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setSingleShot(True)
+        self._scroll_timer.setInterval(SCROLL_MS)
+        self._scroll_timer.timeout.connect(self._refill_in_view)
+        self.scroll.verticalScrollBar().valueChanged.connect(
+            lambda _v: self._scroll_timer.start())
         self.scroll.viewport().installEventFilter(self)
         self.detail = DetailPanel()
         self.detail.show_on_image.connect(self.show_on_image)
@@ -1657,7 +1668,7 @@ class ModelReviewWindow(QWidget):
             text += (f"\ncentre moved {chip.offset():.0f} px from the "
                      f"file's ({chip.source_x:.1f}, {chip.source_y:.1f})")
         if chip.labelled_already():
-            text += "\nlabelled already: " + ", ".join(
+            text += "\nalready in project: " + ", ".join(
                 near.describe() for near in chip.near[:3])
             if chip.verdict is not None:
                 text += ("\nas a new label beside it" if chip.as_new
@@ -1678,10 +1689,53 @@ class ModelReviewWindow(QWidget):
         cell.setToolTip(text)
 
     def _request_pixels(self):
+        """The page's pictures, read grouped by image with the rows in
+        view first (2.9.10): a page of hundreds asked for one by one
+        held the window for its length and starved it while the reads
+        ran; now the file is opened once per chunk, and what the user
+        looks at comes first."""
         size = self.chip_spin.value()
-        for chip in self._visible:
-            self.loader.request(chip.key, chip.image_path, chip.pixel_x,
-                                chip.pixel_y, size)
+        self.loader.request_many(
+            [(chip.key, chip.image_path, chip.pixel_x, chip.pixel_y)
+             for chip in self._fill_order()], size)
+
+    def _fill_order(self) -> list:
+        """The page's chips, the rows in view first and then outwards -
+        by where the rows will lie, as the grid may not be laid out yet."""
+        columns = max(1, self.columns_spin.value())
+        pitch = self._cell_px() + CAPTION_PX + GRID_SPACING
+        margin = self._grid.contentsMargins().top()
+        top = self.scroll.verticalScrollBar().value()
+        bottom = top + self.scroll.viewport().height()
+
+        def away(i: int) -> int:
+            y0 = margin + (i // columns) * pitch
+            y1 = y0 + pitch
+            if y1 < top:
+                return top - y1
+            if y0 > bottom:
+                return y0 - bottom
+            return 0
+        return [chip for _i, chip in sorted(enumerate(self._visible),
+                                            key=lambda p: (away(p[0]), p[0]))]
+
+    def _refill_in_view(self):
+        """After a scroll: the reads still queued for the page go on
+        with the rows now in view first (2.9.10)."""
+        top = self.scroll.verticalScrollBar().value()
+        bottom = top + self.scroll.viewport().height()
+
+        def away(key) -> int:
+            cell = self._cells.get(key)
+            if cell is None:
+                return 10 ** 9
+            box = cell.geometry()
+            if box.bottom() < top:
+                return top - box.bottom()
+            if box.top() > bottom:
+                return box.top() - bottom
+            return 0
+        self.loader.reprioritise(away)
 
     def _frame_of(self, chip, size: "int | None" = None) -> tuple:
         """(x0, y0, w, h): the source pixels a picture of ``size`` around
@@ -1940,7 +1994,7 @@ class ModelReviewWindow(QWidget):
                 colour = self._colour_of(became)
             elif chip.labelled_already() and chip.verdict is None:
                 near = chip.nearest()
-                text = f"labelled: {near.class_name} {near.distance:.0f}px"
+                text = f"in project: {near.class_name} {near.distance:.0f}px"
                 colour = LABELLED_COLOR
             else:
                 text = ("" if chip.verdict is None
@@ -2002,7 +2056,7 @@ class ModelReviewWindow(QWidget):
                         else ", hidden"))
         already = sum(1 for chip in self._chips if chip.labelled_already())
         if already:
-            text += (f"; {already} labelled already"
+            text += (f"; {already} already in project"
                      + ("" if self.show_labelled_check.isChecked()
                         else ", hidden"))
         changed = sum(1 for chip in verdicts
@@ -2152,7 +2206,10 @@ class ModelReviewWindow(QWidget):
         order = self.shown_keys()
         if key not in order:
             return
-        self.set_cursor(None)
+        # The cells are refreshed once, below or by the verdict given:
+        # three refreshes a click was a third of a click's cost on a
+        # page of hundreds (2.9.10).
+        self.set_cursor(None, refresh=False)
         self._set_detail(key)
         if modifiers & Qt.ControlModifier:
             if key in self._selected:
@@ -2171,7 +2228,7 @@ class ModelReviewWindow(QWidget):
             run = order[start:end + 1]
             self._last_click = None
             self._anchor = key
-            self._apply_active(run)
+            entry = self._apply_active(run)
         else:
             # Should this turn out to be the first half of a double-click,
             # the verdict it gives is taken back (_on_cell_recentred).
@@ -2179,7 +2236,9 @@ class ModelReviewWindow(QWidget):
             self._anchor = key
             entry = self._apply_active([key])
             self._last_click = (key, before, entry)
-        self._refresh_cells()
+        if entry is None:
+            self._refresh_cells()       # no verdict given: the cursor and
+                                        # the selection still moved
 
     def _on_cell_cleared(self, key):
         self.setFocus()
@@ -2197,15 +2256,17 @@ class ModelReviewWindow(QWidget):
 
     # -- the keyboard's cursor -----------------------------------------------
 
-    def set_cursor(self, key: "int | None"):
+    def set_cursor(self, key: "int | None", refresh: bool = True):
         """Put the keyboard's cursor on this chip of the page, or on
-        none, and bring it into view."""
+        none, and bring it into view. ``refresh`` False leaves the
+        cells to the caller, which refreshes them once (2.9.10)."""
         if key is not None and key not in self._cells:
             key = None
         self._cursor = key
         if key is not None:
             self._set_detail(key)
-        self._refresh_cells()
+        if refresh:
+            self._refresh_cells()
         if key is not None:
             self.scroll.ensureWidgetVisible(self._cells[key], 16, 16)
 
@@ -2808,10 +2869,10 @@ class ModelReviewWindow(QWidget):
         beside = sum(1 for chip in chips if chip.labelled_already()
                      and chip.verdict not in (None, IGNORE) and chip.as_new)
         if onto:
-            text += (f"\n{onto} labelled already: the verdict goes onto "
+            text += (f"\n{onto} already in project: the verdict goes onto "
                      "the label there, which takes the class.")
         if beside:
-            text += (f"\n{beside} labelled already: a new label beside "
+            text += (f"\n{beside} already in project: a new label beside "
                      "the one there.")
         return text
 
