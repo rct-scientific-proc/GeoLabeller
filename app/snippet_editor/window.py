@@ -27,7 +27,7 @@ class_changed / position_changed / description_changed /
 group_id_changed / mask_names_changed / save_requested / undo_requested /
 redo_requested out.
 """
-from PyQt5.QtCore import QEvent, Qt, pyqtSignal
+from PyQt5.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QKeySequence
 from PyQt5.QtWidgets import (QGroupBox, QAbstractSpinBox, QApplication, QButtonGroup,
                              QCheckBox, QComboBox, QHBoxLayout, QLabel,
@@ -265,12 +265,20 @@ class SnippetEditor(QWidget):
         # A class picked from the list, or a name entered, is a choice
         # made: the keys go back to the window, so Space steps again
         # rather than typing into the class.
-        self.label_class_combo.activated.connect(
-            lambda index: self._class_chosen(
-                self.label_class_combo.itemText(index)))
+        self.label_class_combo.activated.connect(self._on_class_activated)
         self.label_class_combo.lineEdit().returnPressed.connect(
             lambda: self._class_chosen(
                 self.label_class_combo.currentText().strip()))
+        # Qt's combo also emits activated when the box loses focus with
+        # text matching an item: the second of two changes on Enter (the
+        # first stepped the strip, so the second re-classed the NEXT
+        # snippet), and a class applied by clicking away from a name the
+        # user never chose (audit 2026-10-28 H4, 2.9.12). The filter sees
+        # the focus-out first and the activation it brings is left alone.
+        # The combo itself holds the focus (the box is no focus proxy)
+        # and hands the focus-out on to the box: filtered on both.
+        self.label_class_combo.installEventFilter(self)
+        self.label_class_combo.lineEdit().installEventFilter(self)
         class_layout.addWidget(self.label_class_combo)
         self.class_linked_check = QCheckBox("Also change linked labels")
         self.class_linked_check.setToolTip(
@@ -378,9 +386,21 @@ class SnippetEditor(QWidget):
         combo.setEnabled(entry is not None and self.view() == self.SINGLE)
         combo.blockSignals(False)
 
+    _class_focus_out = False        # the class box just lost focus
+
+    def _on_class_activated(self, index: int):
+        """A pick from the list - not the activation a focus-out brings."""
+        if not self._class_focus_out:
+            self._class_chosen(self.label_class_combo.itemText(index))
+
     def _class_chosen(self, class_name: str):
+        # clearFocus() brings a focus-out, and with it the activation
+        # _on_class_activated leaves alone: one change, not two.
         self.label_class_combo.clearFocus()
         self.change_class(class_name)
+
+    def _class_focus_out_over(self):
+        self._class_focus_out = False
 
     def change_class(self, class_name: str):
         """Give the snippet in hand (and its linked object) ``class_name``.
@@ -550,6 +570,15 @@ class SnippetEditor(QWidget):
             return True
         if event.type() == QEvent.KeyRelease and self._owns(obj):
             self._key_released(event)
+        if (event.type() == QEvent.FocusOut
+                and (obj is self.label_class_combo
+                     or obj is self.label_class_combo.lineEdit())
+                and event.reason() != Qt.PopupFocusReason):
+            # The activation this focus-out brings is not a choice (see
+            # _on_class_activated); the flag outlives the event by one
+            # turn of the loop, which is as long as Qt takes to emit it.
+            self._class_focus_out = True
+            QTimer.singleShot(0, self._class_focus_out_over)
         return super().eventFilter(obj, event)
 
     def _key_released(self, event):

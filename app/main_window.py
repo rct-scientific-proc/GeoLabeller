@@ -4211,6 +4211,12 @@ class MainWindow(QMainWindow):
             # imagery relocated beside the project, metadata backfilled
             # into an older file - is a real change, worth saving.
             self._set_saved_baseline()
+            # The Snippet Editor and the sidebar onto the new project NOW,
+            # not when its images have loaded: for that whole load the
+            # editor showed the old project while every key wrote to the
+            # new project's label of the same id (audit 2026-10-28 H5,
+            # 2.9.12). The re-seat after the load is then a no-op.
+            self._reseat_open_editors()
 
             # Show progress for loading images
             num_images = len(self.project.images)
@@ -4446,6 +4452,7 @@ class MainWindow(QMainWindow):
             self._history.clear()
             self.project = LabelProject.load(RECOVERY_FILE)
             self._set_saved_baseline(recovered=True)
+            self._reseat_open_editors()         # as _load_project_file (2.9.12)
 
             # Show progress for loading images
             num_images = len(self.project.images)
