@@ -649,16 +649,24 @@ class TiledLayer:
         the difference between imagery appearing at once and one image
         arriving per second.
         """
+        return self.budget_level(self._zoom_level(scene_units_per_pixel))
+
+    def _zoom_level(self, scene_units_per_pixel: float) -> int:
+        """The decimation the zoom asks for, before any memory cap: the
+        deepest overview no finer than a screen pixel, doubled past the
+        pyramid's end - or up from full resolution, with no pyramid -
+        while the zoom is coarser still. 1 when there is nothing to
+        measure against."""
         full_width = self._full_width or self._width
         if (full_width <= 0 or scene_units_per_pixel <= 0
                 or self.bounds is None):
-            return self.budget_level(1)
+            return 1
 
         # Scene units covered by one full-resolution data pixel.
         west, _south, east, _north = self.bounds
         native_res = (east - west) / full_width
         if native_res <= 0:
-            return self.budget_level(1)
+            return 1
 
         # Pick the largest decimation factor whose level resolution is still no
         # finer than one screen pixel (overviews are sorted ascending).
@@ -678,7 +686,7 @@ class TiledLayer:
         while (best < _MAX_DECIMATION
                 and native_res * (best * 2) <= scene_units_per_pixel):
             best *= 2
-        return self.budget_level(best)
+        return best
 
     def resolution_level(self, scene_units_per_pixel: float) -> int:
         """The level the zoom wants, ignoring the whole-image memory cap.
@@ -686,22 +694,18 @@ class TiledLayer:
         Detail tiles are bounded by the viewport rather than the image, so they
         can honour the zoom even where holding that level whole never could -
         which is the entire point of reading them windowed.
+
+        The zoom's level whatever the pyramid (2.9.14): with none, or past
+        its end, the read is decimated like the backdrop's. It used to be
+        full resolution whenever the overview list was empty - which it
+        also is before the first read reports it - so a saved project's
+        large images read and held every full-resolution tile at fit
+        zoom, a gigabyte for eight 16 MP images, and a pyramid-less one
+        never let them go (audit 2026-10-28 H8). Tiles asked for before
+        the pyramid is known are the same tiles the known pyramid asks
+        for, so nothing waits on it.
         """
-        full_width = self._full_width or self._width
-        if (not self._overviews or full_width <= 0
-                or scene_units_per_pixel <= 0 or self.bounds is None):
-            return 1
-        west, _south, east, _north = self.bounds
-        native_res = (east - west) / full_width
-        if native_res <= 0:
-            return 1
-        best = 1
-        for factor in self._overviews:
-            if native_res * factor <= scene_units_per_pixel:
-                best = factor
-            else:
-                break
-        return best
+        return self._zoom_level(scene_units_per_pixel)
 
     def detail_grid(self, level: int):
         """Cached ``(transform, width, height)`` of this layer's level grid.
