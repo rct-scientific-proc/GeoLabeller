@@ -784,14 +784,21 @@ def _positive_windows(pts, img_width, img_height, width, height, offset,
               f"label at ({x - base_x:.1f}, {y - base_y:.1f}) of "
               f"{width}x{height}")
 
-    # Pass 2: the eight offsets, measured from each label's centred crop.
+    # Pass 2: the eight offsets, measured from the window centred on the
+    # label BEFORE the edge shift - offer() shifts each copy inside the
+    # image on its own. Measured from the shifted crop, a label 6 px from
+    # an edge got three copies pushed clean off it, written as gt=True
+    # crops of empty ground (audit 2026-10-28, 2.9.11). Copies the edge
+    # pushes onto one spot are kept once, as ever.
     if offset > 0:
-        for base_x, base_y, x, y, class_index, object_id, index in bases:
+        for _base_x, _base_y, x, y, class_index, object_id, index in bases:
+            centre_x = int(round(x)) - width // 2
+            centre_y = int(round(y)) - height // 2
             for dy in (-offset, 0, offset):
                 for dx in (-offset, 0, offset):
                     if dx == 0 and dy == 0:
                         continue  # already placed in pass 1
-                    offer(base_x + dx, base_y + dy, x, y, class_index,
+                    offer(centre_x + dx, centre_y + dy, x, y, class_index,
                           object_id, index)
 
     if owners is not None:

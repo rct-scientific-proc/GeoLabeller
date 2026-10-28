@@ -30,6 +30,7 @@ the user decided through signals.
 from __future__ import annotations
 
 import json
+import math
 from collections import Counter
 from pathlib import Path
 
@@ -1327,6 +1328,16 @@ class ModelReviewWindow(QWidget):
                 # Given another class since - by hand on the map, or an
                 # import onto it undone: the note is stale, and the chip
                 # is labelled already by that label (2.9.6).
+                label = None
+            if label is not None and math.hypot(
+                    float(label.pixel_x) - chip.anchor_x,
+                    float(label.pixel_y) - chip.anchor_y) \
+                    > self.chip_spin.value():
+                # Further than a chip's width from where the chip was
+                # reviewed: not this chip's label, whatever its id says.
+                # Ids used to be handed out again after an undo or Clear
+                # All, and a note then latched onto a stranger - the chip
+                # jumped onto it, and an Ignore deleted it (2.9.11).
                 label = None
         if label is None:
             if not chip.label_gone:

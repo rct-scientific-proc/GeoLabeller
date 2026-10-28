@@ -1294,8 +1294,10 @@ class LabelProject:
         tmp_path = destination.with_suffix(destination.suffix + ".tmp")
         data = self.to_dict()
         try:
-            with open(tmp_path, 'w') as f:
-                json.dump(data, f, indent=2)
+            # One call: json.dump streams through the Python encoder and
+            # took five times as long for the same bytes (2.9.11).
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write(json.dumps(data, indent=2))
             os.replace(tmp_path, destination)
         except Exception:
             try:
@@ -1323,13 +1325,22 @@ class LabelProject:
         """
         if data is None:
             data = self.to_dict()
+        # The id counters are bookkeeping, not work: they only ever rise
+        # (2.9.11), so counted here an edit undone would leave the project
+        # "changed" for good. What names a label by id across sessions -
+        # a review file's note - is guarded by distance, not by the counter.
+        data = {key: value for key, value in data.items()
+                if key not in ("_next_id", "_next_waypoint_id")}
         canonical = json.dumps(data, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @classmethod
     def load(cls, file_path: str | Path) -> "LabelProject":
         """Load project from JSON file."""
-        with open(file_path, 'r') as f:
+        # UTF-8, as the ICD says the file is: with the locale's codec a
+        # file another tool wrote with accented class names came back
+        # mangled, or would not open at all (2.9.11).
+        with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
 
         project = cls()
@@ -1452,7 +1463,9 @@ class LabelProject:
         """Clear all labels but keep images and classes."""
         for image in self.images.values():
             image.labels.clear()
-        self._next_id = 1
+        # The id counter stays: an id once given out is never given
+        # again, so nothing that names a label by id - a review file's
+        # notes - can land on a later stranger (2.9.11).
         self._object_id_index.clear()
         self._label_id_index.clear()
 

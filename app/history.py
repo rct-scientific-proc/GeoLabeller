@@ -41,8 +41,10 @@ class Step:
     map an image path to a label-less copy of its entry (so its flags,
     and the entry itself when an edit made it, can be put back), or None
     where the project had no entry for it. ``lists_*`` map a LISTS name to a copy
-    of its value. ``next_id_*`` is the label id counter, which Clear All
-    Labels resets.
+    of its value. ``next_id_*`` is the label id counter - only ever raised
+    when a step is applied, never lowered: an id an undo took out of use
+    stays used, so a review note naming it can never find another label
+    under it (audit 2026-10-28, 2.9.11).
     """
     name: str
     labels_before: dict = field(default_factory=dict)
@@ -132,7 +134,7 @@ def _reorder_images(project, order):
         images[path] = image
 
 
-def _apply(project, labels: dict, images: dict, lists: dict, next_id: int,
+def _apply(project, labels: dict, images: dict, lists: dict,
            image_order=None):
     """Make the project hold exactly these states."""
     for label_id in labels:
@@ -176,7 +178,9 @@ def _apply(project, labels: dict, images: dict, lists: dict, next_id: int,
         _reorder_images(project, image_order)
     for name, value in lists.items():
         setattr(project, name, copy.deepcopy(value))
-    project._next_id = next_id
+    # The label id counter is left alone: it only ever rises (2.9.11).
+    # Redo recreates labels from the snapshots, ids included, and the
+    # counter is already past them.
 
 
 # -- the history ---------------------------------------------------------------
@@ -304,8 +308,7 @@ class EditHistory:
             return None
         step = self._undo.pop()
         _apply(project, step.labels_before, step.images_before,
-               step.lists_before, step.next_id_before,
-               step.image_order_before)
+               step.lists_before, step.image_order_before)
         self._redo.append(step)
         self._changed()
         return step
@@ -315,8 +318,7 @@ class EditHistory:
             return None
         step = self._redo.pop()
         _apply(project, step.labels_after, step.images_after,
-               step.lists_after, step.next_id_after,
-               step.image_order_after)
+               step.lists_after, step.image_order_after)
         self._undo.append(step)
         self._changed()
         return step

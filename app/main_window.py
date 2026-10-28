@@ -575,6 +575,13 @@ class MainWindow(QMainWindow):
         that fails, keeps the project open rather than losing it on the
         way out of the attempt to keep it.
         """
+        # The Model Review window's verdicts first: they never dirty the
+        # project, so a clean project used to take the window down with
+        # them unasked (audit 2026-10-28, 2.9.11).
+        review = self._model_review
+        if review is not None and review.pending() \
+                and not review._confirm_discard(f"{action.capitalize()} anyway?"):
+            return False
         if not self._has_unsaved_changes():
             return True
         choice = self._ask_save_changes(action)
@@ -5050,7 +5057,7 @@ class MainWindow(QMainWindow):
 
             data["images"] = images
 
-            with open(file_path, 'w') as f:
+            with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
 
             total_labels = sum(len(img['labels']) for img in images)
