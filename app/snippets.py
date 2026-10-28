@@ -164,14 +164,19 @@ def nodata_mask(data, nodata):
     return mask
 
 
-def _window_pixels(src, window, channels, nodata, scaling=None):
+def _window_pixels(src, window, channels, nodata, scaling=None,
+                   stats=None):
     """Read a window as an (H, W, C) uint8 array, or None if entirely nodata.
 
     ``scaling`` is the per-band stretch from :func:`_band_scaling` for
-    non-uint8 sources (uint8 data passes through byte-exact).
+    non-uint8 sources (uint8 data passes through byte-exact). A ``stats``
+    dict receives ``"nodata"``: how many pixels carried no data in any
+    band (they are painted black here; the H5 export records the count).
     """
     data = src.read(window=window)  # (bands, h, w)
     empty = nodata_mask(data, nodata)
+    if stats is not None:
+        stats["nodata"] = 0 if empty is None else int(empty.any(axis=0).sum())
     if empty is not None and bool(empty.all()):
         return None
     if scaling is not None:

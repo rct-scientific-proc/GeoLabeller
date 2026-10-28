@@ -62,6 +62,8 @@ from .reference import DEFAULT_COLUMNS as DEFAULT_REF_COLUMNS
 from .reference import MAX_SHOWN, ReferencePanel
 from .snippet_store import SnippetStore
 from .training import LearnThread, save_job, suggest_job, train_job
+from dataclasses import replace
+
 from .ledger import DEFAULT_TOLERANCE_PX, IGNORE, LedgerIndex, Verdict
 from . import labelled, outcomes
 from .source import (CANDIDATE,
@@ -1118,6 +1120,7 @@ class ModelReviewWindow(QWidget):
         self._undo.clear()
         self._redo.clear()
         self._page_start = 0
+        self._listed = []               # the grid's list is this file's
         self._set_detail(None)
         self._chips_gen += 1
         self._verdict_seq.clear()
@@ -1186,8 +1189,16 @@ class ModelReviewWindow(QWidget):
         if not self._path or not notes:
             return False
         misplaced: list = []
+        # Each chip's record as it was opened, so a note cannot land on
+        # another spot a rewritten file put at its index (2.9.15).
+        anchors = {}
+        for key in notes:
+            chip = self._by_key.get(key)
+            if chip is not None:
+                anchors[key] = (chip.image_name, chip.file_x, chip.file_y,
+                                chip.predicted)
         try:
-            outcomes.write_outcomes(self._path, notes, misplaced)
+            outcomes.write_outcomes(self._path, notes, misplaced, anchors)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             if not self._write_failed:
                 self._write_failed = True
@@ -1234,6 +1245,17 @@ class ModelReviewWindow(QWidget):
                 renamed[chip.key] = chip.earlier
         if renamed:
             self._write_outcomes(renamed)
+        if self._suggestions:
+            # The model's suggestions say the new name too, else Accept
+            # would give a class the project no longer has (2.9.15).
+            self._suggestions = {
+                key: replace(s, class_name=new if s.class_name == old
+                             else s.class_name,
+                             probabilities={(new if c == old else c): p
+                                            for c, p in
+                                            s.probabilities.items()})
+                for key, s in self._suggestions.items()}
+            self._fill_suggested_filter()
         settings = app_settings()
         order = load_order(settings)
         if old in order:
@@ -1260,6 +1282,7 @@ class ModelReviewWindow(QWidget):
                           "left the project dropped.")
         before = [(chip.key, chip.reviewed_before(), chip.verdict)
                   for chip in self._chips]
+        old_keys = self.listed_keys()
         placed = {chip.key: (chip.pixel_x, chip.pixel_y)
                   for chip in self._chips}
         for chip in self._chips:
@@ -1275,10 +1298,23 @@ class ModelReviewWindow(QWidget):
                                  if key in self._by_key}
             self._fill_suggested_filter()
         self._reference_dirty = True
+        fresh_keys = [c.key for c in self._listed_chips()]
         if (rebuild or gone or changed or before != after
-                or [c.key for c in self._listed_chips()] != self.listed_keys()):
+                or fresh_keys != old_keys):
             # ...or the list would not be what the grid shows: a chip
             # cleared of its verdict since, labelled already, leaves it.
+            if old_keys and fresh_keys != old_keys:
+                # The page begins at the first chip it showed that is
+                # still listed, as Next does - never further on, so chips
+                # that came back (an import undone) are on it. Kept as a
+                # number, in a list an import had just shortened by the
+                # chips it took, the page skipped as many chips the user
+                # had not seen (2.9.15). With none of its chips left it
+                # stays put, and _rebuild settles on the last page.
+                landing = self._landing(old_keys, fresh_keys,
+                                        self._page_start)
+                if landing is not None:
+                    self._page_start = min(self._page_start, landing)
             self._fill_filter()
             self._rebuild()
         else:
@@ -1566,14 +1602,21 @@ class ModelReviewWindow(QWidget):
         else:
             want = self._page_start  # no page there: this one settles
         if fresh_keys != old_keys:
-            place = {key: i for i, key in enumerate(fresh_keys)}
-            landing = next((place[key] for key in old_keys[want:]
-                            if key in place), None)
+            landing = self._landing(old_keys, fresh_keys, want)
             want = (landing if landing is not None
                     else max(0, len(fresh_keys) - per_page))
         self._page_start = want
         self._rebuild()
         return True
+
+    @staticmethod
+    def _landing(old_keys, fresh_keys, want: int) -> "int | None":
+        """Where the page that began at ``want`` of ``old_keys`` begins
+        in ``fresh_keys``: at the first of its chips still listed, or
+        None when none is."""
+        place = {key: i for i, key in enumerate(fresh_keys)}
+        return next((place[key] for key in old_keys[want:]
+                     if key in place), None)
 
     def _on_per_page(self, value):
         # Keep the place: the chip at the top of the page stays on it,
@@ -2792,9 +2835,13 @@ class ModelReviewWindow(QWidget):
         return pairs
 
     def _give_each(self, pairs, what: str) -> "dict | None":
-        """Each chip its own verdict, as one thing to take back."""
+        """Each chip its own verdict, as one thing to take back. A
+        verdict naming a class the project no longer has - a suggestion
+        made before the class was removed - is not given: importing it
+        would quietly put the class back (2.9.15)."""
         chips = [chip for chip, verdict in pairs
-                 if not chip.reviewed_before() and chip.verdict != verdict]
+                 if not chip.reviewed_before() and chip.verdict != verdict
+                 and (verdict == IGNORE or verdict in self._classes)]
         if not chips:
             return None
         entry = self._remember(chips, what)
@@ -2841,7 +2888,9 @@ class ModelReviewWindow(QWidget):
                  and suggestion.confidence >= floor]
         n = len(pairs)
         if pairs:
-            self._give_each(pairs, f"the page's suggestions accepted ({n})")
+            given = self._give_each(
+                pairs, f"the page's suggestions accepted ({n})")
+            n = len(given["chips"]) if given else 0
         self._note = (f"{n} suggestion{'' if n == 1 else 's'} at or above "
                       f"{floor:.2f} accepted on this page.")
         self._show_counts()

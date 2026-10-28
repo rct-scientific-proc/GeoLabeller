@@ -44,7 +44,7 @@ from .linked_row import LinkedRow
 from .size_section import SizeSection
 from .mask_section import MaskEditor, MaskSection
 from .orientation_section import OrientationEditor, OrientationSection
-from .single_view import TOOL_MOVE, TOOL_ORIENT, TOOL_PAINT
+from .single_view import TOOL_MOVE, TOOL_NONE, TOOL_ORIENT, TOOL_PAINT
 from .strip import SnippetStrip
 
 _VIEW_KEY = "snippet_editor/view"
@@ -448,6 +448,7 @@ class SnippetEditor(QWidget):
         single = view == self.SINGLE
         self.grid.set_active(not single)
         self.strip.panel.setVisible(single)
+        self.strip.current_in_hand = single
         # A class is changed on the snippet in hand, which only the Single
         # view has.
         self._show_class(self.strip.current_entry())
@@ -490,16 +491,20 @@ class SnippetEditor(QWidget):
         self._apply_worklists(on)
         for key, section in self.section_objects.items():
             section.set_shown(key in on)
-        # Each tool goes with its section; if the one in hand went, take up
-        # the first that is left.
+        # Each tool goes with its section; if the one in hand went - or
+        # none is in hand - take up the first section tool that is left,
+        # and with none left hold nothing. Move label is never taken up
+        # unasked: a tool that moves a label at a click is one to pick
+        # up on purpose, and "the first that is left" used to be it.
         for tool_id, button in self._tools.items():
             owner = self._tool_owner[tool_id]
             button.setEnabled(owner is None or owner in on)
-        if not self._tools[self.tool()].isEnabled():
-            for tool_id, button in self._tools.items():
-                if button.isEnabled():
-                    self.set_tool(tool_id)
-                    break
+        in_hand = self._tools.get(self.tool())
+        if in_hand is None or not in_hand.isEnabled():
+            left = [tool_id for tool_id, button in self._tools.items()
+                    if button.isEnabled()
+                    and self._tool_owner[tool_id] is not None]
+            self.set_tool(left[0] if left else TOOL_NONE)
 
     def _apply_worklists(self, keys):
         """The Show filter's pairs: one for each of these sections that
@@ -541,10 +546,22 @@ class SnippetEditor(QWidget):
         return self.masks.canvas.tool()
 
     def set_tool(self, tool: str):
-        """A tool id from a section's ``tool``, for the Single view."""
+        """A tool id from a section's ``tool``, for the Single view - or
+        TOOL_NONE, nothing in hand, when no section with a tool is on."""
         self.masks.canvas.set_tool(tool)
-        self._tools[tool].setChecked(True)
-        self.masks.set_tool_hint(self._tool_hints[tool])
+        button = self._tools.get(tool)
+        if button is not None:
+            button.setChecked(True)
+        else:
+            # An exclusive group lets no button go unchecked.
+            checked = self._tool_buttons.checkedButton()
+            if checked is not None:
+                self._tool_buttons.setExclusive(False)
+                checked.setChecked(False)
+                self._tool_buttons.setExclusive(True)
+        self.masks.set_tool_hint(self._tool_hints.get(
+            tool, "No tool in hand: switch Masks, Orientation or Size on "
+            "for one, or pick Move label (V)."))
 
     # -- keys ---------------------------------------------------------------
 

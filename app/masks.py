@@ -364,8 +364,53 @@ def _flood(seed: np.ndarray, ground: np.ndarray) -> np.ndarray:
     return flood(seed, ground)
 
 
+def pixel_difference(pixels: np.ndarray, x: int, y: int) -> np.ndarray:
+    """How unlike pixel (x, y) every pixel of ``pixels`` is: the most any
+    channel differs, in levels - the wand's ground at every tolerance.
+    Found once per press: a drag changes the tolerance, not the pixel.
+    Bytes do not wrap (the larger less the smaller, channel by channel).
+    """
+    pixels = np.asarray(pixels)
+    value = pixels[y, x]
+    difference = np.maximum(pixels, value) - np.minimum(pixels, value)
+    if difference.ndim == 3:
+        difference = difference.max(axis=2)
+    return difference
+
+
+def _flood_from(ground: np.ndarray, x: int, y: int) -> np.ndarray:
+    """The ground reachable from pixel (x, y), flooded in a window round
+    it that is widened while the patch reaches the window's edge. A patch
+    a few pixels wide on a large snippet costs its own neighbourhood on
+    every tolerance step of a drag, not the whole snippet; one that spans
+    the snippet costs about a third more than a single flood of it all.
+    """
+    height, width = ground.shape
+    region = np.zeros((height, width), dtype=bool)
+    if not ground[y, x]:
+        return region
+    half = 64
+    while True:
+        r0, r1 = max(0, y - half), min(height, y + half + 1)
+        c0, c1 = max(0, x - half), min(width, x + half + 1)
+        window = ground[r0:r1, c0:c1]
+        seed = np.zeros(window.shape, dtype=bool)
+        seed[y - r0, x - c0] = True
+        patch = flood(seed, window)
+        # At an edge of the window that is not the snippet's, the patch
+        # may go on beyond it.
+        if not ((r0 > 0 and patch[0].any())
+                or (r1 < height and patch[-1].any())
+                or (c0 > 0 and patch[:, 0].any())
+                or (c1 < width and patch[:, -1].any())):
+            region[r0:r1, c0:c1] = patch
+            return region
+        half *= 2
+
+
 def similar_region(pixels: np.ndarray, x: int, y: int, tolerance: int,
-                   barrier: "np.ndarray | None" = None) -> np.ndarray:
+                   barrier: "np.ndarray | None" = None,
+                   difference: "np.ndarray | None" = None) -> np.ndarray:
     """The patch around pixel (x, y) that looks like it: the wand.
 
     ``pixels`` is the snippet AS DISPLAYED - (height, width) or (height,
@@ -374,24 +419,22 @@ def similar_region(pixels: np.ndarray, x: int, y: int, tolerance: int,
     channel is within ``tolerance`` levels of it, and it belongs to the
     patch when it can be reached from the click through pixels that are
     (up, down, left, right). ``barrier`` pixels are never taken and never
-    crossed - other masks, when masks may not overlap.
+    crossed - other masks, when masks may not overlap. ``difference`` is
+    ``pixel_difference(pixels, x, y)`` found already, by a host asked for
+    the patch at tolerance after tolerance of one drag.
 
     Empty when the click is outside the snippet or on the barrier.
     """
     pixels = np.asarray(pixels)
     height, width = pixels.shape[:2]
-    seed = np.zeros((height, width), dtype=bool)
     if not (0 <= x < width and 0 <= y < height):
-        return seed
-    difference = np.abs(pixels.astype(np.int16)
-                        - pixels[y, x].astype(np.int16))
-    if difference.ndim == 3:
-        difference = difference.max(axis=2)
+        return np.zeros((height, width), dtype=bool)
+    if difference is None:
+        difference = pixel_difference(pixels, x, y)
     ground = difference <= tolerance
     if barrier is not None:
         ground &= ~np.asarray(barrier, dtype=bool)
-    seed[y, x] = True
-    return flood(seed, ground)
+    return _flood_from(ground, x, y)
 
 
 def grow(mask: np.ndarray,
@@ -637,8 +680,41 @@ def merged_entry(name: str, x0: int, y0: int, layer: np.ndarray,
     return mask_entry(name, ux0, uy0, union)
 
 
-def mask_statistics(pixels: np.ndarray, mask: np.ndarray,
-                    nodata=None) -> "dict | None":
+def window_totals(pixels: np.ndarray, nodata=None) -> tuple:
+    """Per-band sums of a raw (bands, height, width) window, for
+    ``mask_statistics`` - taken once per snippet, so a stroke's readout
+    costs the stroke's own pixels rather than the whole window.
+
+    ``(shift, count, total, squares)``, each a band-long array: the valid
+    pixels' mean - the shift every sum is taken about, so the spread of a
+    near-constant band is not the difference of two large numbers - how
+    many pixels are valid, and their sum and sum of squares about the
+    shift. Nodata (NaN, and the declared ``nodata``) counts for nothing.
+    """
+    from .snippets import nodata_mask
+
+    pixels = np.asarray(pixels)
+    bands = pixels.shape[0]
+    shift, total, squares = (np.zeros(bands) for _ in range(3))
+    count = np.zeros(bands, dtype=np.int64)
+    for band in range(bands):           # a band at a time: a third of
+        data = pixels[band].astype(np.float64).ravel()   # the memory
+        valid = np.isfinite(data)
+        invalid = nodata_mask(data, nodata)
+        if invalid is not None:
+            valid &= ~invalid
+        data = data[valid]
+        count[band] = data.size
+        if data.size:
+            shift[band] = data.mean()
+            data -= shift[band]
+            total[band] = data.sum()
+            squares[band] = np.dot(data, data)
+    return shift, count, total, squares
+
+
+def mask_statistics(pixels: np.ndarray, mask: np.ndarray, nodata=None,
+                    totals: "tuple | None" = None) -> "dict | None":
     """Per-band mean/std of the masked object versus the background.
 
     ``pixels`` is a (bands, height, width) array of RAW source values (not
@@ -652,31 +728,54 @@ def mask_statistics(pixels: np.ndarray, mask: np.ndarray,
     "nan", and a sentinel like -9999 drags the average somewhere
     meaningless. NaN is always excluded; ``nodata`` additionally excludes a
     declared sentinel value.
+
+    ``totals`` is ``window_totals(pixels, nodata)`` taken already. The
+    object is read from the mask's bounding box alone and the background
+    is what the totals have left: the readout after a stroke costs the
+    stroke, where it used to cost the window (a third of a second at
+    2048 px).
     """
     from .snippets import nodata_mask
 
+    pixels = np.asarray(pixels)
     mask = np.asarray(mask, dtype=bool)
     n_object = int(mask.sum())
     if n_object == 0 or n_object == mask.size:
         return None
-    data = np.asarray(pixels, dtype=np.float64)
-    invalid = nodata_mask(data, nodata)
-    if invalid is not None and invalid.any():
-        data = np.where(invalid, np.nan, data)
-
-    inside = data[:, mask]
-    outside = data[:, ~mask]
-    # A band with nothing valid left on one side has no comparison to
-    # report, and nanmean of an empty slice is a warning plus a NaN.
-    if (np.isfinite(inside).sum(axis=1).min() == 0
-            or np.isfinite(outside).sum(axis=1).min() == 0):
+    if totals is None:
+        totals = window_totals(pixels, nodata)
+    shift, count_all, total_all, squares_all = totals
+    rows = np.flatnonzero(mask.any(axis=1))
+    cols = np.flatnonzero(mask.any(axis=0))
+    r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+    inside = pixels[:, r0:r1, c0:c1][:, mask[r0:r1, c0:c1]].astype(
+        np.float64)
+    valid = np.isfinite(inside)
+    invalid = nodata_mask(inside, nodata)
+    if invalid is not None:
+        valid &= ~invalid
+    inside = np.where(valid, inside - shift[:, None], 0.0)
+    count = valid.sum(axis=1)
+    total = inside.sum(axis=1)
+    squares = (inside * inside).sum(axis=1)
+    count_background = count_all - count
+    # A band with nothing valid on one side has no comparison to report.
+    if count.min() == 0 or count_background.min() == 0:
         return None
-    with np.errstate(all="ignore"):
-        return {
-            "pixels_object": n_object,
-            "pixels_background": int(mask.size - n_object),
-            "object_mean": np.nanmean(inside, axis=1).tolist(),
-            "object_std": np.nanstd(inside, axis=1).tolist(),
-            "background_mean": np.nanmean(outside, axis=1).tolist(),
-            "background_std": np.nanstd(outside, axis=1).tolist(),
-        }
+
+    def moments(n, first, second):
+        mean = first / n
+        spread = np.sqrt(np.maximum(second / n - mean * mean, 0.0))
+        return (mean + shift).tolist(), spread.tolist()
+
+    object_mean, object_std = moments(count, total, squares)
+    background_mean, background_std = moments(
+        count_background, total_all - total, squares_all - squares)
+    return {
+        "pixels_object": n_object,
+        "pixels_background": int(mask.size - n_object),
+        "object_mean": object_mean,
+        "object_std": object_std,
+        "background_mean": background_mean,
+        "background_std": background_std,
+    }

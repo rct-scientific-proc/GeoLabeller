@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from PyQt5.QtCore import QSize, Qt, pyqtSignal
+from PyQt5.QtCore import QPoint, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QComboBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu,
@@ -52,6 +52,15 @@ class SnippetPanel(QWidget):
         # What the strip currently shows, one _view_key per tile in order.
         # A rebuild compares against this and touches only what differs.
         self._view_keys: list = []
+        # Tiles without a picture yet, by label id: read as they come
+        # into view, not all at once (audit 2026-10-28 P1, 2.9.15). One
+        # request per label on the UI thread was 13 s for 20,000, and
+        # the icons for all of them 1.6 GB.
+        self._unloaded: dict = {}
+        self._view_timer = QTimer(self)
+        self._view_timer.setSingleShot(True)
+        self._view_timer.setInterval(40)
+        self._view_timer.timeout.connect(self._request_in_view)
         self._setup_ui()
 
     # -- UI -----------------------------------------------------------------
@@ -106,7 +115,17 @@ class SnippetPanel(QWidget):
         self.list.itemDoubleClicked.connect(self._on_double_clicked)
         self.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._show_context_menu)
+        self.list.verticalScrollBar().valueChanged.connect(
+            lambda _value: self._view_timer.start())
         layout.addWidget(self.list)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._view_timer.start()        # more rows may show now
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._view_timer.start()
 
     def _apply_display_size(self):
         size = self.size_spin.value()
@@ -231,6 +250,7 @@ class SnippetPanel(QWidget):
         # Take the existing tiles out without destroying them, so a tile
         # whose key is unchanged keeps the icon it already has.
         held = {}
+        unloaded, self._unloaded = self._unloaded, {}
         self.list.setUpdatesEnabled(False)
         try:
             while self.list.count():
@@ -238,7 +258,6 @@ class SnippetPanel(QWidget):
                 held[item.data(self._ID_ROLE)] = item
             self._items.clear()
 
-            requests = []
             for key in keys:
                 label_id = key[0]
                 entry = entries.get(label_id)
@@ -247,7 +266,9 @@ class SnippetPanel(QWidget):
                 item = held.pop(label_id, None)
                 if item is None or previous.get(label_id) != key:
                     item = self._make_item(entry, size)
-                    requests.append(entry)
+                    self._unloaded[label_id] = entry
+                elif label_id in unloaded:
+                    self._unloaded[label_id] = entry    # still waiting
                 self.list.addItem(item)
                 self._items[label_id] = item
         finally:
@@ -259,9 +280,41 @@ class SnippetPanel(QWidget):
             self._loader.cancel(label_id)
 
         self._view_keys = list(keys)
-        for entry in requests:
-            self._loader.request(entry["label_id"], entry["image_path"],
-                                 entry["pixel_x"], entry["pixel_y"], size)
+        self._request_in_view()
+
+    def _rows_in_view(self) -> tuple:
+        """The first and last row the viewport shows; (-1, -1) if none."""
+        count = self.list.count()
+        if not count:
+            return -1, -1
+        viewport = self.list.viewport()
+        first = self.list.indexAt(QPoint(4, 4)).row()
+        last = self.list.indexAt(QPoint(4, viewport.height() - 4)).row()
+        return (max(0, first), count - 1 if last < 0 else last)
+
+    def _request_in_view(self):
+        """Ask for the pictures of the rows on screen and a screen's
+        worth either side, in strip order and grouped by image, and no
+        more: the rest are asked for as they scroll into view, so a
+        strip of 20,000 costs what the user looks at. A Display
+        Settings change, which remakes every tile, re-reads these
+        few (audit 2026-10-28 P2, 2.9.15)."""
+        if not self._unloaded:
+            return
+        first, last = self._rows_in_view()
+        if first < 0:
+            return
+        margin = max(8, last - first + 1)
+        wanted = []
+        for row in range(max(0, first - margin),
+                         min(self.list.count(), last + margin + 1)):
+            label_id = self.list.item(row).data(self._ID_ROLE)
+            entry = self._unloaded.pop(label_id, None)
+            if entry is not None:
+                wanted.append((label_id, entry["image_path"],
+                               entry["pixel_x"], entry["pixel_y"]))
+        if wanted:
+            self._loader.request_many(wanted, self.size_spin.value())
 
     def _make_item(self, entry, size: int):
         """One strip tile, sized before its icon arrives.

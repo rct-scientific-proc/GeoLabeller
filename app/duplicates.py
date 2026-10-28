@@ -94,6 +94,27 @@ def _hypot(a, b) -> float:
     return math.hypot(a.pixel_x - b.pixel_x, a.pixel_y - b.pixel_y)
 
 
+def _grid(labels, cell: float) -> dict:
+    """The labels by the ``cell``-sized square each lies in. Everything
+    within ``cell`` of a point is in the nine squares around its own,
+    so a check costs the labels near the point, not the image's: every
+    new label against every label on its image was 1.9 s for 2,000
+    (audit 2026-10-28, 2.9.15)."""
+    grid: dict = {}
+    for label in labels:
+        key = (int(label.pixel_x // cell), int(label.pixel_y // cell))
+        grid.setdefault(key, []).append(label)
+    return grid
+
+
+def _around(grid: dict, x: float, y: float, cell: float):
+    """The grid's labels in the nine squares around (x, y)."""
+    column, row = int(x // cell), int(y // cell)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            yield from grid.get((column + dx, row + dy), ())
+
+
 def nearby_ids(project, places, distance: float) -> set:
     """Ids of the labels within ``distance`` of any ``(image_path, x, y)``
     place: what an import may displace, named to its undo step before
@@ -101,15 +122,17 @@ def nearby_ids(project, places, distance: float) -> set:
     wanted: dict = {}
     for path, x, y in places:
         wanted.setdefault(path, []).append((float(x), float(y)))
+    cell = max(float(distance), 1e-6)
     ids: set = set()
     for path, points in wanted.items():
         image = project.images.get(path)
         if image is None:
             continue
-        for label in image.labels:
-            if any(math.hypot(label.pixel_x - x, label.pixel_y - y)
-                   <= distance for x, y in points):
-                ids.add(label.id)
+        grid = _grid(image.labels, cell)
+        for x, y in points:
+            for label in _around(grid, x, y, cell):
+                if math.hypot(label.pixel_x - x, label.pixel_y - y) <= distance:
+                    ids.add(label.id)
     return ids
 
 
@@ -117,15 +140,20 @@ def find_overlaps(project, new_ids, distance: float) -> list:
     """For each label whose id is in ``new_ids``, the nearest label on
     its image that is not new, when within ``distance`` pixels."""
     new_ids = set(new_ids)
+    cell = max(float(distance), 1e-6)
     overlaps = []
     for path, image in project.images.items():
         olds = [label for label in image.labels if label.id not in new_ids]
         if not olds:
             continue
+        grid = _grid(olds, cell)
         for label in image.labels:
             if label.id not in new_ids:
                 continue
-            nearest = min(olds, key=lambda old: _hypot(old, label))
+            nearest = min(_around(grid, label.pixel_x, label.pixel_y, cell),
+                          key=lambda old: _hypot(old, label), default=None)
+            if nearest is None:
+                continue
             d = _hypot(nearest, label)
             if d <= distance:
                 overlaps.append(Overlap(path, nearest, label, d))

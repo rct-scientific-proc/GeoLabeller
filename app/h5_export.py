@@ -29,15 +29,15 @@ import os
 from dataclasses import dataclass, field
 
 import numpy as np
-import rasterio
 from rasterio.windows import Window
 import h5py
-from PyQt5.QtCore import QObject, pyqtSignal
+from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 
 # The framing and stretch live with the snippet service now, so the
 # sidebar/orientation views and the exports can never frame differently.
 from .masks import entry_in_window, prepare_entry
-from .snippets import (centered_window, nodata_mask, _band_scaling,  # noqa: F401
+from . import gdal_config
+from .snippets import (centered_window, nodata_mask, cached_band_scaling,
                        _window_pixels)
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox, QLabel,
@@ -152,11 +152,18 @@ _STRING_COLUMNS = ("locations", "object_ids")
 #                  label. The pixel angle holds in the crop as stored: a
 #                  crop is a plain window of the source raster, which only
 #                  translates it.
+#   nodata         how many of the sample's pixels carried no data in the
+#                  source (NaN or the nodata sentinel) and were filled in:
+#                  with the window's own mean in the float32 format, black
+#                  in uint8. 0 for a sample cut whole from real ground. A
+#                  consumer can weight or drop a sample that is mostly
+#                  made up - a swath-edge crop used to carry NaN unseen.
 _NUMERIC_GROUPS = {
     "confidence": (("confidence", "uint8", 0),),
     "orientation": (("orientation_px_rad", "float32", float("nan")),
                     ("orientation_deg", "float32", float("nan")),
                     ("orientation_derived", "bool", False)),
+    "nodata": (("nodata_filled", "uint32", 0),),
 }
 _NUMERIC_COLUMNS = tuple(name for group in _NUMERIC_GROUPS.values()
                          for name, _dtype, _fill in group)
@@ -205,7 +212,7 @@ def read_settings(path) -> dict | None:
         return None
 
 
-def _float_window_pixels(src, window, nodata):
+def _float_window_pixels(src, window, nodata, stats=None):
     """Read a window as an (H, W, 1) float32 grayscale array, or ``None``.
 
     The float32 pixel format keeps values MEANINGFUL rather than displayable:
@@ -217,6 +224,12 @@ def _float_window_pixels(src, window, nodata):
     the uint8 grayscale export uses; multi-band float imagery takes band 1
     (mixing physical units through luminance weights would mean nothing).
     Entirely-nodata windows return None, like the uint8 reader.
+
+    Pixels without data (NaN, or the sentinel) are filled with the mean of
+    the window's real pixels - a value from the window's own range, so a
+    swath-edge crop trains on nothing it could not contain - and their
+    count goes to ``stats["nodata"]`` when a dict is given. Left as read,
+    a NaN or a -9999 went straight into the training set.
     """
     data = src.read(window=window)
     empty = nodata_mask(data, nodata)
@@ -227,10 +240,19 @@ def _float_window_pixels(src, window, nodata):
         gray = (0.299 * data[0].astype(np.float32)
                 + 0.587 * data[1].astype(np.float32)
                 + 0.114 * data[2].astype(np.float32))
+        missing = None if empty is None else empty[:3].any(axis=0)
     else:
         gray = data[0].astype(np.float32)
+        missing = None if empty is None else empty[0]
     if integer:
         gray /= float(np.iinfo(data.dtype).max)
+    filled = 0 if missing is None else int(missing.sum())
+    if filled == gray.size:
+        return None                 # nothing real in the bands used
+    if filled:
+        gray[missing] = float(gray[~missing].mean())
+    if stats is not None:
+        stats["nodata"] = filled
     return np.ascontiguousarray(gray[..., np.newaxis])
 
 
@@ -551,7 +573,8 @@ class H5DatasetWriter:
 
     def add(self, image_hwc, label_index, gt, split_value,
             location: str = "", object_id: str = "", confidence: int = 0,
-            orientation: "tuple | None" = None) -> int:
+            orientation: "tuple | None" = None,
+            nodata_filled: int = 0) -> int:
         """Buffer one sample; flushes when a batch has accumulated.
 
         Returns the sample's global row index, so masks (and any future
@@ -567,6 +590,8 @@ class H5DatasetWriter:
         ``confidence`` is the label's 1-5 rating, 0 when unrated (and for a
         hard negative). ``orientation`` is ``(px_rad, deg, derived)`` with
         None for what is unknown, or None when there is no orientation.
+        ``nodata_filled`` is how many of the sample's pixels were filled in
+        for want of data (see _NUMERIC_GROUPS).
         """
         self._img_buf.append(image_hwc)
         self._lbl_buf.append(label_index)
@@ -583,6 +608,7 @@ class H5DatasetWriter:
             nan if deg is None or px_rad is None else float(deg))
         self._num_bufs["orientation_derived"].append(
             bool(derived) and px_rad is not None)
+        self._num_bufs["nodata_filled"].append(max(0, int(nodata_filled)))
         self._img_bytes += getattr(image_hwc, "nbytes", 0)
         row = self._n + len(self._img_buf) - 1
         if (len(self._img_buf) >= _FLUSH_BATCH
@@ -774,15 +800,21 @@ def _positive_windows(pts, img_width, img_height, width, height, offset,
     for index, (x, y, class_index, object_id) in enumerate(pts):
         base_x, base_y = centered_window(
             x, y, width, height, img_width, img_height)
-        bases.append((base_x, base_y, x, y, class_index, object_id, index))
+        # The window centred on the label before any edge shift: where the
+        # offset copies are measured from, and the crop that needs no
+        # explaining. The dialog's estimate runs this for every label of
+        # the project, so a centred crop logs nothing (20,000 lines cost it
+        # a third of its time); a crop the edge shifted is logged, so a
+        # real off-centre export can be traced to its label.
+        centre_x = int(round(x)) - width // 2
+        centre_y = int(round(y)) - height // 2
+        bases.append((centre_x, centre_y, x, y, class_index, object_id, index))
         offer(base_x, base_y, x, y, class_index, object_id, index)
-        # Where the label lands inside its centred crop. Anything other than
-        # (width//2, height//2) means the crop was shifted off an image edge -
-        # log it so a real off-centre export can be traced to its label.
-        debug(f"h5 centre crop: label px ({x:.1f}, {y:.1f}) on "
-              f"{img_width}x{img_height} -> window ({base_x}, {base_y}), "
-              f"label at ({x - base_x:.1f}, {y - base_y:.1f}) of "
-              f"{width}x{height}")
+        if (base_x, base_y) != (centre_x, centre_y):
+            debug(f"h5 centre crop: label px ({x:.1f}, {y:.1f}) on "
+                  f"{img_width}x{img_height} -> window ({base_x}, {base_y}), "
+                  f"label at ({x - base_x:.1f}, {y - base_y:.1f}) of "
+                  f"{width}x{height}")
 
     # Pass 2: the eight offsets, measured from the window centred on the
     # label BEFORE the edge shift - offer() shifts each copy inside the
@@ -791,9 +823,7 @@ def _positive_windows(pts, img_width, img_height, width, height, offset,
     # crops of empty ground (audit 2026-10-28, 2.9.11). Copies the edge
     # pushes onto one spot are kept once, as ever.
     if offset > 0:
-        for _base_x, _base_y, x, y, class_index, object_id, index in bases:
-            centre_x = int(round(x)) - width // 2
-            centre_y = int(round(y)) - height // 2
+        for centre_x, centre_y, x, y, class_index, object_id, index in bases:
             for dy in (-offset, 0, offset):
                 for dx in (-offset, 0, offset):
                     if dx == 0 and dy == 0:
@@ -909,28 +939,43 @@ def export_image(writer, path, labels, height, width, overlap, channels,
                         str(getattr(lab, "object_id", "") or "")))
             pt_labels.append(lab)
 
-    # Every painted mask on this image, in source-pixel anchoring. Each
-    # example crop gets every mask that intersects it (re-anchored by pure
-    # translation), so the mask table stays true to the ground even where
-    # crops overlap or a neighbouring object's mask leaks into the window.
+    # Every painted mask on this image, in source-pixel anchoring - the
+    # protected labels' too, since an object-scoped export crops ground
+    # their masks lie on. Each example crop gets every mask that intersects
+    # it (re-anchored by pure translation), so the mask table stays true to
+    # the ground even where crops overlap or a neighbouring object's mask
+    # leaks into the window; built from the exported labels alone, a
+    # masked hull 20 px from the one exported was taught as background.
     # Prepared once for the whole image, not once per crop: each of these
     # is asked about every one of the nine crops of every label, and the
     # RLE parse in front of that read used to be repeated every time.
-    mask_entries = [prepare_entry(entry) for lab in labels
+    exported = {id(lab) for lab in labels}
+    masked = list(labels) + [lab for lab in protect_labels or ()
+                             if id(lab) not in exported]
+    mask_entries = [prepare_entry(entry) for lab in masked
                     for entry in getattr(lab, "masks", []) or []]
 
-    with rasterio.open(path) as src:
+    # Opened as the canvas opens: without listing the folder for sidecars
+    # (2.6 ms against 0.4 ms per open in a folder of 13,000).
+    with gdal_config.opened(path) as src:
         nodata = src.nodata
         as_float = pixel_dtype == "float32"
         # One contrast stretch per raster (None for uint8 sources), so every
-        # snippet of this image is scaled identically - see _band_scaling.
-        # The float32 format never stretches, so it skips the sampling read.
-        scaling = None if as_float else _band_scaling(src)
+        # snippet of this image is scaled identically - and the one every
+        # display surface shares, sampled once per file however many
+        # exports ask (0.8 s a 16-bit image without overviews). The float32
+        # format never stretches, so it skips the sampling read.
+        scaling = None if as_float else cached_band_scaling(src)
 
         def window_pixels(win):
+            """The window's pixels and how many of them were filled in."""
+            stats = {}
             if as_float:
-                return _float_window_pixels(src, win, nodata)
-            return _window_pixels(src, win, channels, nodata, scaling=scaling)
+                arr = _float_window_pixels(src, win, nodata, stats=stats)
+            else:
+                arr = _window_pixels(src, win, channels, nodata,
+                                     scaling=scaling, stats=stats)
+            return arr, stats.get("nodata", 0)
 
         offset = max(0, int(positive_offset))
         owners: dict = {}
@@ -940,7 +985,7 @@ def export_image(writer, path, labels, height, width, overlap, channels,
         for (x0, y0), (class_index, object_id) in positives.items():
             if cancel_check and cancel_check():
                 return added, negative_counts, 0
-            arr = window_pixels(Window(x0, y0, width, height))
+            arr, filled = window_pixels(Window(x0, y0, width, height))
             if arr is None:
                 continue  # entirely nodata
             # The label this crop is framed on - its object id's label -
@@ -952,7 +997,8 @@ def export_image(writer, path, labels, height, width, overlap, channels,
                 confidence=getattr(owner, "confidence", 0),
                 orientation=(getattr(owner, "orientation_px_rad", None),
                              getattr(owner, "orientation_deg", None),
-                             getattr(owner, "orientation_derived", False)))
+                             getattr(owner, "orientation_derived", False)),
+                nodata_filled=filled)
             for entry in mask_entries:
                 layer = entry_in_window(entry, x0, y0, width, height)
                 if layer.any():
@@ -993,7 +1039,7 @@ def export_image(writer, path, labels, height, width, overlap, channels,
                     return added, negative_counts, int(excluded.sum())
                 if excluded[iy, ix]:
                     continue  # shares ground with an example
-                arr = window_pixels(Window(x0, y0, width, height))
+                arr, filled = window_pixels(Window(x0, y0, width, height))
                 if arr is None:
                     continue  # entirely nodata
                 negative_split = split_value
@@ -1001,7 +1047,7 @@ def export_image(writer, path, labels, height, width, overlap, channels,
                     negative_split = int(pool[taken])
                     taken += 1
                 writer.add(arr, hard_negative_index, False, negative_split,
-                           location=location)
+                           location=location, nodata_filled=filled)
                 negative_counts[negative_split] += 1
                 added += 1
     return added, negative_counts, int(excluded.sum())
@@ -1151,6 +1197,15 @@ class H5ExportDialog(QDialog):
         self._counts = dict(counts or {})
         self._selection = dict(selection) if selection else None
         self._estimator = estimator
+        # One count per burst of changes, not one per control: the estimate
+        # walks every label of the project (1.4 s at 20,000), and restoring
+        # the last export's settings below used to run it eight times
+        # before the dialog had even shown. Made before any widget, since
+        # the first scope toggle already asks for a count.
+        self._estimate_timer = QTimer(self)
+        self._estimate_timer.setSingleShot(True)
+        self._estimate_timer.setInterval(150)
+        self._estimate_timer.timeout.connect(self._count_estimate)
         self._defaults = dict(defaults or {})
         self.setWindowTitle("Export HDF5 Dataset")
         self.setMinimumWidth(500)
@@ -1437,10 +1492,20 @@ class H5ExportDialog(QDialog):
         self.channel_combo.currentIndexChanged.connect(self._refresh_estimate)
         self.pixel_format_combo.currentIndexChanged.connect(
             self._refresh_estimate)
-        self._refresh_estimate()
+        # The first count on the spot, so the dialog opens with its number
+        # showing; the restores above each asked for one, now coalesced.
+        self._estimate_timer.stop()
+        self._count_estimate()
 
     def _refresh_estimate(self, *_args):
-        """Show what the current settings would write."""
+        """Show what the current settings would write - once the changes
+        have stopped for a moment."""
+        if self._estimator is None:
+            return
+        self._estimate_timer.start()
+
+    def _count_estimate(self):
+        """Run the estimate and show it."""
         if self._estimator is None:
             return
         try:

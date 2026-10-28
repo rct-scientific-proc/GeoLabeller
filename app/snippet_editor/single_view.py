@@ -33,6 +33,7 @@ TOOL_MEASURE = "measure"    # the same gesture, for a length or a width
 TOOL_MOVE = "move"          # a click puts the label's own point there
 TOOL_POLYGON = "polygon"    # clicks round a shape; the host fills it in
 TOOL_WAND = "wand"          # a click on a pixel; the host finds its like
+TOOL_NONE = "none"          # nothing in hand: a click does nothing
 
 # The tools that draw a line rather than paint.
 _LINE_TOOLS = (TOOL_ORIENT, TOOL_MEASURE)
@@ -315,8 +316,8 @@ class MaskPaintCanvas(QWidget):
         self.update()
 
     def set_tool(self, tool: str):
-        """TOOL_PAINT, TOOL_POLYGON, TOOL_ORIENT, TOOL_MEASURE or
-        TOOL_MOVE."""
+        """TOOL_PAINT, TOOL_POLYGON, TOOL_WAND, TOOL_ORIENT, TOOL_MEASURE
+        or TOOL_MOVE - or TOOL_NONE, nothing in hand."""
         self._tool = tool
         self._line_start = self._line_now = None
         self._polygon, self._polygon_cursor = [], None
@@ -871,6 +872,8 @@ class MaskPaintCanvas(QWidget):
                     and event.modifiers() & Qt.ShiftModifier)):
             self._pan_last = event.globalPos()
             self.setCursor(Qt.ClosedHandCursor)
+            return
+        if self._tool == TOOL_NONE:
             return
         if self._tool == TOOL_MOVE:
             # An image that cannot be read shows nothing to aim at.

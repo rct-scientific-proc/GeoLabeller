@@ -61,6 +61,7 @@ class Step:
     image_order_before: "tuple | None" = None
     image_order_after: "tuple | None" = None
     token: object = None
+    serial: int = 0             # given when pushed; see position()
 
     def label_ids(self) -> set:
         return set(self.labels_before) | set(self.labels_after)
@@ -144,9 +145,23 @@ def _reorder_images(project, order):
         images[path] = image
 
 
+# What a step puts back of an image's record - field by field, and only
+# the fields the step changed (see _apply).
+_IMAGE_FIELDS = ("hard_negative_source", "location", "original_width",
+                 "original_height", "affine_coeffs", "crs_epsg", "crs_wkt")
+
+
 def _apply(project, labels: dict, images: dict, lists: dict,
-           image_order=None):
-    """Make the project hold exactly these states."""
+           image_order=None, other_images=None):
+    """Make the project hold exactly these states.
+
+    ``other_images`` is the step's other side (its "after" when undoing,
+    its "before" when redoing): an image's record takes back only the
+    fields the step changed between the two. The record is also written
+    outside the history - a header read backfilling the geometry, a
+    location tag set since by an older build - and undoing an older
+    step used to rewind those too (audit 2026-10-28 M6, 2.9.15).
+    """
     for label_id in labels:
         _take_label_out(project, label_id)
     # An entry the project no longer has comes back BEFORE the labels do:
@@ -173,17 +188,17 @@ def _apply(project, labels: dict, images: dict, lists: dict,
             if image is not None and not image.labels:
                 del project.images[path]
             continue
-        image.hard_negative_source = state.hard_negative_source
-        image.location = state.location
         # The recorded geometry too: re-seating labels on cropped
         # imagery changes it (2.8.6). The transformer cache goes by
         # the CRS key, so the fields can be set outright.
-        image.original_width = state.original_width
-        image.original_height = state.original_height
-        image.affine_coeffs = (list(state.affine_coeffs)
-                               if state.affine_coeffs is not None else None)
-        image.crs_epsg = state.crs_epsg
-        image.crs_wkt = state.crs_wkt
+        other = other_images.get(path) if other_images else None
+        for name in _IMAGE_FIELDS:
+            value = getattr(state, name)
+            if other is not None and getattr(other, name) == value:
+                continue            # not this step's to put back
+            if name == "affine_coeffs" and value is not None:
+                value = list(value)
+            setattr(image, name, value)
     if image_order is not None:
         _reorder_images(project, image_order)
     for name, value in lists.items():
@@ -203,6 +218,7 @@ class EditHistory:
         self._undo: list = []
         self._redo: list = []
         self._listeners: list = []
+        self._serial = 0            # the last serial given to a step
 
     # -- asking ---------------------------------------------------------------
 
@@ -220,6 +236,16 @@ class EditHistory:
 
     def __len__(self):
         return len(self._undo)
+
+    def position(self) -> tuple:
+        """Where the history stands: how deep, and which step is on
+        top. Two equal positions are the same project, barring edits
+        made outside the history - a step pushed after an undo begins
+        a new line, and its serial tells its states from the old
+        line's. The window asks the project's digest only back at the
+        position it was saved at, and takes any other for a change
+        (2.9.15)."""
+        return (len(self._undo), self._undo[-1].serial if self._undo else 0)
 
     def on_change(self, listener):
         """Call ``listener()`` whenever what can be undone or redone changes."""
@@ -284,10 +310,13 @@ class EditHistory:
     def push(self, step: Step):
         if step.is_empty():
             return
+        self._serial += 1
+        step.serial = self._serial
         top = self._undo[-1] if self._undo else None
         if (step.token is not None and top is not None
                 and top.token == step.token and top.name == step.name):
             self._merge(top, step)
+            top.serial = step.serial    # a different state than before
         else:
             self._undo.append(step)
             del self._undo[:-self.limit]
@@ -318,7 +347,8 @@ class EditHistory:
             return None
         step = self._undo.pop()
         _apply(project, step.labels_before, step.images_before,
-               step.lists_before, step.image_order_before)
+               step.lists_before, step.image_order_before,
+               other_images=step.images_after)
         self._redo.append(step)
         self._changed()
         return step
@@ -328,7 +358,8 @@ class EditHistory:
             return None
         step = self._redo.pop()
         _apply(project, step.labels_after, step.images_after,
-               step.lists_after, step.image_order_after)
+               step.lists_after, step.image_order_after,
+               other_images=step.images_before)
         self._undo.append(step)
         self._changed()
         return step

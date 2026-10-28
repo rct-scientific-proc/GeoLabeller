@@ -11,6 +11,7 @@ Contents:
 - ``GoToLocationDialog`` - the entry dialog.
 - ``WaypointDialog`` - the same coordinate entry, plus a name, for waypoints.
 """
+import math
 import re
 
 from PyQt5.QtWidgets import (
@@ -29,8 +30,21 @@ _DEGREE_MARKS = re.compile(r"[°º'′’\"″”]")
 # so every later comparison still sees a plain "-".
 _MINUS_MARKS = re.compile(r"[‐‑‒–—―−﹘﹣－]")
 # A leading-dot decimal (".98") is a real spelling; without the second
-# alternative the dot was skipped and the number read as 98.
-_TOKENS = re.compile(r"[-+]?(?:\d+(?:\.\d+)?|\.\d+)|[NSEW]|,")
+# alternative the dot was skipped and the number read as 98. A
+# hemisphere letter stands alone: matched inside a word, the N of "Lon"
+# made "Lat: 51.5, Lon: -0.12" a latitude of -0.12 (audit 2026-10-28
+# M23, 2.9.15). The words Lat and Lon (Latitude, Long, Longitude) name
+# their axis, as a letter does without saying which way; North, South,
+# East and West are their letters written out.
+_TOKENS = re.compile(
+    r"[-+]?(?:\d+(?:\.\d+)?|\.\d+)"
+    r"|(?<![A-Z])(?:LATITUDE|LAT|LONGITUDE|LONG|LON"
+    r"|NORTH|SOUTH|EAST|WEST|[NSEW])(?![A-Z])"
+    r"|,")
+_AXIS_WORDS = {"LAT": "LAT", "LATITUDE": "LAT",
+               "LON": "LON", "LONG": "LON", "LONGITUDE": "LON"}
+_HEMISPHERE_WORDS = {"NORTH": "N", "SOUTH": "S", "EAST": "E", "WEST": "W"}
+_LETTERS = ("N", "S", "E", "W")
 
 MAX_LATITUDE = 85.05112878  # Web Mercator is undefined beyond this
 
@@ -43,14 +57,22 @@ def _tokenise(text: str) -> list[list[str]] | None:
     current: list[str] = []
     saw_hemisphere = False
     for token in _TOKENS.findall(cleaned):
+        token = _HEMISPHERE_WORDS.get(token, token)
         if token == ",":
             if current:
                 groups.append(current)
                 current = []
-        elif token in "NSEW":
+        elif token in _AXIS_WORDS:
+            # "Lat" or "Lon" opens a coordinate, as a leading letter does.
             saw_hemisphere = True
-            has_letter = any(t in "NSEW" for t in current)
-            has_number = any(t not in "NSEW" for t in current)
+            if any(_is_number(t) for t in current):
+                groups.append(current)
+                current = []
+            current.append(_AXIS_WORDS[token])
+        elif token in _LETTERS:
+            saw_hemisphere = True
+            has_letter = any(t in _LETTERS for t in current)
+            has_number = any(_is_number(t) for t in current)
             if has_letter:
                 # Already labelled, so this letter opens the next coordinate:
                 # "N40 W73".
@@ -62,7 +84,7 @@ def _tokenise(text: str) -> list[list[str]] | None:
                 groups.append(current)
                 current = []
             else:
-                current = [token]
+                current.append(token)
         else:
             current.append(token)
     if current:
@@ -79,20 +101,30 @@ def _tokenise(text: str) -> list[list[str]] | None:
     return groups if len(groups) == 2 else None
 
 
+def _is_number(token: str) -> bool:
+    return token not in _LETTERS and token not in ("LAT", "LON")
+
+
 def _to_degrees(group: list[str]) -> tuple[float, str | None] | None:
-    """Turn one token group into (degrees, hemisphere letter or None)."""
+    """Turn one token group into (degrees, axis mark or None): the
+    hemisphere letter, else the Lat or Lon word."""
     hemisphere = None
+    axis = None
     numbers = []
     for token in group:
-        if token in "NSEW":
+        if token in _LETTERS:
             hemisphere = token
+        elif token in ("LAT", "LON"):
+            axis = token
         else:
             numbers.append(float(token))
     if not numbers or len(numbers) > 3:
         return None
     if any(n < 0 for n in numbers[1:]):
         return None  # only the degrees term carries the sign
-    negative = numbers[0] < 0
+    # By the sign, not by "< 0": -0 degrees is negative too, and "-0 7
+    # 39" came back as +0.1275 (audit 2026-10-28 M24, 2.9.15).
+    negative = math.copysign(1.0, numbers[0]) < 0
     value = abs(numbers[0])
     if len(numbers) > 1:
         value += numbers[1] / 60.0
@@ -100,7 +132,7 @@ def _to_degrees(group: list[str]) -> tuple[float, str | None] | None:
         value += numbers[2] / 3600.0
     if negative or hemisphere in ("S", "W"):
         value = -value
-    return value, hemisphere
+    return value, hemisphere or axis
 
 
 def parse_lat_lon(text: str) -> tuple[float, float] | None:
@@ -123,9 +155,11 @@ def parse_lat_lon(text: str) -> tuple[float, float] | None:
         return None
     (first, first_hemisphere), (second, second_hemisphere) = parsed
 
-    # Hemisphere letters name the axis, so "W73.98, N40.75" works too.
-    axes = tuple("lat" if h in ("N", "S") else "lon" if h in ("E", "W")
-                 else None for h in (first_hemisphere, second_hemisphere))
+    # Hemisphere letters name the axis, so "W73.98, N40.75" works too;
+    # so do the words Lat and Lon.
+    axes = tuple("lat" if h in ("N", "S", "LAT")
+                 else "lon" if h in ("E", "W", "LON") else None
+                 for h in (first_hemisphere, second_hemisphere))
     if axes[0] is not None and axes[0] == axes[1]:
         # Both letters name the SAME axis - two latitudes, or two
         # longitudes. There is no position in that, and guessing one used

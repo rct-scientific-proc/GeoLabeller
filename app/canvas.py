@@ -2,6 +2,7 @@
 import math
 import os
 import traceback
+from bisect import bisect_left, bisect_right
 from enum import Enum, auto
 from pathlib import Path
 
@@ -409,7 +410,12 @@ class TiledLayer:
         # failed layer is skipped until something could have changed:
         # free_data, a relocation, or an explicit retry.
         self._load_failed = None
-
+        # (level, tx, ty) of detail tiles whose read raised. Forgotten with
+        # the pixels (free_data), like _load_failed: until then a tile
+        # that failed was asked for again on every tile pass - a missing
+        # large image zoomed in cost 5,200 reads in 3 s, and a dead share
+        # kept the tile threads blocked in opens that could not succeed.
+        self._failed_tiles: set = set()
 
         # Lazy loading state
         self._lazy = lazy
@@ -1350,6 +1356,7 @@ class TiledLayer:
         reload is allowed to try again even if the last one failed.
         """
         self._load_failed = None
+        self._failed_tiles.clear()
         if scene is not None:
             for item in self.tiles.values():
                 scene.removeItem(item)
@@ -1613,10 +1620,12 @@ class AsyncFileLoader(QObject):
 # project's (or directory's) images overwhelmingly share a CRS, and
 # Transformer construction is the expensive part of the computation.
 _stored_meta_transformers: dict = {}
+_WEB_MERCATOR_WKT = WEB_MERCATOR.to_wkt()
 
 
 def _scene_grid_estimate(src_crs, src_transform,
-                         src_width: int, src_height: int, dst_crs=None):
+                         src_width: int, src_height: int, dst_crs=None,
+                         src_key=None):
     """Estimated scene-projection (bounds, width, height) for a source grid.
 
     A sampling of the source boundary transformed through a cached
@@ -1626,15 +1635,24 @@ def _scene_grid_estimate(src_crs, src_transform,
     values (apply_level_result overwrites them). Returns None when the
     CRS cannot be transformed finitely; the caller falls back to the
     full computation.
+
+    ``src_key`` is anything that names the source CRS cheaply - the EPSG
+    code or the WKT the caller already holds; without one the WKT is
+    asked for (0.1 ms). The cache used to be keyed on ``to_epsg()``,
+    which for a CRS with no code searches the whole PROJ database to say
+    so: 37 ms per image, eight minutes to open 13,000 images on a local
+    grid.
     """
     dst_crs = dst_crs if dst_crs is not None else WEB_MERCATOR
-    key = (src_crs.to_epsg() or src_crs.to_wkt(),
-           dst_crs.to_epsg() or dst_crs.to_wkt())
-    if key[0] == key[1]:
+    if src_crs == dst_crs:
         # Already in the scene's projection: its own grid is the answer,
         # exactly, with nothing to estimate.
         return (rasterio.transform.array_bounds(
             src_height, src_width, src_transform), src_width, src_height)
+    if src_key is None:
+        src_key = src_crs.to_wkt()
+    key = (src_key, _WEB_MERCATOR_WKT if dst_crs is WEB_MERCATOR
+           else dst_crs.to_wkt())
     transformer = _stored_meta_transformers.get(key)
     if transformer is None:
         transformer = Transformer.from_crs(
@@ -1743,7 +1761,8 @@ def stored_layer_metadata(file_path: str, group_path: str,
         src_crs = (CRS.from_epsg(int(crs_epsg)) if crs_epsg
                    else CRS.from_wkt(crs_wkt))
         est = _scene_grid_estimate(
-            src_crs, src_transform, src_width, src_height)
+            src_crs, src_transform, src_width, src_height,
+            src_key=int(crs_epsg) if crs_epsg else crs_wkt)
         if est is None:
             return None
         bounds, width, height = est
@@ -2415,6 +2434,16 @@ class MapCanvas(QGraphicsView):
         self._preferred: dict[str, int] = {}
         self._marker_role: dict[int, tuple] = {}
         self._hidden_image_keys: set = set()
+        # The markers by position, for the hit test: ((x, y, label id,
+        # draw order) sorted by x, and the xs alone to bisect), built on
+        # the first click after a marker came or went. The hit test used
+        # to walk every marker and answer the first in range - the oldest,
+        # not the one under the cursor - at 45 ms a click for 20,000.
+        self._marker_index: "tuple[list, list] | None" = None
+        # The marker size every marker was last sized for, or None when
+        # some may differ. A cycle step between images of one size used to
+        # re-size every marker at an unchanged zoom: 50 ms a step at 20,000.
+        self._markers_sized_for: float | None = None
         self._marker_pass_timer = QTimer(self)
         self._marker_pass_timer.setSingleShot(True)
         self._marker_pass_timer.setInterval(0)
@@ -2480,6 +2509,16 @@ class MapCanvas(QGraphicsView):
         # Layer storage
         self._layers: dict[str, TiledLayer] = {}
         self._layer_order: list[str] = []
+        # The z the next layer appended gets: one past the highest stamped.
+        # It was the order's length, which after a removal had compacted
+        # the order fell below the survivors' z - a new image then drew
+        # (and hit-tested) underneath older ones.
+        self._next_z = 0
+        # (name, group) -> layer, for a label whose image is not loaded
+        # under its path. Built when first asked after a change rather
+        # than walked per label: a marker rebuild with a quarter of the
+        # images missing scanned every layer for each of their labels.
+        self._layers_by_name_group: dict | None = None
         # The united world clamp, and what it was computed from. Rebuilding
         # it means a QRectF per layer INCLUDING every hidden lazy one a
         # loaded project adds - 13.6 ms at 20k layers, paid about once per
@@ -2584,6 +2623,12 @@ class MapCanvas(QGraphicsView):
         # panning) asked again. Half the tiles of a diagonal survey strip
         # are empty, and those reads kept the ones with data waiting.
         self._empty_tiles: dict = {}
+        # Layers detail tiles have been asked for since their last clear:
+        # the only ones that can have tiles placed, reads in flight or
+        # verdicts. Every tile pass clears every other visible layer, and
+        # scanning the pending table for each of them cost 240 ms a pass
+        # with 2,000 tiles of one large image in flight.
+        self._detailed: set = set()
 
         # Images held in memory while off screen, so stepping onto them is
         # instant (see warm_layers). Insertion order is least-recently-wanted
@@ -2659,13 +2704,15 @@ class MapCanvas(QGraphicsView):
             self._next_id += 1
 
             self._layers[layer_id] = layer
+            self._layers_by_name_group = None
             if visible:
                 self._visible_layer_ids.add(layer_id)
             self._layer_order.append(layer_id)
             self._path_to_layer[file_path] = layer_id
             # Appending goes on top: only the NEW layer needs a z-value.
             # Restamping every layer here made bulk imports quadratic.
-            layer.set_z_value(len(self._layer_order) - 1)
+            layer.set_z_value(self._next_z)
+            self._next_z += 1
 
             # Only update tiles if visible (skip for hidden layers)
             if visible:
@@ -2729,10 +2776,27 @@ class MapCanvas(QGraphicsView):
             self._next_id += 1
 
             self._layers[layer_id] = layer
+            self._layers_by_name_group = None
+            # Shown from the start, like add_layer. Left out of the shown
+            # set, File > Add Image on a plain .tif was ticked but never
+            # drawn - no tile pass looked at it - until unticked and ticked
+            # again, and a Label click on it placed nothing.
+            if visible:
+                self._visible_layer_ids.add(layer_id)
             self._layer_order.append(layer_id)
             self._path_to_layer[file_path] = layer_id
             # Same incremental stamp as add_layer: appending goes on top.
-            layer.set_z_value(len(self._layer_order) - 1)
+            layer.set_z_value(self._next_z)
+            self._next_z += 1
+            # Its labels' markers follow its visibility (see
+            # _set_label_visibility_for_image); an image that opens hidden
+            # starts there, so markers built before it is first ticked
+            # are hidden too, not drawn over the image shown in its place.
+            key = self._image_key(file_path)
+            if visible:
+                self._hidden_image_keys.discard(key)
+            else:
+                self._hidden_image_keys.add(key)
 
             if visible:
                 self._update_visible_tiles()
@@ -2889,6 +2953,10 @@ class MapCanvas(QGraphicsView):
                 layer._fully_loaded = False
                 self._cancel_layer_load(layer)
                 layer.free_data(self._scene)    # raw array, same reason
+                # A geo image's labels stay on the map whether or not it
+                # is shown; a hide while stacked must not outlive the stack.
+                self._hidden_image_keys.discard(
+                    self._image_key(layer.file_path))
             self._clear_layer_tiles(layer)
         self._waterfall_was_geo.clear()
         self._waterfall_saved_bounds.clear()
@@ -3319,6 +3387,11 @@ class MapCanvas(QGraphicsView):
         if not self._uses_detail_tiles(layer) or not layer.visible:
             self._clear_detail_tiles(layer_id, layer)
             return
+        if layer._load_failed is not None:
+            # The file could not be read for the backdrop; tiles read it
+            # the same way. Asking anyway sent every wanted tile to the
+            # pool on every pass until the failure was answered.
+            return
 
         units_per_pixel = self._scene_units_per_pixel()
         level = layer.resolution_level(units_per_pixel)
@@ -3338,6 +3411,7 @@ class MapCanvas(QGraphicsView):
         if grid is None:
             return
         layer._detail_level = level
+        self._detailed.add(layer_id)
         grid_transform, grid_w, grid_h = grid
 
         view = self._effective_cull_bounds()
@@ -3400,6 +3474,8 @@ class MapCanvas(QGraphicsView):
         """Queue one detail tile for background reading."""
         if self._tile_known_empty(layer_id, level, tx, ty):
             return          # read once, nothing in it, and that will not change
+        if (level, tx, ty) in layer._failed_tiles:
+            return          # read once, could not be; nothing has changed since
         signals = _TileLoadSignals()
         self._tile_signals.add(signals)
         signals.finished.connect(self._on_detail_tile_loaded)
@@ -3478,13 +3554,31 @@ class MapCanvas(QGraphicsView):
 
     def _on_detail_tile_failed(self, layer_id: str, level: int, tx: int,
                                ty: int, runnable=None):
-        """Forget a cancelled or failed tile so it can be retried later."""
+        """A tile that produced nothing is no longer pending.
+
+        A cancelled read may be asked for again when the view returns; one
+        that FAILED is remembered on the layer, since the same read would
+        fail the same way, until its pixels are dropped and reloaded.
+        """
         key = (layer_id, level, tx, ty)
-        if self._pending_tiles.get(key) is runnable:
-            del self._pending_tiles[key]
+        if self._pending_tiles.get(key) is not runnable:
+            return
+        del self._pending_tiles[key]
+        if getattr(runnable, "_cancelled", False):
+            return
+        layer = self._layers.get(layer_id)
+        if layer is not None:
+            layer._failed_tiles.add((level, tx, ty))
 
     def _clear_detail_tiles(self, layer_id: str, layer: TiledLayer):
         """Remove a layer's detail tiles and cancel any still reading."""
+        if layer_id not in self._detailed and not layer.detail_tiles:
+            # Nothing asked for since the last clear: no reads in flight
+            # to cancel, so the pending table is not scanned (see
+            # _detailed). A verdict delivered out of the blue still goes.
+            self._forget_empty_tiles(layer_id)
+            return
+        self._detailed.discard(layer_id)
         layer._detail_level = None
         # The verdicts are per level, and this is what runs when the level
         # changes, so they go with the tiles.
@@ -4026,6 +4120,7 @@ class MapCanvas(QGraphicsView):
         for i, layer_id in enumerate(self._layer_order):
             if layer_id in self._layers:
                 self._layers[layer_id].set_z_value(i)
+        self._next_z = len(self._layer_order)
 
     def _get_label_z_base(self) -> float:
         """Base z-value for overlay items, as an offset within the overlays.
@@ -4047,9 +4142,12 @@ class MapCanvas(QGraphicsView):
             self._clear_detail_tiles(layer_id, self._layers[layer_id])
             self._layers[layer_id].remove_from_scene(self._scene)
             del self._layers[layer_id]
+            self._layers_by_name_group = None
             if file_path in self._path_to_layer:
                 del self._path_to_layer[file_path]
             self._visible_layer_ids.discard(layer_id)
+            # No loaded image is hiding its labels any more.
+            self._hidden_image_keys.discard(self._image_key(file_path))
             self._warm_release(layer_id)
             self._invalidate_world_rect()
             # Not removed from _layer_order here: that is a linear scan, and
@@ -4121,12 +4219,15 @@ class MapCanvas(QGraphicsView):
         self._tile_build_queued.clear()
         self._tile_build_timer.stop()
         self._layers.clear()
+        self._layers_by_name_group = None
         self._active_image_key = None
         self._hidden_image_keys.clear()
         self._visible_layer_ids.clear()
         self._empty_tiles.clear()
+        self._detailed.clear()
         self._world_rect_cache = None
         self._layer_order_stale = 0
+        self._next_z = 0
         self._warmed.clear()
         self._warmed_charge.clear()
         self._warmed_pixels = 0
@@ -4140,6 +4241,7 @@ class MapCanvas(QGraphicsView):
         """Set the group path for a layer."""
         if layer_id in self._layers:
             self._layers[layer_id].group_path = group_path
+            self._layers_by_name_group = None
             # Another group may draw it differently.
             self.set_layer_display(
                 layer_id, self._resolve_display(self._layers[layer_id]))
@@ -4277,10 +4379,12 @@ class MapCanvas(QGraphicsView):
 
         bounds = self._layers[layer_id].bounds
         west, south, east, north = bounds
-        # Rebase the floating origin onto the layer so its scene coords are near
-        # zero (allows zooming in arbitrarily far afterwards without overflow).
-        self._reset_origin_group(
-            QPointF((west + east) / 2.0, -(south + north) / 2.0))
+        # The floating origin stays where it is: the fit below rebases it
+        # (_maybe_rebase_origin) only when the layer lies far enough off
+        # for device coordinates to overflow. It used to move on every
+        # call: a cycle step onto the next image of a survey shifted the
+        # group under every marker and tile, and Qt re-indexed all of
+        # them - 46 ms a step at 20,000 labels (audit 2026-10-28 P8).
         rect = self._world_rect_to_scene(
             QRectF(west, -north, east - west, north - south))
         self._fit_view(rect)
@@ -4297,7 +4401,13 @@ class MapCanvas(QGraphicsView):
             self._tile_update_timer.stop()
             self._update_visible_tiles()
         else:
-            self._schedule_tile_update()
+            # On the next turn of the event loop, not behind the motion
+            # throttle: a zoom to a layer is one event, and the 50 ms the
+            # throttle keeps a pan's passes apart was dead time here - the
+            # image asked for started reading 50 ms late. The loop turn
+            # still folds whatever else the caller changes (a layer
+            # switched on just before, say) into the one pass.
+            self._tile_update_timer.start(0)
 
     def zoom_to_point(self, lon: float, lat: float, size_meters: float = 10.0):
         """Zoom the view to center on a point with a given GROUND extent.
@@ -4411,7 +4521,6 @@ class MapCanvas(QGraphicsView):
         scene coordinates, so it is unaffected by view rotation.
         """
         self._hover_end()
-        factor = 1.15
         dy = event.angleDelta().y()
         if dy == 0:
             # A horizontal wheel, a tilt-wheel, or a two-finger sideways
@@ -4420,6 +4529,10 @@ class MapCanvas(QGraphicsView):
             # an order of magnitude.
             event.ignore()
             return
+        # One notch of a classic wheel (120 units) zooms 1.15x. A fine
+        # wheel or a touchpad reports a fraction of a notch per event, and
+        # used to zoom the full 1.15x on each of them.
+        factor = 1.15 ** (abs(dy) / 120.0)
         if dy > 0:
             view_rect = self.mapToScene(self.viewport().rect()).boundingRect()
             if (view_rect.width() / factor < self._MIN_VIEW_SIZE
@@ -5190,11 +5303,21 @@ class MapCanvas(QGraphicsView):
         return pixel_x, pixel_y, lon, lat, inside
 
     def _get_layer_by_name_and_group(self, name: str, group_path: str):
-        """Find a layer by its name and group path."""
-        for layer in self._layers.values():
-            if layer.name == name and layer.group_path == group_path:
-                return layer
-        return None
+        """Find a layer by its name and group path.
+
+        Through an index built on the first ask after the layers changed
+        (the first of a kind wins, as the walk it replaces did), so a
+        rebuild with many missing images pays one pass over the layers
+        rather than one per label: 4.7 s against 1.85 s at 20,000 labels
+        with a quarter of the images missing.
+        """
+        index = self._layers_by_name_group
+        if index is None:
+            index = {}
+            for layer in self._layers.values():
+                index.setdefault((layer.name, layer.group_path), layer)
+            self._layers_by_name_group = index
+        return index.get((name, group_path))
 
     def add_label_marker(self, label_id: int, lon: float, lat: float,
                          image_name: str, image_group: str, image_path: str,
@@ -5250,8 +5373,17 @@ class MapCanvas(QGraphicsView):
         ellipse, text = self._make_label_marker_items(
             x, y, class_name, color, image_path, ring_color=ring_color)
         self._label_items[label_id] = (ellipse, text)
+        self._marker_index = None
         key = self._image_key(image_path)
         self._labels_by_image.setdefault(key, set()).add(label_id)
+        if key in self._hidden_image_keys:
+            # Its image is a hidden non-georeferenced one, stacked at the
+            # same spot as the one shown in its place: drawn, this marker
+            # covered the shown image's and took its right-clicks, so
+            # Remove Label deleted a label the user could not see. Every
+            # marker rebuild (a class edit, a mode change) brought it back.
+            ellipse.setVisible(False)
+            text.setVisible(False)
         if key == self._active_image_key:
             self._set_brackets(ellipse, True)
         self._register_object(label_id, object_id)
@@ -5551,6 +5683,10 @@ class MapCanvas(QGraphicsView):
         """
         # Marker size in scene coordinates (appears ~10 pixels on screen)
         marker_size = self._marker_px()
+        if marker_size != self._markers_sized_for:
+            # Made at another size than the rest were sized for: the next
+            # pass must size every marker, whatever the zoom is then.
+            self._markers_sized_for = None
 
         # Create ellipse marker
         ellipse = QGraphicsEllipseItem(
@@ -5736,6 +5872,7 @@ class MapCanvas(QGraphicsView):
             self._scene.removeItem(ellipse)
             self._scene.removeItem(text)
             del self._label_items[label_id]
+            self._marker_index = None
             self._register_object(label_id, "")
             self._marker_role.pop(label_id, None)
             self._schedule_marker_pass()
@@ -5762,11 +5899,17 @@ class MapCanvas(QGraphicsView):
             self._hidden_image_keys.discard(key)
         else:
             self._hidden_image_keys.add(key)
-        for label_id, (ellipse, text) in self._label_items.items():
-            if ellipse.data(0) == image_path:
-                role = self.marker_role(label_id)
-                ellipse.setVisible(visible and role != ROLE_HIDDEN)
-                text.setVisible(visible and role == ROLE_FULL)
+        # Through the per-image index, not a scan of every marker for the
+        # path (15 ms per toggle at 20,000 labels) - which also missed a
+        # label whose path was spelled in another case than the layer's.
+        for label_id in self._labels_by_image.get(key, ()):
+            item = self._label_items.get(label_id)
+            if item is None:
+                continue
+            ellipse, text = item
+            role = self.marker_role(label_id)
+            ellipse.setVisible(visible and role != ROLE_HIDDEN)
+            text.setVisible(visible and role == ROLE_FULL)
 
     def update_label_markers_scale(self):
         """Update label marker sizes based on current zoom level."""
@@ -5775,6 +5918,17 @@ class MapCanvas(QGraphicsView):
             return
 
         marker_size = 10 / view_scale
+        if (self._markers_sized_for is not None
+                and math.isclose(marker_size, self._markers_sized_for,
+                                 rel_tol=0.01)):
+            # Every marker is already this size, to a tenth of a pixel:
+            # nothing to do. The tolerance is for a cycle step, whose
+            # images fit at scales a hair apart (Mercator stretches
+            # neighbouring images by the latitude between them). Sizes
+            # cannot drift: the record is what the markers were last
+            # sized to, so they are never further than this from right.
+            return
+        self._markers_sized_for = marker_size
 
         markers = list(self._label_items.values())
         # Waterfall projections rescale exactly like real label markers.
@@ -5786,31 +5940,68 @@ class MapCanvas(QGraphicsView):
         # Keep the ruler readout a constant on-screen size across zoom changes.
         self._rescale_ruler_text()
 
+    def _marker_rows(self) -> tuple[list, list]:
+        """The marker index (see __init__), built if a marker came or went."""
+        index = self._marker_index
+        if index is None:
+            rows = []
+            for order, (label_id, (ellipse, _text)) in enumerate(
+                    self._label_items.items()):
+                pos = ellipse.pos()
+                rows.append((pos.x(), pos.y(), label_id, order))
+            rows.sort()
+            index = self._marker_index = ([row[0] for row in rows], rows)
+        return index
+
     def _get_label_at_position(
             self, view_pos) -> tuple[int | None, str | None]:
         """Find the label at the given view position.
+
+        Of the markers whose hit area holds the point, the one drawn on
+        top: the highest z, then the nearest, then the latest drawn (Qt
+        paints equal z in that order). Only the markers within reach of
+        the point are tested, found through the index by position.
 
         Returns:
             Tuple of (label_id, image_path) or (None, None) if no label found.
         """
         scene_pos = self.mapToScene(view_pos)
 
-        # Check each label marker
-        for label_id, (ellipse, text) in self._label_items.items():
-            if not ellipse.isVisible():
-                # A hidden pixel-zone image stacks at the same scene
-                # position as the visible one above it, so hit-testing its
-                # markers meant Remove Label deleting a label the user
-                # could not see.
-                continue
-            if self._hit_rect(ellipse).contains(scene_pos):
-                # Found a label - now find the image_path
-                # We need to look up which image this label belongs to
-                # The label stores its position in scene coords, we need to find
-                # which layer it's on based on the stored data
-                # We'll store image_path in the ellipse
-                image_path = ellipse.data(0)
-                return label_id, image_path
+        if self._label_items:
+            # Marker positions are in the overlay group's frame; a hit
+            # area is at most twice a marker across, and no marker is
+            # larger than the size they were last sized for (or the
+            # current size, for one made since).
+            local = self._overlay_group.mapFromScene(scene_pos)
+            reach = 2.0 * max(self._marker_px(),
+                              self._markers_sized_for or 0.0)
+            xs, rows = self._marker_rows()
+            best, best_rank = None, None
+            for i in range(bisect_left(xs, local.x() - reach),
+                           bisect_right(xs, local.x() + reach)):
+                _x, y, label_id, order = rows[i]
+                if abs(y - local.y()) > reach:
+                    continue
+                ellipse = self._label_items[label_id][0]
+                if not ellipse.isVisible():
+                    # A hidden pixel-zone image stacks at the same scene
+                    # position as the visible one above it, so hit-testing
+                    # its markers meant Remove Label deleting a label the
+                    # user could not see.
+                    continue
+                hit = self._hit_rect(ellipse)
+                if not hit.contains(scene_pos):
+                    continue
+                centre = hit.center()
+                rank = (-ellipse.zValue(),
+                        (centre.x() - scene_pos.x()) ** 2
+                        + (centre.y() - scene_pos.y()) ** 2,
+                        -order)
+                if best_rank is None or rank < best_rank:
+                    best, best_rank = label_id, rank
+            if best is not None:
+                # The marker carries its image path (data slot 0).
+                return best, self._label_items[best][0].data(0)
 
         # Waterfall projections hit-test as their source label, so the normal
         # context menu / link flow works on them transparently.

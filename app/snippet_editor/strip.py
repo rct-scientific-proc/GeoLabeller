@@ -95,6 +95,12 @@ class SnippetStrip(QObject):
         self.items_by_label: dict = {}          # label_id -> list item
         self.entries_by_label: dict = {}        # label_id -> entry
         self._current_id = None
+        # Whether the current row is a snippet in someone's hand - a
+        # host's Single view shows it - so a refill keeps it listed
+        # though it no longer needs doing (_rebuild). A host whose grid
+        # is showing says not: there a finished snippet goes at the
+        # next refill.
+        self.current_in_hand = True
         self.loader = SnippetLoader(self)
         self.loader.ready.connect(self._on_snippet_ready)
 
@@ -402,7 +408,15 @@ class SnippetStrip(QObject):
         self.entries_by_label = {e["label_id"]: e for e in self.entries}
         keep_id = self._current_id
         for entry in self.entries:
-            if not self.in_class(entry) or not self.matches(entry):
+            if not self.in_class(entry):
+                continue
+            # A refill (every undo, Move label, any map edit) keeps the
+            # snippet in hand listed though it no longer needs doing,
+            # as refresh does: it is retired when the user moves off it
+            # (_retire), not taken from under them.
+            if not self.matches(entry) and (
+                    chosen_anew or not self.current_in_hand
+                    or entry["label_id"] != keep_id):
                 continue
             item = QListWidgetItem(placeholder, self._caption(entry))
             item.setData(self.ID_ROLE, entry["label_id"])

@@ -44,8 +44,8 @@ from PyQt5.QtWidgets import (
 from ..settings_scope import settings
 from ..debug_log import debug
 from ..masks import (entry_in_window, fill_enclosed, grow, mask_statistics,
-                     merged_entry, polygon_mask, remove_specks, shrink,
-                     similar_region)
+                     merged_entry, pixel_difference, polygon_mask,
+                     remove_specks, shrink, similar_region, window_totals)
 from ..snippets import (read_label_snippet, read_label_window_raw,
                         snippet_frame)
 from .section import Section
@@ -120,6 +120,13 @@ class MaskEditor(QWidget):
         # What the wand would do if let go now: (mask name, region,
         # take away?), or None.
         self._wand_pending = None
+        # The wand's ground for the pixel pressed - ((x, y), how unlike
+        # it every pixel is) - found once per press, not per tolerance
+        # step of the drag.
+        self._wand_difference = None
+        # The raw window's sums (window_totals), once per snippet: the
+        # readout after a stroke then costs the stroke's pixels only.
+        self._raw_totals = None
         self._raw_nodata = None                   # its declared nodata
         # Image (width, height) by path - one header read each, so every
         # stroke can serialize against the full image without touching disk.
@@ -485,6 +492,8 @@ class MaskEditor(QWidget):
         self._display_source = None
         self._shown = None
         self._wand_pending = None
+        self._wand_difference = None
+        self._raw_totals = None
         self._set_tidy_note("")
         if entry is None:
             self.canvas.set_snippet(None, size, size, None)
@@ -541,7 +550,12 @@ class MaskEditor(QWidget):
         self.canvas.set_snippet(self._shown, w, h,
                                 (entry["pixel_x"] - x0,
                                  entry["pixel_y"] - y0))
-        active = self._order[0] if self._order else None
+        # In hand: the mask the picker names, when this snippet carries
+        # it - the name chosen on the last snippet is the one meant for
+        # this one - else its first.
+        wanted = self.active_mask_name()
+        active = (wanted if wanted in self._layers
+                  else self._order[0] if self._order else None)
         self.canvas.set_layers(self._layers, self._order, active)
         self._set_editable(not self._unreadable)
         self._refresh_mask_list(select=active)
@@ -562,6 +576,7 @@ class MaskEditor(QWidget):
         if adjusted is None:
             return
         self._shown = adjusted
+        self._wand_difference = None
         self.canvas.set_pixels(adjusted)
 
     def reset_display_adjust(self):
@@ -808,13 +823,22 @@ class MaskEditor(QWidget):
             self.canvas.set_preview(None)
             return
         layer = self._layers[name]
+        # A drag changes the tolerance, not the pixel: how unlike it the
+        # rest of the snippet is was settled at the press.
+        if (self._wand_difference is None
+                or self._wand_difference[0] != (x, y)):
+            self._wand_difference = ((x, y),
+                                     pixel_difference(self._shown, x, y))
+        difference = self._wand_difference[1]
         if erase:
             # Only ever from this mask - and what is not in it is not
             # shown as about to go.
-            region = similar_region(self._shown, x, y, tolerance) & layer
+            region = similar_region(self._shown, x, y, tolerance,
+                                    difference=difference) & layer
         else:
             region = similar_region(self._shown, x, y, tolerance,
-                                    barrier=self._walls(name))
+                                    barrier=self._walls(name),
+                                    difference=difference)
         self._wand_pending = (name, region, erase)
         self.canvas.set_preview(region, erase)
 
@@ -966,8 +990,12 @@ class MaskEditor(QWidget):
                 or name not in self._layers):
             self.stats_label.setText("-")
             return
-        stats = mask_statistics(self._raw, self._layers[name],
-                                nodata=self._raw_nodata)
+        layer = self._layers[name]
+        if self._raw_totals is None and layer.any():
+            self._raw_totals = window_totals(self._raw,
+                                             nodata=self._raw_nodata)
+        stats = mask_statistics(self._raw, layer, nodata=self._raw_nodata,
+                                totals=self._raw_totals)
         if stats is None:
             self.stats_label.setText(
                 "Paint some pixels to compare the object's raw values "

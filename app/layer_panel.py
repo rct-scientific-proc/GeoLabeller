@@ -19,6 +19,9 @@ from .settings_scope import settings as app_settings
 # whole-tree emission used to rewrite every image's project group from its
 # tree ancestry, which is not the same string for non-georeferenced images.
 GROUP_PATH_ROLE = Qt.UserRole + 2
+# The tree's root for non-georeferenced imagery. It names no project
+# group: an image under it is in the project group below the root.
+NONGEO_ROOT = "Non-Georeferenced"
 
 # (checked layers, total layers) cached on a GROUP item. The whole-tree
 # recompute is the source of truth and writes these as it goes; the
@@ -461,6 +464,11 @@ class LayerPanel(QWidget):
         """
         check_state = Qt.Checked if checked else Qt.Unchecked
         progress_count = [0]  # Use list for mutable closure
+        # Progress about a hundred times over the walk, not once per layer:
+        # the receiver's QProgressBar.setValue repaints on the spot, and
+        # 13,000 repaints were 0.85 s of a 0.08 s toggle.
+        stride = (max(1, self._count_descendant_layers(item) // 100)
+                  if emit_progress else 1)
         # Pump on a time budget, not every fifth layer. Each pump flushes
         # the canvas repaint that every visibility signal posts, so a fifth
         # of a 20,000-layer group is 4,000 full canvas repaints - the walk
@@ -490,7 +498,9 @@ class LayerPanel(QWidget):
                                 layer_id, checked)
                     progress_count[0] += 1
                     if emit_progress:
-                        self.batch_visibility_progress.emit(progress_count[0])
+                        if progress_count[0] % stride == 0:
+                            self.batch_visibility_progress.emit(
+                                progress_count[0])
                         now = time.perf_counter()
                         if now >= deadline[0]:
                             deadline[0] = now + _TOGGLE_PUMP_SECONDS
@@ -502,6 +512,8 @@ class LayerPanel(QWidget):
                     process_item(child)
 
         process_item(item)
+        if emit_progress and progress_count[0] % stride:
+            self.batch_visibility_progress.emit(progress_count[0])
 
     def _on_rows_moved(self):
         """Handle drag-drop reordering."""
@@ -531,6 +543,20 @@ class LayerPanel(QWidget):
         parts.reverse()
         return "/".join(parts)
 
+    @staticmethod
+    def _project_group(tree_path: str) -> str:
+        """A tree path as the project group it names: the same for
+        georeferenced imagery, and the path below the Non-Georeferenced
+        root for the rest. Written into the project as the tree path,
+        a dragged non-geo image's group grew the root as a level, its
+        Display Settings stopped applying, and every save and reopen
+        nested it one deeper (audit 2026-10-28 M22, 2.9.15)."""
+        if tree_path == NONGEO_ROOT:
+            return ""
+        if tree_path.startswith(NONGEO_ROOT + "/"):
+            return tree_path[len(NONGEO_ROOT) + 1:]
+        return tree_path
+
     def _emit_all_layer_group_changes(self):
         """Report the layers a drag-drop actually moved - and only those.
 
@@ -550,7 +576,7 @@ class LayerPanel(QWidget):
             item_type = item.data(0, Qt.UserRole + 1)
             if item_type == "layer":
                 layer_id = item.data(0, Qt.UserRole)
-                group_path = self._get_group_path(item)
+                group_path = self._project_group(self._get_group_path(item))
                 if group_path != item.data(0, GROUP_PATH_ROLE):
                     item.setData(0, GROUP_PATH_ROLE, group_path)
                     self.layer_group_changed.emit(layer_id, group_path)
@@ -895,11 +921,9 @@ class LayerPanel(QWidget):
                 continue
             above = self._get_group_path(item)
             full = f"{above}/{item.text(0)}" if above else item.text(0)
-            if full == "Non-Georeferenced":
+            if full == NONGEO_ROOT:
                 continue
-            if full.startswith("Non-Georeferenced/"):
-                full = full[len("Non-Georeferenced/"):]
-            paths.append(full)
+            paths.append(self._project_group(full))
         return paths
 
     @staticmethod
@@ -965,6 +989,10 @@ class LayerPanel(QWidget):
 
         blocked = self.tree.signalsBlocked()
         self.tree.blockSignals(True)
+        # Progress about a hundred times over the loop and at its end, not
+        # once per layer: the receiver's QProgressBar.setValue repaints on
+        # the spot, and 13,000 repaints were 0.85 s of a 0.08 s toggle.
+        stride = max(1, total // 100)
         try:
             for i, layer_id in enumerate(layer_ids, start=1):
                 item = self._layer_items.get(layer_id)
@@ -972,7 +1000,8 @@ class LayerPanel(QWidget):
                     item.setCheckState(0, want)
                     changed_items.append(item)
                     changed_layers.append(layer_id)
-                self.batch_visibility_progress.emit(i)
+                if i % stride == 0 or i == total:
+                    self.batch_visibility_progress.emit(i)
         finally:
             self.tree.blockSignals(blocked)
 
@@ -1233,7 +1262,8 @@ class LayerPanel(QWidget):
         item.setIcon(0, _standard_icon(QStyle.SP_FileIcon))
 
         nongeo_parent.addChild(item)
-        item.setData(0, GROUP_PATH_ROLE, self._get_group_path(item))
+        item.setData(0, GROUP_PATH_ROLE,
+                     self._project_group(self._get_group_path(item)))
         self._add_counts_upward(item, 1 if visible else 0, 1)
 
         # Register in O(1) lookup caches

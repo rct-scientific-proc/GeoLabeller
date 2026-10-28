@@ -191,6 +191,8 @@ def get_recovery_dir() -> Path:
 RECOVERY_DIR = get_recovery_dir()
 RECOVERY_FILE = RECOVERY_DIR / "recovery.geolabel"
 CRASH_MARKER_FILE = RECOVERY_DIR / ".running"
+# Declined recovery copies, set aside under dated names: how many stay.
+KEPT_RECOVERIES = 5
 
 # Auto-save interval in milliseconds (60 seconds)
 AUTOSAVE_INTERVAL_MS = 60000
@@ -407,6 +409,9 @@ class MainWindow(QMainWindow):
         # The digest of the project as last saved or opened; None for a
         # recovered session, which has never been saved anywhere.
         self._saved_digest: "str | None" = None
+        # ...and where the history stood then: an undo or redo landing
+        # anywhere else is a change without hashing the project (2.9.15).
+        self._saved_position: "tuple | None" = None
 
         # Background autosave plumbing: a single worker thread at a time
         # writes the recovery file. The snapshot dict is always built on
@@ -494,6 +499,8 @@ class MainWindow(QMainWindow):
         """
         self._saved_digest = (None if recovered
                               else self.project.content_digest(data))
+        self._saved_position = (None if recovered
+                                else self._history.position())
         self.setWindowModified(recovered)
         self._push_save_state()
 
@@ -836,6 +843,15 @@ class MainWindow(QMainWindow):
             "step")
         reseat_action.triggered.connect(lambda: self._reseat_labels())
         file_menu.addAction(reseat_action)
+
+        # ...and for a session that ended unexpectedly (2.9.15).
+        recovery_action = QAction("Open &Recovery...", self)
+        recovery_action.setStatusTip(
+            "Open a recovery copy as an unsaved session: the one from a "
+            "session that ended unexpectedly, or one set aside when its "
+            "offer was declined")
+        recovery_action.triggered.connect(lambda: self._open_recovery())
+        file_menu.addAction(recovery_action)
 
         file_menu.addSeparator()
 
@@ -2949,12 +2965,16 @@ class MainWindow(QMainWindow):
         applied to whatever label now carries that id - in a different
         project - or dropped silently. Re-seating it (with an empty list
         when there is nothing to show) keeps it honest about what it is
-        editing.
+        editing - while it shows. Closed, it flushed what it held and is
+        re-seated when it is opened again, so it need not take every
+        label (0.46 s at 20,000) on every map edit and undo made without
+        it (audit 2026-10-28 P14, 2.9.15).
         """
         # The presets belong to the project too, so they are re-seated with
         # the labels rather than left showing the old project's.
         self._push_mask_names()
-        if self._snippet_editor is not None:
+        if (self._snippet_editor is not None
+                and self._snippet_editor.isVisible()):
             self._snippet_editor.set_labels(self._label_entries())
         self._refresh_snippet_panel()
         # The cleaner holds pairs of the project's labels, as the editor
@@ -3786,7 +3806,14 @@ class MainWindow(QMainWindow):
         # A removal undone brings its pairs back only on the next Find;
         # what it shows must at least exist.
         self._refresh_cleaner()
-        self.setWindowModified(self._has_unsaved_changes())
+        # The project's digest (0.35 s at 20,000 labels) only where it
+        # can say "unchanged": back at the step the project was saved
+        # at. Anywhere else a step the save does not hold was undone or
+        # redone, which is a change (audit 2026-10-28 P4, 2.9.15).
+        at_save = (self._saved_position is not None
+                   and self._history.position() == self._saved_position)
+        self.setWindowModified(self._has_unsaved_changes() if at_save
+                               else True)
         self._push_save_state()
         self._recovery_soon_timer.start()
         if len(ids) == 1:
@@ -4438,7 +4465,8 @@ class MainWindow(QMainWindow):
 
                 if reply == QMessageBox.Yes:
                     self._restore_from_recovery()
-                # If user declines, recovery file is preserved until next save
+                else:
+                    self._set_aside_recovery(recovery_time)
 
             # If has_recovery but no crash_marker, keep the recovery file
             # until user explicitly saves
@@ -4446,11 +4474,56 @@ class MainWindow(QMainWindow):
         except Exception as e:
             debug(f"recovery check failed: {type(e).__name__}: {e}")
 
-    def _restore_from_recovery(self):
-        """Restore project state from recovery file."""
+    def _set_aside_recovery(self, when):
+        """A declined recovery copy, kept under a dated name beside the
+        live one - which the next autosave overwrites, and did: 400
+        labels to none the minute anything was opened (audit 2026-10-28
+        M9, 2.9.15). File > Open Recovery... opens it; the last few
+        such copies are kept."""
+        kept = RECOVERY_DIR / f"recovery-{when:%Y%m%d-%H%M%S}.geolabel"
+        try:
+            RECOVERY_FILE.replace(kept)
+        except OSError as exc:
+            debug(f"recovery copy not set aside: {exc}")
+            return
+        for old in sorted(RECOVERY_DIR.glob("recovery-*.geolabel"))[
+                :-KEPT_RECOVERIES]:
+            old.unlink(missing_ok=True)
+        QTimer.singleShot(0, lambda: self.statusBar.showMessage(
+            f"The recovery copy is kept as {kept.name} - "
+            "File > Open Recovery... opens it", 15000))
+
+    def _open_recovery(self):
+        """File > Open Recovery...: a recovery copy opened as an unsaved
+        session - the live one, or one set aside when its offer was
+        declined (2.9.15)."""
+        if not self._confirm_unsaved_changes("open a recovery copy"):
+            return
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Open Recovery", str(RECOVERY_DIR),
+            "Recovery copies (recovery*.geolabel);;All files (*)")
+        if not path:
+            return
+        # As _load_project_file clears the last project away.
+        self._supersede_async_loading()
+        self._size_check.cancel()
+        self.canvas.clear_label_markers()
+        self.canvas.clear_layers()
+        self._forget_waterfall()
+        self.layer_panel.clear()
+        self._close_display_dialog()
+        self._close_model_review()
+        self._close_detector()
+        self._close_cleaner()
+        self._project_path = None
+        self._restore_from_recovery(path)
+
+    def _restore_from_recovery(self, path=None):
+        """Restore project state from the recovery file, or ``path``."""
+        source = Path(path) if path else RECOVERY_FILE
         try:
             self._history.clear()
-            self.project = LabelProject.load(RECOVERY_FILE)
+            self.project = LabelProject.load(source)
             self._set_saved_baseline(recovered=True)
             self._reseat_open_editors()         # as _load_project_file (2.9.12)
 
@@ -4477,7 +4550,7 @@ class MainWindow(QMainWindow):
                 self,
                 "Recovery Failed",
                 f"Could not restore from recovery file:\n{e}\n\n"
-                f"The recovery file will be preserved at:\n{RECOVERY_FILE}"
+                f"The recovery file will be preserved at:\n{source}"
             )
 
     def _autosave_recovery(self):
@@ -4831,12 +4904,16 @@ class MainWindow(QMainWindow):
         else:
             layer_ids = [layer_id for layer_id, layer
                          in self.canvas._layers.items() if layer.visible]
-        images = []
+        # Two layers of one file are one image: by identity, not by the
+        # dataclass equality a list membership test runs (5 s against 3 ms
+        # at 13,000 images).
+        images, seen = [], set()
         for layer_id in layer_ids:
             layer = self.canvas.get_layer(layer_id)
             image = (self._project_image_for(layer.file_path)
                      if layer is not None else None)
-            if image is not None and image not in images:
+            if image is not None and id(image) not in seen:
+                seen.add(id(image))
                 images.append(image)
         return images
 
@@ -6557,9 +6634,17 @@ class MainWindow(QMainWindow):
         applying = [(img, p) for img, p in plans if p.changes()]
         if applying:
             label_ids = [lab.id for img, _p in applying for lab in img.labels]
-            with self._recorded("Re-seat labels", labels=label_ids,
-                                images=[img.path for img, _p in applying],
-                                lists=("model_review",)):
+            if label_ids:
+                with self._recorded("Re-seat labels", labels=label_ids,
+                                    images=[img.path for img, _p in applying],
+                                    lists=("model_review",)):
+                    for img, p in applying:
+                        reseat.apply(self.project, p)
+            else:
+                # Records only - unlabelled images brought up to date, as
+                # a layer's first read does (2.8.8): nothing the user did,
+                # so not a step for Ctrl+Z to undo in place of their edit,
+                # and no marker moved (audit 2026-10-28 M7, 2.9.15).
                 for img, p in applying:
                     reseat.apply(self.project, p)
             self._mark_unsaved()
@@ -6571,9 +6656,10 @@ class MainWindow(QMainWindow):
                 if self.canvas.get_layer_source_dimensions(layer_id) != (
                         p.header.width, p.header.height):
                     self.canvas.refresh_layer_from_file(layer_id)
-            self._refresh_label_markers()
-            self._schedule_refresh("labeled", "snippets")
-            self._reseat_open_editors()
+            if label_ids:
+                self._refresh_label_markers()
+                self._schedule_refresh("labeled", "snippets")
+                self._reseat_open_editors()
             self._recovery_soon_timer.start()
         only = [p for _img, p in plans]
         self.statusBar.showMessage(reseat.summary(only), 10000)
@@ -6680,8 +6766,13 @@ class MainWindow(QMainWindow):
         if not accepted:
             return
         location = location.strip()
-        for img in images:
-            img.location = location
+        # One undo step (2.9.15): set by plain assignment, the tag was
+        # not in the history at all, and undoing an older image step
+        # wrote the older record back over it.
+        with self._recorded("Set location",
+                            images=[img.path for img in images]):
+            for img in images:
+                img.location = location
         self._mark_unsaved()
         self.statusBar.showMessage(
             (f'Tagged {len(images)} image(s) in "{group_path}" as '

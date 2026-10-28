@@ -462,13 +462,36 @@ class OrientationEditor(QWidget):
         self._page = max(0, min(pages - 1, self._page + delta))
         self._rebuild()
 
+    def _page_of(self, label_ids: list) -> int:
+        """The page now holding the first of ``label_ids`` (the chips
+        of a page, in order) the strip still lists - failing that, as
+        the strip itself lands, the first chip after them in the order
+        before this refill, or the nearest before; and the page as it
+        was when none of those is listed either."""
+        listed = {e["label_id"]: i
+                  for i, e in enumerate(self._shown_entries())}
+        candidates = list(label_ids)
+        before = [e["label_id"] for e in self._entries]
+        if label_ids and label_ids[-1] in before:
+            at = before.index(label_ids[-1])
+            candidates += before[at + 1:] + before[:at][::-1]
+        for label_id in candidates:
+            if label_id in listed:
+                return listed[label_id] // PAGE_SIZE
+        return self._page
+
     def _on_strip_rebuilt(self, chosen_anew: bool):
         """The shared strip changed what it lists. A new choice (class,
-        filter) starts at page one; new labels keep the page."""
-        self._entries = self.strip.entries
-        self._entries_by_id = {e["label_id"]: e for e in self._entries}
+        filter) starts at page one; new labels keep the page - the one
+        now holding the first chip in view, since a refill may have
+        retired chips before it (kept by number, page 2 showed what
+        had been page 3)."""
         if chosen_anew:
             self._page = 0
+        else:
+            self._page = self._page_of(list(self._cells))
+        self._entries = self.strip.entries
+        self._entries_by_id = {e["label_id"]: e for e in self._entries}
         if not self._active:
             self._stale = True
             return

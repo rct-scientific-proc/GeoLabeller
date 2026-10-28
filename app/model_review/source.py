@@ -106,6 +106,8 @@ class Chip:
     image_height: int = 0
     source_x: float = 0.0       # the centre as the file gave it
     source_y: float = 0.0
+    file_x: float = 0.0         # ...as written, in the file's own pixels:
+    file_y: float = 0.0         # what tells its record apart (2.9.15)
     anchor_x: float = 0.0       # the centre as the project has it
     anchor_y: float = 0.0       # (2.8.11): its label's, else the
                                 # file's; a move since is to import
@@ -403,7 +405,8 @@ def match_candidates(candidates, project, malformed: int = 0,
                     predicted=candidate.predicted,
                     score=candidate.score, rescaled=rescaled,
                     image_width=width, image_height=height,
-                    source_x=px, source_y=py, anchor_x=px, anchor_y=py)
+                    source_x=px, source_y=py, anchor_x=px, anchor_y=py,
+                    file_x=float(candidate.x), file_y=float(candidate.y))
         if candidate.review is not None:
             # The file's note (2.9.4): the chip was reviewed before.
             note = candidate.review

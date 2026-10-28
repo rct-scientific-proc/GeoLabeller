@@ -33,7 +33,8 @@ from pathlib import Path
 
 from .ledger import (OUTCOME_KEY, LedgerIndex, Verdict, image_key,
                      outcome_to_dict)
-from .source import _IMAGE_KEYS, _LIST_KEYS, parse_candidates
+from .source import (_CLASS_KEYS, _IMAGE_KEYS, _LIST_KEYS, _X_KEYS,
+                     _Y_KEYS, _first, _number, parse_candidates)
 
 
 def _records_of(data):
@@ -49,18 +50,27 @@ def _records_of(data):
     return data
 
 
-def write_outcomes(path, outcomes: dict, misplaced=None) -> int:
+def write_outcomes(path, outcomes: dict, misplaced=None,
+                   anchors=None) -> int:
     """Write ``outcomes`` - record index -> Verdict, or None to take a
     note away - into the file at ``path``, every other field kept, and
     atomically: the file is whole or untouched. Returns how many
     records changed. OSError when the file cannot be written. A record
     that is no longer the chip's - the file replaced since it was
     opened, its image another - takes no note; its index goes into
-    ``misplaced`` when a list is given (2.9.6)."""
+    ``misplaced`` when a list is given (2.9.6).
+
+    ``anchors`` - record index -> (image name, x, y, predicted class),
+    the chip's record as it was opened - tells the chip's record from
+    another at its index: Find Candidates rewrites its file in place,
+    and with the first run's verdicts kept, a note written by index and
+    image alone went onto the second run's spots, which then hid as
+    done and one of which claimed the label (2.9.15)."""
     path = Path(path)
     with open(path, "r", encoding="utf-8") as handle:
         data = json.load(handle)
     records = _records_of(data)
+    anchors = anchors or {}
     changed = 0
     for index, verdict in outcomes.items():
         if not (0 <= index < len(records)) or not isinstance(records[index],
@@ -69,7 +79,10 @@ def write_outcomes(path, outcomes: dict, misplaced=None) -> int:
                 misplaced.append(index)
             continue
         record = records[index]
-        if verdict is not None and not _same_image(record, verdict):
+        anchor = anchors.get(index)
+        image = verdict.image if verdict is not None else (
+            anchor[0] if anchor else None)
+        if not _same_record(record, image, anchor):
             if misplaced is not None:
                 misplaced.append(index)
             continue
@@ -90,15 +103,31 @@ def write_outcomes(path, outcomes: dict, misplaced=None) -> int:
     return changed
 
 
-def _same_image(record: dict, verdict) -> bool:
-    """Is the record's image the note's, by file name - the one thing
-    both are sure to agree on when the record is the chip's."""
+def _same_record(record: dict, image, anchor) -> bool:
+    """Is the record the chip's: its image the note's, by file name -
+    the one thing both are sure to agree on - and, with the chip's
+    record as opened in hand (``anchor``), at the same spot and of the
+    same class, which tell it from the record a rewritten file put at
+    its index. Without an anchor, the image is all there is to check."""
     name = None
     for key in _IMAGE_KEYS:
         if isinstance(record.get(key), str):
             name = record[key]
             break
-    return name is None or image_key(name) == image_key(verdict.image)
+    if (name is not None and image is not None
+            and image_key(name) != image_key(image)):
+        return False
+    if anchor is None:
+        return True
+    _image, x, y, predicted = anchor
+    record_x = _number(_first(record, _X_KEYS))
+    record_y = _number(_first(record, _Y_KEYS))
+    if (record_x is None or record_y is None
+            or abs(record_x - float(x)) > 0.5
+            or abs(record_y - float(y)) > 0.5):
+        return False
+    found = _first(record, _CLASS_KEYS)
+    return not isinstance(found, str) or found.strip() == predicted
 
 
 def read_outcomes(path) -> list:
