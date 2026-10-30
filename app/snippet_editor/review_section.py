@@ -12,14 +12,19 @@ them out, and the canvas draws them dimmed.
 In the Single view, A accepts, X rejects and F flags for another look;
 with "Advance after marking" on (the default) the editor moves to the next
 snippet, so a review pass needs no mouse. Each mark is one undo step.
+Delete (or the Remove label button) takes the label out of the project
+altogether - the main window's Remove Label, one undo step, the editor
+re-seated without it and landing on the next snippet (2026-10-30). A
+label with painted masks or a linked object asks first; a plain one
+goes at once, as it does on the map.
 
 In the Grid view's Review mode a page is marked at a time: the grid
 (orientation_section.py) takes the clicks and reports them, and this
 section sends them on - a page accepted at once as one undo step.
 """
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtWidgets import (QCheckBox, QGridLayout, QLabel, QPushButton,
-                             QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QCheckBox, QGridLayout, QLabel, QMessageBox,
+                             QPushButton, QVBoxLayout, QWidget)
 
 from ..labels import (REVIEW_ACCEPTED, REVIEW_RECHECK, REVIEW_REJECTED,
                       REVIEW_UNREVIEWED, valid_review)
@@ -50,12 +55,15 @@ KEYS = {Qt.Key_A: REVIEW_ACCEPTED,
 
 NAMES = {REVIEW_ACCEPTED: "Accepted", REVIEW_REJECTED: "Rejected",
          REVIEW_RECHECK: "Look again", REVIEW_UNREVIEWED: "Not reviewed"}
+# The key that removes the label in hand from the project.
+REMOVE_KEY = Qt.Key_Delete
 
 
 class ReviewPanel(QWidget):
     """Accept, Reject, Look again and Clear for the snippet in hand."""
 
     marked = pyqtSignal(str)             # a status; "" clears
+    remove_requested = pyqtSignal()      # the Remove label button
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -95,7 +103,15 @@ class ReviewPanel(QWidget):
             "without the mouse.")
         self.advance_check.setChecked(True)
         layout.addWidget(self.advance_check)
-        hint = QLabel("Keys: A accept, X reject, F look again.")
+        self.remove_button = QPushButton("Remove label")
+        self.remove_button.setToolTip(
+            "Take the label out of the project - masks and links too; "
+            "one undo step, Ctrl+Z puts it back. The editor moves to the "
+            "next snippet. (key Delete)")
+        self.remove_button.clicked.connect(self.remove_requested)
+        layout.addWidget(self.remove_button)
+        hint = QLabel("Keys: A accept, X reject, F look again; "
+                      "Delete removes the label.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: palette(mid);")
         layout.addWidget(hint)
@@ -111,6 +127,7 @@ class ReviewPanel(QWidget):
             button.setChecked(value == status)
             button.setEnabled(enabled)
         self.clear_button.setEnabled(enabled and status != REVIEW_UNREVIEWED)
+        self.remove_button.setEnabled(enabled)
 
 
 class ReviewSection(Section):
@@ -123,6 +140,8 @@ class ReviewSection(Section):
     review_changed = pyqtSignal(int, str)
     # ([label ids], status): a page marked at once - one undo step.
     reviews_changed = pyqtSignal(list, str)
+    # (label_id): take this label out of the project.
+    remove_requested = pyqtSignal(int)
 
     def __init__(self, grid=None, parent=None):
         """``grid`` is the Grid view, whose Review mode this section
@@ -131,6 +150,7 @@ class ReviewSection(Section):
         self._entry = None
         self._grid = grid
         self.panel.marked.connect(self.mark)
+        self.panel.remove_requested.connect(self.remove)
         if grid is not None:
             grid.review_marked.connect(self._on_grid_marked)
             grid.reviews_marked.connect(self._on_grid_page_marked)
@@ -172,12 +192,52 @@ class ReviewSection(Section):
         self.review_changed.emit(label_id, status)
         self.entry_changed.emit(label_id)
 
+    def remove(self):
+        """Take the snippet in hand out of the project (Delete, or the
+        button): the main window removes the label as one undo step and
+        re-seats the editor, which lands on the next snippet. A label
+        with painted masks or a linked object asks first; a plain one
+        goes at once, as Remove Label on the map does."""
+        if self._entry is None:
+            return
+        label_id = self._entry["label_id"]
+        losses = self._losses(self._entry)
+        if losses and not self._confirm_remove(
+                f"Label #{label_id} {' and '.join(losses)}.\n\n"
+                "Remove it from the project? Ctrl+Z puts it back."):
+            return
+        self.remove_requested.emit(label_id)
+
+    @staticmethod
+    def _losses(entry: dict) -> list:
+        """What a removal takes with it that a glance might miss."""
+        losses = []
+        masks = entry.get("masks") or []
+        if masks:
+            n = len(masks)
+            losses.append(f"has {n} painted mask{'' if n == 1 else 's'}")
+        if entry.get("linked"):
+            losses.append("is part of a linked object")
+        return losses
+
+    def _confirm_remove(self, text: str) -> bool:
+        """A question before a label with more to lose goes; a method so
+        tests answer it."""
+        return QMessageBox.question(
+            self.panel, "Remove Label", text,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+
     def view_changed(self, single):
         self.panel.setEnabled(single)
         return ("" if single else "In the Grid view, pick Review above the "
                                   "snippets to mark a page at a time.")
 
     def key_pressed(self, key):
+        if key == REMOVE_KEY:
+            if self._entry is None:
+                return False
+            self.remove()
+            return True
         if key not in KEYS:
             return False
         self.mark(KEYS[key])

@@ -3147,6 +3147,7 @@ class MainWindow(QMainWindow):
             editor.confidence_changed.connect(self._on_confidence_changed)
             editor.review_changed.connect(self._on_review_changed)
             editor.reviews_changed.connect(self._on_reviews_changed)
+            editor.remove_requested.connect(self._on_editor_remove_requested)
             editor.class_changed.connect(self._on_label_class_changed)
             editor.position_changed.connect(self._on_label_position_changed)
             editor.description_changed.connect(self._set_label_description)
@@ -3288,6 +3289,18 @@ class MainWindow(QMainWindow):
                 REVIEW_REJECTED: "rejected - left out of exports",
                 REVIEW_RECHECK: "flagged to look at again",
             }.get(status, "back to not reviewed"), 3000)
+
+    def _on_editor_remove_requested(self, label_id: int):
+        """The Snippet Editor's Review section asks for the label in
+        hand to be taken out of the project (Delete, or its button):
+        Remove Label as the map does it, one undo step; the editor
+        follows and lands on the next snippet."""
+        image, label = self.project.get_label_by_id(label_id)
+        if label is None:
+            return
+        self._on_label_removed(label_id, image.path)
+        self.statusBar.showMessage(
+            f"Removed label #{label_id} - Ctrl+Z puts it back", 4000)
 
     def _on_reviews_changed(self, label_ids, status):
         """Store one review on many labels - the Snippet Editor's review

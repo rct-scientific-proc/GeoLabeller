@@ -24,8 +24,8 @@ It talks to the rest of the app through set_labels / set_classes /
 set_mask_names / set_save_state in, and masks_changed /
 orientation_changed / size_changed / confidence_changed / review_changed /
 class_changed / position_changed / description_changed /
-group_id_changed / mask_names_changed / save_requested / undo_requested /
-redo_requested out.
+group_id_changed / mask_names_changed / remove_requested / save_requested /
+undo_requested / redo_requested out.
 """
 from PyQt5.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QKeySequence
@@ -111,6 +111,9 @@ class SnippetEditor(QWidget):
     orientation_changed = pyqtSignal(int, object, object, bool)
     confidence_changed = pyqtSignal(int, int)
     review_changed = pyqtSignal(int, str)
+    # (label_id): the Review section asks for the label to be removed
+    # from the project (Delete, or its button).
+    remove_requested = pyqtSignal(int)
     # ([label ids], status): a page of the review grid marked at once.
     reviews_changed = pyqtSignal(list, str)
     # (label_id, class name): the main window applies it to the label's
@@ -340,6 +343,7 @@ class SnippetEditor(QWidget):
         review = self.section_objects["review"]
         review.review_changed.connect(self.review_changed)
         review.reviews_changed.connect(self.reviews_changed)
+        review.remove_requested.connect(self.remove_requested)
         notes = self.section_objects["notes"]
         notes.description_changed.connect(self.description_changed)
         notes.group_id_changed.connect(self.group_id_changed)
