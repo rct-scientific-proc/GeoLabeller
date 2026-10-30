@@ -35,7 +35,7 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
-from PyQt5.QtCore import QPointF, QRect, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QEvent, QPointF, QRect, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import (QColor, QCursor, QIcon, QImage, QPainter, QPen,
                          QPixmap)
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox,
@@ -169,6 +169,13 @@ class ChipCell(QWidget):
         super().__init__(parent)
         self.key = key
         self.hover_text = ""        # the tooltip's words, for the popup
+        # Fresh from a rebuild: a cell that lands under a resting pointer
+        # gets an Enter the mouse never made, and the hover timers used
+        # to arm on it - a page turned by key raised the popup (2.9.17).
+        # That Enter is swallowed; the first real move on the cell is the
+        # hover (a pointer that comes onto the cell moves on it too).
+        self.parked = False
+        self.setMouseTracking(True)
         self._pixmap: QPixmap | None = None
         self._scaled: QPixmap | None = None
         self._score = ""
@@ -326,9 +333,19 @@ class ChipCell(QWidget):
                             y + dy * (MARK_GAP_PX + MARK_PX)))
         painter.setRenderHint(QPainter.Antialiasing, False)
 
+    def _under_the_resting_pointer(self) -> bool:
+        """Is this Enter the grid's doing: the cell fresh from a rebuild,
+        and the pointer on it with no move seen yet."""
+        return (self.parked
+                and self.rect().contains(self.mapFromGlobal(QCursor.pos())))
+
     def enterEvent(self, event):
         self._hover = True
         self.update()
+        if self._under_the_resting_pointer():
+            super().enterEvent(event)   # the grid moved, not the mouse
+            return
+        self.parked = False
         self.hovered.emit(self.key)
         super().enterEvent(event)
 
@@ -337,6 +354,12 @@ class ChipCell(QWidget):
         self.update()
         self.left.emit(self.key)
         super().leaveEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.parked:
+            self.parked = False
+            self.hovered.emit(self.key)     # the rest counts from here
+        super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event):
         self._pressed = (event.button(), event.modifiers())
@@ -1700,6 +1723,7 @@ class ModelReviewWindow(QWidget):
         px = self._cell_px()
         for i, chip in enumerate(self._visible):
             cell = ChipCell(chip.key)
+            cell.parked = True          # see ChipCell.parked
             cell.set_size(px)
             cell.set_mark(self.mark_check.isChecked())
             self._set_tooltip(cell, chip)
@@ -3246,6 +3270,13 @@ class ModelReviewWindow(QWidget):
         user has already answered for its unsaved work."""
         self._discard_on_close = True
         self.close()
+
+    def changeEvent(self, event):
+        # Another window taken: the popup would hang beside it (2.9.17).
+        if (event.type() == QEvent.ActivationChange
+                and not self.isActiveWindow()):
+            self._description.hide()
+        super().changeEvent(event)
 
     def closeEvent(self, event):
         if not self._discard_on_close and not self._confirm_discard(

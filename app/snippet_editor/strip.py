@@ -90,6 +90,9 @@ class SnippetStrip(QObject):
         """``worklist`` may be None: a host with several gives them all
         at once through set_worklists."""
         super().__init__(parent)
+        # The project's classes (set_known_classes): a class in view that
+        # lost its last snippet is still one, and stays in view (2.9.17).
+        self._known_classes: set = set()
         self._worklists = [] if worklist is None else [worklist]
         self.entries: list = []
         self.items_by_label: dict = {}          # label_id -> list item
@@ -169,8 +172,16 @@ class SnippetStrip(QObject):
         self.entries = sorted(
             entries, key=lambda e: (e["class_name"], e["image_name"],
                                     e["label_id"]))
-        classes = sorted({e["class_name"] for e in self.entries})
+        classes = {e["class_name"] for e in self.entries}
         current = self.class_combo.currentData()
+        kind, _sep, value = str(current or "all:").partition(":")
+        if kind == "class" and value in self._known_classes:
+            # The class in view stays in view with nothing listed when
+            # its last snippet went (removed from the editor, say),
+            # rather than falling to All classes with a label of another
+            # class in hand and the Remove button live (2.9.17).
+            classes.add(value)
+        classes = sorted(classes)
         combo = self.class_combo
         combo.blockSignals(True)
         combo.clear()
@@ -187,7 +198,11 @@ class SnippetStrip(QObject):
         index = combo.findData(current) if current is not None else -1
         combo.setCurrentIndex(index if index >= 0 else 0)
         combo.blockSignals(False)
-        self._rebuild(chosen_anew=False)
+        # A choice that is gone (its linked object, say) falls back to
+        # All classes - with nothing in hand, not the nearest label of
+        # whatever class (2.9.17).
+        self._rebuild(chosen_anew=False,
+                      in_hand=index >= 0 or kind == "all")
 
     def _linked_objects(self) -> list:
         """(object_id, caption) for each object with two or more labels,
@@ -391,7 +406,12 @@ class SnippetStrip(QObject):
         # signal arguments as its signature will take.
         self._rebuild(chosen_anew=True)
 
-    def _rebuild(self, chosen_anew: bool):
+    def set_known_classes(self, names):
+        """The project's classes: a class in view that lost its last
+        snippet is still a class, and stays in view."""
+        self._known_classes = set(names)
+
+    def _rebuild(self, chosen_anew: bool, in_hand: bool = True):
         self.loader.cancel_all()
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
@@ -423,7 +443,7 @@ class SnippetStrip(QObject):
             self.list_widget.addItem(item)
             self.items_by_label[entry["label_id"]] = item
         self._update_counts()
-        if self.list_widget.count():
+        if self.list_widget.count() and in_hand:
             row = 0
             if keep_id is not None and keep_id in self.items_by_label:
                 row = self.list_widget.row(self.items_by_label[keep_id])

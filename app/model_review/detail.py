@@ -20,8 +20,9 @@ import math
 import numpy as np
 from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
-from PyQt5.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QPushButton,
-                             QSpinBox, QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QCheckBox, QFrame, QHBoxLayout, QLabel,
+                             QPushButton, QScrollArea, QSpinBox,
+                             QVBoxLayout, QWidget)
 
 from ..labels import geodesic_distance
 from .ledger import IGNORE
@@ -38,6 +39,7 @@ MARK_RING_PX = 6
 MARK_GAP_PX = 9
 MARK_PX = 9
 NOTHING = "No chip in hand: move the cursor onto one, or click one."
+DESCRIPTION_LINES = 4           # the Details box shows this many, scrolling
 COULD_NOT_READ = "No picture: this chip could not be read."
 
 
@@ -368,12 +370,25 @@ class DetailPanel(QWidget):
         self.info.setWordWrap(True)
         self.info.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.info)
-        # The file's own words on the chip, when it has any (2.9.16).
+        # The file's own words on the chip, when it has any (2.9.16), in
+        # a box a few lines high that scrolls: a paragraph used to squeeze
+        # the picture to its floor and was clipped besides (2.9.17). The
+        # popup on the grid shows the whole text.
         self.description = QLabel("")
         self.description.setWordWrap(True)
         self.description.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.description.setVisible(False)
-        layout.addWidget(self.description)
+        self.description_box = QScrollArea()
+        self.description_box.setWidget(self.description)
+        self.description_box.setWidgetResizable(True)
+        self.description_box.setFrameShape(QFrame.NoFrame)
+        self.description_box.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff)
+        self.description_box.viewport().setAutoFillBackground(False)
+        self.description_box.setMaximumHeight(
+            DESCRIPTION_LINES * self.description.fontMetrics().lineSpacing()
+            + 6)
+        self.description_box.setVisible(False)
+        layout.addWidget(self.description_box)
         self.measure_info = QLabel("")
         self.measure_info.setWordWrap(True)
         self.measure_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -453,7 +468,7 @@ class DetailPanel(QWidget):
         self.image_button.setEnabled(False)
         self.as_new_check.setVisible(False)
         self.description.setText("")
-        self.description.setVisible(False)
+        self.description_box.setVisible(False)
 
     def near(self) -> list:
         """The labels already there, as last shown."""
@@ -550,10 +565,13 @@ class DetailPanel(QWidget):
                              "below for a new label here instead.")
         self.info.setText("<br>".join(lines))
         description = chip.description
+        # Escaped, so it reads as written; its line breaks kept (2.9.17).
         self.description.setText(
-            f"<b>Description:</b> {html.escape(description, quote=False)}"
+            "<b>Description:</b> " + "<br>".join(
+                html.escape(line, quote=False)
+                for line in description.splitlines())
             if description else "")
-        self.description.setVisible(bool(description))
+        self.description_box.setVisible(bool(description))
 
     def set_picture(self, chip, arr: np.ndarray, picture_frame: tuple,
                     chip_frame: tuple):

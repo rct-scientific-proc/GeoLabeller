@@ -616,6 +616,15 @@ class SnippetLoader(QObject):
         self._chunks: dict = {}          # id(runnable) -> (runnable, signals)
         self._cache: OrderedDict = OrderedDict()   # content key -> array
         self._cache_bytes = 0
+        self._cache_salt = None     # see set_cache_salt
+
+    def set_cache_salt(self, salt):
+        """Tell the cache's keys apart by what the reader does differently
+        from now on - the hover snippet's look (2.9.17): every picture
+        read under another salt is a miss, and the loader stays (a new
+        one meant shutting this one, which waited out a read in flight
+        on the UI thread)."""
+        self._cache_salt = salt
 
     def request(self, key, image_path: str, pixel_x: float, pixel_y: float,
                 size_px: int):
@@ -623,7 +632,8 @@ class SnippetLoader(QObject):
         # The display settings are part of what a snippet looks like, so
         # a change of them is a cache miss rather than a stale picture.
         content = (image_path, int(round(pixel_x)), int(round(pixel_y)),
-                   int(size_px), display_settings.for_image(image_path))
+                   int(size_px), display_settings.for_image(image_path),
+                   self._cache_salt)
         cached = self._cache.get(content)
         if cached is not None:
             self._cache.move_to_end(content)
@@ -655,7 +665,8 @@ class SnippetLoader(QObject):
         pending = []
         for key, image_path, pixel_x, pixel_y in items:
             content = (image_path, int(round(pixel_x)), int(round(pixel_y)),
-                       int(size_px), display_settings.for_image(image_path))
+                       int(size_px), display_settings.for_image(image_path),
+                       self._cache_salt)
             cached = self._cache.get(content)
             if cached is not None:
                 self._cache.move_to_end(content)

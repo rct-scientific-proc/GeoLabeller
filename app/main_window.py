@@ -3270,6 +3270,9 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage(
                 f"'{HARD_NEGATIVE}' is reserved for the HDF5 export's "
                 "negatives and cannot be a class.", 6000)
+            # An editor that showed the name before asking shows the
+            # labels' real classes again (review 2026-10-30, 2.9.17).
+            self._reseat_open_editors()
             return
         changed = [other for other in ids
                    if self.project.get_label_by_id(other)[1].class_name
@@ -7047,11 +7050,12 @@ class MainWindow(QMainWindow):
         hover_snippet.set_north_up(bool(on))
         self.canvas.end_hover()         # the one up is the other look
         if self._hover_loader is not None:
-            # Its cache holds the other look, and its reader is fixed:
-            # the next hover makes one for this look.
-            self._hover_loader.shutdown()
-            self._hover_loader.deleteLater()
-            self._hover_loader = None
+            # The reads in flight are for the other look, and the cache
+            # holds that look: dropped, and keyed apart from now on. The
+            # loader stays: shutting it waited out a read in flight on
+            # the UI thread, up to 5 s on a slow share (2.9.17).
+            self._hover_loader.cancel_all()
+            self._hover_loader.set_cache_salt(hover_snippet.north_up())
 
     def _on_label_hover(self, label_id: int, _image_path: str):
         """The canvas: Ctrl held, the mouse at rest on this label."""
@@ -7061,10 +7065,11 @@ class MainWindow(QMainWindow):
             return
         if self._hover_loader is None:
             # Turned the way the map shows the image, unless the View
-            # menu says the file's framing (2.9.16).
+            # menu says the file's framing (2.9.16): the reader decides
+            # at each read, the cache is keyed by the look.
             self._hover_loader = SnippetLoader(
-                self, reader=(hover_snippet.read_map_oriented_snippet
-                              if hover_snippet.north_up() else None))
+                self, reader=hover_snippet.read_hover_snippet)
+            self._hover_loader.set_cache_salt(hover_snippet.north_up())
             self._hover_loader.ready.connect(self._on_hover_snippet)
         if self._hover_popup is None:
             self._hover_popup = hover_snippet.HoverSnippet(self)
@@ -7079,7 +7084,12 @@ class MainWindow(QMainWindow):
         if label is None:
             return
         caption = f"{label.class_name} on {image.name}"
-        if hover_snippet.north_up() and image.get_affine() is not None:
+        affine = image.get_affine()
+        # ...when there is a map to turn to: a file with a CRS but no
+        # transform is read as it lies (2.9.17).
+        if (hover_snippet.north_up() and affine is not None
+                and not affine.is_identity
+                and (image.crs_epsg is not None or bool(image.crs_wkt))):
             caption += "  \N{MIDDLE DOT}  as on the map"
         if label.description:
             caption += f"\n{label.description}"

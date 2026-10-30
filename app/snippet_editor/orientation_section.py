@@ -313,11 +313,14 @@ class OrientationCell(QWidget):
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             # Judged at the release: a click picks the snippet, a drag
-            # draws - and with Ctrl or Shift held the release is a pick
-            # or nothing, whatever this press armed or began.
+            # draws. With Ctrl or Shift held the release can only pick:
+            # the press arms no mark and begins no drag (no preview
+            # arrow across a pick, 2.9.17).
             mods = int(event.modifiers()
                        & (Qt.ControlModifier | Qt.ShiftModifier))
             self._press = (QPoint(event.pos()), mods)
+            if mods:
+                return
         if self._review_mode:
             if event.button() == Qt.LeftButton:
                 self._click_armed = True
@@ -353,19 +356,19 @@ class OrientationCell(QWidget):
         press, self._press = self._press, None
         if event.button() == Qt.LeftButton and press is not None:
             where, mods = press
-            clicked = (self.rect().contains(event.pos()) and
-                       (event.pos() - where).manhattanLength() < MIN_DRAG_PX)
+            # One rule for a click, the drag's own (euclidean): judged
+            # by city blocks here and as the crow flies below, a (4, 4)
+            # wobble was neither a click nor a drag (2.9.17).
+            offset = event.pos() - where
+            clicked = (self.rect().contains(event.pos())
+                       and math.hypot(offset.x(), offset.y()) < MIN_DRAG_PX)
             if mods:
                 # Ctrl or Shift: a pick, whatever the mode - or nothing,
-                # let go off the snippet. Not a mark and not a drawn line:
-                # what the press armed or began is dropped here.
-                self._click_armed = False
-                self._drag_start = self._drag_now = None
-                self.update()
+                # let go off the snippet. The press armed and began
+                # nothing, so what follows does nothing either.
                 if clicked:
                     self.select_clicked.emit(self._label_id, mods)
-                return
-            if clicked and not self._review_mode:
+            elif clicked and not self._review_mode:
                 # A click, not a drag: it picks the snippet and draws
                 # nothing (whatever orientation was committed stays).
                 self._drag_start = self._drag_now = None
@@ -450,6 +453,10 @@ class OrientationEditor(QWidget):
         # refill keeps what is still on it, a turned page drops it.
         self._selected: set = set()
         self._anchor: "int | None" = None
+        # The pick a plain click replaced, (label id, picks, anchor): put
+        # back when the click turns out to be the first half of a
+        # double-click, which opens the snippet (2.9.17).
+        self._pick_before_click: "tuple | None" = None
         self._classes: list = []
         self._setup_ui()
         strip.rebuilt.connect(self._on_strip_rebuilt)
@@ -668,6 +675,7 @@ class OrientationEditor(QWidget):
                                  SNIPPET_SIZE)
         # The pick lives on the page: what is still on it stays picked.
         self._selected &= set(self._cells)
+        self._pick_before_click = None
         self._show_selection()
 
     # -- picking snippets for a change of class (2.9.16) --------------------
@@ -692,12 +700,14 @@ class OrientationEditor(QWidget):
     def select_all(self):
         """Ctrl+A: every snippet on the page."""
         self._selected = set(self._cells)
+        self._pick_before_click = None
         self._show_selection()
 
     def select_none(self) -> bool:
         """Escape: nothing picked; True when something was."""
         had = bool(self._selected)
         self._selected.clear()
+        self._pick_before_click = None
         self._show_selection()
         return had
 
@@ -708,6 +718,7 @@ class OrientationEditor(QWidget):
         order = list(self._cells)
         if label_id not in order:
             return
+        self._pick_before_click = None
         if mods & int(Qt.ControlModifier):
             if label_id in self._selected:
                 self._selected.discard(label_id)
@@ -718,6 +729,8 @@ class OrientationEditor(QWidget):
                                  order.index(label_id)))
             self._selected = set(order[start:end + 1])
         else:
+            self._pick_before_click = (label_id, set(self._selected),
+                                       self._anchor)
             self._selected = {label_id}
         self._anchor = label_id
         self._show_selection()
@@ -733,11 +746,16 @@ class OrientationEditor(QWidget):
             n > 0 and bool(self.pick_class_combo.currentText().strip()))
 
     def apply_class(self):
-        """Give the picked snippets the class in the box - only those
-        whose class it is not already, and only them: a linked sibling
-        that was not picked keeps its class. The entries say the new
-        class at once, and the main window, told, makes it one undo
-        step (and a new class, when the name is new)."""
+        """Ask for the picked snippets to be given the class in the box
+        - only those whose class it is not already, and only them: a
+        linked sibling that was not picked keeps its class. The main
+        window makes it one undo step (and a new class, when the name
+        is new) and re-seats the editor, which is when the entries and
+        captions say the new class: said here at once, a name the main
+        window refused stayed on the labels in the editor (2.9.17)."""
+        # A reject shown but not stored yet goes in first, so the undo
+        # order is the order of the clicks.
+        self.flush_review()
         name = self.pick_class_combo.currentText().strip()
         ids = self.selected()
         changed = [label_id for label_id in ids
@@ -745,11 +763,6 @@ class OrientationEditor(QWidget):
                    and self._entry(label_id)["class_name"] != name]
         if not name or not changed:
             return
-        for label_id in changed:
-            entry = self._entry(label_id)
-            entry["class_name"] = name
-            self._set_caption(entry)
-        self.strip.refresh_many(changed)
         self.pick_class_combo.clearFocus()
         self.select_none()
         self.classes_requested.emit(changed, name)
@@ -877,12 +890,17 @@ class OrientationEditor(QWidget):
 
     def _on_open_requested(self, label_id: int):
         """A double-click: open the snippet - and the click it began with
-        was never a mark."""
+        was never a mark, nor a pick that replaced the one in hand."""
         if (self._pending_review is not None
                 and self._pending_review[0] == label_id):
             self._pending_review = None
             self._review_timer.stop()
             self._show_review(label_id)
+        before, self._pick_before_click = self._pick_before_click, None
+        if before is not None and before[0] == label_id:
+            _id, self._selected, self._anchor = before
+            self._selected = set(self._selected)
+            self._show_selection()
         self.open_requested.emit(label_id)
 
     def flush_review(self):

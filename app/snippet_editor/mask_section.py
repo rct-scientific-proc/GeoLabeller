@@ -214,7 +214,9 @@ class MaskEditor(QWidget):
             "Show a larger window of the image around the snippet - the\n"
             "snippet's own frame outlined, the surround dimmed. For\n"
             "looking: the tools, the label point and the readout stay on\n"
-            "the snippet. Single view only. (key C)")
+            "the snippet. Single view only. (key C)\n"
+            f"The window is at most {_CONTEXT_MAX_PX} px: a 1024 px snippet "
+            "gets 2x, and above that there is no room, so this is off.")
         self.context_button.setChecked(self._remembered(_CONTEXT_KEY, False))
         controls.addWidget(self.context_button)
         self.context_combo = QComboBox()
@@ -224,11 +226,15 @@ class MaskEditor(QWidget):
             self._remembered_context_factor())))
         self.context_combo.setToolTip(
             "How much of the image the context window takes in, as a\n"
-            "multiple of the snippet size.")
+            f"multiple of the snippet size (at most {_CONTEXT_MAX_PX} px "
+            "in all).")
         controls.addWidget(self.context_combo)
         self.context_button.toggled.connect(self._on_context_changed)
+        # The factor alone changes nothing while the context is off: it
+        # used to reset a kept zoom and read the snippet again (2.9.17).
         self.context_combo.currentIndexChanged.connect(
-            self._on_context_changed)
+            self._on_context_factor_changed)
+        self._enable_context(self.size_spin.value())
         controls.addSpacing(16)
         controls.addWidget(QLabel("Bright:"))
         self.brightness_slider = QSlider(Qt.Horizontal)
@@ -452,7 +458,18 @@ class MaskEditor(QWidget):
         return value if value in CONTEXT_FACTORS else DEFAULT_CONTEXT_FACTOR
 
     def context_on(self) -> bool:
-        return self.context_button.isChecked()
+        """Is a context window asked for, with room for one?"""
+        return (self.context_button.isChecked()
+                and self.context_button.isEnabled())
+
+    def _enable_context(self, size: int):
+        """Room for a context, or not: the window is capped, so a snippet
+        above half the cap can show no larger window - the button is off
+        rather than lit with nothing framed (2.9.17). Its tick is kept
+        for a size that has room again."""
+        room = size * 2 <= _CONTEXT_MAX_PX
+        self.context_button.setEnabled(room)
+        self.context_combo.setEnabled(room)
 
     def context_factor(self) -> int:
         """How many times the snippet's size the window shown is: 1
@@ -472,6 +489,10 @@ class MaskEditor(QWidget):
         # starts fitted, whatever zoom the last one was given.
         self.canvas.reset_zoom()
         self._show_entry(self._current)
+
+    def _on_context_factor_changed(self, _index):
+        if self.context_on():
+            self._on_context_changed()
 
     @staticmethod
     def _remembered(key: str, default: bool) -> bool:
@@ -509,7 +530,7 @@ class MaskEditor(QWidget):
             settings().setValue(_OVERLAP_KEY, self.allow_overlap())
             settings().setValue(_POINT_KEY, self.point_check.isChecked())
             settings().setValue(_TOLERANCE_KEY, self.tolerance_spin.value())
-            settings().setValue(_CONTEXT_KEY, self.context_on())
+            settings().setValue(_CONTEXT_KEY, self.context_button.isChecked())
             settings().setValue(_CONTEXT_FACTOR_KEY,
                                 int(self.context_combo.currentData()
                                     or DEFAULT_CONTEXT_FACTOR))
@@ -631,6 +652,13 @@ class MaskEditor(QWidget):
         if shown != size:
             self._context_frame = self._snippet_frame_in_crop(entry, size)
         self.canvas.set_frame(self._context_frame)
+        if self._context_frame is not None and not self.canvas.zoom_kept():
+            # Fitted at zoom 1, a window larger than the view opened on
+            # its top-left corner with the snippet off the screen: the
+            # frame goes to the middle of the view (2.9.17). A kept zoom
+            # holds the label's point where the last one's was instead.
+            fx, fy, fw, fh = self._context_frame
+            self.canvas.centre_on(fx + fw / 2.0, fy + fh / 2.0)
         # In hand: the mask the picker names, when this snippet carries
         # it - the name chosen on the last snippet is the one meant for
         # this one - else its first.
@@ -652,8 +680,13 @@ class MaskEditor(QWidget):
             return None
         ex0, ey0, ew, eh = snippet_frame(entry["pixel_x"], entry["pixel_y"],
                                          size, dims[0], dims[1])
-        x0, y0, _w, _h = self._frame
-        return (ex0 - x0, ey0 - y0, ew, eh)
+        x0, y0, w, h = self._frame
+        # Inside the window shown: the record's size places the frame
+        # and the file's gives the window, and a cropped copy whose
+        # check was declined put the frame past the window (2.9.17).
+        ew, eh = min(ew, w), min(eh, h)
+        return (max(0, min(ex0 - x0, w - ew)), max(0, min(ey0 - y0, h - eh)),
+                ew, eh)
 
     def _clip_to_frame(self, region: np.ndarray) -> np.ndarray:
         """What a tool would take, kept to the snippet's own frame when a
@@ -666,15 +699,32 @@ class MaskEditor(QWidget):
         kept[fy:fy + fh, fx:fx + fw] = region[fy:fy + fh, fx:fx + fw]
         return kept
 
-    def _within_frame(self, new: np.ndarray, old: np.ndarray) -> np.ndarray:
-        """``new`` inside the snippet's own frame, ``old`` outside it."""
+    def _frame_window(self) -> tuple:
+        """The snippet's own frame as (rows, cols) slices of the window
+        shown - the whole window with no context. The wand and the
+        tidy tools work on this sub-window and nothing else: judged on
+        the whole window and cut to the frame after, the wand flooded
+        out through the surround and back in, Remove Specks kept a
+        blob in the surround as the largest piece, Fill Enclosed found
+        a hole out there, and Grow reached in from it (2.9.17)."""
         frame = self._context_frame
         if frame is None:
-            return new
+            return slice(None), slice(None)
         fx, fy, fw, fh = frame
-        kept = old.copy()
-        kept[fy:fy + fh, fx:fx + fw] = new[fy:fy + fh, fx:fx + fw]
-        return kept
+        return slice(fy, fy + fh), slice(fx, fx + fw)
+
+    def _tidied_in_frame(self, name: str, op) -> np.ndarray:
+        """``op(part, walls)`` run on the frame's sub-window of the mask
+        ``name`` (and of its walls, or None), the result put back in a
+        copy of the whole layer."""
+        layer = self._layers[name]
+        rows, cols = self._frame_window()
+        walls = self._walls(name)
+        part = op(layer[rows, cols], None if walls is None
+                  else walls[rows, cols])
+        tidied = layer.copy()
+        tidied[rows, cols] = part
+        return tidied
 
     def _adjusted_display(self) -> "np.ndarray | None":
         """The current snippet's pixels with the view settings applied."""
@@ -734,6 +784,7 @@ class MaskEditor(QWidget):
         # latest masks; re-showing re-anchors them into the new window. A
         # window of another size is another thing to look at: it starts
         # fitted, whatever zoom the last one was given.
+        self._enable_context(self.size_spin.value())
         self.canvas.reset_zoom()
         self._show_entry(self._current)
 
@@ -938,23 +989,33 @@ class MaskEditor(QWidget):
             self.canvas.set_preview(None)
             return
         layer = self._layers[name]
+        # On the snippet's own frame, whole window or not.
+        rows, cols = self._frame_window()
+        xs, ys = x - (cols.start or 0), y - (rows.start or 0)
+        shown = np.ascontiguousarray(self._shown[rows, cols])
+        if not (0 <= xs < shown.shape[1] and 0 <= ys < shown.shape[0]):
+            self.canvas.set_preview(None)       # the surround: nothing
+            return
         # A drag changes the tolerance, not the pixel: how unlike it the
         # rest of the snippet is was settled at the press.
         if (self._wand_difference is None
                 or self._wand_difference[0] != (x, y)):
             self._wand_difference = ((x, y),
-                                     pixel_difference(self._shown, x, y))
+                                     pixel_difference(shown, xs, ys))
         difference = self._wand_difference[1]
+        walls = self._walls(name)
         if erase:
             # Only ever from this mask - and what is not in it is not
             # shown as about to go.
-            region = similar_region(self._shown, x, y, tolerance,
-                                    difference=difference) & layer
+            part = similar_region(shown, xs, ys, tolerance,
+                                  difference=difference) & layer[rows, cols]
         else:
-            region = similar_region(self._shown, x, y, tolerance,
-                                    barrier=self._walls(name),
-                                    difference=difference)
-        region = self._clip_to_frame(region)
+            part = similar_region(shown, xs, ys, tolerance,
+                                  barrier=None if walls is None
+                                  else walls[rows, cols],
+                                  difference=difference)
+        region = np.zeros_like(layer)
+        region[rows, cols] = part
         self._wand_pending = (name, region, erase)
         self.canvas.set_preview(region, erase)
 
@@ -990,7 +1051,6 @@ class MaskEditor(QWidget):
         """Make ``name``'s layer ``tidied`` and commit it - one undo step,
         or none at all when nothing changed."""
         layer = self._layers[name]
-        tidied = self._within_frame(tidied, layer)
         if np.array_equal(tidied, layer):
             return False
         layer[:] = tidied
@@ -1011,13 +1071,14 @@ class MaskEditor(QWidget):
     def _on_grow(self):
         name = self._tidy_target()
         if name is not None:
-            self._tidied(name, grow(self._layers[name],
-                                    barrier=self._walls(name)))
+            self._tidied(name, self._tidied_in_frame(
+                name, lambda part, walls: grow(part, barrier=walls)))
 
     def _on_shrink(self):
         name = self._tidy_target()
         if name is not None:
-            self._tidied(name, shrink(self._layers[name]))
+            self._tidied(name, self._tidied_in_frame(
+                name, lambda part, _walls: shrink(part)))
 
     def speck_limit(self) -> int:
         """How small a speck is: fewer pixels than one stamp of the
@@ -1030,8 +1091,15 @@ class MaskEditor(QWidget):
         if name is None:
             return
         limit = self.speck_limit()
-        cleaned, removed = remove_specks(self._layers[name], limit)
-        self._tidied(name, cleaned)
+        counts = []
+
+        def specks(part, _walls):
+            cleaned, removed = remove_specks(part, limit)
+            counts.append(removed)
+            return cleaned
+
+        self._tidied(name, self._tidied_in_frame(name, specks))
+        removed = counts[0]
         self._set_tidy_note(
             f"Removed {removed} speck{'s' if removed != 1 else ''} - "
             f"pieces smaller than the brush ({limit} px)." if removed else
@@ -1045,10 +1113,15 @@ class MaskEditor(QWidget):
             return
         # The other masks are walls: the shadow drawn up to the hull is
         # closed by the hull's edge, and the fill stops there.
-        barrier = self._walls(name)
-        filled, added = fill_enclosed(self._layers[name], barrier=barrier)
-        filled = self._within_frame(filled, self._layers[name])
-        if added == 0:
+        counts = []
+
+        def fill(part, walls):
+            filled, added = fill_enclosed(part, barrier=walls)
+            counts.append(added)
+            return filled
+
+        filled = self._tidied_in_frame(name, fill)
+        if counts[0] == 0:
             QMessageBox.information(
                 self, "Nothing enclosed",
                 f"'{name}' does not fully enclose any area - the outline "

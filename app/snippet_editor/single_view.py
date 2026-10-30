@@ -354,6 +354,17 @@ class MaskPaintCanvas(QWidget):
     def arrow(self) -> "tuple | None":
         return self._arrow
 
+    def arrow_half_px(self) -> float:
+        """Half the orientation arrow's length on screen: by the
+        snippet's own frame when a context window is shown (sized by
+        the window, it ran through the surround, 2.9.17), else by the
+        window."""
+        if self._frame is not None:
+            w, h = self._frame[2], self._frame[3]
+        else:
+            w, h = self._w, self._h
+        return 0.35 * min(w, h) * self._scale
+
     def set_arrow(self, angle_rad: "float | None", color: QColor,
                   centre: "tuple | None"):
         """Show an orientation arrow through ``centre`` (snippet pixels),
@@ -515,6 +526,19 @@ class MaskPaintCanvas(QWidget):
         bar): where it is now is where they want it."""
         self._view_owed = (0.0, 0.0)
 
+    def centre_on(self, x: float, y: float):
+        """Scroll the view to put snippet pixel (x, y) at the middle of
+        the viewport, as far as the scroll bars reach. A context window
+        larger than the view opened on its top-left corner, the
+        snippet's own frame off the screen (2.9.17)."""
+        area = self._scroll_area()
+        if area is None:
+            return
+        view = area.viewport()
+        area.ensureVisible(round(x * self._scale), round(y * self._scale),
+                           view.width() // 2, view.height() // 2)
+        self._view_owed = (0.0, 0.0)
+
     def _scroll_by(self, dx: float, dy: float):
         """Move the view, with whatever the last move was left owing."""
         area = self._scroll_area()
@@ -590,7 +614,7 @@ class MaskPaintCanvas(QWidget):
             rad, color, (cx, cy) = self._arrow
             # A fixed length on screen, through the centre; the minus
             # because the convention's y grows up and the screen's down.
-            half = 0.35 * min(self._w, self._h) * self._scale
+            half = self.arrow_half_px()
             x, y = cx * self._scale, cy * self._scale
             dx, dy = math.cos(rad) * half, -math.sin(rad) * half
             self._draw_arrow(painter, QPointF(x - dx, y - dy),
@@ -787,6 +811,10 @@ class MaskPaintCanvas(QWidget):
         """The corners clicked so far, in snippet pixels."""
         return list(self._polygon)
 
+    def has_polygon(self) -> bool:
+        """Is a shape being clicked out?"""
+        return bool(self._polygon)
+
     def polygon_erases(self) -> bool:
         return self._polygon_erase
 
@@ -931,8 +959,12 @@ class MaskPaintCanvas(QWidget):
             return
         if self._tool == TOOL_NONE:
             return
-        if not self._in_frame(event.pos()):
-            return                  # the surround of a context window
+        if (event.button() == Qt.LeftButton
+                and not self._in_frame(event.pos())):
+            # The surround of a context window is for looking: nothing
+            # is painted, drawn or moved there. A right click still
+            # clears a line or takes a corner back, as anywhere (2.9.17).
+            return
         if self._tool == TOOL_MOVE:
             # An image that cannot be read shows nothing to aim at.
             if (event.button() == Qt.LeftButton and not self._read_only

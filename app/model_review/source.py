@@ -50,7 +50,8 @@ _HEIGHT_KEYS = ("image_height", "height", "h")
 _CLASS_KEYS = ("class", "predicted", "class_name", "label", "prediction")
 _SCORE_KEYS = ("score", "confidence", "probability", "prob", "p")
 # What the file says of the chip in words, if anything (2.9.16): the
-# first of these present; a non-empty string, else no description.
+# first of these holding a non-empty string - a null or empty one does
+# not hide a later key (2.9.17); none with words means no description.
 _DESCRIPTION_KEYS = ("description", "note", "comment", "reason")
 _LIST_KEYS = ("chips", "items", "records", "mistakes", "predictions")
 # A chip no model called anything: a detector's (app/detect, 2.9.0).
@@ -267,6 +268,15 @@ def _text(value) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _first_text(record: dict, keys) -> str:
+    """The first of ``keys`` whose value has words in it (see _text)."""
+    for key in keys:
+        text = _text(record.get(key))
+        if text:
+            return text
+    return ""
+
+
 def parse_candidates(data) -> tuple:
     """(candidates, malformed) from the decoded JSON: a list of records,
     or an object holding one under a known name."""
@@ -301,7 +311,7 @@ def parse_candidates(data) -> tuple:
             predicted=predicted.strip(),
             score=0.0 if score is None else score,
             review=outcome_from_record(record),
-            description=_text(_first(record, _DESCRIPTION_KEYS))))
+            description=_first_text(record, _DESCRIPTION_KEYS)))
     return candidates, malformed
 
 

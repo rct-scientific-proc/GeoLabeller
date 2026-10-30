@@ -383,6 +383,7 @@ class SnippetEditor(QWidget):
         self._classes = list(names)
         self._show_class(self.strip.current_entry())
         self.grid.set_classes(self._classes)
+        self.strip.set_known_classes(self._classes)
 
     def _show_class(self, entry):
         combo = self.label_class_combo
@@ -681,8 +682,16 @@ class SnippetEditor(QWidget):
             return True
         if event.key() == Qt.Key_C:
             # The context window, on or off (2.9.16): the view's, not a
-            # section's, so it answers whatever sections are on.
-            self.masks.toggle_context()
+            # section's, so it answers whatever sections are on. Not
+            # with a shape being clicked out: another window to show
+            # would drop it (2.9.17).
+            if not self.masks.canvas.has_polygon():
+                self.masks.toggle_context()
+            return True
+        if event.key() == Qt.Key_Delete and event.isAutoRepeat():
+            # Delete removes the label in hand: held down, it removed one
+            # per repeat, each its own undo step (2.9.17). The first
+            # press is the one meant.
             return True
         for key in self.sections_on():
             if self.section_objects[key].key_pressed(event.key()):

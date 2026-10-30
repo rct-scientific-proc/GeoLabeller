@@ -97,10 +97,19 @@ def description_for(chip, source: str) -> str:
 
 def _describe(old, description: str):
     """The file's words onto a label already there, once: appended
-    after " - " unless the label's description holds them already."""
-    if description and description not in (old.description or ""):
-        old.description = (f"{old.description} - {description}"
-                           if old.description else description)
+    after " - " unless the label's description already holds them as a
+    segment of its own - whole and case folded (2.9.17: a substring
+    test let "no shadow here" swallow "shadow", and a change of case
+    add a second copy)."""
+    wanted = (description or "").strip()
+    if not wanted:
+        return
+    held = [part.strip().casefold()
+            for part in (old.description or "").split(" - ")]
+    if wanted.casefold() in held:
+        return
+    old.description = (f"{old.description} - {wanted}"
+                       if old.description else wanted)
 
 
 def _label_for(project, image, chip, source: str, stamp, verdict=None):
