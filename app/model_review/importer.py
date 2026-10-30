@@ -3,9 +3,10 @@
 Every chip given a class becomes a label on its image: at the chip's
 centre, with lon/lat through the image's georeferencing where it has
 any, attributed to the current user, and carrying a description that
-says what the model said - "model: vessel 0.97, round3.json" - so "this
-became that" can be read off the label itself, in the Snippet Editor
-and wherever descriptions go. Ignored chips make no label.
+says what the model said - "model: vessel 0.97, round3.json" - and,
+after " - ", whatever the file said of the chip in words (2.9.16) - so
+"this became that" can be read off the label itself, in the Snippet
+Editor and wherever descriptions go. Ignored chips make no label.
 
 A chip labelled already (2.9.4) - a label on its image within the
 distance, not its own - gives its verdict to that label: the label
@@ -84,9 +85,22 @@ class ImportResult:
 
 def description_for(chip, source: str) -> str:
     """What the model said, as the label's description - or, for a
-    detector's candidate, that it was found and how strongly."""
+    detector's candidate, that it was found and how strongly - and the
+    file's own words on the chip after " - ", when it has any."""
     text = called(chip)
-    return f"{text}, {source}" if source else text
+    if source:
+        text = f"{text}, {source}"
+    if chip.description:
+        text = f"{text} - {chip.description}"
+    return text
+
+
+def _describe(old, description: str):
+    """The file's words onto a label already there, once: appended
+    after " - " unless the label's description holds them already."""
+    if description and description not in (old.description or ""):
+        old.description = (f"{old.description} - {description}"
+                           if old.description else description)
 
 
 def _label_for(project, image, chip, source: str, stamp, verdict=None):
@@ -117,8 +131,10 @@ def outcome_for(chip, label_id, stamp, became) -> Verdict:
         group=chip.group or "")
 
 
-def _reclass(old, verdict: str, project, stamp, result: ImportResult):
-    """The label takes the class, if it has not got it."""
+def _reclass(old, verdict: str, project, stamp, result: ImportResult,
+             description: str = ""):
+    """The label takes the class, if it has not got it - and the
+    chip's description, if it has not got that (2.9.16)."""
     if verdict not in project.classes:
         project.classes.append(verdict)
     if old.class_name != verdict:
@@ -127,6 +143,7 @@ def _reclass(old, verdict: str, project, stamp, result: ImportResult):
             old.attribution["class"] = dict(stamp)
         result.labels_changed += 1
         result.classes[verdict] += 1
+    _describe(old, description)
 
 
 def apply_verdicts(project, chips, source: str) -> ImportResult:
@@ -174,7 +191,8 @@ def apply_verdicts(project, chips, source: str) -> ImportResult:
                     result.removed_ids.append(old.id)
                 result.ignored += 1
             elif old is not None:
-                _reclass(old, verdict, project, stamp, result)
+                _reclass(old, verdict, project, stamp, result,
+                         chip.description)
                 if chip.moved_since_import() and (
                         old.pixel_x, old.pixel_y) != (chip.pixel_x,
                                                       chip.pixel_y):
@@ -216,7 +234,8 @@ def apply_verdicts(project, chips, source: str) -> ImportResult:
                 result.classes[verdict] += 1
                 result.label_ids.append(label.id)
             else:
-                _reclass(old, verdict, project, stamp, result)
+                _reclass(old, verdict, project, stamp, result,
+                         chip.description)
                 label_id = old.id
                 result.adopted += 1
                 result.label_ids.append(old.id)

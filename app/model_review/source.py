@@ -49,6 +49,9 @@ _WIDTH_KEYS = ("image_width", "width", "w")
 _HEIGHT_KEYS = ("image_height", "height", "h")
 _CLASS_KEYS = ("class", "predicted", "class_name", "label", "prediction")
 _SCORE_KEYS = ("score", "confidence", "probability", "prob", "p")
+# What the file says of the chip in words, if anything (2.9.16): the
+# first of these present; a non-empty string, else no description.
+_DESCRIPTION_KEYS = ("description", "note", "comment", "reason")
 _LIST_KEYS = ("chips", "items", "records", "mistakes", "predictions")
 # A chip no model called anything: a detector's (app/detect, 2.9.0).
 # Not a class of the project's, and the one such name a file may use.
@@ -67,6 +70,7 @@ class Candidate:
     predicted: str
     score: float
     review: dict | None = None  # the record's note (ledger.OUTCOME_KEY)
+    description: str = ""       # the file's words on it (2.9.16)
 
     @property
     def name(self) -> str:
@@ -108,6 +112,7 @@ class Chip:
     source_y: float = 0.0
     file_x: float = 0.0         # ...as written, in the file's own pixels:
     file_y: float = 0.0         # what tells its record apart (2.9.15)
+    description: str = ""       # the file's words on it (2.9.16)
     anchor_x: float = 0.0       # the centre as the project has it
     anchor_y: float = 0.0       # (2.8.11): its label's, else the
                                 # file's; a move since is to import
@@ -257,6 +262,11 @@ def _whole(value) -> int | None:
     return int(round(number))
 
 
+def _text(value) -> str:
+    """A string with something in it, stripped; anything else is ""."""
+    return value.strip() if isinstance(value, str) else ""
+
+
 def parse_candidates(data) -> tuple:
     """(candidates, malformed) from the decoded JSON: a list of records,
     or an object holding one under a known name."""
@@ -290,7 +300,8 @@ def parse_candidates(data) -> tuple:
             image_height=_whole(_first(record, _HEIGHT_KEYS)),
             predicted=predicted.strip(),
             score=0.0 if score is None else score,
-            review=outcome_from_record(record)))
+            review=outcome_from_record(record),
+            description=_text(_first(record, _DESCRIPTION_KEYS))))
     return candidates, malformed
 
 
@@ -406,7 +417,8 @@ def match_candidates(candidates, project, malformed: int = 0,
                     score=candidate.score, rescaled=rescaled,
                     image_width=width, image_height=height,
                     source_x=px, source_y=py, anchor_x=px, anchor_y=py,
-                    file_x=float(candidate.x), file_y=float(candidate.y))
+                    file_x=float(candidate.x), file_y=float(candidate.y),
+                    description=candidate.description)
         if candidate.review is not None:
             # The file's note (2.9.4): the chip was reviewed before.
             note = candidate.review

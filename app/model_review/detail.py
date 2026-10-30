@@ -14,6 +14,7 @@ decides which chip is in hand.
 """
 from __future__ import annotations
 
+import html
 import math
 
 import numpy as np
@@ -367,6 +368,12 @@ class DetailPanel(QWidget):
         self.info.setWordWrap(True)
         self.info.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.info)
+        # The file's own words on the chip, when it has any (2.9.16).
+        self.description = QLabel("")
+        self.description.setWordWrap(True)
+        self.description.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.description.setVisible(False)
+        layout.addWidget(self.description)
         self.measure_info = QLabel("")
         self.measure_info.setWordWrap(True)
         self.measure_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -445,6 +452,8 @@ class DetailPanel(QWidget):
         self.measure_info.setText("")
         self.image_button.setEnabled(False)
         self.as_new_check.setVisible(False)
+        self.description.setText("")
+        self.description.setVisible(False)
 
     def near(self) -> list:
         """The labels already there, as last shown."""
@@ -540,6 +549,11 @@ class DetailPanel(QWidget):
                 lines.append("A verdict goes onto the nearest of them; tick "
                              "below for a new label here instead.")
         self.info.setText("<br>".join(lines))
+        description = chip.description
+        self.description.setText(
+            f"<b>Description:</b> {html.escape(description, quote=False)}"
+            if description else "")
+        self.description.setVisible(bool(description))
 
     def set_picture(self, chip, arr: np.ndarray, picture_frame: tuple,
                     chip_frame: tuple):

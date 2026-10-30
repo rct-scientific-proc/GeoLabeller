@@ -344,6 +344,17 @@ def read_label_window_raw(image_path: str, pixel_x: float, pixel_y: float,
         return None
 
 
+def _display_window(src, window, scaling, display):
+    """One window of an open dataset as RGB, drawn the way the group's
+    Display Settings draw it on the canvas - a file's own colour table
+    included. Exports never come through here."""
+    if not display.is_default() \
+            or display_settings.paletted_band(display, src) is not None:
+        return display_settings.display_rgb(
+            src, window, src.nodata, scaling, display)
+    return _window_pixels(src, window, 3, src.nodata, scaling=scaling)
+
+
 def read_label_snippet(image_path: str, pixel_x: float, pixel_y: float,
                        size_px: int, display=None) -> np.ndarray | None:
     """The un-warped RGB pixels around one label, export-identical framing.
@@ -360,18 +371,30 @@ def read_label_snippet(image_path: str, pixel_x: float, pixel_y: float,
             scaling = cached_band_scaling(src, display.stretch)
             x0, y0, w, h = snippet_frame(pixel_x, pixel_y, size_px,
                                          src.width, src.height)
-            if not display.is_default() \
-                    or display_settings.paletted_band(display, src) is not None:
-                # Drawn the way the group's Display Settings draw it on
-                # the canvas - a file's own colour table included.
-                # Exports never come through here.
-                return display_settings.display_rgb(
-                    src, Window(x0, y0, w, h), src.nodata, scaling, display)
-            return _window_pixels(src, Window(x0, y0, w, h), 3,
-                                  src.nodata, scaling=scaling)
+            return _display_window(src, Window(x0, y0, w, h), scaling,
+                                   display)
     except Exception as exc:  # noqa: BLE001 - a bad file costs one thumbnail
         debug(f"snippet read failed: {Path(image_path).name} "
               f"({pixel_x:.0f},{pixel_y:.0f}): {type(exc).__name__}: {exc}")
+        return None
+
+
+def read_display_window(image_path: str, x0: int, y0: int, w: int, h: int,
+                        display=None) -> np.ndarray | None:
+    """The RGB pixels of one window of an image, as read_label_snippet
+    reads a label's - for a caller that frames the window itself (the
+    hover snippet's map-oriented read, 2.9.16). None when it cannot be
+    read."""
+    try:
+        if display is None:
+            display = display_settings.for_image(image_path)
+        with gdal_config.opened(image_path) as src:
+            scaling = cached_band_scaling(src, display.stretch)
+            return _display_window(src, Window(x0, y0, w, h), scaling,
+                                   display)
+    except Exception as exc:  # noqa: BLE001 - a bad file costs one picture
+        debug(f"window read failed: {Path(image_path).name} "
+              f"({x0},{y0} {w}x{h}): {type(exc).__name__}: {exc}")
         return None
 
 
@@ -470,10 +493,12 @@ class _SnippetRunnable(QRunnable):
     """One windowed read on the pool."""
 
     def __init__(self, key, image_path, px, py, size, token, signals,
-                 loader, display=None):
+                 loader, display=None, reader=None):
         super().__init__()
         self._args = (key, image_path, px, py, size, token)
         self._display = display
+        self._reader = reader          # None: read_label_snippet, as it
+        # is when the read runs (a test may stand in for it)
         self._signals = signals
         self._loader = loader
         self._cancelled = False
@@ -493,8 +518,8 @@ class _SnippetRunnable(QRunnable):
             if self._cancelled or not self._loader.is_current(key, token):
                 arr = None
             else:
-                arr = read_label_snippet(image_path, px, py, size,
-                                         display=self._display)
+                arr = (self._reader or read_label_snippet)(
+                    image_path, px, py, size, display=self._display)
             self._signals.finished.emit(key, arr, token)
         except Exception:  # noqa: BLE001 - never die silently in a worker
             try:
@@ -574,8 +599,14 @@ class SnippetLoader(QObject):
     CHUNK = 16                  # chips per read of one file (request_many)
     BAND = 48                   # ...grouped by image within this many
 
-    def __init__(self, parent=None, max_workers: int = 4):
+    def __init__(self, parent=None, max_workers: int = 4, reader=None):
         super().__init__(parent)
+        # What a single request reads with: read_label_snippet, or a
+        # function of the same signature given by the owner (the hover
+        # snippet's map-oriented read, 2.9.16). request_many keeps the
+        # grouped reader. None stands for read_label_snippet, looked up
+        # when a read runs.
+        self._reader = reader
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(
             min(max_workers, max(1, QThread.idealThreadCount() - 1)))
@@ -612,7 +643,7 @@ class SnippetLoader(QObject):
                 self._on_finished(k, arr, t, s, c))
         runnable = _SnippetRunnable(key, image_path, pixel_x, pixel_y,
                                     size_px, token, signals, self,
-                                    display=content[4])
+                                    display=content[4], reader=self._reader)
         self._pool.start(runnable)
 
     def request_many(self, items, size_px: int):

@@ -17,7 +17,8 @@ import numpy as np
 
 import math
 
-from PyQt5.QtCore import QLineF, QPoint, QPointF, QSize, Qt, pyqtSignal
+from PyQt5.QtCore import (QLineF, QPoint, QPointF, QRectF, QSize, Qt,
+                          pyqtSignal)
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import QScrollArea, QWidget
 
@@ -177,6 +178,10 @@ class MaskPaintCanvas(QWidget):
         # A look under the masks, while a key is held: nothing of them is
         # drawn, and nothing about them has changed.
         self._peek = False
+        # A context window (2.9.16): the snippet's own frame inside a
+        # larger window of the image, (x, y, w, h) in the pixels shown.
+        # The surround is for looking: dimmed, and no tool works there.
+        self._frame: "tuple | None" = None
         self._tool = TOOL_PAINT
         # The orientation arrow, drawn back from a stored angle: (radians,
         # colour, centre in snippet pixels) or None. The colour is the
@@ -219,6 +224,7 @@ class MaskPaintCanvas(QWidget):
         one's was, so the next object is where the eye already is.
         """
         self._w, self._h = width, height
+        self._frame = None          # the host sets a context frame after
         # A shape, a line or a stroke begun on the last snippet is not one
         # on this (Space is pressed mid-drag): the host has already taken
         # what a stroke painted; a line or a shape never finished is gone.
@@ -250,6 +256,27 @@ class MaskPaintCanvas(QWidget):
 
     def focus(self) -> "tuple | None":
         return self._focus
+
+    def frame(self) -> "tuple | None":
+        """The snippet's own frame within a context window, or None
+        when the window shown is the snippet itself."""
+        return self._frame
+
+    def set_frame(self, frame: "tuple | None"):
+        """Show ``frame`` ((x, y, w, h) in the pixels shown) as the
+        snippet proper: outlined, the rest dimmed, and the only part a
+        tool works on. None: the whole window is the snippet."""
+        self._frame = None if frame is None else tuple(
+            int(v) for v in frame)
+        self.update()
+
+    def _in_frame(self, pos) -> bool:
+        """Is this widget position on the snippet proper?"""
+        if self._frame is None:
+            return True
+        x, y = self._to_mask_point(pos)
+        fx, fy, fw, fh = self._frame
+        return fx <= x < fx + fw and fy <= y < fy + fh
 
     def set_layers(self, layers: dict, order: list, active: "str | None"):
         self._layers = layers
@@ -543,6 +570,8 @@ class MaskPaintCanvas(QWidget):
                     painter.drawImage(target, self._preview)
             if self._tool == TOOL_PAINT:
                 self._draw_brush_preview(painter)
+        if self._frame is not None:
+            self._paint_context(painter)
         painter.setRenderHint(QPainter.Antialiasing, True)
         if self._polygon:
             self._draw_polygon(painter)
@@ -573,6 +602,27 @@ class MaskPaintCanvas(QWidget):
     def point_marked(self) -> bool:
         """Is the label's own point being drawn on this snippet?"""
         return self._focus is not None and self._point_shown
+
+    def _paint_context(self, painter):
+        """The surround dimmed and the snippet's own frame outlined."""
+        fx, fy, fw, fh = self._frame
+        s = self._scale
+        frame = QRectF(fx * s, fy * s, fw * s, fh * s)
+        whole = QRectF(self.rect())
+        shade = QColor(0, 0, 0, 110)
+        painter.fillRect(QRectF(whole.left(), whole.top(), whole.width(),
+                                frame.top() - whole.top()), shade)
+        painter.fillRect(QRectF(whole.left(), frame.bottom(), whole.width(),
+                                whole.bottom() - frame.bottom()), shade)
+        painter.fillRect(QRectF(whole.left(), frame.top(),
+                                frame.left() - whole.left(),
+                                frame.height()), shade)
+        painter.fillRect(QRectF(frame.right(), frame.top(),
+                                whole.right() - frame.right(),
+                                frame.height()), shade)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(255, 235, 90), 2))
+        painter.drawRect(frame)
 
     def _draw_label_point(self, painter):
         """Where the label itself is: a ring and four ticks, open in the
@@ -691,6 +741,12 @@ class MaskPaintCanvas(QWidget):
         r = max(0.5, self._brush_px / 2.0)
         x_lo = max(0, int(cx - r)); x_hi = min(self._w, int(cx + r) + 1)
         y_lo = max(0, int(cy - r)); y_hi = min(self._h, int(cy + r) + 1)
+        if self._frame is not None:
+            # A stroke stops at the snippet's own frame: the surround is
+            # for looking.
+            fx, fy, fw, fh = self._frame
+            x_lo, x_hi = max(x_lo, fx), min(x_hi, fx + fw)
+            y_lo, y_hi = max(y_lo, fy), min(y_hi, fy + fh)
         if x_hi <= x_lo or y_hi <= y_lo:
             return
         yy, xx = np.ogrid[y_lo:y_hi, x_lo:x_hi]
@@ -875,6 +931,8 @@ class MaskPaintCanvas(QWidget):
             return
         if self._tool == TOOL_NONE:
             return
+        if not self._in_frame(event.pos()):
+            return                  # the surround of a context window
         if self._tool == TOOL_MOVE:
             # An image that cannot be read shows nothing to aim at.
             if (event.button() == Qt.LeftButton and not self._read_only

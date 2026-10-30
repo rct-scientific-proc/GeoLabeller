@@ -1106,6 +1106,18 @@ class MainWindow(QMainWindow):
             hover_menu.addAction(action)
         self.hover_actions.triggered.connect(
             lambda action: self._set_hover_px(action.data()))
+        hover_menu.addSeparator()
+        # Turned the way the map shows the image (2.9.16), or as the
+        # file's pixels lie - the framing the exports and the editor use.
+        self.hover_north_up_action = QAction("Oriented as on the &map", self)
+        self.hover_north_up_action.setCheckable(True)
+        self.hover_north_up_action.setChecked(hover_snippet.north_up())
+        self.hover_north_up_action.setStatusTip(
+            "Turn the hover snippet the way the map shows the image - north "
+            "up - rather than as its pixels lie in the file, which is how "
+            "the exports and the Snippet Editor frame it")
+        self.hover_north_up_action.toggled.connect(self._set_hover_north_up)
+        hover_menu.addAction(self.hover_north_up_action)
         self.canvas.set_hover_enabled(chosen > 0)
 
         # Remove the crosshair that Go to Coordinates leaves behind
@@ -3149,6 +3161,7 @@ class MainWindow(QMainWindow):
             editor.reviews_changed.connect(self._on_reviews_changed)
             editor.remove_requested.connect(self._on_editor_remove_requested)
             editor.class_changed.connect(self._on_label_class_changed)
+            editor.classes_changed.connect(self._on_label_classes_changed)
             editor.position_changed.connect(self._on_label_position_changed)
             editor.description_changed.connect(self._set_label_description)
             editor.group_id_changed.connect(self._set_label_group_id)
@@ -3231,17 +3244,35 @@ class MainWindow(QMainWindow):
         class_name = (class_name or "").strip()
         if label is None or not class_name:
             return
+        ids = (self._object_ids_of(label_id) if whole_object
+               else {label_id})
+        self._reclass_labels(ids, class_name, "of the object")
+
+    def _on_label_classes_changed(self, label_ids, class_name: str):
+        """Give these labels - and only these - another class: the
+        Snippet Editor's Grid view, a selection at a time (2.9.16).
+        Linked siblings are left alone; a name that is not a class yet
+        becomes one, in the same undo step."""
+        self._reclass_labels([int(i) for i in label_ids], class_name,
+                             "picked")
+
+    def _reclass_labels(self, ids, class_name: str, which: str):
+        """The class change itself: one undo step over ``ids`` (those
+        that exist and do not have the class already), the markers,
+        panels and editor brought up to date. ``which`` names the
+        labels in the status line when there are several."""
+        class_name = (class_name or "").strip()
+        ids = [i for i in ids if self.project.get_label_by_id(i)[1] is not None]
+        if not ids or not class_name:
+            return
         new_class = class_name not in self.project.classes
         if new_class and class_name == HARD_NEGATIVE:
             self.statusBar.showMessage(
                 f"'{HARD_NEGATIVE}' is reserved for the HDF5 export's "
                 "negatives and cannot be a class.", 6000)
             return
-        ids = (self._object_ids_of(label_id) if whole_object
-               else {label_id})
         changed = [other for other in ids
-                   if self.project.get_label_by_id(other)[1] is not None
-                   and self.project.get_label_by_id(other)[1].class_name
+                   if self.project.get_label_by_id(other)[1].class_name
                    != class_name]
         if not changed:
             return                           # it already had that class
@@ -3269,7 +3300,7 @@ class MainWindow(QMainWindow):
         self.statusBar.showMessage(
             (f"New class '{class_name}'. " if new_class else "")
             + f"Class changed to {class_name}"
-            + (f" on {n} labels of the object" if n > 1 else ""), 4000)
+            + (f" on {n} labels {which}" if n > 1 else ""), 4000)
 
     def _on_review_changed(self, label_id, status):
         """Store a review the Snippet Editor reports ("" clears it)."""
@@ -7011,6 +7042,17 @@ class MainWindow(QMainWindow):
             if action.data() == size and not action.isChecked():
                 action.setChecked(True)
 
+    def _set_hover_north_up(self, on: bool):
+        """View > Hover Snippet > Oriented as on the map (2.9.16)."""
+        hover_snippet.set_north_up(bool(on))
+        self.canvas.end_hover()         # the one up is the other look
+        if self._hover_loader is not None:
+            # Its cache holds the other look, and its reader is fixed:
+            # the next hover makes one for this look.
+            self._hover_loader.shutdown()
+            self._hover_loader.deleteLater()
+            self._hover_loader = None
+
     def _on_label_hover(self, label_id: int, _image_path: str):
         """The canvas: Ctrl held, the mouse at rest on this label."""
         size = hover_snippet.hover_px()
@@ -7018,8 +7060,13 @@ class MainWindow(QMainWindow):
         if size <= 0 or label is None:
             return
         if self._hover_loader is None:
-            self._hover_loader = SnippetLoader(self)
+            # Turned the way the map shows the image, unless the View
+            # menu says the file's framing (2.9.16).
+            self._hover_loader = SnippetLoader(
+                self, reader=(hover_snippet.read_map_oriented_snippet
+                              if hover_snippet.north_up() else None))
             self._hover_loader.ready.connect(self._on_hover_snippet)
+        if self._hover_popup is None:
             self._hover_popup = hover_snippet.HoverSnippet(self)
         self._hover_wanted = label_id
         self._hover_loader.request(label_id, image.path, label.pixel_x,
@@ -7032,6 +7079,8 @@ class MainWindow(QMainWindow):
         if label is None:
             return
         caption = f"{label.class_name} on {image.name}"
+        if hover_snippet.north_up() and image.get_affine() is not None:
+            caption += "  \N{MIDDLE DOT}  as on the map"
         if label.description:
             caption += f"\n{label.description}"
         self._hover_popup.show_at(QCursor.pos(), arr, caption, key)

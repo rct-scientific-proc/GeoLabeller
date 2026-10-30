@@ -12,20 +12,40 @@ the View menu, Off among the choices, and remembered.
 The canvas notices the rest and asks (label_hover_requested); the main
 window, which has the project, reads the snippet off the UI thread
 through a SnippetLoader and shows this window.
+
+Oriented as on the map (2.9.16): the snippet used to show the file's
+pixels as they lie, the framing the exports and the Snippet Editor use,
+while the canvas draws the image warped onto the map - so on a survey
+line flown at an angle the snippet looked turned against the image
+under the cursor, and users took the object for rotating. By default
+the hover snippet is now warped the way the map shows the image (north
+up, the canvas's Web Mercator) by read_map_oriented_snippet; View >
+Hover Snippet > Oriented as on the map switches it back to the file's
+framing. Nothing else - the exports, the editor, the sidebar - changes.
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
+from affine import Affine
 from PyQt5.QtCore import QPoint, Qt
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
+from rasterio.crs import CRS
+from rasterio.warp import Resampling, reproject, transform as _transform
 
+from . import gdal_config
+from .debug_log import debug
 from .settings_scope import settings as app_settings
+from .snippets import read_display_window, read_label_snippet, snippet_frame
 
 HOVER_KEY = "view/hover_snippet_px"
 HOVER_SIZES = (0, 96, 128, 192, 256)      # 0 is Off
 DEFAULT_HOVER_PX = 128
 OFFSET_PX = 16                            # from the cursor
+NORTH_UP_KEY = "view/hover_snippet_north_up"
+MAP_CRS = CRS.from_epsg(3857)             # what the canvas draws in
 
 
 def hover_px() -> int:
@@ -41,6 +61,72 @@ def set_hover_px(size: int):
     if size not in HOVER_SIZES:
         raise ValueError(size)
     app_settings().setValue(HOVER_KEY, int(size))
+
+
+def north_up() -> bool:
+    """Is the hover snippet turned the way the map shows the image (the
+    default), or shown as its pixels lie in the file."""
+    value = app_settings().value(NORTH_UP_KEY, True)
+    return str(value).lower() in ("true", "1")
+
+
+def set_north_up(on: bool):
+    app_settings().setValue(NORTH_UP_KEY, bool(on))
+
+
+def read_map_oriented_snippet(image_path: str, pixel_x: float,
+                              pixel_y: float, size_px: int,
+                              display=None) -> "np.ndarray | None":
+    """The snippet around a label turned the way the map shows the
+    image: north up, in the canvas's Web Mercator, ``size_px`` across
+    at the length a source pixel has on the map there. The same
+    signature as read_label_snippet, for a SnippetLoader's reader.
+
+    A window of the file around the label - wide enough that the
+    turned square lies within it whatever the angle - is read as the
+    group's Display Settings draw it and warped (bilinear) onto a grid
+    centred on the label. A non-georeferenced image has no map to turn
+    to and is read as it lies; a warp that fails falls back to that too.
+    """
+    try:
+        with gdal_config.opened(image_path) as src:
+            width, height = src.width, src.height
+            affine, crs = src.transform, src.crs
+        if crs is None or affine is None or affine.is_identity:
+            return read_label_snippet(image_path, pixel_x, pixel_y, size_px,
+                                      display=display)
+        size = max(1, int(size_px))
+        # The diagonal, plus a little: the north-up square turned by any
+        # angle fits inside the file's window.
+        big = min(int(math.ceil(size * math.sqrt(2))) + 4, max(width, height))
+        x0, y0, w, h = snippet_frame(pixel_x, pixel_y, big, width, height)
+        rgb = read_display_window(image_path, x0, y0, w, h, display=display)
+        if rgb is None:
+            return None
+        # Where the label is on the map, and how long a source pixel is
+        # there along each of the file's axes: the output's pixel.
+        corners = [affine * (pixel_x, pixel_y), affine * (pixel_x + 1, pixel_y),
+                   affine * (pixel_x, pixel_y + 1)]
+        xs, ys = _transform(crs, MAP_CRS, [c[0] for c in corners],
+                            [c[1] for c in corners])
+        res = (math.hypot(xs[1] - xs[0], ys[1] - ys[0])
+               + math.hypot(xs[2] - xs[0], ys[2] - ys[0])) / 2.0
+        if not res > 0 or not all(map(math.isfinite, (xs[0], ys[0], res))):
+            return read_label_snippet(image_path, pixel_x, pixel_y, size_px,
+                                      display=display)
+        dst_transform = Affine(res, 0.0, xs[0] - size / 2.0 * res,
+                               0.0, -res, ys[0] + size / 2.0 * res)
+        out = np.zeros((3, size, size), dtype=np.uint8)
+        reproject(np.ascontiguousarray(rgb.transpose(2, 0, 1)), out,
+                  src_transform=affine * Affine.translation(x0, y0),
+                  src_crs=crs, dst_transform=dst_transform, dst_crs=MAP_CRS,
+                  resampling=Resampling.bilinear, dst_nodata=0)
+        return np.ascontiguousarray(out.transpose(1, 2, 0))
+    except Exception as exc:  # noqa: BLE001 - a look, never a crash
+        debug(f"map-oriented snippet failed: {image_path}: "
+              f"{type(exc).__name__}: {exc}")
+        return read_label_snippet(image_path, pixel_x, pixel_y, size_px,
+                                  display=display)
 
 
 class HoverSnippet(QWidget):

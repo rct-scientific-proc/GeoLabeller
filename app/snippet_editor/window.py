@@ -119,6 +119,10 @@ class SnippetEditor(QWidget):
     # (label_id, class name): the main window applies it to the label's
     # whole linked object - the same thing seen in different images.
     class_changed = pyqtSignal(int, str, bool)   # +also the linked labels
+    # ([label ids], class name): the Grid view's picked snippets, given
+    # a class at once (2.9.16) - those labels only, never their linked
+    # siblings; one undo step, and a new class when the name is new.
+    classes_changed = pyqtSignal(list, str)
     # (label_id, pixel_x, pixel_y): the Move label tool - where on its
     # own image the label belongs.
     position_changed = pyqtSignal(int, float, float)
@@ -337,6 +341,7 @@ class SnippetEditor(QWidget):
         self.masks.mask_names_changed.connect(self.mask_names_changed)
         self.masks.label_moved.connect(self.position_changed)
         self.grid.orientation_changed.connect(self.orientation_changed)
+        self.grid.classes_requested.connect(self.classes_changed)
         self.section_objects["confidence"].confidence_changed.connect(
             self.confidence_changed)
         self.section_objects["size"].size_changed.connect(self.size_changed)
@@ -373,9 +378,11 @@ class SnippetEditor(QWidget):
         self.masks.set_mask_names(names)
 
     def set_classes(self, names: list):
-        """The project's classes, in order, for the Label class picker."""
+        """The project's classes, in order, for the Label class picker -
+        and the Grid view's, for the picked snippets."""
         self._classes = list(names)
         self._show_class(self.strip.current_entry())
+        self.grid.set_classes(self._classes)
 
     def _show_class(self, entry):
         combo = self.label_class_combo
@@ -638,7 +645,13 @@ class SnippetEditor(QWidget):
             return True
         if self.view() != self.SINGLE:
             # The Grid view has keys of its own (A accepts a page, in
-            # Review mode) - plain ones, like the sections'.
+            # Review mode; Escape unpicks) - plain ones, like the
+            # sections' - and Ctrl+A, which picks the page (2.9.16).
+            mods = event.modifiers() & (Qt.ControlModifier | Qt.AltModifier
+                                        | Qt.ShiftModifier)
+            if event.key() == Qt.Key_A and mods == Qt.ControlModifier:
+                self.grid.select_all()
+                return True
             if event.modifiers() & (Qt.ControlModifier | Qt.AltModifier):
                 return False
             return self.grid.key_pressed(event.key())
@@ -665,6 +678,11 @@ class SnippetEditor(QWidget):
         tool = self._tool_keys.get(event.key())
         if tool is not None and self._tools[tool].isEnabled():
             self.set_tool(tool)
+            return True
+        if event.key() == Qt.Key_C:
+            # The context window, on or off (2.9.16): the view's, not a
+            # section's, so it answers whatever sections are on.
+            self.masks.toggle_context()
             return True
         for key in self.sections_on():
             if self.section_objects[key].key_pressed(event.key()):

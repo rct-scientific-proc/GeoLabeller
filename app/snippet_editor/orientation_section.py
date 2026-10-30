@@ -32,11 +32,11 @@ from pathlib import Path
 import numpy as np
 import rasterio
 
-from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QPolygonF
 from PyQt5.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QGridLayout, QHBoxLayout, QLabel,
-    QPushButton, QScrollArea, QVBoxLayout, QWidget)
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QGridLayout,
+    QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
 from ..debug_log import debug
 from ..labels import (REVIEW_ACCEPTED, REVIEW_RECHECK, REVIEW_REJECTED,
@@ -77,13 +77,18 @@ REVIEW_COLORS = {REVIEW_ACCEPTED: QColor(70, 200, 100),
                  REVIEW_RECHECK: QColor(255, 200, 60)}
 _REVIEW_WORDS = {REVIEW_ACCEPTED: "accepted", REVIEW_REJECTED: "rejected",
                  REVIEW_RECHECK: "look again"}
+# Snippets picked for a change of class (2.9.16): a tint and a border.
+SELECT_COLOR = QColor(60, 160, 255)
 
 _HINTS = {
     MODE_ORIENT: "Drag across a snippet from the object's tail to its "
-                 "nose to set its orientation; right-click clears it.",
+                 "nose to set its orientation; right-click clears it. "
+                 "A click picks it, Ctrl+click and Shift+click pick more, "
+                 "for Change class.",
     MODE_REVIEW: "Click a snippet to reject it (again to take that back); "
                  "right-click flags it to look at again. Double-click "
-                 "opens it in the Single view.",
+                 "opens it in the Single view. Ctrl+click and Shift+click "
+                 "pick snippets for Change class.",
 }
 
 
@@ -114,6 +119,9 @@ class OrientationCell(QWidget):
     # Review mode: a click (REVIEW_REJECTED) or a right-click
     # (REVIEW_RECHECK) - the status asked for: (label_id, status).
     review_clicked = pyqtSignal(int, str)
+    # A click that picks the snippet for a change of class (2.9.16):
+    # (label_id, the Ctrl and Shift modifiers held, as an int).
+    select_clicked = pyqtSignal(int, int)
 
     def __init__(self, label_id: int, size: int, parent=None):
         super().__init__(parent)
@@ -132,6 +140,10 @@ class OrientationCell(QWidget):
         self._review_mode = False
         self._review = REVIEW_UNREVIEWED
         self._click_armed = False       # a left press, not yet let go
+        # Picked for a change of class, and the left press being judged
+        # a click or a drag: (where, the Ctrl/Shift modifiers held).
+        self._selected = False
+        self._press: "tuple | None" = None
         self.setFixedSize(size, size)
         self._apply_cursor()
 
@@ -180,6 +192,14 @@ class OrientationCell(QWidget):
         self._review = valid_review(status)
         self.update()
 
+    def selected(self) -> bool:
+        return self._selected
+
+    def set_selected(self, on: bool):
+        if bool(on) != self._selected:
+            self._selected = bool(on)
+            self.update()
+
     def _apply_cursor(self):
         if self._review_mode:
             self.setCursor(Qt.PointingHandCursor)
@@ -202,7 +222,19 @@ class OrientationCell(QWidget):
             self._paint_orientation(painter)
         if self._review_mode:
             self._paint_review(painter)
+        if self._selected:
+            self._paint_selection(painter)
         painter.end()
+
+    def _paint_selection(self, painter):
+        """Picked for Change class: a tint and a border, inside whatever
+        border the orientation or the review drew."""
+        painter.fillRect(self.rect(), QColor(SELECT_COLOR.red(),
+                                             SELECT_COLOR.green(),
+                                             SELECT_COLOR.blue(), 45))
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(SELECT_COLOR, 3))
+        painter.drawRect(6, 6, self._size - 12, self._size - 12)
 
     def _paint_orientation(self, painter):
         if self._drag_start is not None and self._drag_now is not None:
@@ -279,6 +311,13 @@ class OrientationCell(QWidget):
     # -- interaction --------------------------------------------------------
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            # Judged at the release: a click picks the snippet, a drag
+            # draws - and with Ctrl or Shift held the release is a pick
+            # or nothing, whatever this press armed or began.
+            mods = int(event.modifiers()
+                       & (Qt.ControlModifier | Qt.ShiftModifier))
+            self._press = (QPoint(event.pos()), mods)
         if self._review_mode:
             if event.button() == Qt.LeftButton:
                 self._click_armed = True
@@ -300,6 +339,7 @@ class OrientationCell(QWidget):
         # Review mode, marks nothing).
         self._drag_start = self._drag_now = None
         self._click_armed = False
+        self._press = None
         if event.button() == Qt.LeftButton:
             self.open_requested.emit(self._label_id)
         self.update()
@@ -310,6 +350,28 @@ class OrientationCell(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, event):
+        press, self._press = self._press, None
+        if event.button() == Qt.LeftButton and press is not None:
+            where, mods = press
+            clicked = (self.rect().contains(event.pos()) and
+                       (event.pos() - where).manhattanLength() < MIN_DRAG_PX)
+            if mods:
+                # Ctrl or Shift: a pick, whatever the mode - or nothing,
+                # let go off the snippet. Not a mark and not a drawn line:
+                # what the press armed or began is dropped here.
+                self._click_armed = False
+                self._drag_start = self._drag_now = None
+                self.update()
+                if clicked:
+                    self.select_clicked.emit(self._label_id, mods)
+                return
+            if clicked and not self._review_mode:
+                # A click, not a drag: it picks the snippet and draws
+                # nothing (whatever orientation was committed stays).
+                self._drag_start = self._drag_now = None
+                self.update()
+                self.select_clicked.emit(self._label_id, 0)
+                return
         if self._review_mode:
             armed, self._click_armed = self._click_armed, False
             # Let go off the snippet: a change of mind, not a click.
@@ -343,6 +405,10 @@ class OrientationEditor(QWidget):
     # of them accepted at once - ([label ids], status), one step to undo.
     review_marked = pyqtSignal(int, str)
     reviews_marked = pyqtSignal(list, str)
+    # The picked snippets given a class (2.9.16): ([label ids], class
+    # name) - those labels only, never their linked siblings; a name
+    # that is not a class yet is for the main window to make one.
+    classes_requested = pyqtSignal(list, str)
 
     def __init__(self, strip: SnippetStrip, parent=None):
         super().__init__(parent)
@@ -379,6 +445,12 @@ class OrientationEditor(QWidget):
         self._review_timer.setSingleShot(True)
         self._review_timer.setInterval(QApplication.doubleClickInterval())
         self._review_timer.timeout.connect(self.flush_review)
+        # Snippets picked on the page for Change class (2.9.16), and the
+        # one a Shift+click runs from. The pick lives on the page: a
+        # refill keeps what is still on it, a turned page drops it.
+        self._selected: set = set()
+        self._anchor: "int | None" = None
+        self._classes: list = []
         self._setup_ui()
         strip.rebuilt.connect(self._on_strip_rebuilt)
 
@@ -420,6 +492,37 @@ class OrientationEditor(QWidget):
         self.hint.setWordWrap(True)
         top.addWidget(self.hint, 1)
         layout.addLayout(top)
+
+        # The picked snippets and the class to give them (2.9.16): the
+        # project's classes to pick from, or a new name typed, as the
+        # Single view's Label class picker takes.
+        picked = QHBoxLayout()
+        self.selected_label = QLabel("")
+        picked.addWidget(self.selected_label)
+        picked.addSpacing(8)
+        picked.addWidget(QLabel("Class for the picked:"))
+        self.pick_class_combo = QComboBox()
+        self.pick_class_combo.setEditable(True)
+        self.pick_class_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.pick_class_combo.setMinimumWidth(160)
+        self.pick_class_combo.setToolTip(
+            "The class to give every picked snippet. Pick one, or type a "
+            "new name - it becomes a class. Enter applies it.")
+        self.pick_class_combo.lineEdit().returnPressed.connect(self.apply_class)
+        self.pick_class_combo.editTextChanged.connect(
+            lambda _text: self._show_selection())
+        picked.addWidget(self.pick_class_combo)
+        self.change_class_button = QPushButton("Change class")
+        self.change_class_button.setToolTip(
+            "Give every picked snippet the class beside - those labels "
+            "only, not the labels linked to them. One undo step.\n"
+            "Click picks a snippet, Ctrl+click adds one, Shift+click a "
+            "run, Ctrl+A the page, Escape none.")
+        self.change_class_button.clicked.connect(self.apply_class)
+        picked.addWidget(self.change_class_button)
+        picked.addStretch(1)
+        layout.addLayout(picked)
+        self._show_selection()
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
@@ -542,6 +645,7 @@ class OrientationEditor(QWidget):
             cell.clear_requested.connect(self._on_clear)
             cell.open_requested.connect(self._on_open_requested)
             cell.review_clicked.connect(self._on_review_clicked)
+            cell.select_clicked.connect(self._on_select_clicked)
             cell.set_angle(entry.get("orientation_px_rad"),
                            derived=bool(entry.get("orientation_derived")))
             cell.set_orientation_shown(self._orientation_shown)
@@ -562,6 +666,93 @@ class OrientationEditor(QWidget):
             self._loader.request(label_id, entry["image_path"],
                                  entry["pixel_x"], entry["pixel_y"],
                                  SNIPPET_SIZE)
+        # The pick lives on the page: what is still on it stays picked.
+        self._selected &= set(self._cells)
+        self._show_selection()
+
+    # -- picking snippets for a change of class (2.9.16) --------------------
+
+    def set_classes(self, names: list):
+        """The project's classes, for the picker; a typed name is kept."""
+        self._classes = list(names)
+        combo = self.pick_class_combo
+        typed = combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(self._classes)
+        combo.setCurrentText(typed)
+        combo.blockSignals(False)
+        self._show_selection()
+
+    def selected(self) -> list:
+        """The picked snippets' label ids, in the page's order."""
+        return [label_id for label_id in self._cells
+                if label_id in self._selected]
+
+    def select_all(self):
+        """Ctrl+A: every snippet on the page."""
+        self._selected = set(self._cells)
+        self._show_selection()
+
+    def select_none(self) -> bool:
+        """Escape: nothing picked; True when something was."""
+        had = bool(self._selected)
+        self._selected.clear()
+        self._show_selection()
+        return had
+
+    def _on_select_clicked(self, label_id: int, mods: int):
+        """A click picks the one snippet, Ctrl+click adds or takes it,
+        Shift+click picks the run from the last click - as Model
+        Review's grid does."""
+        order = list(self._cells)
+        if label_id not in order:
+            return
+        if mods & int(Qt.ControlModifier):
+            if label_id in self._selected:
+                self._selected.discard(label_id)
+            else:
+                self._selected.add(label_id)
+        elif mods & int(Qt.ShiftModifier) and self._anchor in order:
+            start, end = sorted((order.index(self._anchor),
+                                 order.index(label_id)))
+            self._selected = set(order[start:end + 1])
+        else:
+            self._selected = {label_id}
+        self._anchor = label_id
+        self._show_selection()
+
+    def _show_selection(self):
+        for label_id, cell in self._cells.items():
+            cell.set_selected(label_id in self._selected)
+        n = len(self.selected())
+        self.selected_label.setText(
+            "Nothing picked" if not n
+            else f"{n} picked" if n > 1 else "1 picked")
+        self.change_class_button.setEnabled(
+            n > 0 and bool(self.pick_class_combo.currentText().strip()))
+
+    def apply_class(self):
+        """Give the picked snippets the class in the box - only those
+        whose class it is not already, and only them: a linked sibling
+        that was not picked keeps its class. The entries say the new
+        class at once, and the main window, told, makes it one undo
+        step (and a new class, when the name is new)."""
+        name = self.pick_class_combo.currentText().strip()
+        ids = self.selected()
+        changed = [label_id for label_id in ids
+                   if self._entry(label_id) is not None
+                   and self._entry(label_id)["class_name"] != name]
+        if not name or not changed:
+            return
+        for label_id in changed:
+            entry = self._entry(label_id)
+            entry["class_name"] = name
+            self._set_caption(entry)
+        self.strip.refresh_many(changed)
+        self.pick_class_combo.clearFocus()
+        self.select_none()
+        self.classes_requested.emit(changed, name)
 
     def set_orientation_shown(self, shown: bool):
         """Show arrows and take drawings - or neither (the section is off)."""
@@ -646,6 +837,8 @@ class OrientationEditor(QWidget):
         if key == Qt.Key_A and self._mode == MODE_REVIEW:
             self.accept_page()
             return True
+        if key == Qt.Key_Escape:
+            return self.select_none()
         return False
 
     def refresh_review(self, label_id: int):

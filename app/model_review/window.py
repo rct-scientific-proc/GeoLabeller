@@ -36,7 +36,8 @@ from pathlib import Path
 
 import numpy as np
 from PyQt5.QtCore import QPointF, QRect, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QIcon, QImage, QPainter, QPen, QPixmap
+from PyQt5.QtGui import (QColor, QCursor, QIcon, QImage, QPainter, QPen,
+                         QPixmap)
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox,
                              QFileDialog, QGridLayout, QHBoxLayout,
                              QInputDialog, QLabel, QMessageBox,
@@ -50,6 +51,8 @@ from ..shortcuts import SHIFTED_DIGITS
 from ..snippets import SnippetLoader, snippet_frame
 from .centering import find_centre
 from .class_order import load_order, ordered, save_order, with_rename
+from .description_popup import REST_MS as DESCRIPTION_MS
+from .description_popup import DescriptionPopup
 from .detail import DEFAULT_CONTEXT, DetailPanel, standing_of
 from .image_window import ImageWindow
 from .labels_panel import IGNORE_COLOR, LabelsPanel
@@ -165,6 +168,7 @@ class ChipCell(QWidget):
     def __init__(self, key: int, parent=None):
         super().__init__(parent)
         self.key = key
+        self.hover_text = ""        # the tooltip's words, for the popup
         self._pixmap: QPixmap | None = None
         self._scaled: QPixmap | None = None
         self._score = ""
@@ -467,6 +471,13 @@ class ModelReviewWindow(QWidget):
         self._hover_timer.setSingleShot(True)
         self._hover_timer.setInterval(HOVER_MS)
         self._hover_timer.timeout.connect(self._on_hover_rest)
+        # The file's description of a chip, shown when the mouse rests
+        # on it a little longer than the panel takes (2.9.16).
+        self._description = DescriptionPopup(self)
+        self._description_timer = QTimer(self)
+        self._description_timer.setSingleShot(True)
+        self._description_timer.setInterval(DESCRIPTION_MS)
+        self._description_timer.timeout.connect(self._on_description_rest)
         self._image_window: ImageWindow | None = None
         # Learning (learner.py, training.py): the verdicts taught to a
         # model, which suggests for what is left; chips through the
@@ -1656,6 +1667,7 @@ class ModelReviewWindow(QWidget):
 
     def _rebuild(self):
         self.loader.cancel_all()
+        self._description.hide()
         while self._grid.count():
             item = self._grid.takeAt(0)
             if item.widget() is not None:
@@ -1740,7 +1752,11 @@ class ModelReviewWindow(QWidget):
             if chip.verdict is not None:
                 text += "\nnow: " + ("Ignore" if chip.verdict == IGNORE
                                      else chip.verdict)
-        cell.setToolTip(text)
+        # A chip with a description shows these words in the popup
+        # instead, above the description - not a tooltip and a popup
+        # both (2.9.16).
+        cell.hover_text = text
+        cell.setToolTip("" if chip.description else text)
 
     def _request_pixels(self):
         """The page's pictures, read grouped by image with the rows in
@@ -2395,16 +2411,31 @@ class ModelReviewWindow(QWidget):
     def _on_cell_hovered(self, key):
         self._hover_key = key
         self._hover_timer.start()
+        self._description_timer.start()
 
     def _on_cell_left(self, key):
         if self._hover_key == key:
             self._hover_timer.stop()
             self._hover_key = None
+        # The description timer runs on: it finds no chip hovered, or
+        # the next one, when it fires.
+        self._description.hide()
 
     def _on_hover_rest(self):
         """The mouse has rested on a chip: the panel turns to it."""
         if self._hover_key in self._cells:
             self._set_detail(self._hover_key)
+
+    def _on_description_rest(self):
+        """...and rested a little longer: the file's description of it,
+        if it has one, beside the cursor (2.9.16)."""
+        key = self._hover_key
+        chip = self._by_key.get(key) if key is not None else None
+        cell = self._cells.get(key)
+        if chip is None or cell is None or not chip.description:
+            return
+        self._description.show_for(key, cell.hover_text, chip.description,
+                                   QCursor.pos())
 
     def detail_key(self) -> "int | None":
         """The key of the chip in hand - the panel's - or None."""
@@ -3224,6 +3255,8 @@ class ModelReviewWindow(QWidget):
         self.save_settings()
         self.loader.shutdown()
         self._hover_timer.stop()
+        self._description_timer.stop()
+        self._description.hide()
         if self._image_window is not None:
             self._image_window.close()
         if self._working is not None:

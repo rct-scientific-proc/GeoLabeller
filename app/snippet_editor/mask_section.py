@@ -55,6 +55,17 @@ from .single_view import (DEFAULT_BRUSH_PX, DEFAULT_TOLERANCE, MASK_COLORS,
 from .strip import SnippetStrip, Worklist
 
 
+# The context window (2.9.16): the Single view can show a larger window
+# of the image around the snippet - 2, 3 or 4 times its size, capped -
+# with the snippet's own frame outlined and the surround dimmed, for
+# looking only. On or off and the factor are remembered.
+_CONTEXT_KEY = "snippet_editor/context_on"
+_CONTEXT_FACTOR_KEY = "snippet_editor/context_factor"
+CONTEXT_FACTORS = (2, 3, 4)
+DEFAULT_CONTEXT_FACTOR = 3
+_CONTEXT_MAX_PX = 2048
+
+
 def _mask_badge(entry: dict) -> str:
     n = len(entry.get("masks") or [])
     return f"  [{n} mask{'s' if n > 1 else ''}]" if n else ""
@@ -96,6 +107,9 @@ class MaskEditor(QWidget):
 
     def __init__(self, strip: SnippetStrip, parent=None):
         super().__init__(parent)
+        # The snippet's own frame within a context window, (x, y, w, h)
+        # in the pixels shown; None with the snippet itself shown (2.9.16).
+        self._context_frame: "tuple | None" = None
         # The snippet list, its filters and their counts (strip.py) - the
         # host's: it places them, and owns the save bar and Ctrl+S. This is
         # the paint canvas and the mask panel for the host's column.
@@ -192,6 +206,29 @@ class MaskEditor(QWidget):
         controls = self.view_row = QHBoxLayout()
         controls.addWidget(QLabel("Snippet:"))
         controls.addWidget(self.size_spin)
+        # The context window: the snippet inside a larger window of the
+        # image, as Model Review's Details shows a chip (2.9.16).
+        self.context_button = QPushButton("Context (C)")
+        self.context_button.setCheckable(True)
+        self.context_button.setToolTip(
+            "Show a larger window of the image around the snippet - the\n"
+            "snippet's own frame outlined, the surround dimmed. For\n"
+            "looking: the tools, the label point and the readout stay on\n"
+            "the snippet. Single view only. (key C)")
+        self.context_button.setChecked(self._remembered(_CONTEXT_KEY, False))
+        controls.addWidget(self.context_button)
+        self.context_combo = QComboBox()
+        for factor in CONTEXT_FACTORS:
+            self.context_combo.addItem(f"{factor}x", factor)
+        self.context_combo.setCurrentIndex(max(0, self.context_combo.findData(
+            self._remembered_context_factor())))
+        self.context_combo.setToolTip(
+            "How much of the image the context window takes in, as a\n"
+            "multiple of the snippet size.")
+        controls.addWidget(self.context_combo)
+        self.context_button.toggled.connect(self._on_context_changed)
+        self.context_combo.currentIndexChanged.connect(
+            self._on_context_changed)
         controls.addSpacing(16)
         controls.addWidget(QLabel("Bright:"))
         self.brightness_slider = QSlider(Qt.Horizontal)
@@ -406,6 +443,37 @@ class MaskEditor(QWidget):
         return max(0, min(255, value))
 
     @staticmethod
+    def _remembered_context_factor() -> int:
+        try:
+            value = int(settings().value(_CONTEXT_FACTOR_KEY,
+                                         DEFAULT_CONTEXT_FACTOR))
+        except (TypeError, ValueError):
+            return DEFAULT_CONTEXT_FACTOR
+        return value if value in CONTEXT_FACTORS else DEFAULT_CONTEXT_FACTOR
+
+    def context_on(self) -> bool:
+        return self.context_button.isChecked()
+
+    def context_factor(self) -> int:
+        """How many times the snippet's size the window shown is: 1
+        with the context off."""
+        if not self.context_on():
+            return 1
+        factor = self.context_combo.currentData()
+        return int(factor) if factor in CONTEXT_FACTORS else \
+            DEFAULT_CONTEXT_FACTOR
+
+    def toggle_context(self):
+        """The C key."""
+        self.context_button.setChecked(not self.context_on())
+
+    def _on_context_changed(self, *_args):
+        # Another window to look at, like another snippet size: it
+        # starts fitted, whatever zoom the last one was given.
+        self.canvas.reset_zoom()
+        self._show_entry(self._current)
+
+    @staticmethod
     def _remembered(key: str, default: bool) -> bool:
         """Last session's choice for ``key``; ``default`` when never set."""
         value = settings().value(key)
@@ -441,6 +509,10 @@ class MaskEditor(QWidget):
             settings().setValue(_OVERLAP_KEY, self.allow_overlap())
             settings().setValue(_POINT_KEY, self.point_check.isChecked())
             settings().setValue(_TOLERANCE_KEY, self.tolerance_spin.value())
+            settings().setValue(_CONTEXT_KEY, self.context_on())
+            settings().setValue(_CONTEXT_FACTOR_KEY,
+                                int(self.context_combo.currentData()
+                                    or DEFAULT_CONTEXT_FACTOR))
         except Exception as exc:                  # noqa: BLE001
             debug(f"mask editor settings not saved: "
                   f"{type(exc).__name__}: {exc}")
@@ -489,6 +561,12 @@ class MaskEditor(QWidget):
         self._unreadable = False
         self._undecodable = set()
         size = self.size_spin.value()
+        # The window read and shown: the snippet, or the context window
+        # around it (2.9.16) - a larger crop, every coordinate below in
+        # it, with the snippet's own frame marked on the canvas.
+        factor = self.context_factor()
+        shown = min(size * factor, _CONTEXT_MAX_PX) if factor > 1 else size
+        self._context_frame = None
         self._display_source = None
         self._shown = None
         self._wand_pending = None
@@ -503,7 +581,7 @@ class MaskEditor(QWidget):
             self.snippet_shown.emit(None)
             return
         raw = read_label_window_raw(entry["image_path"], entry["pixel_x"],
-                                    entry["pixel_y"], size)
+                                    entry["pixel_y"], shown)
         if raw is not None:
             self._raw, self._frame, self._raw_nodata = raw
         else:
@@ -518,10 +596,10 @@ class MaskEditor(QWidget):
             dims = self._dims_for(entry)
             if dims:
                 self._frame = snippet_frame(entry["pixel_x"],
-                                            entry["pixel_y"], size,
+                                            entry["pixel_y"], shown,
                                             dims[0], dims[1])
             else:
-                self._frame = (0, 0, size, size)
+                self._frame = (0, 0, shown, shown)
         x0, y0, w, h = self._frame
         # Stored masks re-anchor into the current crop (paint-time snippet
         # size may differ from today's).
@@ -545,11 +623,14 @@ class MaskEditor(QWidget):
             self._order.append(name)
             self._stored_by_name[name] = stored
         self._display_source = read_label_snippet(
-            entry["image_path"], entry["pixel_x"], entry["pixel_y"], size)
+            entry["image_path"], entry["pixel_x"], entry["pixel_y"], shown)
         self._shown = self._adjusted_display()
         self.canvas.set_snippet(self._shown, w, h,
                                 (entry["pixel_x"] - x0,
                                  entry["pixel_y"] - y0))
+        if shown != size:
+            self._context_frame = self._snippet_frame_in_crop(entry, size)
+        self.canvas.set_frame(self._context_frame)
         # In hand: the mask the picker names, when this snippet carries
         # it - the name chosen on the last snippet is the one meant for
         # this one - else its first.
@@ -561,6 +642,39 @@ class MaskEditor(QWidget):
         self._refresh_mask_list(select=active)
         self._refresh_stats()
         self.snippet_shown.emit(entry)
+
+    def _snippet_frame_in_crop(self, entry: dict, size: int) -> "tuple | None":
+        """The snippet's own frame - the export's crop at ``size`` -
+        placed in the window shown, (x, y, w, h); None when the image's
+        size is unknown, and the whole window is the snippet then."""
+        dims = self._dims_for(entry)
+        if not dims:
+            return None
+        ex0, ey0, ew, eh = snippet_frame(entry["pixel_x"], entry["pixel_y"],
+                                         size, dims[0], dims[1])
+        x0, y0, _w, _h = self._frame
+        return (ex0 - x0, ey0 - y0, ew, eh)
+
+    def _clip_to_frame(self, region: np.ndarray) -> np.ndarray:
+        """What a tool would take, kept to the snippet's own frame when a
+        context window is shown: the surround is for looking."""
+        frame = self._context_frame
+        if frame is None:
+            return region
+        fx, fy, fw, fh = frame
+        kept = np.zeros_like(region)
+        kept[fy:fy + fh, fx:fx + fw] = region[fy:fy + fh, fx:fx + fw]
+        return kept
+
+    def _within_frame(self, new: np.ndarray, old: np.ndarray) -> np.ndarray:
+        """``new`` inside the snippet's own frame, ``old`` outside it."""
+        frame = self._context_frame
+        if frame is None:
+            return new
+        fx, fy, fw, fh = frame
+        kept = old.copy()
+        kept[fy:fy + fh, fx:fx + fw] = new[fy:fy + fh, fx:fx + fw]
+        return kept
 
     def _adjusted_display(self) -> "np.ndarray | None":
         """The current snippet's pixels with the view settings applied."""
@@ -797,7 +911,8 @@ class MaskEditor(QWidget):
                 or getattr(self, "_unreadable", False)):
             return
         layer = self._layers[name]
-        shape = polygon_mask(points, layer.shape[1], layer.shape[0])
+        shape = self._clip_to_frame(
+            polygon_mask(points, layer.shape[1], layer.shape[0]))
         if erase:
             layer &= ~shape
         else:
@@ -839,6 +954,7 @@ class MaskEditor(QWidget):
             region = similar_region(self._shown, x, y, tolerance,
                                     barrier=self._walls(name),
                                     difference=difference)
+        region = self._clip_to_frame(region)
         self._wand_pending = (name, region, erase)
         self.canvas.set_preview(region, erase)
 
@@ -874,6 +990,7 @@ class MaskEditor(QWidget):
         """Make ``name``'s layer ``tidied`` and commit it - one undo step,
         or none at all when nothing changed."""
         layer = self._layers[name]
+        tidied = self._within_frame(tidied, layer)
         if np.array_equal(tidied, layer):
             return False
         layer[:] = tidied
@@ -930,6 +1047,7 @@ class MaskEditor(QWidget):
         # closed by the hull's edge, and the fill stops there.
         barrier = self._walls(name)
         filled, added = fill_enclosed(self._layers[name], barrier=barrier)
+        filled = self._within_frame(filled, self._layers[name])
         if added == 0:
             QMessageBox.information(
                 self, "Nothing enclosed",
@@ -991,10 +1109,16 @@ class MaskEditor(QWidget):
             self.stats_label.setText("-")
             return
         layer = self._layers[name]
+        raw = self._raw
+        if self._context_frame is not None:
+            # The readout is the snippet's: object against the background
+            # of its own frame, not of the window around it.
+            fx, fy, fw, fh = self._context_frame
+            raw = raw[:, fy:fy + fh, fx:fx + fw]
+            layer = layer[fy:fy + fh, fx:fx + fw]
         if self._raw_totals is None and layer.any():
-            self._raw_totals = window_totals(self._raw,
-                                             nodata=self._raw_nodata)
-        stats = mask_statistics(self._raw, layer, nodata=self._raw_nodata,
+            self._raw_totals = window_totals(raw, nodata=self._raw_nodata)
+        stats = mask_statistics(raw, layer, nodata=self._raw_nodata,
                                 totals=self._raw_totals)
         if stats is None:
             self.stats_label.setText(
