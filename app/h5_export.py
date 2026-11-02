@@ -114,9 +114,19 @@ COMPRESSION_CHOICES = {"None": None, "gzip": "gzip", "lzf": "lzf"}
 # NATIVE units (no stretch - physical values stay comparable across images)
 # and normalizes integer sources by their dtype's full range (uint8 / 255),
 # always as one grayscale channel so the file only grows ~4/3 over 3-channel
-# uint8.
+# uint8. float16 is the same values at half precision (three significant
+# figures, nothing beyond +-65504): half the file, and what the training
+# side widens to float32 anyway.
 PIXEL_FORMAT_CHOICES = {"uint8 (stretched 0-255)": "uint8",
-                        "float32 grayscale (native / 0-1)": "float32"}
+                        "float32 grayscale (native / 0-1)": "float32",
+                        "float16 grayscale (native / 0-1, half precision)":
+                            "float16"}
+FLOAT_FORMATS = ("float32", "float16")
+
+
+def is_float_format(pixel_dtype: str) -> bool:
+    """Does this pixel format store native-scale floats (one channel)?"""
+    return pixel_dtype in FLOAT_FORMATS
 
 # One sample per chunk (default) makes shuffled random-access reads cheap during
 # training: a single-index read fetches exactly one sample instead of a whole
@@ -318,8 +328,8 @@ def estimate_export(images, width, height, overlap, channels,
         blocked = _excluded_grid(guarded, xs, ys, width, height)
         negatives += int(blocked.size - blocked.sum())
 
-    stored_channels = 1 if pixel_dtype == "float32" else channels
-    itemsize = 4 if pixel_dtype == "float32" else 1
+    stored_channels = 1 if is_float_format(pixel_dtype) else channels
+    itemsize = {"float32": 4, "float16": 2}.get(pixel_dtype, 1)
     total = examples + negatives
     if class_names:
         per_class = {name: per_class.get(name, 0) for name in class_names
@@ -475,9 +485,42 @@ class H5DatasetWriter:
                 f"pixels, not {self.pixel_dtype} - mixing the two would "
                 "give the samples two different value scales.")
         self._validate_alignment()
+        self._adopt_foreign_columns()
         existing = list(f["classes"].asstr()[:]) if "classes" in f else []
         if existing != self.classes:
             self._reconcile_classes(existing)
+
+    # Aligned one-per-sample columns another tool added to the file - the
+    # training side's curation mask ``removed`` (one bool per sample) -
+    # kept in step on append: resized with the images and the new rows
+    # given the column's zero (False: not removed). Left short, the
+    # training side refused the whole file after the first append.
+    def _adopt_foreign_columns(self):
+        f = self._f
+        rows = f["images"].shape[0]
+        own = {"images", "classes", "labels", "gt", "split", "mask_pixels",
+               "mask_sample", "mask_names"}
+        own |= set(_STRING_COLUMNS) | set(_NUMERIC_COLUMNS)
+        self._foreign: list = []
+        for name, node in list(f.items()):
+            if (name in own or not isinstance(node, h5py.Dataset)
+                    or node.ndim != 1 or node.dtype.kind not in "biuf"):
+                continue
+            if node.shape[0] != rows:
+                raise ValueError(
+                    f"Cannot append: this file's datasets disagree about how "
+                    f"many samples it holds - images has {rows} but "
+                    f"{name} has {node.shape[0]}; export to a new file "
+                    "instead.")
+            if node.maxshape[0] is not None:
+                # Written at a fixed size (another tool's plain assignment):
+                # made resizable, as this writer's own columns are.
+                data = node[:]
+                dtype = node.dtype
+                del f[name]
+                f.create_dataset(name, data=data, maxshape=(None,),
+                                 dtype=dtype, chunks=(_META_CHUNK,))
+            self._foreign.append(name)
 
     def _validate_alignment(self):
         """Refuse to append to a file whose aligned columns disagree.
@@ -682,6 +725,9 @@ class H5DatasetWriter:
             self._flush_string_column(name, end)
         for group in _NUMERIC_GROUPS:
             self._flush_numeric_group(group, end)
+        for name in getattr(self, "_foreign", ()):
+            f[name].resize(end, axis=0)
+            f[name][self._n:end] = np.zeros(b, dtype=f[name].dtype)
         self._n = end
         self._img_buf.clear(); self._lbl_buf.clear()
         self._gt_buf.clear(); self._split_buf.clear()
@@ -959,7 +1005,7 @@ def export_image(writer, path, labels, height, width, overlap, channels,
     # (2.6 ms against 0.4 ms per open in a folder of 13,000).
     with gdal_config.opened(path) as src:
         nodata = src.nodata
-        as_float = pixel_dtype == "float32"
+        as_float = is_float_format(pixel_dtype)
         # One contrast stretch per raster (None for uint8 sources), so every
         # snippet of this image is scaled identically - and the one every
         # display surface shares, sampled once per file however many
@@ -972,6 +1018,8 @@ def export_image(writer, path, labels, height, width, overlap, channels,
             stats = {}
             if as_float:
                 arr = _float_window_pixels(src, win, nodata, stats=stats)
+                if arr is not None and pixel_dtype == "float16":
+                    arr = arr.astype(np.float16)     # buffered at half size
             else:
                 arr = _window_pixels(src, win, channels, nodata,
                                      scaling=scaling, stats=stats)
@@ -1336,8 +1384,9 @@ class H5ExportDialog(QDialog):
             "NATIVE-scale values: float imagery (sonar dB, elevation) "
             "passes through unchanged, so the same physical value reads "
             "the same in every image, and integer imagery is divided by "
-            "its full range (uint8 by 255) to land in 0-1. (New files "
-            "only.)")
+            "its full range (uint8 by 255) to land in 0-1. float16 is the "
+            "same at half precision - three significant figures, nothing "
+            "beyond +-65504 - in half the file. (New files only.)")
         self.pixel_format_combo.currentTextChanged.connect(
             self._on_pixel_format_changed)
         form.addRow("Pixel format:", self.pixel_format_combo)
@@ -1672,9 +1721,9 @@ class H5ExportDialog(QDialog):
                 self.offset_spin, self.offset_check)
 
     def _on_pixel_format_changed(self, *_):
-        """float32 storage is always single-channel grayscale."""
-        is_float = PIXEL_FORMAT_CHOICES.get(
-            self.pixel_format_combo.currentText()) == "float32"
+        """float storage is always single-channel grayscale."""
+        is_float = is_float_format(PIXEL_FORMAT_CHOICES.get(
+            self.pixel_format_combo.currentText()))
         if is_float:
             label = _choice_label(CHANNEL_CHOICES, 1)
             if label is not None:
