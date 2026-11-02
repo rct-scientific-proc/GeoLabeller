@@ -104,6 +104,18 @@ class SnippetStrip(QObject):
         # is showing says not: there a finished snippet goes at the
         # next refill.
         self.current_in_hand = True
+        # One row per linked object (asked for 2026-11-02): the list
+        # collapses to one view of each object - the view on the image
+        # the map is showing, else the one the user asked to see in the
+        # linked row, else the lowest id - so a pass down the list looks
+        # at every group once, the linked row showing its views. An
+        # unlinked label is an object of one; an object is listed when
+        # any of its views passes the Show filter; the dropdown's choice
+        # of one object lists all of its views as ever.
+        self.one_per_object = False
+        self._shown_image: "str | None" = None
+        self._preferred: dict = {}            # object key -> label id
+        self._object_sizes: dict = {}         # a row's label id -> views
         self.loader = SnippetLoader(self)
         self.loader.ready.connect(self._on_snippet_ready)
 
@@ -203,6 +215,78 @@ class SnippetStrip(QObject):
         # whatever class (2.9.17).
         self._rebuild(chosen_anew=False,
                       in_hand=index >= 0 or kind == "all")
+
+    # -- one per object -------------------------------------------------------
+
+    def set_one_per_object(self, on: bool):
+        """Collapse the list to one view per linked object, or list every
+        snippet again; the object in hand stays in hand."""
+        on = bool(on)
+        if on == self.one_per_object:
+            return
+        self.one_per_object = on
+        self._rebuild(chosen_anew=False)
+
+    def set_shown_image(self, image_path):
+        """The image the map is showing, whose view of an object stands
+        for it in the one-per-object list."""
+        self._shown_image = image_path or None
+
+    def _collapsing(self) -> bool:
+        """Is the list one row per object just now? Not while the
+        dropdown shows one object, whose views are the point."""
+        return self.one_per_object and self._shown()[0] != "object"
+
+    @staticmethod
+    def _object_key(entry: dict):
+        return entry.get("object_id") or ("label", entry["label_id"])
+
+    def _members(self, entry: dict) -> list:
+        """Every entry of this one's object."""
+        key = self._object_key(entry)
+        return [e for e in self.entries if self._object_key(e) == key]
+
+    def _representative(self, views: list) -> dict:
+        """The view that stands for an object among ``views``: on the
+        image the map shows, else the one the user asked to see, else
+        the lowest id."""
+        if self._shown_image is not None:
+            on_shown = [e for e in views if e["image_path"] == self._shown_image]
+            if on_shown:
+                return min(on_shown, key=lambda e: e["label_id"])
+        preferred = self._preferred.get(self._object_key(views[0]))
+        for entry in views:
+            if entry["label_id"] == preferred:
+                return entry
+        return min(views, key=lambda e: e["label_id"])
+
+    def _one_per_object(self, listed: list, keep_id) -> list:
+        """``listed`` (the entries the class and filter let through, in
+        order) as one row per object, in the list's order. The snippet
+        in hand stays its object's row: a refill must not move the list
+        under the user."""
+        members: dict = {}
+        for entry in self.entries:
+            members.setdefault(self._object_key(entry), []).append(entry)
+        passing: dict = {}
+        for entry in listed:
+            passing.setdefault(self._object_key(entry), []).append(entry)
+        rows = []
+        for key, views in passing.items():
+            in_hand = next((e for e in views if e["label_id"] == keep_id), None)
+            row = in_hand if in_hand is not None else self._representative(views)
+            self._object_sizes[row["label_id"]] = len(members[key])
+            rows.append(row)
+        rows.sort(key=lambda e: (e["class_name"], e["image_name"],
+                                 e["label_id"]))
+        return rows
+
+    def _row_matches(self, entry: dict) -> bool:
+        """Does this row still belong on the list: the entry passes the
+        filter - or, one per object, any view of its object does."""
+        if self._collapsing():
+            return any(self.matches(e) for e in self._members(entry))
+        return self.matches(entry)
 
     def _linked_objects(self) -> list:
         """(object_id, caption) for each object with two or more labels,
@@ -323,8 +407,20 @@ class SnippetStrip(QObject):
                 for row in range(self.list_widget.count())]
 
     def select(self, label_id) -> bool:
-        """Put a listed snippet in hand; False if it is not listed."""
+        """Put a listed snippet in hand; False if it is not listed. One
+        per object, a view of a listed object that is not its row (a
+        click in the linked row) becomes the one the user asked to see:
+        its object's row from now on, and in hand."""
         item = self.items_by_label.get(label_id)
+        if item is None and self._collapsing():
+            entry = self.entries_by_label.get(label_id)
+            if entry is not None and any(
+                    self._object_key(self.entries_by_label[row]) ==
+                    self._object_key(entry) for row in self.items_by_label):
+                self._preferred[self._object_key(entry)] = label_id
+                self._current_id = label_id
+                self._rebuild(chosen_anew=False)
+                item = self.items_by_label.get(label_id)
         if item is None:
             return False
         self.list_widget.setCurrentItem(item)
@@ -427,6 +523,7 @@ class SnippetStrip(QObject):
         placeholder = self._placeholder_icon()
         self.entries_by_label = {e["label_id"]: e for e in self.entries}
         keep_id = self._current_id
+        listed = []
         for entry in self.entries:
             if not self.in_class(entry):
                 continue
@@ -438,6 +535,11 @@ class SnippetStrip(QObject):
                     chosen_anew or not self.current_in_hand
                     or entry["label_id"] != keep_id):
                 continue
+            listed.append(entry)
+        self._object_sizes = {}
+        if self._collapsing():
+            listed = self._one_per_object(listed, keep_id)
+        for entry in listed:
             item = QListWidgetItem(placeholder, self._caption(entry))
             item.setData(self.ID_ROLE, entry["label_id"])
             self.list_widget.addItem(item)
@@ -447,6 +549,11 @@ class SnippetStrip(QObject):
             row = 0
             if keep_id is not None and keep_id in self.items_by_label:
                 row = self.list_widget.row(self.items_by_label[keep_id])
+            elif (self._collapsing() and keep_id in self.entries_by_label
+                  and self._object_row(self.entries_by_label[keep_id])
+                  is not None):
+                # The object in hand, by whichever view stands for it now.
+                row = self._object_row(self.entries_by_label[keep_id])
             elif not chosen_anew and keep_id in old_order:
                 # The snippet in hand has left the list (its class changed,
                 # say): land on the next one still listed, as stepping
@@ -517,6 +624,14 @@ class SnippetStrip(QObject):
             self._thumb_timer.start()
         return False
 
+    def _object_row(self, entry: dict) -> "int | None":
+        """The row standing for this entry's object, if one is listed."""
+        key = self._object_key(entry)
+        for label_id, item in self.items_by_label.items():
+            if self._object_key(self.entries_by_label[label_id]) == key:
+                return self.list_widget.row(item)
+        return None
+
     def _nearest_row(self, old_order: list, at: int) -> int:
         """The row of the first snippet after position ``at`` of the old
         order that is still listed - failing that, the nearest before it,
@@ -533,6 +648,9 @@ class SnippetStrip(QObject):
         caption = entry["image_name"]
         if self.shown_class() is None:       # all classes, or an object
             caption = f"{entry['class_name']}  \N{MIDDLE DOT}  {caption}"
+        views = self._object_sizes.get(entry["label_id"], 0)
+        if views > 1:
+            caption += f"  ({views} views)"
         return (caption + "".join(w.badge(entry) for w in self._worklists)
                 + group_line(entry))
 
@@ -541,11 +659,24 @@ class SnippetStrip(QObject):
         left to do falls as the work is done, where the user chose what
         to look at."""
         in_class = [e for e in self.entries if self.in_class(e)]
-        labels = [f"All ({len(in_class)})"]
-        for worklist in self._worklists:
-            done = sum(1 for e in in_class if worklist.is_done(e))
-            labels += [f"{worklist.needs} ({len(in_class) - done})",
-                       f"{worklist.done} ({done})"]
+        if self._collapsing():
+            # Objects, not views: one to do while any view needs doing.
+            objects: dict = {}
+            for entry in in_class:
+                objects.setdefault(self._object_key(entry), []).append(entry)
+            in_class = list(objects.values())
+            labels = [f"All ({len(in_class)} objects)"]
+            for worklist in self._worklists:
+                done = sum(1 for views in in_class
+                           if all(worklist.is_done(e) for e in views))
+                labels += [f"{worklist.needs} ({len(in_class) - done})",
+                           f"{worklist.done} ({done})"]
+        else:
+            labels = [f"All ({len(in_class)})"]
+            for worklist in self._worklists:
+                done = sum(1 for e in in_class if worklist.is_done(e))
+                labels += [f"{worklist.needs} ({len(in_class) - done})",
+                           f"{worklist.done} ({done})"]
         self.filter_combo.blockSignals(True)
         for index, text in enumerate(labels):
             self.filter_combo.setItemText(index, text)
@@ -589,7 +720,7 @@ class SnippetStrip(QObject):
         """
         entry = self.entries_by_label.get(label_id)
         item = self.items_by_label.get(label_id)
-        if entry is None or item is None or self.matches(entry):
+        if entry is None or item is None or self._row_matches(entry):
             return
         if self._current_id == label_id:
             return

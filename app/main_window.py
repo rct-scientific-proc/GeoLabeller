@@ -2869,6 +2869,18 @@ class MainWindow(QMainWindow):
                     self._splitter.setSizes(sizes)
             self._refresh_snippet_panel()
 
+    def _shown_image_path(self) -> "str | None":
+        """The project path of the image the map is showing (a cycle's
+        active image), whose view of an object stands for it in the
+        Snippet Editor's one-per-object list; None when there is none."""
+        key = self.canvas._active_image_key
+        if key is None:
+            return None
+        for path in self.project.images:
+            if self.canvas._image_key(path) == key:
+                return path
+        return None
+
     def _label_entries(self) -> list:
         """Every label as a plain dict, for the snippet views."""
         entries = []
@@ -2987,7 +2999,8 @@ class MainWindow(QMainWindow):
         self._push_mask_names()
         if (self._snippet_editor is not None
                 and self._snippet_editor.isVisible()):
-            self._snippet_editor.set_labels(self._label_entries())
+            self._snippet_editor.set_labels(self._label_entries(),
+                                            shown_image=self._shown_image_path())
         self._refresh_snippet_panel()
         # The cleaner holds pairs of the project's labels, as the editor
         # holds entries: re-seated with it (2.9.3); the review window's
@@ -3172,7 +3185,8 @@ class MainWindow(QMainWindow):
             editor.redo_requested.connect(self._redo)
         self._snippet_editor.set_mask_names(self._mask_name_presets())
         self._snippet_editor.set_classes(self.project.classes)
-        self._snippet_editor.set_labels(self._label_entries())
+        self._snippet_editor.set_labels(self._label_entries(),
+                                        shown_image=self._shown_image_path())
         self._push_save_state()
         self._snippet_editor.show()
         self._snippet_editor.raise_()

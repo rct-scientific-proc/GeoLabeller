@@ -55,6 +55,7 @@ _SECTIONS_OFF_KEY = "snippet_editor/sections_off"
 _TOOL_KEY = "snippet_editor/tool"
 _CLASS_LINKED_KEY = "snippet_editor/class_change_linked"
 _GRID_MODE_KEY = "snippet_editor/grid_mode"
+_ONE_PER_OBJECT_KEY = "snippet_editor/one_per_object"
 
 
 class SectionFrame(QWidget):
@@ -175,6 +176,22 @@ class SnippetEditor(QWidget):
         toolbar.addWidget(self.strip.class_combo, 1)
         toolbar.addWidget(QLabel("Show:"))
         toolbar.addWidget(self.strip.filter_combo)
+        # One row per linked object (2026-11-02): a pass down the list
+        # that looks at every group once, the linked row showing its views.
+        self.one_per_object_button = QPushButton("One per object")
+        self.one_per_object_button.setCheckable(True)
+        self.one_per_object_button.setToolTip(
+            "List one snippet for each linked object (an unlinked label is "
+            "an object of one): the view on the image the map is showing, "
+            "else the one you last clicked in the linked row, else the "
+            "lowest label id. Step down the list and the linked row below "
+            "shows every view of the object - a quick check that each group "
+            "holds what it should. An object is listed when any of its "
+            "views passes the Show filter; choosing one object in the "
+            "Class list shows all of its views as ever. Remembered.")
+        self.one_per_object_button.toggled.connect(
+            self.strip.set_one_per_object)
+        toolbar.addWidget(self.one_per_object_button)
         toolbar.addSpacing(16)
         toolbar.addWidget(QLabel("View:"))
         self.single_button = QPushButton("Single")
@@ -370,8 +387,11 @@ class SnippetEditor(QWidget):
 
     # -- data in ------------------------------------------------------------
 
-    def set_labels(self, entries: list):
-        """Every label, as the entry dicts the main window builds."""
+    def set_labels(self, entries: list, shown_image=None):
+        """Every label, as the entry dicts the main window builds;
+        ``shown_image`` the path of the image the map is showing, whose
+        view stands for an object in the one-per-object list."""
+        self.strip.set_shown_image(shown_image)
         self.strip.set_labels(entries)
 
     def set_mask_names(self, names: list):
@@ -784,6 +804,9 @@ class SnippetEditor(QWidget):
                       else TOOL_PAINT)
         self.class_linked_check.setChecked(
             str(settings.value(_CLASS_LINKED_KEY, "true")).lower() != "false")
+        self.one_per_object_button.setChecked(
+            str(settings.value(_ONE_PER_OBJECT_KEY, "false")).lower()
+            == "true")
         for section in self.section_objects.values():
             section.restore_settings(settings)
         self._apply_sections()
@@ -803,6 +826,9 @@ class SnippetEditor(QWidget):
             settings.setValue(_GRID_MODE_KEY, self.grid.mode())
             settings.setValue(_CLASS_LINKED_KEY, "true"
                               if self.class_linked_check.isChecked()
+                              else "false")
+            settings.setValue(_ONE_PER_OBJECT_KEY, "true"
+                              if self.one_per_object_button.isChecked()
                               else "false")
             for section in self.section_objects.values():
                 section.save_settings(settings)
