@@ -124,6 +124,10 @@ class SnippetEditor(QWidget):
     # a class at once (2.9.16) - those labels only, never their linked
     # siblings; one undo step, and a new class when the name is new.
     classes_changed = pyqtSignal(list, str)
+    # The linked row's "All as <class>" (every view of the object) and
+    # Unlink this view (2026-11-02).
+    object_class_requested = pyqtSignal(list, str)
+    unlink_requested = pyqtSignal(int)
     # (label_id, pixel_x, pixel_y): the Move label tool - where on its
     # own image the label belongs.
     position_changed = pyqtSignal(int, float, float)
@@ -261,6 +265,8 @@ class SnippetEditor(QWidget):
             lambda entry: "".join(w.badge(entry)
                                   for w in self.strip._worklists))
         self.linked_row.picked.connect(self._pick_linked)
+        self.linked_row.reclass_requested.connect(self.object_class_requested)
+        self.linked_row.unlink_requested.connect(self.unlink_requested)
         single_page = QWidget()
         single_box = QVBoxLayout(single_page)
         single_box.setContentsMargins(0, 0, 0, 0)

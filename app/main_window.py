@@ -3175,6 +3175,9 @@ class MainWindow(QMainWindow):
             editor.remove_requested.connect(self._on_editor_remove_requested)
             editor.class_changed.connect(self._on_label_class_changed)
             editor.classes_changed.connect(self._on_label_classes_changed)
+            editor.object_class_requested.connect(
+                self._on_object_class_requested)
+            editor.unlink_requested.connect(self._on_editor_unlink_requested)
             editor.position_changed.connect(self._on_label_position_changed)
             editor.description_changed.connect(self._set_label_description)
             editor.group_id_changed.connect(self._set_label_group_id)
@@ -3337,6 +3340,23 @@ class MainWindow(QMainWindow):
                 REVIEW_REJECTED: "rejected - left out of exports",
                 REVIEW_RECHECK: "flagged to look at again",
             }.get(status, "back to not reviewed"), 3000)
+
+    def _on_object_class_requested(self, label_ids, class_name: str):
+        """The Snippet Editor's linked row asks for every view of the
+        object in hand to take one class ("All as vessel (2)", offered
+        while the views' classes differ): one undo step over exactly
+        those views (2026-11-02)."""
+        self._reclass_labels([int(i) for i in label_ids], class_name,
+                             "of the object")
+
+    def _on_editor_unlink_requested(self, label_id: int):
+        """The linked row's Unlink this view: the view in hand leaves its
+        object, as the map's Unlink does - one undo step, the editor
+        following once the gesture is over."""
+        label_id = int(label_id)
+        if len(self._object_ids_of(label_id)) < 2:
+            return
+        self._on_label_unlinked(label_id)
 
     def _on_editor_remove_requested(self, label_id: int):
         """The Snippet Editor's Review section asks for the label in

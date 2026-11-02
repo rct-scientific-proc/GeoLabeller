@@ -13,8 +13,9 @@ common case.
 """
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QIcon, QImage, QPixmap
-from PyQt5.QtWidgets import (QLabel, QListView, QListWidget, QListWidgetItem,
-                             QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QHBoxLayout, QLabel, QListView, QListWidget,
+                             QListWidgetItem, QPushButton, QVBoxLayout,
+                             QWidget)
 
 from ..snippets import SnippetLoader
 from .strip import THUMB_PX, group_line
@@ -24,6 +25,10 @@ class LinkedRow(QWidget):
     """A horizontal strip of the current object's snippets."""
 
     picked = pyqtSignal(int)             # label_id clicked
+    # "All as <class>": every view of the object to take this class
+    # (shown only while the views' classes differ, 2026-11-02).
+    reclass_requested = pyqtSignal(list, str)   # label_ids, class_name
+    unlink_requested = pyqtSignal(int)          # the view in hand
 
     ID_ROLE = Qt.UserRole
 
@@ -41,9 +46,30 @@ class LinkedRow(QWidget):
         self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.list_widget.itemClicked.connect(
             lambda item: self.picked.emit(item.data(self.ID_ROLE)))
+        # Under the title: one "All as <class> (n)" button per class the
+        # views carry, when they differ - the labeller's "maybe" class
+        # resolved in one click - and Unlink this view for the one in
+        # hand, so a wrong view can leave the object without going to
+        # the map.
+        self.actions = QWidget()
+        actions_box = QHBoxLayout(self.actions)
+        actions_box.setContentsMargins(0, 0, 0, 0)
+        self.class_buttons: list = []
+        self._class_box = QHBoxLayout()
+        self._class_box.setContentsMargins(0, 0, 0, 0)
+        actions_box.addLayout(self._class_box)
+        actions_box.addStretch(1)
+        self.unlink_button = QPushButton("Unlink this view")
+        self.unlink_button.setToolTip(
+            "Take the snippet in hand out of this object: it becomes a "
+            "label of its own, keeping its class, as Unlink on the map "
+            "does. One undo step.")
+        self.unlink_button.clicked.connect(self._on_unlink)
+        actions_box.addWidget(self.unlink_button)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 4, 0, 0)
         layout.addWidget(self.title)
+        layout.addWidget(self.actions)
         layout.addWidget(self.list_widget)
         self.loader = SnippetLoader(self)
         self.loader.ready.connect(self._on_snippet_ready)
@@ -71,6 +97,7 @@ class LinkedRow(QWidget):
              if e.get("object_id") == entry.get("object_id")),
             key=lambda e: (e["image_name"], e["label_id"]))
         if len(members) < 2:
+            self._current = None             # nothing to unlink
             self._clear()
             self.setVisible(False)
             return
@@ -92,7 +119,36 @@ class LinkedRow(QWidget):
             self._count(members)
             + (f" - {group}" if group else "")
             + self._disagreement(members))
+        self._show_actions(members)
         self.setVisible(True)
+
+    def _show_actions(self, members):
+        """One "All as <class> (n)" button per class the views carry,
+        most views first, only while they differ; Unlink for the view
+        in hand."""
+        for button in self.class_buttons:
+            self._class_box.removeWidget(button)
+            button.deleteLater()
+        self.class_buttons = []
+        counts: dict = {}
+        for entry in members:
+            counts[entry["class_name"]] = counts.get(entry["class_name"], 0) + 1
+        if len(counts) > 1:
+            ids = [e["label_id"] for e in members]
+            for name in sorted(counts, key=lambda n: (-counts[n], n)):
+                button = QPushButton(f"All as {name} ({counts[name]})")
+                button.setToolTip(
+                    f"Give every view of this object the class '{name}' "
+                    f"- one undo step.")
+                button.clicked.connect(
+                    lambda _checked=False, n=name, i=list(ids):
+                    self.reclass_requested.emit(i, n))
+                self._class_box.addWidget(button)
+                self.class_buttons.append(button)
+
+    def _on_unlink(self):
+        if self._current is not None:
+            self.unlink_requested.emit(self._current)
 
     def redraw(self):
         """Read every thumbnail again (the Display Settings changed)."""

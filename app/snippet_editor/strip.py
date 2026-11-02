@@ -116,6 +116,10 @@ class SnippetStrip(QObject):
         self._shown_image: "str | None" = None
         self._preferred: dict = {}            # object key -> label id
         self._object_sizes: dict = {}         # a row's label id -> views
+        # Objects whose views disagree on a class (asked for 2026-11-02):
+        # marked on the caption and listed by the Show entry "Classes
+        # differ", the last on the filter after the needs/done pairs.
+        self._differing: set = set()          # object keys
         self.loader = SnippetLoader(self)
         self.loader.ready.connect(self._on_snippet_ready)
 
@@ -128,9 +132,9 @@ class SnippetStrip(QObject):
         # the editor to work through, and its count falling is how they
         # see the work being done.
         self.filter_combo = QComboBox()
-        # One entry for All, then a needs/done pair per worklist; the text
-        # is set with the counts.
-        self.filter_combo.addItems([""] * (1 + 2 * len(self._worklists)))
+        # One entry for All, then a needs/done pair per worklist, then
+        # Classes differ; the text is set with the counts.
+        self.filter_combo.addItems([""] * (2 + 2 * len(self._worklists)))
         self.filter_combo.setCurrentIndex(self.FILTER_ALL)
         self.filter_combo.setToolTip(
             "Which snippets the strip lists. A snippet you have just\n"
@@ -353,9 +357,11 @@ class SnippetStrip(QObject):
         A one-section host changing what "done" means: Needs stays Needs,
         now in the new worklist's sense.
         """
+        was_differ = self.filter_mode() == self.differ_mode()
         mode = min(self.filter_mode(), self.FILTER_DONE)
         self._worklists = [worklist]
-        self._reset_filter(max(mode, self.FILTER_ALL))
+        self._reset_filter(self.differ_mode() if was_differ
+                           else max(mode, self.FILTER_ALL))
 
     def set_worklists(self, worklists: list):
         """Offer a needs/done pair on the filter for each of these.
@@ -365,9 +371,12 @@ class SnippetStrip(QObject):
         back to All rather than silently becoming something else.
         """
         chosen = self._chosen()
+        was_differ = self.filter_mode() == self.differ_mode()
         self._worklists = list(worklists)
         mode = self.FILTER_ALL
-        if chosen is not None and chosen[0] in self._worklists:
+        if was_differ:
+            mode = self.differ_mode()
+        elif chosen is not None and chosen[0] in self._worklists:
             mode = 1 + 2 * self._worklists.index(chosen[0]) + int(chosen[1])
         self._reset_filter(mode)
 
@@ -375,7 +384,7 @@ class SnippetStrip(QObject):
         """One needs/done pair per worklist, ``mode`` chosen, then refill."""
         self.filter_combo.blockSignals(True)
         self.filter_combo.clear()
-        self.filter_combo.addItems([""] * (1 + 2 * len(self._worklists)))
+        self.filter_combo.addItems([""] * (2 + 2 * len(self._worklists)))
         self.filter_combo.setCurrentIndex(mode)
         self.filter_combo.blockSignals(False)
         self._rebuild(chosen_anew=True)
@@ -385,6 +394,15 @@ class SnippetStrip(QObject):
     def filter_mode(self) -> int:
         """Which of FILTER_ALL / FILTER_NEEDS / FILTER_DONE is showing."""
         return self.filter_combo.currentIndex()
+
+    def differ_mode(self) -> int:
+        """The filter index of "Classes differ": after the needs/done
+        pairs, so it moves as sections are switched on and off."""
+        return 1 + 2 * len(self._worklists)
+
+    def classes_differ(self, entry: dict) -> bool:
+        """Do the views of this entry's object disagree on a class?"""
+        return self._object_key(entry) in self._differing
 
     def set_filter_mode(self, mode: int):
         self.filter_combo.setCurrentIndex(mode)
@@ -445,6 +463,8 @@ class SnippetStrip(QObject):
         return self._worklists[index], bool(done)
 
     def matches(self, entry: dict) -> bool:
+        if self.filter_mode() == self.differ_mode():
+            return self.classes_differ(entry)
         chosen = self._chosen()
         if chosen is None:
             return True
@@ -522,6 +542,12 @@ class SnippetStrip(QObject):
         self._thumb_asked = set()
         placeholder = self._placeholder_icon()
         self.entries_by_label = {e["label_id"]: e for e in self.entries}
+        classes_of: dict = {}
+        for entry in self.entries:
+            classes_of.setdefault(self._object_key(entry), set()).add(
+                entry["class_name"])
+        self._differing = {key for key, names in classes_of.items()
+                           if len(names) > 1}
         keep_id = self._current_id
         listed = []
         for entry in self.entries:
@@ -648,9 +674,14 @@ class SnippetStrip(QObject):
         caption = entry["image_name"]
         if self.shown_class() is None:       # all classes, or an object
             caption = f"{entry['class_name']}  \N{MIDDLE DOT}  {caption}"
+        notes = []
         views = self._object_sizes.get(entry["label_id"], 0)
         if views > 1:
-            caption += f"  ({views} views)"
+            notes.append(f"{views} views")
+        if self.classes_differ(entry):
+            notes.append("classes differ")
+        if notes:
+            caption += f"  ({', '.join(notes)})"
         return (caption + "".join(w.badge(entry) for w in self._worklists)
                 + group_line(entry))
 
@@ -671,12 +702,16 @@ class SnippetStrip(QObject):
                            if all(worklist.is_done(e) for e in views))
                 labels += [f"{worklist.needs} ({len(in_class) - done})",
                            f"{worklist.done} ({done})"]
+            differ = sum(1 for views in in_class
+                         if self.classes_differ(views[0]))
         else:
             labels = [f"All ({len(in_class)})"]
             for worklist in self._worklists:
                 done = sum(1 for e in in_class if worklist.is_done(e))
                 labels += [f"{worklist.needs} ({len(in_class) - done})",
                            f"{worklist.done} ({done})"]
+            differ = sum(1 for e in in_class if self.classes_differ(e))
+        labels.append(f"Classes differ ({differ})")
         self.filter_combo.blockSignals(True)
         for index, text in enumerate(labels):
             self.filter_combo.setItemText(index, text)
@@ -688,7 +723,9 @@ class SnippetStrip(QObject):
             self.message_label.setVisible(False)
             return
         chosen = self._chosen()
-        if chosen is None:
+        if self.filter_mode() == self.differ_mode():
+            text = "Every object's views agree on a class."
+        elif chosen is None:
             text = "No snippets in this class."
         elif chosen[1]:
             text = chosen[0].none_done
