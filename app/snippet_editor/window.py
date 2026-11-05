@@ -22,7 +22,8 @@ new module, one line in that list, and its outward signal.
 
 It talks to the rest of the app through set_labels / set_classes /
 set_mask_names / set_save_state in, and masks_changed /
-orientation_changed / size_changed / confidence_changed / review_changed /
+orientation_changed / size_changed / confidence_changed /
+confidences_changed / review_changed / reviews_changed /
 class_changed / position_changed / description_changed /
 group_id_changed / mask_names_changed / remove_requested / save_requested /
 undo_requested / redo_requested out.
@@ -115,8 +116,12 @@ class SnippetEditor(QWidget):
     # (label_id): the Review section asks for the label to be removed
     # from the project (Delete, or its button).
     remove_requested = pyqtSignal(int)
-    # ([label ids], status): a page of the review grid marked at once.
+    # ([label ids], status): a page of the review grid marked at once -
+    # or, One per object, every view of the object a mark was given to.
     reviews_changed = pyqtSignal(list, str)
+    # ([label ids], rating 0-5): every view of an object rated at once,
+    # One per object (audit 2026-11-05 M2) - one undo step.
+    confidences_changed = pyqtSignal(list, int)
     # (label_id, class name): the main window applies it to the label's
     # whole linked object - the same thing seen in different images.
     class_changed = pyqtSignal(int, str, bool)   # +also the linked labels
@@ -161,8 +166,8 @@ class SnippetEditor(QWidget):
                     OrientationSection(self.grid, self.masks, self),
                     MaskSection(self.masks, self),
                     SizeSection(self.masks, self.grid._geo_info, self),
-                    ConfidenceSection(self),
-                    ReviewSection(self.grid, self))
+                    ConfidenceSection(self.strip, self),
+                    ReviewSection(self.grid, self.strip, self))
         self.section_objects = {section.key: section for section in sections}
         self.orientation_panel = self.section_objects["orientation"].panel
         self._apply_worklists(self.section_objects)
@@ -190,9 +195,18 @@ class SnippetEditor(QWidget):
             "else the one you last clicked in the linked row, else the "
             "lowest label id. Step down the list and the linked row below "
             "shows every view of the object - a quick check that each group "
-            "holds what it should. An object is listed when any of its "
-            "views passes the Show filter; choosing one object in the "
-            "Class list shows all of its views as ever. Remembered.")
+            "holds what it should.\n"
+            "Show and its counts go by that view: finishing it takes the "
+            "object off a Needs list, whatever its other views still need "
+            "(the linked row shows them); Classes differ lists an object "
+            "when any of its views disagree.\n"
+            "A review mark (A, X, F) or a confidence rating given to a row "
+            "reaches every view of its object, as one undo step - so does "
+            "the Grid's Accept the rest of the page, and its Change class "
+            "takes every view of each picked object. Masks, orientation "
+            "and size stay with the view they were drawn on.\n"
+            "Choosing one object in the Class list shows all of its views "
+            "as ever, each marked on its own. Remembered.")
         self.one_per_object_button.toggled.connect(
             self.strip.set_one_per_object)
         toolbar.addWidget(self.one_per_object_button)
@@ -367,6 +381,8 @@ class SnippetEditor(QWidget):
         self.grid.classes_requested.connect(self.classes_changed)
         self.section_objects["confidence"].confidence_changed.connect(
             self.confidence_changed)
+        self.section_objects["confidence"].confidences_changed.connect(
+            self.confidences_changed)
         self.section_objects["size"].size_changed.connect(self.size_changed)
         review = self.section_objects["review"]
         review.review_changed.connect(self.review_changed)

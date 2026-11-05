@@ -21,6 +21,12 @@ goes at once, as it does on the map.
 In the Grid view's Review mode a page is marked at a time: the grid
 (orientation_section.py) takes the clicks and reports them, and this
 section sends them on - a page accepted at once as one undo step.
+
+With One per object on (the list one row per linked object) a mark on a
+row is the object's: every view takes it, as one undo step
+(reviews_changed), since the row stands for the group - audit
+2026-11-05 M2, where a pass of A down "Needs review" marked one view per
+object and the list never shrank. Remove label stays the row's view.
 """
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (QCheckBox, QGridLayout, QLabel, QMessageBox,
@@ -143,12 +149,14 @@ class ReviewSection(Section):
     # (label_id): take this label out of the project.
     remove_requested = pyqtSignal(int)
 
-    def __init__(self, grid=None, parent=None):
+    def __init__(self, grid=None, strip=None, parent=None):
         """``grid`` is the Grid view, whose Review mode this section
-        answers for (None: a section on its own)."""
+        answers for; ``strip`` the list, which says what a row stands
+        for (None for either: a section on its own)."""
         super().__init__(REVIEW_WORKLIST, ReviewPanel(), parent)
         self._entry = None
         self._grid = grid
+        self._strip = strip
         self.panel.marked.connect(self.mark)
         self.panel.remove_requested.connect(self.remove)
         if grid is not None:
@@ -182,15 +190,27 @@ class ReviewSection(Section):
         if self._grid is not None:
             self._grid.refresh_review(label_id)
 
+    def _views(self, entry: dict) -> list:
+        """The entries a mark on this one is for: one per object, every
+        view of its object (M2); else the entry alone."""
+        return [entry] if self._strip is None else self._strip.stands_for(entry)
+
     def mark(self, status: str):
-        """Mark the snippet in hand ("" clears)."""
+        """Mark the snippet in hand ("" clears) - and, one per object,
+        every view of its object, as one undo step."""
         if self._entry is None or valid_review(status) != status:
             return
-        self._entry["review"] = status
+        views = self._views(self._entry)
+        for view in views:
+            view["review"] = status
         self.show_entry(self._entry)
-        label_id = self._entry["label_id"]
-        self.review_changed.emit(label_id, status)
-        self.entry_changed.emit(label_id)
+        ids = [view["label_id"] for view in views]
+        if len(ids) == 1:
+            self.review_changed.emit(ids[0], status)
+            self.entry_changed.emit(ids[0])
+        else:
+            self.reviews_changed.emit(ids, status)
+            self.entries_changed.emit(ids)
 
     def remove(self):
         """Take the snippet in hand out of the project (Delete, or the

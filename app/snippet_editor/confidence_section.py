@@ -9,6 +9,12 @@ rating" ticked a key that rates also moves on to the next snippet, so a
 rating pass is one key a snippet; it is off until ticked, since a key
 that used to leave the snippet in hand would otherwise start skipping.
 
+With One per object on (the list one row per linked object) a rating on
+a row is the object's: every view takes it, as one undo step
+(confidences_changed), since the row stands for the group - audit
+2026-11-05 M2, where a pass of 5 down "Needs confidence" rated one view
+per object and the list never shrank.
+
 The smallest complete Section (section.py): a worklist, a panel, a key
 handler - no overlay and no tool. The next per-snippet value can start
 from a copy of this file.
@@ -112,10 +118,16 @@ class ConfidenceSection(Section):
 
     # (label_id, rating 0-5) - out to the main window.
     confidence_changed = pyqtSignal(int, int)
+    # ([label ids], rating 0-5): every view of an object rated at once
+    # (One per object, M2) - one undo step.
+    confidences_changed = pyqtSignal(list, int)
 
-    def __init__(self, parent=None):
+    def __init__(self, strip=None, parent=None):
+        """``strip`` is the list, which says what a row stands for
+        (None: a section on its own)."""
         super().__init__(CONFIDENCE_WORKLIST, ConfidencePanel(), parent)
         self._entry = None
+        self._strip = strip
         self.panel.rated.connect(self.rate)
         self.show_entry(None)
 
@@ -128,17 +140,29 @@ class ConfidenceSection(Section):
         if self._entry is not None and self._entry["label_id"] == label_id:
             self.show_entry(self._entry)
 
+    def _views(self, entry: dict) -> list:
+        """The entries a rating of this one is for: one per object, every
+        view of its object (M2); else the entry alone."""
+        return [entry] if self._strip is None else self._strip.stands_for(entry)
+
     def rate(self, value: int):
-        """Rate the snippet in hand (0 clears)."""
+        """Rate the snippet in hand (0 clears) - and, one per object,
+        every view of its object, as one undo step."""
         if self._entry is None:
             return
         if value != CONFIDENCE_UNSET and valid_confidence(value) != value:
             return
-        self._entry["confidence"] = value
+        views = self._views(self._entry)
+        for view in views:
+            view["confidence"] = value
         self.show_entry(self._entry)
-        label_id = self._entry["label_id"]
-        self.confidence_changed.emit(label_id, value)
-        self.entry_changed.emit(label_id)
+        ids = [view["label_id"] for view in views]
+        if len(ids) == 1:
+            self.confidence_changed.emit(ids[0], value)
+            self.entry_changed.emit(ids[0])
+        else:
+            self.confidences_changed.emit(ids, value)
+            self.entries_changed.emit(ids)
 
     def view_changed(self, single):
         # Rated on the snippet in hand, which the Grid view does not show.

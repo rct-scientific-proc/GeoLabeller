@@ -30,8 +30,8 @@ from PyQt5.QtGui import (
 from PyQt5.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
     QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem, QGraphicsTextItem,
-    QGraphicsPathItem, QGraphicsRectItem, QMenu, QRubberBand, QWidget,
-    QLabel, QGraphicsOpacityEffect
+    QGraphicsSimpleTextItem, QGraphicsPathItem, QGraphicsRectItem, QMenu,
+    QRubberBand, QWidget, QLabel, QGraphicsOpacityEffect
 )
 from affine import Affine
 from pyproj import Transformer
@@ -218,6 +218,108 @@ class _ActiveBrackets(QGraphicsPathItem):
         line.setJoinStyle(Qt.MiterJoin)
         painter.setPen(line)
         painter.drawPath(self.path())
+
+
+class _Caption:
+    """A label marker's caption - the class, the size measured, the count
+    of views - made into a scene item only when the marker is first
+    drawn.
+
+    Every marker used to carry a QGraphicsTextItem (a text document and
+    a font of its own) from the moment it was added: 0.9 s of the 1.8 s
+    a rebuild of 20,000 markers cost, for captions mostly off screen.
+    The parts are kept here, and the item - a QGraphicsSimpleTextItem in
+    the canvas's one caption font, seven times cheaper to make - is
+    built by the canvas when the marker comes into view (audit
+    2026-11-05 P6, 2.10.1). The names are the item's own, so the canvas
+    reads and sets a caption the same way built or not.
+    """
+
+    __slots__ = ("parts", "text", "visible", "opacity", "tooltip",
+                 "x", "y", "z", "group", "item")
+
+    # A QGraphicsTextItem drew its text inside a 4 px document margin;
+    # the caption keeps that offset from the marker's corner.
+    _MARGIN_PX = 4
+
+    def __init__(self, base: str, x: float, y: float, z: float, group):
+        self.parts = [base, "", ""]     # class; size measured; view count
+        self.text = base
+        self.visible = True
+        self.opacity = 1.0
+        self.tooltip = ""
+        self.x, self.y, self.z = x, y, z
+        self.group = group
+        self.item: "QGraphicsSimpleTextItem | None" = None
+
+    def data(self, slot: int):
+        return self.parts[slot]
+
+    def setData(self, slot: int, value):
+        self.parts[slot] = value or ""
+
+    def toPlainText(self) -> str:
+        return self.text
+
+    def setPlainText(self, text: str):
+        self.text = text
+        if self.item is not None:
+            self.item.setText(text)
+
+    def isVisible(self) -> bool:
+        return self.visible
+
+    def setVisible(self, on: bool):
+        self.visible = bool(on)
+        if self.item is not None:
+            self.item.setVisible(self.visible)
+
+    def setPos(self, x: float, y: float):
+        self.x, self.y = x, y
+        if self.item is not None:
+            self.item.setPos(x, y)
+
+    def setOpacity(self, opacity: float):
+        self.opacity = opacity
+        if self.item is not None:
+            self.item.setOpacity(opacity)
+
+    def setToolTip(self, tooltip: str):
+        self.tooltip = tooltip
+        if self.item is not None:
+            self.item.setToolTip(tooltip)
+
+    def zValue(self) -> float:
+        return self.z
+
+    def parentItem(self):
+        return self.group
+
+    def build(self, font: QFont):
+        """Make the scene item, in the overlay group, as recorded."""
+        item = QGraphicsSimpleTextItem(self.text, self.group)
+        item.setFont(font)
+        item.setBrush(QBrush(Qt.white))
+        item.setPen(QPen(Qt.NoPen))
+        # Ignore the view transform so the caption stays upright and a
+        # constant on-screen size whatever the zoom; its own transform
+        # still applies, in pixels, and gives the margin.
+        item.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        item.setTransform(QTransform.fromTranslate(self._MARGIN_PX,
+                                                   self._MARGIN_PX))
+        item.setPos(self.x, self.y)
+        item.setZValue(self.z)
+        item.setOpacity(self.opacity)
+        if self.tooltip:
+            item.setToolTip(self.tooltip)
+        item.setVisible(self.visible)
+        self.item = item
+
+    def drop(self, scene):
+        """Take the scene item down, if there is one."""
+        if self.item is not None:
+            scene.removeItem(self.item)
+            self.item = None
 
 
 # Waterfall mode: a bottom-level group's images are stacked vertically in the
@@ -2499,10 +2601,18 @@ class MapCanvas(QGraphicsView):
         self._ruler_panning = False
         self._ruler_pan_start = None  # QPoint: last pan position (view coords)
 
-        # Label graphics items: label_id -> (ellipse_item, text_item)
+        # Label graphics items: label_id -> (ellipse_item, caption)
         self._label_items: dict[int,
-                                tuple[QGraphicsEllipseItem,
-                                      QGraphicsTextItem]] = {}
+                                tuple[QGraphicsEllipseItem, _Caption]] = {}
+        # The markers whose caption has no scene item yet: made when the
+        # marker is first drawn, through paintEvent (P6, 2.10.1).
+        self._captions_pending: set[int] = set()
+        # The one font every caption is drawn in.
+        self._caption_font = QFont("Arial", 8)
+        self._caption_font.setBold(True)
+        # A marker's outline colour and fill by its class colour, made
+        # once per colour rather than per marker.
+        self._marker_looks: dict[int, tuple[QColor, QBrush]] = {}
         # Z-value offset for labels (added to max layer z-value to ensure
         # labels are always on top)
 
@@ -5373,6 +5483,7 @@ class MapCanvas(QGraphicsView):
         ellipse, text = self._make_label_marker_items(
             x, y, class_name, color, image_path, ring_color=ring_color)
         self._label_items[label_id] = (ellipse, text)
+        self._captions_pending.add(label_id)
         self._marker_index = None
         key = self._image_key(image_path)
         self._labels_by_image.setdefault(key, set()).add(label_id)
@@ -5674,12 +5785,14 @@ class MapCanvas(QGraphicsView):
     def _make_label_marker_items(self, x: float, y: float, class_name: str,
                                  color: QColor, image_path: str,
                                  ring_color: QColor | None = None):
-        """Create the (ellipse, text) items of a label marker at world (x, y).
+        """Create the (ellipse, caption) of a label marker at world (x, y).
 
         Shared by real label markers and waterfall projections so both render
-        identically. Items are parented to the floating-origin group.
-        ``ring_color`` adds the linked-group halo: an outer circle in the
-        group's colour (see set_label_ring).
+        identically. The ellipse is parented to the floating-origin group;
+        the caption is a _Caption, whose scene item is made when the
+        marker is first drawn (P6, 2.10.1). ``ring_color`` adds the
+        linked-group halo: an outer circle in the group's colour (see
+        set_label_ring).
         """
         # Marker size in scene coordinates (appears ~10 pixels on screen)
         marker_size = self._marker_px()
@@ -5688,36 +5801,31 @@ class MapCanvas(QGraphicsView):
             # pass must size every marker, whatever the zoom is then.
             self._markers_sized_for = None
 
+        look = self._marker_looks.get(color.rgba())
+        if look is None:
+            look = (color.darker(150), QBrush(color))
+            self._marker_looks[color.rgba()] = look
+        outline, brush = look
         # Create ellipse marker
         ellipse = QGraphicsEllipseItem(
             -marker_size / 2, -marker_size / 2,
             marker_size, marker_size
         )
         ellipse.setPos(x, -y)  # Y is flipped in scene coords
-        ellipse.setPen(QPen(color.darker(150), marker_size / 5))
-        ellipse.setBrush(QBrush(color))
-        ellipse.setZValue(self._get_label_z_base())
+        ellipse.setPen(QPen(outline, marker_size / 5))
+        ellipse.setBrush(brush)
+        z = self._get_label_z_base()
+        ellipse.setZValue(z)
         ellipse.setData(0, image_path)  # Store image_path for later retrieval
         if ring_color is not None:
             self._add_ring_item(ellipse, ring_color, marker_size)
 
-        # Create text label
-        text = QGraphicsTextItem(class_name)
-        text.setData(0, class_name)  # base label text, for measurement relabeling
-        text.setDefaultTextColor(Qt.white)
-        font = QFont("Arial", 8)
-        font.setBold(True)
-        text.setFont(font)
-        # Ignore the view transform so the label stays upright and a constant
-        # on-screen size regardless of zoom.
-        text.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
-        text.setPos(x + marker_size / 2, -y - marker_size / 2)
-        text.setZValue(self._get_label_z_base() + 1)
-
         # Parent to the floating-origin group so scene coords stay small at
         # deep zoom (positions above are in world coords).
         ellipse.setParentItem(self._overlay_group)
-        text.setParentItem(self._overlay_group)
+        # The caption's slot 0 is the base text, for measurement relabeling.
+        text = _Caption(class_name, x + marker_size / 2, -y - marker_size / 2,
+                        z + 1, self._overlay_group)
         return ellipse, text
 
     @staticmethod
@@ -5850,6 +5958,9 @@ class MapCanvas(QGraphicsView):
                     x, y, class_name,
                     color if color is not None else QColor(255, 50, 50),
                     source_path, ring_color=ring_color)
+                # A projection is drawn where it is made: its caption
+                # is built at once, not on the first paint.
+                text.build(self._caption_font)
                 self._waterfall_projection_items.append(
                     (label_id, ellipse, text))
 
@@ -5857,7 +5968,7 @@ class MapCanvas(QGraphicsView):
         """Remove all projected label markers."""
         for _label_id, ellipse, text in self._waterfall_projection_items:
             self._scene.removeItem(ellipse)
-            self._scene.removeItem(text)
+            text.drop(self._scene)
         self._waterfall_projection_items = []
         self._waterfall_infos = []
 
@@ -5870,7 +5981,8 @@ class MapCanvas(QGraphicsView):
             if on_image is not None:
                 on_image.discard(label_id)
             self._scene.removeItem(ellipse)
-            self._scene.removeItem(text)
+            text.drop(self._scene)
+            self._captions_pending.discard(label_id)
             del self._label_items[label_id]
             self._marker_index = None
             self._register_object(label_id, "")
@@ -5939,6 +6051,38 @@ class MapCanvas(QGraphicsView):
 
         # Keep the ruler readout a constant on-screen size across zoom changes.
         self._rescale_ruler_text()
+
+    # A caption hangs right of and below its marker by its own size in
+    # pixels, whatever the zoom: a marker this far outside the viewport
+    # can still show one. Comfortably past the longest caption.
+    _CAPTION_REACH_PX = 200
+
+    def paintEvent(self, event):
+        # A marker's caption is made when the marker is first drawn,
+        # not when it is added (P6, 2.10.1): the items go in before the
+        # scene paints, so this paint shows them.
+        if self._captions_pending:
+            self._build_captions_in(event.rect())
+        super().paintEvent(event)
+
+    def _build_captions_in(self, view_rect: QRect):
+        """Make the caption items of the pending markers within this part
+        of the viewport, found through the marker index by position."""
+        scene_rect = self.mapToScene(view_rect).boundingRect()
+        local = self._overlay_group.mapFromScene(scene_rect).boundingRect()
+        view_scale = self._view_scale()
+        reach = self._CAPTION_REACH_PX / view_scale if view_scale > 0 else 0.0
+        top, bottom = local.top() - reach, local.bottom() + reach
+        xs, rows = self._marker_rows()
+        pending = self._captions_pending
+        for i in range(bisect_left(xs, local.left() - reach),
+                       bisect_right(xs, local.right() + reach)):
+            _x, y, label_id, _order = rows[i]
+            if label_id in pending and top <= y <= bottom:
+                caption = self._label_items[label_id][1]
+                if caption.visible:
+                    caption.build(self._caption_font)
+                    pending.discard(label_id)
 
     def _marker_rows(self) -> tuple[list, list]:
         """The marker index (see __init__), built if a marker came or went."""

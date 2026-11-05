@@ -11,10 +11,14 @@ on the chip's own record, under "review":
 
     {"image": "survey_03.tif", "x": 1812.4, "y": 640.9, "class": "vessel",
      "score": 0.97,
-     "review": {"became": "vessel", "label_id": 12, "by": "Ryan",
-                "at": "2026-10-27T10:00:00Z"}}
+     "review": {"became": "vessel", "label_id": 12,
+                "label_x": 1820.0, "label_y": 644.5,
+                "by": "Ryan", "at": "2026-10-27T10:00:00Z"}}
 
-"became" is a class name, or "ignore". The file is rewritten whole and
+"became" is a class name, or "ignore". "label_x" / "label_y" is where
+the label was when the note was written, in pixels at the project's
+resolution (2.10.1): what the chip finds its own label by on the next
+open, whatever the chip size is set to. The file is rewritten whole and
 atomically with every other field as it was, so the model team's file
 stays theirs with a note per chip. A file that cannot be written - read
 only, a share without rights - is said once; the chips keep their
@@ -158,7 +162,8 @@ def verdict_of(candidate, pixel_x: float, pixel_y: float, image: str,
                    predicted=candidate.predicted, score=float(candidate.score),
                    became=note["became"], label_id=note.get("label_id"),
                    by=note.get("by", ""), at=note.get("at", ""),
-                   group=group or "")
+                   group=group or "", label_x=note.get("label_x"),
+                   label_y=note.get("label_y"))
 
 
 def carry_over(records: list, previous: list, tolerance: float) -> int:

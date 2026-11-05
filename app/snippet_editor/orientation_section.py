@@ -409,8 +409,9 @@ class OrientationEditor(QWidget):
     review_marked = pyqtSignal(int, str)
     reviews_marked = pyqtSignal(list, str)
     # The picked snippets given a class (2.9.16): ([label ids], class
-    # name) - those labels only, never their linked siblings; a name
-    # that is not a class yet is for the main window to make one.
+    # name) - those labels only, not their linked siblings, except one
+    # per object, where a cell is its whole object (M3); a name that is
+    # not a class yet is for the main window to make one.
     classes_requested = pyqtSignal(list, str)
 
     def __init__(self, strip: SnippetStrip, parent=None):
@@ -522,7 +523,8 @@ class OrientationEditor(QWidget):
         self.change_class_button = QPushButton("Change class")
         self.change_class_button.setToolTip(
             "Give every picked snippet the class beside - those labels "
-            "only, not the labels linked to them. One undo step.\n"
+            "only, not the labels linked to them; with One per object on, "
+            "every view of each picked object. One undo step.\n"
             "Click picks a snippet, Ctrl+click adds one, Shift+click a "
             "run, Ctrl+A the page, Escape none.")
         self.change_class_button.clicked.connect(self.apply_class)
@@ -748,19 +750,24 @@ class OrientationEditor(QWidget):
     def apply_class(self):
         """Ask for the picked snippets to be given the class in the box
         - only those whose class it is not already, and only them: a
-        linked sibling that was not picked keeps its class. The main
-        window makes it one undo step (and a new class, when the name
-        is new) and re-seats the editor, which is when the entries and
-        captions say the new class: said here at once, a name the main
-        window refused stayed on the labels in the editor (2.9.17)."""
+        linked sibling that was not picked keeps its class. One per
+        object, a cell is its whole object, so every view of each
+        picked object is asked for, as the Single view's picker does
+        (audit 2026-11-05 M3: the representatives alone left every
+        picked object with its views in two classes). The main window
+        makes it one undo step (and a new class, when the name is new)
+        and re-seats the editor, which is when the entries and captions
+        say the new class: said here at once, a name the main window
+        refused stayed on the labels in the editor (2.9.17)."""
         # A reject shown but not stored yet goes in first, so the undo
         # order is the order of the clicks.
         self.flush_review()
         name = self.pick_class_combo.currentText().strip()
-        ids = self.selected()
-        changed = [label_id for label_id in ids
-                   if self._entry(label_id) is not None
-                   and self._entry(label_id)["class_name"] != name]
+        picked = [self._entry(label_id) for label_id in self.selected()]
+        changed = [view["label_id"]
+                   for entry in picked if entry is not None
+                   for view in self.strip.stands_for(entry)
+                   if view["class_name"] != name]
         if not name or not changed:
             return
         self.pick_class_combo.clearFocus()
@@ -912,27 +919,39 @@ class OrientationEditor(QWidget):
         self._mark(label_id, status)
 
     def _mark(self, label_id: int, status: str):
+        """Store a mark on a cell's label - and, one per object, on
+        every view of its object, as one undo step (M2)."""
         entry = self._entry(label_id)
         if entry is None:
             return                  # the label went while the click waited
-        if valid_review(entry.get("review")) != status:
-            entry["review"] = status
-            self.review_marked.emit(label_id, status)
+        marked = []
+        for view in self.strip.stands_for(entry):
+            if valid_review(view.get("review")) != status:
+                view["review"] = status
+                marked.append(view["label_id"])
+        if len(marked) == 1:
+            self.review_marked.emit(marked[0], status)
+        elif marked:
+            self.reviews_marked.emit(marked, status)
         self._show_review(label_id)
 
     def accept_page(self):
-        """Accept every snippet on this page nobody has marked, and go on
-        to the next page."""
+        """Accept every snippet on this page nobody has marked - one per
+        object, every view of each such object (M2) - and go on to the
+        next page."""
         if self._mode != MODE_REVIEW:
             return
         self.flush_review()
         accepted = []
         for label_id in self._cells:
             entry = self._entry(label_id)
-            if (entry is not None and valid_review(entry.get("review"))
-                    == REVIEW_UNREVIEWED):
-                entry["review"] = REVIEW_ACCEPTED
-                accepted.append(label_id)
+            if (entry is None or valid_review(entry.get("review"))
+                    != REVIEW_UNREVIEWED):
+                continue
+            for view in self.strip.stands_for(entry):
+                if valid_review(view.get("review")) != REVIEW_ACCEPTED:
+                    view["review"] = REVIEW_ACCEPTED
+                    accepted.append(view["label_id"])
         if accepted:
             self.reviews_marked.emit(accepted, REVIEW_ACCEPTED)
         if self._page < self._page_count() - 1:

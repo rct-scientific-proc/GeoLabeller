@@ -117,6 +117,10 @@ class Chip:
     anchor_x: float = 0.0       # the centre as the project has it
     anchor_y: float = 0.0       # (2.8.11): its label's, else the
                                 # file's; a move since is to import
+    # The label the chip is seated on, by id (2.10.1): a note's label
+    # is tested against the note's own position when taken, and once
+    # held is followed wherever the map moves it.
+    held: int | None = None
 
     def reviewed_before(self) -> bool:
         """Has the file a note on the chip that still stands: ignored,
@@ -157,8 +161,9 @@ class Chip:
 
     def unseat(self):
         """The project has nothing of the chip: the file's centre
-        is the anchor again. A move staged here stays."""
+        is the anchor again, no label held. A move staged here stays."""
         self.anchor_x, self.anchor_y = self.source_x, self.source_y
+        self.held = None
 
     def offset(self) -> float:
         """How far the centre has been moved from the file's, in pixels."""
@@ -436,7 +441,8 @@ def match_candidates(candidates, project, malformed: int = 0,
                 image=chip.image_name, pixel_x=px, pixel_y=py,
                 predicted=candidate.predicted, score=float(candidate.score),
                 became=note["became"], label_id=note["label_id"],
-                by=note["by"], at=note["at"], group=chip.group)
+                by=note["by"], at=note["at"], group=chip.group,
+                label_x=note.get("label_x"), label_y=note.get("label_y"))
         chips.append(chip)
         report.matched += 1
     return chips, report

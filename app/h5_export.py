@@ -180,6 +180,36 @@ _NUMERIC_COLUMNS = tuple(name for group in _NUMERIC_GROUPS.values()
 # Label rows read at a time when re-indexing an existing file's classes; 1M
 # uint16 is a couple of MB, so even a huge dataset migrates in bounded memory.
 _SCAN_BLOCK = 1 << 20
+# Every dataset an append grows by ``resize`` (``classes`` is rewritten
+# whole, so it need not be resizable).
+_GROWN_ON_APPEND = (("images", "labels", "gt", "split", "mask_pixels",
+                     "mask_sample", "mask_names")
+                    + _STRING_COLUMNS + _NUMERIC_COLUMNS)
+# The one sentence a fixed-size file is refused with: the dialog shows it
+# in place of "snippets will be appended" and the writer raises it.
+FIXED_SIZE_REFUSAL = (
+    "Cannot append: this file was rewritten by another tool "
+    "(optimize_h5.py does this) and its datasets are fixed-size, so it "
+    "must be re-created - export to a new file, or have that tool write "
+    "resizable datasets.")
+
+
+def _fixed_size_refusal(f) -> str:
+    """Why ``f`` cannot take an append, or "" when it can.
+
+    h5py resizes only a dataset created with an unlimited ``maxshape``.
+    The training side's ``optimize_h5.py`` (its purge / reorder step)
+    rewrites a file with plain ``create_dataset`` calls - fixed-size, and
+    with ``--compression`` chunked but still capped at its length - and
+    nothing here used to look: the dialog promised an append, the writer
+    rewrote ``classes``, and the first flush failed on ``images.resize``
+    (audit 2026-11-05 M4). Checked over ``images`` and every one of the
+    writer's own columns the file holds, before anything is written.
+    """
+    for name in _GROWN_ON_APPEND:
+        if name in f and f[name].maxshape[0] is not None:
+            return FIXED_SIZE_REFUSAL
+    return ""
 
 
 def read_settings(path) -> dict | None:
@@ -188,7 +218,9 @@ def read_settings(path) -> dict | None:
     Snippet size, channels, chunking and compression are read back from the
     ``images`` dataset itself (so files written before the overlap attribute
     existed still work); the overlap is only available as an attribute. Any
-    unreadable or non-dataset file gives ``None``.
+    unreadable or non-dataset file gives ``None``. A dataset the writer
+    could not grow carries the reason under ``"refusal"`` (M4), so the
+    dialog can say so before an export is run.
     """
     if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
         return None
@@ -217,6 +249,9 @@ def read_settings(path) -> dict | None:
                     float(v) for v in f.attrs["negative_ratio"])
             if "positive_offset" in f.attrs:
                 settings["positive_offset"] = int(f.attrs["positive_offset"])
+            refusal = _fixed_size_refusal(f)
+            if refusal:
+                settings["refusal"] = refusal
             return settings
     except Exception:  # noqa: BLE001 - a bad/locked file just has no settings
         return None
@@ -484,6 +519,11 @@ class H5DatasetWriter:
                 f"Cannot append: the existing file stores {existing_dtype} "
                 f"pixels, not {self.pixel_dtype} - mixing the two would "
                 "give the samples two different value scales.")
+        # Before the adoption and the class rewrite below: a refused file
+        # is left exactly as found (M4).
+        refusal = _fixed_size_refusal(f)
+        if refusal:
+            raise ValueError(refusal)
         self._validate_alignment()
         self._adopt_foreign_columns()
         existing = list(f["classes"].asstr()[:]) if "classes" in f else []
@@ -1255,6 +1295,9 @@ class H5ExportDialog(QDialog):
         self._estimate_timer.setInterval(150)
         self._estimate_timer.timeout.connect(self._count_estimate)
         self._defaults = dict(defaults or {})
+        # Why the output file cannot take an append ("" while it can) -
+        # read with the path, consulted by every Export-enable check (M4).
+        self._path_refusal = ""
         self.setWindowTitle("Export HDF5 Dataset")
         self.setMinimumWidth(500)
         self._build_ui()
@@ -1588,13 +1631,17 @@ class H5ExportDialog(QDialog):
                 bool(settings["split_negatives"]))
         # The remembered axes, when they still apply. An object scope is
         # never restored: it belongs to the selection this dialog was opened
-        # on, not to the last export.
-        wanted = settings.get("examples_scope")
-        if wanted in (EXAMPLES_VISIBLE, EXAMPLES_ALL, EXAMPLES_NONE):
-            self._select_value(self._example_buttons, wanted)
-        if settings.get("negatives_scope"):
-            self._select_value(self._negative_buttons,
-                               settings["negatives_scope"])
+        # on, not to the last export. And a dialog opened ON an object keeps
+        # its own pair (this object, no negatives): the last whole-project
+        # export's scopes used to replace it and offer to slide every loaded
+        # image again (audit 2026-11-05 M5).
+        if self._selection is None:
+            wanted = settings.get("examples_scope")
+            if wanted in (EXAMPLES_VISIBLE, EXAMPLES_ALL, EXAMPLES_NONE):
+                self._select_value(self._example_buttons, wanted)
+            if settings.get("negatives_scope"):
+                self._select_value(self._negative_buttons,
+                                   settings["negatives_scope"])
         ratio = settings.get("negative_ratio")
         if ratio is not None and len(ratio) == 3:
             for spin, share in zip(
@@ -1790,21 +1837,28 @@ class H5ExportDialog(QDialog):
                  "object falls outside its own examples.")
         # An export with neither examples nor negatives would write an
         # empty file; it is the one pair of axis choices that means nothing.
+        # A refused output file keeps Export off whatever else changes (M4).
         self.buttons.button(QDialogButtonBox.Ok).setEnabled(
-            has_path and ratio_ok and offset_ok and self._writes_anything())
+            has_path and ratio_ok and offset_ok and self._writes_anything()
+            and not self._path_refusal)
 
     def _on_out_path_changed(self):
         """Adopt an existing target file's settings and enable/disable Export."""
         text = self.out_edit.text().strip()
+        settings = read_settings(text)
+        # A dataset the writer cannot grow is refused here, in the writer's
+        # own words, instead of promised an append that fails at the first
+        # flush (M4); the size widgets stay editable for the next path.
+        self._path_refusal = (settings or {}).get("refusal", "")
         self._update_ok_enabled()
 
-        settings = read_settings(text)
-        if settings is not None:
+        if settings is not None and not self._path_refusal:
             # Snippet size, channels and storage are fixed once the datasets
             # exist; overlap is only a default, so it stays editable.
             self._apply_settings(settings)
             for widget in self._fixed_widgets():
                 widget.setEnabled(False)
+            self._append_note.setStyleSheet("color: #0066cc;")
             self._append_note.setText(
                 "Existing dataset - snippets will be appended using its "
                 "snippet size, channels, object radius and storage settings.")
@@ -1815,6 +1869,11 @@ class H5ExportDialog(QDialog):
         # Re-enabling everything may have freed the channels combo although
         # float32 (grayscale-only) is still selected.
         self._on_pixel_format_changed()
+        if self._path_refusal:
+            self._append_note.setStyleSheet("color: #cc0000;")
+            self._append_note.setText(self._path_refusal)
+            return
+        self._append_note.setStyleSheet("color: #0066cc;")
         if text and os.path.exists(text):
             self._append_note.setText("Existing file - snippets will be appended.")
         else:

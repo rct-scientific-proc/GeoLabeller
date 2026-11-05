@@ -109,13 +109,20 @@ class SnippetStrip(QObject):
         # the map is showing, else the one the user asked to see in the
         # linked row, else the lowest id - so a pass down the list looks
         # at every group once, the linked row showing its views. An
-        # unlinked label is an object of one; an object is listed when
-        # any of its views passes the Show filter; the dropdown's choice
-        # of one object lists all of its views as ever.
+        # unlinked label is an object of one. The Show filter and its
+        # counts go by that row's view (audit 2026-11-05 M2): listing an
+        # object while ANY view needed doing, and counting it done only
+        # when EVERY view was, left a Needs list that a pass of marks
+        # down it could never work off. So finishing the row's view takes
+        # the row off a Needs list and the count falls; "Classes differ"
+        # is the object's (any view); and a review mark or a rating on a
+        # row is the object's - every view takes it (stands_for). The
+        # dropdown's choice of one object lists all of its views as ever.
         self.one_per_object = False
         self._shown_image: "str | None" = None
         self._preferred: dict = {}            # object key -> label id
         self._object_sizes: dict = {}         # a row's label id -> views
+        self._views_by_object: dict = {}      # object key -> its entries
         # Objects whose views disagree on a class (asked for 2026-11-02):
         # marked on the caption and listed by the Show entry "Classes
         # differ", the last on the filter after the needs/done pairs.
@@ -246,9 +253,19 @@ class SnippetStrip(QObject):
         return entry.get("object_id") or ("label", entry["label_id"])
 
     def _members(self, entry: dict) -> list:
-        """Every entry of this one's object."""
-        key = self._object_key(entry)
-        return [e for e in self.entries if self._object_key(e) == key]
+        """Every entry of this one's object (the index _rebuild keeps)."""
+        return list(self._views_by_object.get(self._object_key(entry),
+                                              [entry]))
+
+    def stands_for(self, entry: dict) -> list:
+        """The entries a value given to this one is given to: one per
+        object, every view of its object - the row stands for the whole
+        group, so a review mark or a rating on it is the object's, as
+        one undo step (audit 2026-11-05 M2) - else the entry alone. Not
+        while the dropdown shows one object: its views are listed one by
+        one, and marked one by one. Masks, orientation and size stay
+        per view; their sections do not ask."""
+        return self._members(entry) if self._collapsing() else [entry]
 
     def _representative(self, views: list) -> dict:
         """The view that stands for an object among ``views``: on the
@@ -264,33 +281,23 @@ class SnippetStrip(QObject):
                 return entry
         return min(views, key=lambda e: e["label_id"])
 
-    def _one_per_object(self, listed: list, keep_id) -> list:
-        """``listed`` (the entries the class and filter let through, in
-        order) as one row per object, in the list's order. The snippet
-        in hand stays its object's row: a refill must not move the list
-        under the user."""
-        members: dict = {}
-        for entry in self.entries:
-            members.setdefault(self._object_key(entry), []).append(entry)
-        passing: dict = {}
-        for entry in listed:
-            passing.setdefault(self._object_key(entry), []).append(entry)
+    def _one_per_object(self, in_class: list, keep_id) -> list:
+        """``in_class`` (the entries the Class list lets through, in
+        order) as one row per object, in the list's order - BEFORE the
+        Show filter, which then goes by the row's view (audit 2026-11-05
+        M2). The snippet in hand stays its object's row: a refill must
+        not move the list under the user."""
+        by_object: dict = {}
+        for entry in in_class:
+            by_object.setdefault(self._object_key(entry), []).append(entry)
         rows = []
-        for key, views in passing.items():
+        for views in by_object.values():
             in_hand = next((e for e in views if e["label_id"] == keep_id), None)
-            row = in_hand if in_hand is not None else self._representative(views)
-            self._object_sizes[row["label_id"]] = len(members[key])
-            rows.append(row)
+            rows.append(in_hand if in_hand is not None
+                        else self._representative(views))
         rows.sort(key=lambda e: (e["class_name"], e["image_name"],
                                  e["label_id"]))
         return rows
-
-    def _row_matches(self, entry: dict) -> bool:
-        """Does this row still belong on the list: the entry passes the
-        filter - or, one per object, any view of its object does."""
-        if self._collapsing():
-            return any(self.matches(e) for e in self._members(entry))
-        return self.matches(entry)
 
     def _linked_objects(self) -> list:
         """(object_id, caption) for each object with two or more labels,
@@ -542,17 +549,28 @@ class SnippetStrip(QObject):
         self._thumb_asked = set()
         placeholder = self._placeholder_icon()
         self.entries_by_label = {e["label_id"]: e for e in self.entries}
-        classes_of: dict = {}
+        # Views by object, once per refill: what a row stands for, the
+        # "(n views)" on its caption, the objects whose classes differ.
+        views: dict = {}
         for entry in self.entries:
-            classes_of.setdefault(self._object_key(entry), set()).add(
-                entry["class_name"])
-        self._differing = {key for key, names in classes_of.items()
-                           if len(names) > 1}
+            views.setdefault(self._object_key(entry), []).append(entry)
+        self._views_by_object = views
+        self._differing = {key for key, group in views.items()
+                           if len({e["class_name"] for e in group}) > 1}
         keep_id = self._current_id
+        candidates = [e for e in self.entries if self.in_class(e)]
+        self._object_sizes = {}
+        if self._collapsing():
+            # One row per object first, the Show filter on that row's
+            # view second (M2): the list and its counts agree, and a
+            # finished row leaves a Needs list whatever its other views
+            # still need - the linked row shows them.
+            candidates = self._one_per_object(candidates, keep_id)
+            self._object_sizes = {
+                row["label_id"]: len(views[self._object_key(row)])
+                for row in candidates}
         listed = []
-        for entry in self.entries:
-            if not self.in_class(entry):
-                continue
+        for entry in candidates:
             # A refill (every undo, Move label, any map edit) keeps the
             # snippet in hand listed though it no longer needs doing,
             # as refresh does: it is retired when the user moves off it
@@ -562,9 +580,6 @@ class SnippetStrip(QObject):
                     or entry["label_id"] != keep_id):
                 continue
             listed.append(entry)
-        self._object_sizes = {}
-        if self._collapsing():
-            listed = self._one_per_object(listed, keep_id)
         for entry in listed:
             item = QListWidgetItem(placeholder, self._caption(entry))
             item.setData(self.ID_ROLE, entry["label_id"])
@@ -690,27 +705,17 @@ class SnippetStrip(QObject):
         left to do falls as the work is done, where the user chose what
         to look at."""
         in_class = [e for e in self.entries if self.in_class(e)]
-        if self._collapsing():
-            # Objects, not views: one to do while any view needs doing.
-            objects: dict = {}
-            for entry in in_class:
-                objects.setdefault(self._object_key(entry), []).append(entry)
-            in_class = list(objects.values())
-            labels = [f"All ({len(in_class)} objects)"]
-            for worklist in self._worklists:
-                done = sum(1 for views in in_class
-                           if all(worklist.is_done(e) for e in views))
-                labels += [f"{worklist.needs} ({len(in_class) - done})",
-                           f"{worklist.done} ({done})"]
-            differ = sum(1 for views in in_class
-                         if self.classes_differ(views[0]))
-        else:
-            labels = [f"All ({len(in_class)})"]
-            for worklist in self._worklists:
-                done = sum(1 for e in in_class if worklist.is_done(e))
-                labels += [f"{worklist.needs} ({len(in_class) - done})",
-                           f"{worklist.done} ({done})"]
-            differ = sum(1 for e in in_class if self.classes_differ(e))
+        collapsing = self._collapsing()
+        if collapsing:
+            # Objects, each by the view standing for it (its row), as
+            # the list is (M2): the count falls as the rows are done.
+            in_class = self._one_per_object(in_class, self._current_id)
+        labels = [f"All ({len(in_class)}{' objects' if collapsing else ''})"]
+        for worklist in self._worklists:
+            done = sum(1 for e in in_class if worklist.is_done(e))
+            labels += [f"{worklist.needs} ({len(in_class) - done})",
+                       f"{worklist.done} ({done})"]
+        differ = sum(1 for e in in_class if self.classes_differ(e))
         labels.append(f"Classes differ ({differ})")
         self.filter_combo.blockSignals(True)
         for index, text in enumerate(labels):
@@ -753,11 +758,11 @@ class SnippetStrip(QObject):
         Finishing a snippet should take it off a Needs list - but not while
         it is the one being worked on, which would move the list under the
         user. So it goes when they move on, and the count has already told
-        them it counted.
+        them it counted. One per object, by the row's own view (M2).
         """
         entry = self.entries_by_label.get(label_id)
         item = self.items_by_label.get(label_id)
-        if entry is None or item is None or self._row_matches(entry):
+        if entry is None or item is None or self.matches(entry):
             return
         if self._current_id == label_id:
             return

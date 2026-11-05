@@ -252,8 +252,10 @@ def _write_recovery_snapshot(
     """
     try:
         tmp_path = recovery_path.with_suffix(recovery_path.suffix + ".tmp")
+        # One dumps call, as save() does (2.9.11): json.dump streams in
+        # small writes and holds the GIL far longer.
         with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, separators=(",", ":"))
+            f.write(json.dumps(snapshot, separators=(",", ":")))
         os.replace(tmp_path, recovery_path)
         crash_marker_path.write_text(datetime.now().isoformat())
     except Exception as e:
@@ -459,6 +461,12 @@ class MainWindow(QMainWindow):
         self._hover_popup = None
         self._hover_loader = None
         self._hover_wanted = None
+        # Images a group removal just deleted, so the row removal that
+        # follows in the same gesture does not scan the project for each
+        # (audit 2026-11-05 P3); and whether anything has changed since
+        # the last recovery snapshot (P4).
+        self._removed_by_group: set = set()
+        self._recovery_dirty = True
         # Last-used export settings, so a re-export doesn't start from scratch.
         # An existing target file's own settings still take precedence.
         self._h5_last_options: dict = {}
@@ -527,6 +535,7 @@ class MainWindow(QMainWindow):
         """
         self.setWindowModified(True)
         self._push_save_state(stored=True)
+        self._recovery_dirty = True
 
     def _push_save_state(self, stored: bool = False,
                          label_id: "int | None" = None):
@@ -3170,6 +3179,8 @@ class MainWindow(QMainWindow):
             editor.masks_changed.connect(self._on_masks_changed)
             editor.orientation_changed.connect(self._on_orientation_changed)
             editor.confidence_changed.connect(self._on_confidence_changed)
+            editor.confidences_changed.connect(
+                self._on_confidences_changed)      # One per object (2.10.1)
             editor.review_changed.connect(self._on_review_changed)
             editor.reviews_changed.connect(self._on_reviews_changed)
             editor.remove_requested.connect(self._on_editor_remove_requested)
@@ -3399,6 +3410,30 @@ class MainWindow(QMainWindow):
                 REVIEW_REJECTED: "rejected - left out of exports",
                 REVIEW_RECHECK: "flagged to look at again",
             }.get(status, "back to not reviewed"), 3000)
+
+    def _on_confidences_changed(self, label_ids, value):
+        """Store one rating on many labels - every view of an object, in
+        the Snippet Editor's One per object list (2.10.1, audit
+        2026-11-05 M2) - as ONE undo step; 0 clears them."""
+        if value != CONFIDENCE_UNSET and valid_confidence(value) != value:
+            return
+        labels = [label for label in
+                  (self.project.get_label_by_id(i)[1] for i in label_ids)
+                  if label is not None]
+        if not labels:
+            return
+        with self._recorded("Rate confidence",
+                            labels=[label.id for label in labels]):
+            for label in labels:
+                if label.confidence != value:
+                    label.confidence = value
+                    self._stamp(label, "confidence")
+        self._mark_unsaved()
+        self._schedule_refresh("labeled", "snippets")
+        n = len(labels)
+        self.statusBar.showMessage(
+            f"Confidence cleared for {n} labels" if not value
+            else f"{n} labels rated {value} of 5", 3000)
 
     def _on_confidence_changed(self, label_id, value):
         """Store a rating (1-5) the Snippet Editor reports; 0 clears it."""
@@ -3687,6 +3722,23 @@ class MainWindow(QMainWindow):
             # ...and its object, for one marker per object (2.9.2).
             self.canvas.set_label_object(label.id, label.object_id)
 
+    @staticmethod
+    def _class_colours_shifted(step) -> bool:
+        """Did the step move an existing class to another place in the
+        class list? Marker colours index that list, so then every marker
+        is redrawn. A class appended, or renamed in place, moves none,
+        and the step's own labels are redrawn anyway: "classes" in the
+        step's lists used to rebuild all 20,000 markers and the labelled
+        panel for a one-label class change that typed a new name - 3.3 s
+        to undo (audit 2026-11-05 P2)."""
+        before = step.lists_before.get("classes")
+        after = step.lists_after.get("classes")
+        if before is None or after is None:
+            return before is not None or after is not None
+        common = set(before) & set(after)
+        return any(before.index(name) != after.index(name)
+                   for name in common)
+
     def _refresh_label_markers(self):
         """Refresh all label markers on the canvas."""
         self.canvas.clear_label_markers()
@@ -3804,6 +3856,7 @@ class MainWindow(QMainWindow):
                                 images=images, lists=lists,
                                 all_labels=all_labels, coalesce=token):
             yield
+        self._recovery_dirty = True
 
     def _history_token(self):
         if not self._history_turn_open:
@@ -3858,7 +3911,8 @@ class MainWindow(QMainWindow):
         """
         ids = step.label_ids()
         lists = set(step.lists_before) | set(step.lists_after)
-        if len(ids) > self._HISTORY_REDRAW_ALL or "classes" in lists:
+        if (len(ids) > self._HISTORY_REDRAW_ALL
+                or self._class_colours_shifted(step)):
             self._refresh_label_markers()
         else:
             for label_id in ids:
@@ -3896,6 +3950,7 @@ class MainWindow(QMainWindow):
         self.setWindowModified(self._has_unsaved_changes() if at_save
                                else True)
         self._push_save_state()
+        self._recovery_dirty = True
         self._recovery_soon_timer.start()
         if len(ids) == 1:
             self._bring_into_view(next(iter(ids)))
@@ -4071,6 +4126,11 @@ class MainWindow(QMainWindow):
         if image is not None:
             return image
         wanted = os.path.normcase(canonical_path(file_path))
+        # A row of a group just removed misses here by design: its image
+        # is gone. Scanning 12,500 keys for each of 500 such rows cost
+        # 3.4 s per group removal (audit 2026-11-05 P3).
+        if wanted in self._removed_by_group:
+            return None
         for key, image in self.project.images.items():
             if os.path.normcase(key) == wanted:
                 return image
@@ -4126,6 +4186,8 @@ class MainWindow(QMainWindow):
         images = self._images_to_remove([], group_paths)
         if not images:
             return
+        self._removed_by_group = {
+            os.path.normcase(canonical_path(image.path)) for image in images}
         removed_images, removed_labels = \
             self._remove_images_from_project(images)
         self._mark_unsaved()
@@ -4140,8 +4202,10 @@ class MainWindow(QMainWindow):
         "Remove" was view-only - the images and labels survived in the
         project and all came back on the next open.
         """
-        removed_images, removed_labels = self._remove_images_from_project(
-            self._images_to_remove(entries))
+        images = self._images_to_remove(entries)
+        self._removed_by_group = set()       # the gesture is complete
+        removed_images, removed_labels = \
+            self._remove_images_from_project(images)
         if not removed_images:
             return
         self._mark_unsaved()
@@ -4150,14 +4214,19 @@ class MainWindow(QMainWindow):
     def _after_project_removal(self, removed_images: int,
                                removed_labels: int):
         """Refresh every surface that listed the images just deleted."""
-        # Removing an image can leave the OTHER half of a linked pair alone
-        # in its object group: without this the survivor keeps the halo that
-        # says it is linked, while the panel correctly shows it is not.
-        self._update_ring_colors()
-        self.layer_panel.refresh_labeled_panel(self.project)
-        # The Snippet Editor too, not only the sidebar: it holds its own
-        # copy of the labels and went on listing the ones just deleted.
-        self._reseat_open_editors()
+        if removed_labels:
+            # Removing an image can leave the OTHER half of a linked pair
+            # alone in its object group: without this the survivor keeps
+            # the halo that says it is linked, while the panel correctly
+            # shows it is not. An image without labels was in none of
+            # these - the labelled panel's rebuild alone was 1 s at
+            # 20,000 labels (audit 2026-11-05 P3).
+            self._update_ring_colors()
+            self.layer_panel.refresh_labeled_panel(self.project)
+            # The Snippet Editor too, not only the sidebar: it holds its
+            # own copy of the labels and went on listing the ones just
+            # deleted.
+            self._reseat_open_editors()
         self._refresh_hard_negative_panel()
         self._update_waterfall_projections()
         self.statusBar.showMessage(
@@ -4208,16 +4277,7 @@ class MainWindow(QMainWindow):
         self.project = LabelProject()
         self._project_path = None
         self._set_saved_baseline()
-
-        # Clear cycle mode state
-        self._cycle_layers.clear()
-        self._cycle_group.clear()
-        self._cycle_index = -1
-        self._cycle_mode = None
-        self._cycle_at_end = False
-        self._cycle_parked.clear()
-        self._cycle_turned_on.clear()
-        self._cycle_shown = None
+        self._forget_cycle()
 
         # Clear canvas and UI
         self.canvas.clear_label_markers()
@@ -4291,6 +4351,41 @@ class MainWindow(QMainWindow):
     def _clear_recent_projects(self):
         recent.clear_projects()
 
+    def _forget_cycle(self):
+        """Drop the cycle state - the layer ids and parking of a project
+        that is going away (New, Open, Open Recovery)."""
+        self._cycle_layers.clear()
+        self._cycle_group.clear()
+        self._cycle_index = -1
+        self._cycle_mode = None
+        self._cycle_at_end = False
+        self._cycle_parked.clear()
+        self._cycle_turned_on.clear()
+        self._cycle_shown = None
+
+    def _seat_project_controls(self, title: str):
+        """Every control that reads the project, onto the project just
+        assigned - BEFORE its images load, not after.
+
+        The load is asynchronous and the window stays live. Until 2.10.1
+        the class combo, the right-click class menu (canvas.class_names),
+        the description presets, the waypoint and hard-negative panels,
+        the cycle state and a hover read in flight were the previous
+        project's for the whole load, and a label placed meanwhile was
+        written with a class the new project did not have, which the H5
+        export then dropped (audit 2026-11-05 H1). The Snippet Editor
+        was moved here for the same reason in 2.9.12 (audit 2026-10-28
+        H5). The calls after the load catch up on what the load itself
+        changed.
+        """
+        self._forget_cycle()
+        self._hover_wanted = None
+        self._update_class_combo()
+        self._refresh_waypoints()
+        self._refresh_hard_negative_panel()
+        self._reseat_open_editors()
+        self._apply_title(title)
+
     def _load_project_file(self, file_path):
         """Open the project at ``file_path``, whoever chose it.
 
@@ -4319,12 +4414,8 @@ class MainWindow(QMainWindow):
             # imagery relocated beside the project, metadata backfilled
             # into an older file - is a real change, worth saving.
             self._set_saved_baseline()
-            # The Snippet Editor and the sidebar onto the new project NOW,
-            # not when its images have loaded: for that whole load the
-            # editor showed the old project while every key wrote to the
-            # new project's label of the same id (audit 2026-10-28 H5,
-            # 2.9.12). The re-seat after the load is then a no-op.
-            self._reseat_open_editors()
+            self._seat_project_controls(
+                f"{app_title()} - {self._project_path.name}")
 
             # Show progress for loading images
             num_images = len(self.project.images)
@@ -4333,12 +4424,7 @@ class MainWindow(QMainWindow):
                 # Start async project loading
                 self._start_project_image_loading()
             else:
-                self._update_class_combo()
                 self._refresh_label_markers()
-                self._refresh_waypoints()
-                self._refresh_hard_negative_panel()
-                self._apply_title(
-                    f"{app_title()} - {self._project_path.name}")
                 self.statusBar.showMessage(
                     f"Opened project with {
                         self.project.label_count} labels", 3000)
@@ -4606,7 +4692,8 @@ class MainWindow(QMainWindow):
             self._history.clear()
             self.project = LabelProject.load(source)
             self._set_saved_baseline(recovered=True)
-            self._reseat_open_editors()         # as _load_project_file (2.9.12)
+            self._seat_project_controls(
+                f"{app_title()} - Recovered Session (unsaved)")
 
             # Show progress for loading images
             num_images = len(self.project.images)
@@ -4614,12 +4701,7 @@ class MainWindow(QMainWindow):
                 self._show_progress(num_images, "Restoring session")
                 self._start_project_image_loading()
             else:
-                self._update_class_combo()
                 self._refresh_label_markers()
-                self._refresh_waypoints()
-                self._refresh_hard_negative_panel()
-
-            self._apply_title(f"{app_title()} - Recovered Session (unsaved)")
             self.statusBar.showMessage(
                 f"Restored {self.project.label_count} labels from recovery", 5000)
 
@@ -4646,6 +4728,14 @@ class MainWindow(QMainWindow):
         try:
             if self.project.label_count == 0 and not self.project.images:
                 return
+            # Nothing has changed since the last snapshot: the file on
+            # disk already says it. Every minute of an idle session, and
+            # 5 s after each burst of strokes, used to rebuild and rewrite
+            # 13 MB regardless - 0.2-0.5 s on the UI thread and a second
+            # of the writer holding the GIL at 20,000 labels (audit
+            # 2026-11-05 P4). The flag is raised by every edit and undo.
+            if not self._recovery_dirty:
+                return
 
             # Skip if a previous autosave hasn't finished yet (don't queue up
             # writes if a save is genuinely slow).
@@ -4657,6 +4747,7 @@ class MainWindow(QMainWindow):
             # with the project state. This is pure-Python and does not perform
             # any I/O.
             snapshot = self.project.to_dict()
+            self._recovery_dirty = False
             recovery_path = RECOVERY_FILE
             crash_marker_path = CRASH_MARKER_FILE
 
@@ -4707,6 +4798,7 @@ class MainWindow(QMainWindow):
 
     def _clear_recovery_file(self):
         """Clear the recovery file (called after manual save or new project)."""
+        self._recovery_dirty = False         # the save holds it all
         try:
             if RECOVERY_FILE.exists():
                 RECOVERY_FILE.unlink()

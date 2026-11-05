@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from PyQt5.QtCore import QPoint, QSize, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QIcon, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QComboBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu,
@@ -283,14 +283,27 @@ class SnippetPanel(QWidget):
         self._request_in_view()
 
     def _rows_in_view(self) -> tuple:
-        """The first and last row the viewport shows; (-1, -1) if none."""
+        """The first and last row the viewport shows; (-1, -1) if none.
+
+        From the geometry: the strip is one column of equal cells, so
+        the row at a viewport height is the scroll position plus that
+        height, over the cell height. Not from a hit test - a point
+        probed in the 4 px gap under each tile hit no item, which read
+        as the strip's first or last row, and the fill then asked for
+        every tile (audit 2026-11-05 P1, 2.10.1)."""
         count = self.list.count()
         if not count:
             return -1, -1
-        viewport = self.list.viewport()
-        first = self.list.indexAt(QPoint(4, 4)).row()
-        last = self.list.indexAt(QPoint(4, viewport.height() - 4)).row()
-        return (max(0, first), count - 1 if last < 0 else last)
+        cell = max(1, self.list.gridSize().height())
+        top = self.list.verticalScrollBar().value()
+        first = min(top // cell, count - 1)
+        last = min((top + self.list.viewport().height()) // cell, count - 1)
+        return first, last
+
+    def _rows_per_screen(self) -> int:
+        """The most rows a viewport's height can touch."""
+        cell = max(1, self.list.gridSize().height())
+        return self.list.viewport().height() // cell + 2
 
     def _request_in_view(self):
         """Ask for the pictures of the rows on screen and a screen's
@@ -298,13 +311,17 @@ class SnippetPanel(QWidget):
         more: the rest are asked for as they scroll into view, so a
         strip of 20,000 costs what the user looks at. A Display
         Settings change, which remakes every tile, re-reads these
-        few (audit 2026-10-28 P2, 2.9.15)."""
+        few (audit 2026-10-28 P2, 2.9.15). Whatever the rows say, the
+        window is a screenful and the margin another either side, so
+        one request is a few screens at most (P1, 2.10.1)."""
         if not self._unloaded:
             return
         first, last = self._rows_in_view()
         if first < 0:
             return
-        margin = max(8, last - first + 1)
+        screen = self._rows_per_screen()
+        last = min(last, first + screen - 1)
+        margin = max(8, screen)
         wanted = []
         for row in range(max(0, first - margin),
                          min(self.list.count(), last + margin + 1)):

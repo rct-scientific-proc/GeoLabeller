@@ -84,25 +84,35 @@ class Step:
 
 # -- reading and writing project state ---------------------------------------
 
-def _label_state(project, label_id):
-    entry = project._label_id_index.get(label_id)
-    if entry is None:
-        return None
-    path, label = entry
-    image = project.images.get(path)
-    if image is None:
-        return None
-    index = next((i for i, lab in enumerate(image.labels) if lab is label),
-                 len(image.labels))
-    return (path, index, copy.deepcopy(label))
+def _label_states(project, label_ids) -> dict:
+    """The state of each label: (image path, place in its list, copy), or
+    None where the project has no such label.
+
+    A label's place comes from its image (``ImageData.index_of``), which
+    walks its list once and remembers, not from a walk per label: at
+    10,000 labels on one scene a sweep step's two snapshots were 2.5 s
+    of scanning (audit 2026-11-05 P5, 2.10.1).
+    """
+    states = {}
+    for label_id in label_ids:
+        entry = project._label_id_index.get(label_id)
+        image = project.images.get(entry[0]) if entry is not None else None
+        if image is None:
+            states[label_id] = None
+            continue
+        path, label = entry
+        states[label_id] = (path, image.index_of(label), copy.deepcopy(label))
+    return states
 
 
 # What an ImageData keeps for itself and a snapshot must not copy: the
 # pyproj transformers (deep-copying one builds a new PROJ object - two per
 # image, 9 s and a gigabyte held for a 13,000-image step, audit 2026-10-28
-# H7) and the derived corners, which rebuild on demand from the fields.
+# H7), the derived corners, which rebuild on demand from the fields, and
+# the remembered places of its labels (P5), which are for its own list.
 _IMAGE_CACHES = ("_to_wgs84_transformer", "_from_wgs84_transformer",
-                 "_cached_transformer_epsg", "_derived_cache")
+                 "_cached_transformer_epsg", "_derived_cache", "_label_at",
+                 "_taken_out")
 
 
 def _image_state(project, path):
@@ -120,15 +130,22 @@ def _list_state(project, name):
     return copy.deepcopy(getattr(project, name))
 
 
-def _take_label_out(project, label_id):
-    entry = project._label_id_index.get(label_id)
-    if entry is None:
-        return
-    path, label = entry
-    project._unindex_label(label)
-    image = project.images.get(path)
-    if image is not None:
-        image.labels = [lab for lab in image.labels if lab is not label]
+def _take_labels_out(project, label_ids):
+    """Take these labels out of the project: each image's list is
+    rebuilt once, without them, not once per label (P5, 2.10.1)."""
+    leaving: dict = {}              # image path -> id() of each label going
+    for label_id in label_ids:
+        entry = project._label_id_index.get(label_id)
+        if entry is None:
+            continue
+        path, label = entry
+        project._unindex_label(label)
+        leaving.setdefault(path, set()).add(id(label))
+    for path, gone in leaving.items():
+        image = project.images.get(path)
+        if image is not None:
+            image.labels = [lab for lab in image.labels
+                            if id(lab) not in gone]
 
 
 def _reorder_images(project, order):
@@ -162,8 +179,7 @@ def _apply(project, labels: dict, images: dict, lists: dict,
     location tag set since by an older build - and undoing an older
     step used to rewind those too (audit 2026-10-28 M6, 2.9.15).
     """
-    for label_id in labels:
-        _take_label_out(project, label_id)
+    _take_labels_out(project, labels)
     # An entry the project no longer has comes back BEFORE the labels do:
     # undoing a removal of images, its labels need somewhere to return to.
     # (Put back after them, as it once was, they were skipped for want of
@@ -171,17 +187,33 @@ def _apply(project, labels: dict, images: dict, lists: dict,
     for path, state in images.items():
         if state is not None and path not in project.images:
             project.images[path] = copy.deepcopy(state)
-    # Back in list order, so a whole image's labels return to their places.
-    ordered = sorted(((state[1], label_id, state)
-                      for label_id, state in labels.items()
-                      if state is not None), key=lambda item: item[0])
-    for index, _label_id, (path, _index, stored) in ordered:
+    # Back in list order, so a whole image's labels return to their
+    # places: each image's list is rebuilt once, the returning labels
+    # merged in at their places, lowest first - an insert per label
+    # walked the list each time (P5, 2.10.1). Two recorded at one place
+    # (a step that took out neighbours one after the other) return in
+    # the order they were recorded, which is the order they had.
+    returning: dict = {}            # image path -> [(place, stored copy)]
+    for state in labels.values():
+        if state is not None:
+            returning.setdefault(state[0], []).append((state[1], state[2]))
+    for path, states in returning.items():
         image = project.images.get(path)
         if image is None:
             continue            # the image left the project; nothing to hold it
-        label = copy.deepcopy(stored)   # the stored copy stays pristine
-        image.labels.insert(min(index, len(image.labels)), label)
-        project._index_label(label, path)
+        states.sort(key=lambda item: item[0])
+        existing = image.labels
+        merged: list = []
+        k = 0
+        for index, stored in states:
+            while len(merged) < index and k < len(existing):
+                merged.append(existing[k])
+                k += 1
+            label = copy.deepcopy(stored)   # the stored copy stays pristine
+            merged.append(label)
+            project._index_label(label, path)
+        merged.extend(existing[k:])
+        image.labels = merged
     for path, state in images.items():
         image = project.images.get(path)
         if state is None:
@@ -277,7 +309,7 @@ class EditHistory:
         """
         label_ids = set(project._label_id_index) if all_labels \
             else set(labels)
-        before_labels = {i: _label_state(project, i) for i in label_ids}
+        before_labels = _label_states(project, label_ids)
         before_images = {p: _image_state(project, p) for p in images}
         order_before = tuple(project.images) if images else None
         before_lists = {n: _list_state(project, n) for n in lists}
@@ -294,7 +326,7 @@ class EditHistory:
         step = Step(
             name=name,
             labels_before=before_labels,
-            labels_after={i: _label_state(project, i) for i in before_labels},
+            labels_after=_label_states(project, before_labels),
             images_before=before_images,
             images_after={p: _image_state(project, p) for p in images},
             lists_before=before_lists,

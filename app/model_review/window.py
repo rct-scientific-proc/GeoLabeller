@@ -1154,6 +1154,7 @@ class ModelReviewWindow(QWidget):
         self._undo.clear()
         self._redo.clear()
         self._page_start = 0
+        self.scroll.verticalScrollBar().setValue(0)     # a fresh page (M6)
         self._listed = []               # the grid's list is this file's
         self._set_detail(None)
         self._chips_gen += 1
@@ -1231,6 +1232,7 @@ class ModelReviewWindow(QWidget):
             if chip is not None:
                 anchors[key] = (chip.image_name, chip.file_x, chip.file_y,
                                 chip.predicted)
+        self._place_labels(notes)
         try:
             outcomes.write_outcomes(self._path, notes, misplaced, anchors)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -1250,6 +1252,19 @@ class ModelReviewWindow(QWidget):
                       "were. They hold for this session. Open the file "
                       "again to review it as it is now.")
         return not misplaced
+
+    def _place_labels(self, notes: dict):
+        """Each note takes its label's position as it stands, whenever
+        the file is written (2.10.1): what _at_its_place tests the label
+        against on the next open, in place of the chip size in hand."""
+        find = getattr(self._project(), "get_label_by_id", None)
+        for verdict in notes.values():
+            if verdict is None or verdict.label_id is None or find is None:
+                continue
+            _image, label = find(verdict.label_id)
+            if label is not None:
+                verdict.label_x = float(label.pixel_x)
+                verdict.label_y = float(label.pixel_y)
 
     def record_outcomes(self, notes: dict) -> bool:
         """An import went through (main window): each chip takes its
@@ -1399,21 +1414,22 @@ class ModelReviewWindow(QWidget):
                 # import onto it undone: the note is stale, and the chip
                 # is labelled already by that label (2.9.6).
                 label = None
-            if label is not None and math.hypot(
-                    float(label.pixel_x) - chip.anchor_x,
-                    float(label.pixel_y) - chip.anchor_y) \
-                    > self.chip_spin.value():
-                # Further than a chip's width from where the chip was
-                # reviewed: not this chip's label, whatever its id says.
-                # Ids used to be handed out again after an undo or Clear
-                # All, and a note then latched onto a stranger - the chip
-                # jumped onto it, and an Ignore deleted it (2.9.11).
+            if (label is not None and chip.held != label.id
+                    and not self._at_its_place(chip, label)):
+                # Not where the note left it: not this chip's label,
+                # whatever its id says. Ids used to be handed out again
+                # after an undo or Clear All, and a note then latched
+                # onto a stranger - the chip jumped onto it, and an
+                # Ignore deleted it (2.9.11). A label once taken is
+                # followed wherever the map moves it: ids only rise, so
+                # within a session that id is this label.
                 label = None
         if label is None:
             if not chip.label_gone:
                 chip.label_gone = True
                 chip.unseat()
             return
+        chip.held = label.id
         if chip.label_gone:
             chip.label_gone = False     # back (an undo undone)
         if chip.verdict == earlier.became:
@@ -1424,12 +1440,35 @@ class ModelReviewWindow(QWidget):
         # move thrown away; by value, a move imported with no user name
         # set records an entry equal in every field (2.8.17).
         where = (float(label.pixel_x), float(label.pixel_y))
+        # The note knows where its label is now: a label moved by hand,
+        # removed and brought back is taken again from there.
+        earlier.label_x, earlier.label_y = where
         if where == (chip.anchor_x, chip.anchor_y):
             return                  # nothing moved
         if chip.moved_since_import():
             chip.anchor_at(*where)      # a staged move stays staged
         else:
             chip.seat(*where)
+
+    def _at_its_place(self, chip, label) -> bool:
+        """Is the label where the chip's note left it: within the Import
+        Options distance of the position the note stores, or - for a
+        note of before 2.10.1, which stores none - within a chip's width
+        of the anchor. Ids are never handed out twice (2.9.11), so this
+        is belt and braces against a stranger's id: an old project's, or
+        another project's. The chip-size rule measured against the size
+        in hand, a setting: a chip re-centred further than a later,
+        smaller size was "not this chip's" on the next open - plain,
+        listed again, and a second verdict made a second label (audit
+        2026-11-05 M1)."""
+        earlier = chip.earlier
+        if earlier.label_x is not None and earlier.label_y is not None:
+            return math.hypot(float(label.pixel_x) - earlier.label_x,
+                              float(label.pixel_y) - earlier.label_y) \
+                <= labelled.default_distance()
+        return math.hypot(float(label.pixel_x) - chip.anchor_x,
+                          float(label.pixel_y) - chip.anchor_y) \
+            <= self.chip_spin.value()
 
     def note(self, text: str):
         """A word for the status line - what an import came to, say."""
@@ -1639,9 +1678,18 @@ class ModelReviewWindow(QWidget):
             landing = self._landing(old_keys, fresh_keys, want)
             want = (landing if landing is not None
                     else max(0, len(fresh_keys) - per_page))
-        self._page_start = want
-        self._rebuild()
+        self._turn_to(want)
         return True
+
+    def _turn_to(self, start: int):
+        """A fresh page beginning at ``start``, read from its top. The
+        bar kept its value across a rebuild, so Next pressed at the
+        bottom of a page opened the next at ITS bottom, with _fill_order
+        queueing the rows the user reads first last (audit 2026-11-05
+        M6). refresh_earlier's landing keeps its place on purpose."""
+        self._page_start = start
+        self.scroll.verticalScrollBar().setValue(0)
+        self._rebuild()
 
     @staticmethod
     def _landing(old_keys, fresh_keys, want: int) -> "int | None":
@@ -1660,14 +1708,12 @@ class ModelReviewWindow(QWidget):
         self._rebuild()
 
     def _on_show_reviewed(self, _on):
-        self._page_start = 0
         self._fill_filter()             # its counts change with it
-        self._rebuild()
+        self._turn_to(0)
 
     def _on_show_labelled(self, _on):
-        self._page_start = 0
         self._fill_filter()
-        self._rebuild()
+        self._turn_to(0)
 
     def _on_as_new(self, on: bool):
         """Details' tick: the chip in hand wants a new label beside the
@@ -2169,8 +2215,7 @@ class ModelReviewWindow(QWidget):
         self.status.setText(text)
 
     def _on_filter(self, _index):
-        self._page_start = 0
-        self._rebuild()
+        self._turn_to(0)
 
     # -- verdicts -------------------------------------------------------------
 
@@ -2826,8 +2871,7 @@ class ModelReviewWindow(QWidget):
         combo.blockSignals(True)
         combo.setCurrentIndex(max(0, combo.findData("suggestion")))
         combo.blockSignals(False)
-        self._page_start = 0
-        self._rebuild()
+        self._turn_to(0)
 
     def _on_work_done(self, result):
         kind = self._work_kind

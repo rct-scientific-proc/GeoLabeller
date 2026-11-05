@@ -762,6 +762,48 @@ class ImageData:
             location=str(data.get("location", ""))
         )
 
+    # How many labels may be taken out one at a time before the places
+    # are retaken: the search below a remembered place grows with it.
+    _RETAKE_AFTER = 64
+
+    def index_of(self, label: PointLabel) -> int:
+        """Where ``label`` sits in ``labels``; ``len(labels)`` when it is
+        not there.
+
+        The places are taken in one walk and remembered, and a remembered
+        place is checked by identity before it is trusted, so a list
+        rebuilt elsewhere costs one walk more, never a wrong answer. A
+        label taken out through ``take_out`` shifts those after it one
+        place down, so a label is looked for that many places below its
+        remembered one first. Finding every label by its own walk made a
+        history step on a scene of 10,000 labels 2.5 s of scanning, and
+        removing half of them one by one another second (audit 2026-11-05
+        P5, 2.10.1).
+        """
+        labels = self.labels
+        at = getattr(self, "_label_at", None)
+        if at is not None:
+            place = at.get(id(label))
+            if place is not None:
+                lowest = max(place - self._taken_out, 0)
+                for i in range(min(place, len(labels) - 1), lowest - 1, -1):
+                    if labels[i] is label:
+                        return i
+        self._label_at = at = {id(lab): i for i, lab in enumerate(labels)}
+        self._taken_out = 0
+        return at.get(id(label), len(labels))
+
+    def take_out(self, label: PointLabel) -> bool:
+        """Remove ``label`` from ``labels``; False when it is not there."""
+        i = self.index_of(label)
+        if i == len(self.labels):
+            return False
+        del self.labels[i]
+        self._taken_out += 1
+        if self._taken_out > self._RETAKE_AFTER:
+            self._label_at = None
+        return True
+
 
 @dataclass
 class LabelProject:
@@ -1036,15 +1078,16 @@ class LabelProject:
         return image
 
     def remove_label(self, label_id: int):
-        """Remove a label by ID from its image. O(1) lookup via index."""
-        if label_id not in self._label_id_index:
+        """Remove a label by ID from its image: the index names the label
+        and its image, the image knows the label's place (P5, 2.10.1)."""
+        entry = self._label_id_index.get(label_id)
+        if entry is None:
             return
-        image_path, label = self._label_id_index[label_id]
+        image_path, label = entry
         self._unindex_label(label)
-        if image_path in self.images:
-            self.images[image_path].labels = [
-                l for l in self.images[image_path].labels if l.id != label_id
-            ]
+        image = self.images.get(image_path)
+        if image is not None:
+            image.take_out(label)
 
     def get_all_labels(self) -> list[tuple["ImageData", PointLabel]]:
         """Get all labels with their associated image data."""

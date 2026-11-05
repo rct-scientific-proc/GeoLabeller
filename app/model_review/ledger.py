@@ -35,8 +35,9 @@ OUTCOME_KEY = "review"
 
 def outcome_from_record(record) -> "dict | None":
     """The note a file record carries, checked: {"became", "label_id",
-    "by", "at"} with became a class or IGNORE; None for none, or one
-    that cannot be read."""
+    "by", "at"} with became a class or IGNORE, and "label_x" / "label_y"
+    when the note has them (2.10.1); None for none, or one that cannot
+    be read."""
     if not isinstance(record, dict):
         return None
     note = record.get(OUTCOME_KEY)
@@ -50,16 +51,27 @@ def outcome_from_record(record) -> "dict | None":
         label_id = None if label_id is None else int(label_id)
     except (TypeError, ValueError):
         label_id = None
-    return {"became": became.strip(), "label_id": label_id,
-            "by": str(note.get("by") or ""), "at": str(note.get("at") or "")}
+    found = {"became": became.strip(), "label_id": label_id,
+             "by": str(note.get("by") or ""), "at": str(note.get("at") or "")}
+    try:
+        x, y = float(note["label_x"]), float(note["label_y"])
+    except (KeyError, TypeError, ValueError):
+        return found
+    if math.isfinite(x) and math.isfinite(y):
+        found["label_x"], found["label_y"] = x, y
+    return found
 
 
 def outcome_to_dict(verdict) -> dict:
     """The note as written: what the chip became, the label it made or
-    took over, who and when."""
+    took over and where that label was when the note was written -
+    pixels at the project's resolution (2.10.1) - who and when."""
     note = {"became": verdict.became}
     if verdict.label_id is not None:
         note["label_id"] = int(verdict.label_id)
+        if verdict.label_x is not None and verdict.label_y is not None:
+            note["label_x"] = float(verdict.label_x)
+            note["label_y"] = float(verdict.label_y)
     if verdict.by:
         note["by"] = verdict.by
         if verdict.at:
@@ -88,6 +100,12 @@ class Verdict:
     by: str = ""
     at: str = ""
     group: str = ""         # the image's group in the project (2.8.17)
+    # Where the label was when the note was written, at the project's
+    # resolution (2.10.1): what tells the chip's label from a stranger's
+    # id, in place of the chip size in hand - a setting (audit
+    # 2026-11-05 M1).
+    label_x: float | None = None
+    label_y: float | None = None
 
     def ignored(self) -> bool:
         return self.became == IGNORE
