@@ -88,8 +88,8 @@ class LayerPanel(QWidget):
     # all, after the group was "removed". MainWindow deletes them by
     # group membership. The second list says, for each path, whether its
     # group is under the Non-Georeferenced root: a georeferenced group and
-    # its Non-Georeferenced twin share a project path, and each reaches
-    # the row-less images of its own side only (retest panels R1, 2.10.3).
+    # its Non-Georeferenced twin share a project path, and the twin
+    # reaches row-less plain pictures only (retest panels R1, 2.10.3).
     groups_removed = pyqtSignal(list, list)
     # The GROUPS a drag-drop moved: [(old project path, new project
     # path), ...], the outermost of them only, emitted after the
