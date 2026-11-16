@@ -425,6 +425,9 @@ class MainWindow(QMainWindow):
         # ...and where the history stood then: an undo or redo landing
         # anywhere else is a change without hashing the project (2.9.15).
         self._saved_position: "tuple | None" = None
+        # The project file as this window last read or wrote it (see
+        # _file_state); None until a project is opened or saved.
+        self._file_seen: "tuple | None" = None
 
         # Background autosave plumbing: a single worker thread at a time
         # writes the recovery file. The snapshot dict is always built on
@@ -4418,8 +4421,12 @@ class MainWindow(QMainWindow):
             self._close_detector()
             self._close_cleaner()
             self._history.clear()
+            # Taken before the read: a save from elsewhere during it must
+            # not pass for what this window opened (see _changed_on_disk).
+            seen = self._file_state(file_path)
             self.project = LabelProject.load(file_path)
             self._project_path = Path(file_path)
+            self._file_seen = seen
             self._remember_recent_project(file_path)
             # What is on disk. Anything the load goes on to change -
             # imagery relocated beside the project, metadata backfilled
@@ -4854,10 +4861,119 @@ class MainWindow(QMainWindow):
                 file_path += '.geolabel'
             self._do_save(Path(file_path))
 
+    # -- the project file as last seen on disk (hunt M10, 2.10.2) ---------
+    #
+    # Save replaced whatever was at the path: two windows, or two people,
+    # on one project and the last to save won without a word. The window
+    # now remembers the file as it last read or wrote it and asks before
+    # replacing one that is no longer that.
+
+    @staticmethod
+    def _file_key(path) -> str:
+        """One spelling of a file's path, to compare two of them by."""
+        return os.path.normcase(os.path.abspath(str(path)))
+
+    def _file_state(self, path, seen: "tuple | None" = None):
+        """The file at ``path`` as it is now: (path key, size,
+        modification time, sha256 of its bytes); None when it is not
+        there or cannot be read.
+
+        With ``seen``, an earlier state of it: that same tuple when the
+        size and time still match, without reading the file. sha256 and
+        nothing else: md5 and sha1 raise on the FIPS deployments.
+        """
+        try:
+            with open(path, "rb") as handle:
+                stat = os.fstat(handle.fileno())
+                if seen is not None and seen[1:3] == (stat.st_size,
+                                                      stat.st_mtime_ns):
+                    return seen
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(chunk)
+        except OSError:
+            return None
+        return (self._file_key(path), stat.st_size, stat.st_mtime_ns,
+                digest.hexdigest())
+
+    def _changed_on_disk(self, path) -> bool:
+        """Is the file a save is about to replace no longer the one this
+        window last read or wrote?
+
+        Asked only of the open project's own file: a Save As to another
+        path, a new project and a recovered session have nothing
+        remembered to compare with. Not when the file is gone, and not
+        when only its time changed - both the size or time AND the bytes
+        must differ, so a file touched or copied back as it was is taken
+        as seen again. The recovery file is the app's own to rewrite.
+        """
+        seen, current = self._file_seen, self._project_path
+        key = self._file_key(path)
+        if (seen is None or current is None
+                or not seen[0] == key == self._file_key(current)
+                or key == self._file_key(RECOVERY_FILE)):
+            return False
+        now = self._file_state(path, seen)
+        if now is None:
+            return False            # gone, or unreadable: the save says so
+        if now[3] == seen[3]:
+            self._file_seen = now
+            return False
+        return True
+
+    def _wrote_file(self, path):
+        """The app itself just wrote ``path`` - Combine's output, a ground
+        truth export. When that is the open project's file, what is there
+        now is what this window last wrote: Save does not ask about it."""
+        seen = self._file_seen
+        if seen is not None and seen[0] == self._file_key(path):
+            self._file_seen = self._file_state(path)
+
+    def _changed_on_disk_box(self, name: str) -> QMessageBox:
+        """The question asked before Save replaces a project file that
+        was saved from somewhere else since this window read it."""
+        box = QMessageBox(
+            QMessageBox.Warning, "Save Project",
+            f"{name} was changed on disk since you opened it - another "
+            "window or another person saved it.",
+            QMessageBox.NoButton, self)
+        box.replace_button = box.addButton("Replace it",
+                                           QMessageBox.AcceptRole)
+        box.save_as_button = box.addButton("Save As...",
+                                           QMessageBox.ActionRole)
+        cancel = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        return box
+
+    def _ask_changed_on_disk(self, name: str) -> str:
+        """Ask it: "replace", "save_as" or "cancel".
+
+        Its own method so tests can answer it, as _ask_save_changes is -
+        a real modal box under the offscreen platform takes the process
+        down.
+        """
+        box = self._changed_on_disk_box(name)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is box.replace_button:
+            return "replace"
+        if clicked is box.save_as_button:
+            return "save_as"
+        return "cancel"
+
     def _do_save(self, path: Path):
         """Perform the actual save operation."""
+        if self._changed_on_disk(path):
+            choice = self._ask_changed_on_disk(Path(path).name)
+            if choice == "save_as":
+                self._save_project_as()
+            if choice != "replace":
+                return
         try:
             data = self.project.save(path)
+            # At once: whatever fails below, the file is this window's.
+            self._file_seen = self._file_state(path)
             self._project_path = path
             self._remember_recent_project(path)
             self._set_saved_baseline(data=data)
@@ -4924,6 +5040,7 @@ class MainWindow(QMainWindow):
 
             # Save combined project
             combined.save(output_file)
+            self._wrote_file(output_file)
 
             # Show summary
             QMessageBox.information(
@@ -5284,6 +5401,7 @@ class MainWindow(QMainWindow):
                 file_path += '.json'
             try:
                 self.project.save(file_path)
+                self._wrote_file(file_path)
                 self.statusBar.showMessage(
                     f"Exported {
                         self.project.label_count} labels to {file_path}",
@@ -5329,6 +5447,7 @@ class MainWindow(QMainWindow):
 
             with open(file_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
+            self._wrote_file(file_path)
 
             total_labels = sum(len(img['labels']) for img in images)
             self.statusBar.showMessage(
