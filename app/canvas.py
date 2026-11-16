@@ -6561,11 +6561,13 @@ class MapCanvas(QGraphicsView):
         self._link_mode_active = False
         self._link_source_label_id = None
 
-        # Restore cursor based on mode
-        if self._mode in LABELING_MODES:
-            self.setCursor(_crosshair_cursor())
+        # Restore cursor based on mode. A link can end in Pan or Ruler
+        # mode too: it is kept through a mode switch, and a project
+        # switch or its label's removal ends it there (2.10.2).
+        if self._mode == CanvasMode.PAN:
+            self.setCursor(Qt.OpenHandCursor)
         else:
-            self.setCursor(Qt.ArrowCursor)
+            self.setCursor(_crosshair_cursor())
 
         self.link_mode_changed.emit(False, "")
 
