@@ -177,13 +177,24 @@ class GroupMemoryWorker(QObject):
 
 
 def get_recovery_dir() -> Path:
-    """Get the directory for recovery files (platform-specific)."""
+    """Get the directory for recovery files (platform-specific).
+
+    Made here when it can be. When it cannot - a roaming profile on a
+    share that is offline, ``.geolabel`` there as a file - the path is
+    returned all the same: this runs at import, and the mkdir raising
+    there was "GeoLabeller failed to start" (hunt M11, 2.10.2). Arming
+    crash detection then fails on that folder and says, once, that crash
+    recovery is not active; nothing else needs the folder to exist.
+    """
     if platform.system() == "Windows":
         base = Path(os.environ.get("APPDATA", tempfile.gettempdir()))
     else:
         base = Path.home()
     recovery_dir = base / ".geolabel"
-    recovery_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        recovery_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
     return recovery_dir
 
 
