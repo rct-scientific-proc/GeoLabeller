@@ -87,7 +87,11 @@ def write_kml(path, project, colours: dict | None = None,
             if label.review == REVIEW_REJECTED:
                 report.rejected += 1
                 continue
-            if not grounded and (label.lat, label.lon) == (0.0, 0.0):
+            # Where the label is: its own lat / lon, or - for one that came
+            # from a file without them (hunt M9, 2.10.2) - where its pixel
+            # is by the image; None when neither says.
+            ground = image.ground_of(label)
+            if ground is None or (not grounded and ground == (0.0, 0.0)):
                 report.no_ground += 1
                 continue
             folder = folders.get(label.class_name)
@@ -97,7 +101,7 @@ def write_kml(path, project, colours: dict | None = None,
                     label.class_name)
                 folders[label.class_name] = folder
             _placemark(folder, image, label,
-                       _style_id(classes.index(label.class_name)))
+                       _style_id(classes.index(label.class_name)), ground)
             report.written += 1
             report.classes[label.class_name] += 1
     tree = ET.ElementTree(root)
@@ -136,7 +140,8 @@ def _style(document, style_id: str, rgb: str | None):
     ET.SubElement(label_style, _tag("scale")).text = "0.8"
 
 
-def _placemark(folder, image, label, style_id: str):
+def _placemark(folder, image, label, style_id: str, ground: tuple):
+    """One label as a Placemark at ``ground``, its (lat, lon)."""
     mark = ET.SubElement(folder, _tag("Placemark"),
                          {"id": f"label-{int(label.id)}"})
     ET.SubElement(mark, _tag("name")).text = _clean(label.class_name)
@@ -181,7 +186,7 @@ def _placemark(folder, image, label, style_id: str):
         ET.SubElement(entry, _tag("value")).text = _clean(value)
     point = ET.SubElement(mark, _tag("Point"))
     ET.SubElement(point, _tag("coordinates")).text = (
-        f"{float(label.lon):.8f},{float(label.lat):.8f},0")
+        f"{float(ground[1]):.8f},{float(ground[0]):.8f},0")
 
 
 def _tag(name: str) -> str:

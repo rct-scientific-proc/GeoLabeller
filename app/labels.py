@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import math
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -168,6 +169,157 @@ def valid_review(value) -> str:
         else REVIEW_UNREVIEWED
 
 
+# -- what a file may put in the model (hunt M9, 2.10.2) ----------------------
+#
+# A project, a ground truth file, a recovery copy and a project to combine
+# all come in through LabelProject.load, and it used to take each field as
+# the file had it. A file written by a script rather than by this
+# application - a quoted number, a class given as an index, a null where a
+# position belongs - loaded, and then failed wherever the value was first
+# used: Save and the autosave for good, or every later open of the project
+# it had been imported into. Each field is now brought to its declared type
+# as it is read, or the file is refused in one sentence that names the
+# image, the label and the field.
+
+class ProjectFileError(ValueError):
+    """The file cannot be taken in as a project. The message is the one
+    sentence the user is shown, after "Failed to open project:"."""
+
+
+_MISSING = object()         # a field the file does not have at all
+
+
+def _found(value) -> str:
+    """How a refusal says what the file holds."""
+    if value is _MISSING:
+        return "missing"
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float) and not _finite(value):
+        return "NaN" if value != value else (
+            "Infinity" if value > 0 else "-Infinity")
+    if isinstance(value, (int, float)):
+        return f"the number {value!r:.40}"
+    if isinstance(value, str):
+        return f"the text {value[:40]!r}"
+    return "a list" if isinstance(value, list) else "a set of fields"
+
+
+def _refuse(where: str, field: str, value, wanted: str):
+    raise ProjectFileError(
+        f"{where}: {field} is {_found(value)}, not {wanted}.")
+
+
+def _finite(value) -> bool:
+    """A float that is neither NaN nor an infinity (their difference from
+    themselves is NaN, never zero)."""
+    return value - value == 0.0
+
+
+def _number(value, where: str, field: str):
+    """A finite number as the file has it, or the float a text spells
+    ("42.5"); anything else is refused - a bool and a container too."""
+    if isinstance(value, float):
+        if _finite(value):
+            return value
+    elif isinstance(value, int) and not isinstance(value, bool):
+        try:
+            float(value)
+            return value
+        except OverflowError:
+            pass
+    elif isinstance(value, str):
+        try:
+            number = float(value)
+        except ValueError:
+            number = math.nan
+        if _finite(number):
+            return number
+    _refuse(where, field, value, "a number")
+
+
+def _number_or_none(value, where: str, field: str):
+    """As _number, for a value that may be unset: None for null and for
+    a number that is not finite - how a missing value is written by tools
+    that have no null (NaN from a spreadsheet or a data frame)."""
+    if value is None:
+        return None
+    number = value
+    if isinstance(value, str):
+        try:
+            number = float(value)
+        except ValueError:
+            pass
+    if isinstance(number, float) and not _finite(number):
+        return None
+    return _number(value, where, field)
+
+
+def _whole(value, where: str, field: str) -> int:
+    """A whole number: an int, a float without a fraction (300.0) or a
+    text that spells one."""
+    if isinstance(value, bool):
+        _refuse(where, field, value, "a whole number")
+    if isinstance(value, int):
+        return value
+    number = value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            try:
+                number = float(value)
+            except ValueError:
+                pass
+    if isinstance(number, float) and number.is_integer():
+        return int(number)
+    _refuse(where, field, value, "a whole number")
+
+
+def _text(value, where: str, field: str, default=""):
+    """Text as it is; a number as its text (a description written as 5 is
+    "5"); ``default`` for null and for a number that is not finite."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, float):
+        return str(value) if _finite(value) else default
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    _refuse(where, field, value, "text")
+
+
+def _list(value, where: str, field: str) -> list:
+    """A list; an empty one for null."""
+    if isinstance(value, list):
+        return value
+    if value is None:
+        return []
+    _refuse(where, field, value, "a list")
+
+
+def _texts(value, where: str, field: str, each: str) -> list:
+    """A list of texts, each read as _text reads one; null: none."""
+    texts = []
+    for item in _list(value, where, field):
+        text = _text(item, where, each, None)
+        if text is None:
+            _refuse(where, each, item, "text")
+        texts.append(text)
+    return texts
+
+
+def _fields(value, where: str, field: str) -> dict:
+    """One entry of the file - a label, an image, a waypoint: a JSON
+    object, nothing else."""
+    if isinstance(value, dict):
+        return value
+    _refuse(where, field, value, "a set of fields")
+
+
 @dataclass
 class PointLabel:
     """A single point label annotation."""
@@ -182,9 +334,13 @@ class PointLabel:
     pixel_x: float  # column (x)
     pixel_y: float  # row (y)
 
-    # Coordinates in WGS84
-    lon: float
-    lat: float
+    # Coordinates in WGS84. Both None for a label whose file gave it no
+    # ground position - null, NaN, or a latitude off the globe, from a
+    # script that knew only pixels (hunt M9, 2.10.2). ImageData.ground_of
+    # then answers from the image's georeferencing, and what is saved is
+    # a number again, as the format has it.
+    lon: Optional[float]
+    lat: Optional[float]
 
     # Unique ID for this specific label (UUID v4) - always unique per label
     unique_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -282,8 +438,11 @@ class PointLabel:
             "class_name": self.class_name,
             "pixel_x": pct_x,
             "pixel_y": pct_y,
-            "lon": self.lon,
-            "lat": self.lat,
+            # Without a ground position: 0.0, as the format writes it for
+            # imagery that has none (ImageData.to_dict puts the pixel's
+            # own position here when the image can say where that is).
+            "lon": 0.0 if self.lon is None else self.lon,
+            "lat": 0.0 if self.lat is None else self.lat,
             "object_id": self.object_id
         }
         if self.length_m is not None:
@@ -318,7 +477,7 @@ class PointLabel:
 
     @classmethod
     def from_dict(cls, data: dict, image_width: int = 0, image_height: int = 0,
-                  version: str = "2.1") -> "PointLabel":
+                  version: str = "2.1", on: str = "") -> "PointLabel":
         """Create from dictionary.
 
         Args:
@@ -326,45 +485,138 @@ class PointLabel:
             image_width: Original image width for converting percentages back to pixels
             image_height: Original image height for converting percentages back to pixels
             version: Project version for interpreting pixel coordinates
+            on: The image's name, for the sentence a refusal is worded in
+
+        Every field comes out as its declared type, or ProjectFileError
+        is raised (hunt M9, 2.10.2). A label written as this application
+        writes one passes the single test below; any other goes through
+        _checked, field by field.
         """
-        raw_x = data.get("pixel_x", data.get("x", 0))
-        raw_y = data.get("pixel_y", data.get("y", 0))
+        get = data.get
+        label_id, class_name = get("id"), get("class_name")
+        pixel_x = get("pixel_x", get("x", 0))
+        pixel_y = get("pixel_y", get("y", 0))
+        lon, lat = get("lon"), get("lat")
+        length_m, width_m = get("length_m"), get("width_m")
+        px_rad, deg = get("orientation_px_rad"), get("orientation_deg")
+        description, group_id = get("description", ""), get("group_id", "")
+        unique_id, object_id = get("unique_id"), get("object_id")
+        # (x - x == 0.0: a float that is finite, without a call.)
+        if not (type(label_id) is int and type(class_name) is str
+                and type(pixel_x) is float and type(pixel_y) is float
+                and type(lon) is float and lon - lon == 0.0
+                and type(lat) is float and -90.0 <= lat <= 90.0
+                and type(description) is str and type(group_id) is str
+                and type(unique_id) is str and unique_id
+                and type(object_id) is str and object_id
+                and (length_m is None or type(length_m) is float
+                     and length_m - length_m == 0.0)
+                and (width_m is None or type(width_m) is float
+                     and width_m - width_m == 0.0)
+                and (px_rad is None or type(px_rad) is float
+                     and px_rad - px_rad == 0.0)
+                and (deg is None or type(deg) is float
+                     and deg - deg == 0.0)):
+            (label_id, class_name, pixel_x, pixel_y, lon, lat, length_m,
+             width_m, px_rad, deg, description, group_id, unique_id,
+             object_id) = cls._checked(data, on)
 
         # Version 2.1+ stores percentages, convert back to absolute pixels
+        # (older versions store absolute pixel coordinates).
         if version >= "2.1" and image_width > 0 and image_height > 0:
-            pixel_x = raw_x * image_width
-            pixel_y = raw_y * image_height
+            pixel_x = pixel_x * image_width
+            pixel_y = pixel_y * image_height
+        if not (pixel_x - pixel_x == 0 and pixel_y - pixel_y == 0):
+            # NaN, an infinity, or a fraction too large to be a pixel.
+            bad = "pixel_x" if pixel_x - pixel_x != 0 else "pixel_y"
+            _refuse(cls._where(data, on), bad, get(bad, get(bad[-1])),
+                    "a place in the image")
+
+        masks = get("masks")
+        if masks:
+            masks = cls._normalized_masks(
+                _list(masks, cls._where(data, on), "masks"),
+                image_width, image_height, cls._where(data, on))
+        elif masks is None or isinstance(masks, list):
+            masks = []
         else:
-            # Older versions store absolute pixel coordinates
-            pixel_x = raw_x
-            pixel_y = raw_y
+            _refuse(cls._where(data, on), "masks", masks, "a list")
 
         return cls(
-            id=data["id"],
-            class_name=data["class_name"],
+            id=label_id,
+            class_name=class_name,
             pixel_x=pixel_x,
             pixel_y=pixel_y,
-            lon=data["lon"],
-            lat=data["lat"],
-            # Generate UUIDs if not present (backwards compatibility)
-            unique_id=data.get("unique_id") or str(uuid.uuid4()),
-            object_id=data.get("object_id") or str(uuid.uuid4()),
-            length_m=data.get("length_m"),
-            width_m=data.get("width_m"),
-            description=data.get("description", ""),
-            group_id=data.get("group_id", ""),
-            orientation_px_rad=data.get("orientation_px_rad"),
-            orientation_deg=data.get("orientation_deg"),
-            orientation_derived=bool(data.get("orientation_derived", False)),
-            confidence=valid_confidence(data.get("confidence")),
-            review=valid_review(data.get("review")),
-            attribution=valid_attribution(data.get("attribution")),
-            masks=cls._normalized_masks(data.get("masks", []),
-                                        image_width, image_height)
+            lon=lon,
+            lat=lat,
+            unique_id=unique_id,
+            object_id=object_id,
+            length_m=length_m,
+            width_m=width_m,
+            description=description,
+            group_id=group_id,
+            orientation_px_rad=px_rad,
+            orientation_deg=deg,
+            orientation_derived=bool(get("orientation_derived", False)),
+            confidence=valid_confidence(get("confidence")),
+            review=valid_review(get("review")),
+            attribution=valid_attribution(get("attribution")),
+            masks=masks
         )
 
     @staticmethod
-    def _normalized_masks(entries, image_width: int, image_height: int) -> list:
+    def _where(data: dict, on: str) -> str:
+        """How a refusal names a label: by its id when that is one, and
+        by its image."""
+        label_id = data.get("id")
+        return ((f"Label {label_id}" if type(label_id) is int else "A label")
+                + (f" on image {on}" if on else ""))
+
+    @classmethod
+    def _checked(cls, data: dict, on: str) -> tuple:
+        """A label's fields, each brought to its declared type - for a
+        label not written the way this application writes one.
+
+        A number may be spelled as text. A number in a free-text field
+        (description, group id) is its text. lat / lon that are null, not
+        finite or off the globe are no ground position: both None. An
+        identifier the file does not have is made up, as it always was.
+        Refused, naming the label and the field: an id that is not a
+        whole number, a class that is not text (a class index is not a
+        class), a pixel position that is not a finite number, and a bool
+        or a container anywhere a number or text belongs.
+        """
+        get = data.get
+        where = cls._where(data, on)
+        label_id = _whole(get("id", _MISSING), where, "id")
+        class_name = get("class_name", _MISSING)
+        if not isinstance(class_name, str):
+            _refuse(where, "class_name", class_name, "text")
+        pixel_x = _number(get("pixel_x", get("x", 0)), where, "pixel_x")
+        pixel_y = _number(get("pixel_y", get("y", 0)), where, "pixel_y")
+        lon = _number_or_none(get("lon"), where, "lon")
+        lat = _number_or_none(get("lat"), where, "lat")
+        if lon is None or lat is None or not -90.0 <= lat <= 90.0:
+            lon = lat = None
+        return (
+            label_id, class_name, pixel_x, pixel_y, lon, lat,
+            _number_or_none(get("length_m"), where, "length_m"),
+            _number_or_none(get("width_m"), where, "width_m"),
+            _number_or_none(get("orientation_px_rad"), where,
+                            "orientation_px_rad"),
+            _number_or_none(get("orientation_deg"), where,
+                            "orientation_deg"),
+            _text(get("description"), where, "description"),
+            _text(get("group_id"), where, "group_id"),
+            # Generate UUIDs if not present (backwards compatibility)
+            _text(get("unique_id"), where, "unique_id")
+            or str(uuid.uuid4()),
+            _text(get("object_id"), where, "object_id")
+            or str(uuid.uuid4()))
+
+    @staticmethod
+    def _normalized_masks(entries, image_width: int, image_height: int,
+                          where: str = "A label") -> list:
         """Stored mask entries upgraded to the current on-disk form.
 
         Two migrations happen here, so any load-and-save modernizes the
@@ -374,14 +626,28 @@ class PointLabel:
         runs are recomputed arithmetically, never through an image-sized
         array. Without the image dimensions (or on a corrupt rle) the entry
         is kept as stored; readers honor whatever window it records.
+
+        What an entry holds is of the right type, or the file is refused
+        (hunt M9, 2.10.2): the window four whole numbers, the name text,
+        the rle text or a list of whole numbers. What it SAYS - runs that
+        do not add up - is still the readers' to fail on.
         """
         from app.masks import entry_to_full_image
         masks = []
         for m in entries:
-            if isinstance(m.get("rle"), list):
-                m = dict(m, rle=",".join(str(int(r)) for r in m["rle"]))
-            else:
-                m = dict(m)
+            m = dict(_fields(m, where, "a mask"))
+            for key in ("x0", "y0", "width", "height"):
+                if key in m and type(m[key]) is not int:
+                    m[key] = _whole(m[key], where, f"a mask's {key}")
+            if "name" in m and type(m["name"]) is not str:
+                m["name"] = _text(m["name"], where, "a mask's name")
+            rle = m.get("rle")
+            if isinstance(rle, list):
+                m["rle"] = ",".join(
+                    str(r if type(r) is int
+                        else _whole(r, where, "a mask's rle")) for r in rle)
+            elif rle is not None and not isinstance(rle, str):
+                _refuse(where, "a mask's rle", rle, "text")
             if image_width > 0 and image_height > 0:
                 try:
                     m = entry_to_full_image(m, image_width, image_height)
@@ -422,12 +688,24 @@ class Waypoint:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Waypoint":
-        """Create from a serialized dictionary."""
+        """Create from a serialized dictionary.
+
+        Checked as a label's fields are (hunt M9, 2.10.2). A waypoint IS
+        its position, so one without a finite latitude and longitude on
+        the globe is refused rather than kept somewhere it never was.
+        """
+        get = _fields(data, "The project", "a waypoint").get
+        name = get("name", "")
+        where = f"Waypoint {name!r:.40}" if isinstance(name, str) and name \
+            else "A waypoint"
+        lat = float(_number(get("lat", 0.0), where, "lat"))
+        if not -90.0 <= lat <= 90.0:
+            _refuse(where, "lat", get("lat"), "a latitude")
         return cls(
-            id=int(data.get("id", 0)),
-            name=str(data.get("name", "")),
-            lat=float(data.get("lat", 0.0)),
-            lon=float(data.get("lon", 0.0)),
+            id=_whole(get("id", 0), where, "id"),
+            name=_text(name, where, "name"),
+            lat=lat,
+            lon=float(_number(get("lon", 0.0), where, "lon")),
         )
 
 
@@ -591,6 +869,25 @@ class ImageData:
         pixel_x, pixel_y = ~affine * (x_proj, y_proj)
         return (pixel_x, pixel_y)
 
+    def ground_of(self, label: PointLabel) -> Optional[tuple[float, float]]:
+        """(lat, lon) of a label on this image, or None.
+
+        Its own when it has them, as every label placed here does. A
+        label that came from a file without a ground position (lat / lon
+        None: hunt M9, 2.10.2) is where its pixel falls by this image's
+        georeferencing - what a click on that pixel would have recorded;
+        None when the image cannot say (no georeferencing, or a pixel
+        that is nowhere on the ground). Whoever needs a label's place on
+        the ground asks here rather than reading lat / lon.
+        """
+        if label.lat is not None and label.lon is not None:
+            return label.lat, label.lon
+        place = self.pixel_to_latlon(label.pixel_x, label.pixel_y)
+        if place is None or not (math.isfinite(place[0])
+                                 and math.isfinite(place[1])):
+            return None
+        return place
+
     def get_corner_coords(self) -> Optional[dict[str, tuple[float, float]]]:
         """Get WGS84 lat/lon coordinates for the 4 image corners.
 
@@ -643,12 +940,27 @@ class ImageData:
         for idx, label in enumerate(self.labels):
             label_dict = label.to_dict(self.original_width, self.original_height)
 
+            lat, lon = label.lat, label.lon
+            if lat is None or lon is None:
+                # No ground position of its own (see ground_of): written
+                # as where its pixel is, so the file holds numbers, as
+                # the format says. When the image cannot say either, the
+                # 0.0 already in label_dict stands and nothing is
+                # measured from it - geodesic_distance raised here, at
+                # every save and autosave.
+                ground = self.ground_of(label)
+                if ground is None:
+                    label_dicts.append(label_dict)
+                    continue
+                lat, lon = ground
+                label_dict["lat"], label_dict["lon"] = lat, lon
+
             # Calculate distance from left edge of image to label position
             left_edge = left_edge_by_label.get(idx)
             if left_edge is not None:
                 distance_m = geodesic_distance(
                     left_edge[0], left_edge[1],  # left edge lat, lon
-                    label.lat, label.lon         # label lat, lon
+                    lat, lon                     # label lat, lon
                 )
                 label_dict["geodesic_distance"] = round(distance_m, 3)
 
@@ -730,36 +1042,77 @@ class ImageData:
 
     @classmethod
     def from_dict(cls, data: dict, version: str = "2.1") -> "ImageData":
-        """Create from dictionary."""
-        width = data.get("original_width", 0)
-        height = data.get("original_height", 0)
+        """Create from dictionary.
+
+        The image's own fields are brought to their declared types as a
+        label's are, or the file is refused naming the image and the
+        field (hunt M9, 2.10.2): the path text, the name text (a number
+        is its text), the size two whole numbers, the transform six
+        finite numbers or none at all, the EPSG code a whole number.
+        """
+        get = _fields(data, "The project", "an image").get
+        path, name = get("path", _MISSING), get("name", _MISSING)
+        on = (name if isinstance(name, str) and name
+              else os.path.basename(path) if isinstance(path, str) else "")
+        where = f"Image {on}" if on else "An image"
+        if not isinstance(path, str):
+            _refuse(where, "path", path, "text")
+        if name is _MISSING or name is None:
+            _refuse(where, "name", name, "text")
+        name = _text(name, where, "name")
+
+        width, height = get("original_width", 0), get("original_height", 0)
+        if type(width) is not int:
+            width = 0 if width is None else _whole(
+                width, where, "original_width")
+        if type(height) is not int:
+            height = 0 if height is None else _whole(
+                height, where, "original_height")
 
         # Handle reader field - can be dict or legacy reader_ext string
-        reader = data.get("reader", {})
-        if not reader and data.get("reader_ext"):
+        reader = get("reader")
+        if reader is None:
+            reader = {}
+        elif not isinstance(reader, dict):
+            _refuse(where, "reader", reader, "a set of fields")
+        elif not all(type(value) is str for value in reader.values()):
+            reader = {key: _text(value, where, f"reader {key}")
+                      for key, value in reader.items()}
+        if not reader and get("reader_ext"):
             # Convert legacy reader_ext to new format
-            reader = {data["reader_ext"]: "custom"}
+            reader = {_text(get("reader_ext"), where, "reader_ext"): "custom"}
 
+        affine = get("affine_coeffs")
+        if affine is not None:
+            if not (isinstance(affine, (list, tuple)) and len(affine) == 6):
+                _refuse(where, "affine_coeffs", affine, "six numbers")
+            if not all(type(c) is float and c - c == 0.0 for c in affine):
+                affine = [_number(c, where, "a coefficient of affine_coeffs")
+                          for c in affine]
+        crs_epsg = get("crs_epsg")
+        if crs_epsg is not None and type(crs_epsg) is not int:
+            crs_epsg = _whole(crs_epsg, where, "crs_epsg")
+
+        labels = []
+        for index, entry in enumerate(
+                _list(get("labels"), where, "labels"), start=1):
+            if type(entry) is not dict:
+                _fields(entry, where, f"label number {index}")
+            labels.append(PointLabel.from_dict(entry, width, height, version,
+                                               on))
         return cls(
-            path=data["path"],
-            name=data["name"],
-            group=data.get("group", ""),
-            labels=[
-                PointLabel.from_dict(
-                    l,
-                    width,
-                    height,
-                    version) for l in data.get(
-                    "labels",
-                    [])],
+            path=path,
+            name=name,
+            group=_text(get("group"), where, "group"),
+            labels=labels,
             original_width=width,
             original_height=height,
             reader=reader,
-            affine_coeffs=data.get("affine_coeffs"),
-            crs_epsg=data.get("crs_epsg"),
-            crs_wkt=data.get("crs_wkt"),
-            hard_negative_source=bool(data.get("hard_negative_source", False)),
-            location=str(data.get("location", ""))
+            affine_coeffs=affine,
+            crs_epsg=crs_epsg,
+            crs_wkt=_text(get("crs_wkt"), where, "crs_wkt", None),
+            hard_negative_source=bool(get("hard_negative_source", False)),
+            location=_text(get("location"), where, "location")
         )
 
     # How many labels may be taken out one at a time before the places
@@ -1049,7 +1402,10 @@ class LabelProject:
             return False
         old_path, label = entry
         label.pixel_x, label.pixel_y = float(pixel_x), float(pixel_y)
-        label.lon, label.lat = float(lon), float(lat)
+        # None stays None: a label without a ground position, moved on an
+        # image that has none to give it (see ImageData.ground_of).
+        label.lon = None if lon is None else float(lon)
+        label.lat = None if lat is None else float(lat)
         if image_path and canonical_path(image_path) != canonical_path(
                 old_path):
             if image_path not in self.images:
@@ -1379,42 +1735,82 @@ class LabelProject:
 
     @classmethod
     def load(cls, file_path: str | Path) -> "LabelProject":
-        """Load project from JSON file."""
+        """Load project from JSON file.
+
+        Raises ProjectFileError - one sentence naming the image, the
+        label and the field - for a file whose values are not of the
+        types the format gives them (hunt M9, 2.10.2; see _checked).
+        Open, Import Ground Truth, Combine and the recovery restore all
+        read through here and show that sentence; nothing of a refused
+        file reaches a project.
+        """
         # UTF-8, as the ICD says the file is: with the locale's codec a
         # file another tool wrote with accented class names came back
         # mangled, or would not open at all (2.9.11).
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
+        if not isinstance(data, dict):
+            raise ProjectFileError(
+                f"The file is not a GeoLabeller project: it holds "
+                f"{_found(data)} where a project's fields belong.")
+        get = data.get
+        top = "The project"
 
         project = cls()
-        project.classes = data.get("classes", [])
+        project.classes = _list(get("classes"), top, "classes")
+        for name in project.classes:
+            if not isinstance(name, str):
+                # Not made text: 2 may be a class's place in some list.
+                _refuse(top, "a class name", name, "text")
         # Description presets arrived in 4.2; older projects have none.
-        project.descriptions = [str(d) for d in data.get("descriptions", [])]
+        project.descriptions = _texts(get("descriptions"), top,
+                                      "descriptions", "a description preset")
         # Mask-name presets arrived in 4.4, likewise.
-        project.mask_names = [str(n) for n in data.get("mask_names", [])]
+        project.mask_names = _texts(get("mask_names"), top,
+                                    "mask_names", "a mask name preset")
+
+        def read(key, reader):
+            # Both readers fall back to a default on what they cannot
+            # read; what gets past that is a value of the wrong kind.
+            try:
+                return reader(get(key))
+            except (TypeError, ValueError, KeyError, IndexError,
+                    AttributeError, OverflowError):
+                raise ProjectFileError(
+                    f"{top}: {key} holds a value of the wrong "
+                    "kind.") from None
+
         # Display settings arrived in 4.6, likewise.
-        project.display_settings = settings_from_project_data(
-            data.get("display_settings"))
+        project.display_settings = read("display_settings",
+                                        settings_from_project_data)
         # Model Review verdicts, 5.0 to 5.2: read to be moved into the
         # review file they belong to (2.9.4), never written again.
-        project.model_review = verdicts_from_project_data(
-            data.get("model_review"))
-        project._next_id = data.get("_next_id", 1)
+        project.model_review = read("model_review",
+                                    verdicts_from_project_data)
+        next_id = get("_next_id")
+        project._next_id = 1 if next_id is None else _whole(
+            next_id, top, "_next_id")
 
         # Waypoints arrived in 3.3; older projects simply have none. The id
         # counter is rebuilt from the data when absent, so a hand-edited file
         # can never hand out an id that is already taken.
-        project.waypoints = [Waypoint.from_dict(w)
-                             for w in data.get("waypoints", [])]
-        project._next_waypoint_id = data.get(
-            "_next_waypoint_id",
-            max((w.id for w in project.waypoints), default=0) + 1)
+        project.waypoints = [Waypoint.from_dict(w) for w in _list(
+            get("waypoints"), top, "waypoints")]
+        next_waypoint_id = get("_next_waypoint_id")
+        project._next_waypoint_id = (
+            max((w.id for w in project.waypoints), default=0) + 1
+            if next_waypoint_id is None
+            else _whole(next_waypoint_id, top, "_next_waypoint_id"))
 
-        version = data.get("version", "1.0")
+        version = get("version", "1.0")
+        if not isinstance(version, str):
+            # Compared as text below; a number guessed into text could
+            # send a current file down the 1.0 branch, where it is empty.
+            _refuse(top, "version", version, 'text such as "5.3"')
 
         if version >= "2.0":
             # Image-centric format (2.0 and later)
-            for img_data in data.get("images", []):
+            for img_data in _list(get("images"), top, "images"):
                 image = ImageData.from_dict(img_data, version)
                 image.path = canonical_path(image.path)
                 existing = project.images.get(image.path)
@@ -1440,10 +1836,15 @@ class LabelProject:
                     existing.crs_wkt = image.crs_wkt
         else:
             # Legacy format (version 1.0) - convert from label-centric
-            for label_data in data.get("labels", []):
-                image_path = label_data.get("image_path", "")
-                image_name = label_data.get("image_name", "")
-                image_group = label_data.get("image_group", "")
+            for label_data in _list(get("labels"), top, "labels"):
+                entry = _fields(label_data, top, "a label").get
+                image_path = entry("image_path") or ""
+                if not isinstance(image_path, str):
+                    _refuse(top, "a label's image_path", image_path, "text")
+                image_name = _text(entry("image_name"), top,
+                                   "a label's image_name")
+                image_group = _text(entry("image_group"), top,
+                                    "a label's image_group")
 
                 if image_path and image_path not in project.images:
                     project.images[image_path] = ImageData(
@@ -1453,20 +1854,22 @@ class LabelProject:
                     )
 
                 if image_path:
+                    (label_id, class_name, pixel_x, pixel_y, lon,
+                     lat) = PointLabel._checked(label_data, image_name)[:6]
                     label = PointLabel(
-                        id=label_data["id"],
-                        class_name=label_data["class_name"],
-                        pixel_x=label_data.get(
-                            "pixel_x", label_data.get("x", 0)),
-                        pixel_y=label_data.get(
-                            "pixel_y", label_data.get("y", 0)),
-                        lon=label_data["lon"],
-                        lat=label_data["lat"]
+                        id=label_id,
+                        class_name=class_name,
+                        pixel_x=pixel_x,
+                        pixel_y=pixel_y,
+                        lon=lon,
+                        lat=lat
                     )
                     project.images[image_path].labels.append(label)
 
             # Also check for image_paths from v1 format
-            for path in data.get("image_paths", []):
+            for path in _list(get("image_paths"), top, "image_paths"):
+                if not isinstance(path, str):
+                    _refuse(top, "an image path", path, "text")
                 if path not in project.images:
                     name = Path(path).stem
                     project.images[path] = ImageData(

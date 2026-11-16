@@ -204,7 +204,10 @@ def _regrid(image, header: Header) -> Plan:
     p = _start(image, REGRID, header)
     temp = _as_file(image, header)
     for label in image.labels:
-        pixel = temp.latlon_to_pixel(label.lat, label.lon)
+        # ground_of: a label that came without lat / lon of its own is
+        # where the record puts its pixel, or nowhere (hunt M9, 2.10.2).
+        ground = image.ground_of(label)
+        pixel = temp.latlon_to_pixel(*ground) if ground else None
         if pixel is None:
             p.dropped.append(label.id)
             continue
@@ -234,6 +237,8 @@ def _by_consensus(image, header: Header) -> Plan:
     temp = _as_file(image, header)
     offsets = []
     for label in image.labels:
+        if label.lat is None or label.lon is None:
+            continue      # no ground position (hunt M9): it has no say
         pixel = temp.latlon_to_pixel(label.lat, label.lon)
         if pixel is None:
             return _start(image, UNKNOWN, header)

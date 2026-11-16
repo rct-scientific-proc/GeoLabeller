@@ -2555,7 +2555,10 @@ class MainWindow(QMainWindow):
                 self.canvas._path_to_layer.get(image.path, ""))
             if layer is None or layer._src_crs is None:
                 continue  # plain image - a pixel has no meaningful lat/lon
-            infos.append((label.id, label.lon, label.lat, label.class_name,
+            ground = image.ground_of(label)
+            if ground is None:
+                continue  # ...nor has a label nobody gave one (hunt M9)
+            infos.append((label.id, ground[1], ground[0], label.class_name,
                           self._get_class_color(label.class_name), image.path,
                           self._label_ring_color(label)))
         self.canvas.set_waterfall_projections(infos)
@@ -2845,10 +2848,13 @@ class MainWindow(QMainWindow):
         # draw (2.9.2).
         self.canvas.prefer_label(label_id)
         layer = self.canvas.get_layer(layer_id)
-        if layer is not None and layer.geo:
-            self.canvas.zoom_to_point(label.lon, label.lat, size_meters=10.0)
+        ground = (image.ground_of(label)
+                  if layer is not None and layer.geo else None)
+        if ground is not None:
+            self.canvas.zoom_to_point(ground[1], ground[0], size_meters=10.0)
         else:
-            # Pixel-zone images have no meaningful lon/lat; frame the layer.
+            # Pixel-zone images have no meaningful lon/lat (nor has a
+            # label nobody gave one, hunt M9); frame the layer.
             self.canvas.zoom_to_layer(layer_id)
 
     def _add_layer_for_reveal(self, image) -> str | None:
@@ -2909,6 +2915,11 @@ class MainWindow(QMainWindow):
         entries = []
         for image in self.project.images.values():
             for label in image.labels:
+                lat, lon = label.lat, label.lon
+                if lat is None or lon is None:
+                    # No ground position of its own (hunt M9): by the
+                    # image, as the map draws it; None when it has none.
+                    lat, lon = image.ground_of(label) or (None, None)
                 entries.append({
                     "label_id": label.id,
                     "image_path": image.path,
@@ -2924,8 +2935,8 @@ class MainWindow(QMainWindow):
                     "object_id": label.object_id,
                     "group_id": label.group_id,
                     "description": label.description,
-                    "lon": label.lon,
-                    "lat": label.lat,
+                    "lon": lon,
+                    "lat": lat,
                     "orientation_px_rad": label.orientation_px_rad,
                     "orientation_deg": label.orientation_deg,
                     "orientation_derived": label.orientation_derived,
@@ -3768,8 +3779,12 @@ class MainWindow(QMainWindow):
     def _add_label_marker(self, image, label):
         """Draw one label with everything its marker shows."""
         color = self._get_class_color(label.class_name)
+        # Where it is on the ground: for a label that came without a
+        # position of its own, where its pixel is (hunt M9, 2.10.2). A
+        # plain picture's marker is placed by pixel and these go unused.
+        lat, lon = image.ground_of(label) or (0.0, 0.0)
         self.canvas.add_label_marker(
-            label.id, label.lon, label.lat,
+            label.id, lon, lat,
             image.name, image.group, image.path,
             label.class_name, color,
             pixel_x=label.pixel_x, pixel_y=label.pixel_y,
@@ -5097,10 +5112,15 @@ class MainWindow(QMainWindow):
         except Exception as exc:                  # noqa: BLE001
             debug(f"GT import could not read {path}: "
                   f"{type(exc).__name__}: {exc}")
+            # The loader's own refusal is a sentence for the user (hunt
+            # M9, 2.10.2): shown as it is. Anything else, with its kind.
+            from .labels import ProjectFileError
+            why = (str(exc) if isinstance(exc, ProjectFileError)
+                   else f"{type(exc).__name__}: {exc}")
             QMessageBox.warning(
                 self, title,
                 f"Could not read {Path(path).name} as a ground truth or "
-                f"project file.\n\n{type(exc).__name__}: {exc}")
+                f"project file.\n\n{why}")
             return
         if gt.label_count == 0:
             QMessageBox.information(

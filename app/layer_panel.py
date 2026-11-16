@@ -1397,6 +1397,15 @@ class LabeledLayerPanel(QWidget):
         width_s = f"{width_m:.1f}" if width_m is not None else "?"
         return f"  •  {length_s}×{width_s} m"
 
+    @staticmethod
+    def _position_text(lon, lat) -> str:
+        """The "Lon: ..., Lat: ..." line of a label row's tooltip. A
+        label that came from a file without a ground position has
+        neither (hunt M9, 2.10.2), and the row says so."""
+        if lon is None or lat is None:
+            return "No ground position recorded"
+        return f"Lon: {lon:.6f}, Lat: {lat:.6f}"
+
     def refresh(self, project, visibility_checker=None):
         """Refresh the tree with current labels from the project.
 
@@ -1497,9 +1506,8 @@ class LabeledLayerPanel(QWidget):
                     any_visible = True
 
                 label_item.setToolTip(
-                    0, f"Label #{label_id} on {file_path}\nLon: {
-                        lon:.6f}, Lat: {
-                        lat:.6f}")
+                    0, f"Label #{label_id} on {file_path}\n"
+                       + self._position_text(lon, lat))
                 label_item.setIcon(0, _standard_icon(QStyle.SP_FileIcon))
                 group_item.addChild(label_item)
 
@@ -1575,7 +1583,8 @@ class LabeledLayerPanel(QWidget):
         label_item.setCheckState(0, Qt.Checked if is_visible else Qt.Unchecked)
 
         label_item.setToolTip(
-            0, f"Label #{label.id} on {image.path}\nLon: {label.lon:.6f}, Lat: {label.lat:.6f}")
+            0, f"Label #{label.id} on {image.path}\n"
+               + self._position_text(label.lon, label.lat))
         label_item.setIcon(0, _standard_icon(QStyle.SP_FileIcon))
         group_item.addChild(label_item)
         self._item_by_label[label.id] = label_item
@@ -1613,7 +1622,7 @@ class LabeledLayerPanel(QWidget):
                                                   label.width_m))
                 item.setToolTip(
                     0, f"Label #{label.id} on {image.path}\n"
-                       f"Lon: {label.lon:.6f}, Lat: {label.lat:.6f}")
+                       + self._position_text(label.lon, label.lat))
                 found = True
         finally:
             self.tree.blockSignals(False)

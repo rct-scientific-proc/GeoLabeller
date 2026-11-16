@@ -62,9 +62,11 @@ def pixel_angle_from_heading(heading_deg: float, lon: float, lat: float,
     it back into that image's own unit-circle pixel angle through its
     georeferencing (rotation, convergence and all). Walks a short geodesic
     from (lon, lat) along the heading, maps both ends into pixel space, and
-    takes the principal angle. None when the image has no georeferencing.
+    takes the principal angle. None when the image has no georeferencing,
+    or the label no place on the ground to walk from (hunt M9, 2.10.2).
     """
-    if heading_deg is None or affine is None or crs is None:
+    if heading_deg is None or affine is None or crs is None \
+            or lon is None or lat is None:
         return None
     lon2, lat2, _back = _GEOD.fwd(lon, lat, heading_deg, 10.0)
     transformer = Transformer.from_crs(WGS84, crs, always_xy=True)
