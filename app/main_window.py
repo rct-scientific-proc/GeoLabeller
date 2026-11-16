@@ -3444,8 +3444,13 @@ class MainWindow(QMainWindow):
         for label in labels:
             self.canvas.set_label_rejected(label.id,
                                            status == REVIEW_REJECTED)
-        # One rebuild for the page, not a row at a time.
-        self._schedule_refresh("labeled", "snippets")
+        # The sidebar once, as one label's review asks of it - and not
+        # the Labeled Images panel: no row of it shows a review, nor do
+        # the cleaner and Model Review that are refreshed with it read
+        # one. Since a mark on an object's row comes this way (2.10.1),
+        # rebuilding it was 0.6 s of every key at 20,000 labels, and
+        # took the panel's selection and folds (hunt P1, 2.10.2).
+        self._schedule_refresh("snippets")
         n = len(labels)
         self.statusBar.showMessage(
             f"{n} label{'s' if n != 1 else ''} " + {
@@ -3472,7 +3477,9 @@ class MainWindow(QMainWindow):
                     label.confidence = value
                     self._stamp(label, "confidence")
         self._mark_unsaved()
-        self._schedule_refresh("labeled", "snippets")
+        # Nothing to refresh, as for one label's rating: neither the
+        # Labeled Images panel nor the sidebar shows one (hunt P1,
+        # 2.10.2; see _on_reviews_changed).
         n = len(labels)
         self.statusBar.showMessage(
             f"Confidence cleared for {n} labels" if not value
