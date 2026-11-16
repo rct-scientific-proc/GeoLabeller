@@ -586,6 +586,11 @@ class OrientationEditor(QWidget):
         whose rows all took another view (the map showing another
         image) was lost, and the order before the refill is the
         objects', not their views' (hunt 2026-11-16 M20, 2.10.2)."""
+        if not label_ids:
+            # No page was built (the Single view since the window opened):
+            # nothing to hold, and the list is not walked for it at
+            # every refill.
+            return self._page
         key = self.strip.row_key()
         listed = {key(e): i for i, e in enumerate(self._shown_entries())}
         old = self._entries_by_id
@@ -598,7 +603,7 @@ class OrientationEditor(QWidget):
         # is made only now (it is every entry): one per object, each
         # object once, where the first of its views stood.
         before = list(dict.fromkeys(key(e) for e in self._entries))
-        if candidates and candidates[-1] in before:
+        if candidates[-1] in before:
             at = before.index(candidates[-1])
             for candidate in before[at + 1:] + before[:at][::-1]:
                 if candidate in listed:
