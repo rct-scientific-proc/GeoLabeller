@@ -18,7 +18,9 @@ on the chip's own record, under "review":
 "became" is a class name, or "ignore". "label_x" / "label_y" is where
 the label was when the note was written, in pixels at the project's
 resolution (2.10.1): what the chip finds its own label by on the next
-open, whatever the chip size is set to. The file is rewritten whole and
+open, whatever the chip size is set to. An open that finds the label
+elsewhere, or a note of before 2.10.1 with no place, writes the place
+as it is (2.10.2). The file is rewritten whole and
 atomically with every other field as it was, so the model team's file
 stays theirs with a note per chip. A file that cannot be written - read
 only, a share without rights - is said once; the chips keep their
@@ -101,11 +103,17 @@ def write_outcomes(path, outcomes: dict, misplaced=None,
     if not changed:
         return 0
     temp = path.with_name(path.name + ".tmp")
-    with open(temp, "w", encoding="utf-8") as handle:
-        # The team's own characters kept, not escaped: the file stays
-        # theirs to read (2.9.6).
-        json.dump(data, handle, indent=1, ensure_ascii=False)
-    os.replace(temp, path)
+    try:
+        with open(temp, "w", encoding="utf-8") as handle:
+            # The team's own characters kept, not escaped: the file stays
+            # theirs to read (2.9.6).
+            json.dump(data, handle, indent=1, ensure_ascii=False)
+        os.replace(temp, path)
+    finally:
+        # Only a write that failed leaves one: a read-only file, which
+        # an open may now try to write (the labels' places, 2.10.2),
+        # would gain a copy of itself beside it at every open.
+        temp.unlink(missing_ok=True)
     return changed
 
 

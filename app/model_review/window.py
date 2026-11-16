@@ -1169,16 +1169,46 @@ class ModelReviewWindow(QWidget):
         self._fill_suggested_filter()
         self.setWindowTitle(f"Model Review - {name}")
         self.file_label.setText(f"{name}: {report.summary()}")
-        if moved:
-            written = self._write_outcomes(moved)
-            n = len(moved)
-            self._note = (f"{n} note{'' if n == 1 else 's'} moved from the "
-                          f"project's memory into {name}"
-                          + ("." if written else " - for this session only, "
-                             "the file could not be written."))
+        # Where the file says each note's label is, before any is seated.
+        places = {chip.key: (chip.earlier.label_x, chip.earlier.label_y)
+                  for chip in chips if chip.earlier is not None}
         self.refresh_earlier()          # which also fills the grid
+        self._note_places(moved, places)
         self._show_learning()
         return True
+
+    def _note_places(self, moved: dict, places: dict):
+        """The one write an open makes, once its chips are seated (hunt
+        2026-11-16 M18): the notes moved in from the project's old
+        memory (``moved``), and every note whose label is not where the
+        file says (``places``, as it was read). A note of before 2.10.1
+        stores no place, and one seated by the chip-size rule kept the
+        place in memory only - so on such a file November's M1 played
+        out as before, sessions later, at a smaller chip size; a label
+        moved on the map since its note was written is the other case.
+
+        After the seat, never before it: a note is given the place of a
+        label only when its chip took that label (_place_labels). Once
+        per open, not per chip, and not at all when no place changed: a
+        second open writes nothing. A file that cannot be written is
+        said only for the notes moved in; the places are found again at
+        the next open."""
+        notes = dict(moved)
+        for chip in self._chips:
+            earlier = chip.earlier
+            if (earlier is not None and chip.held is not None
+                    and (earlier.label_x, earlier.label_y)
+                    != places.get(chip.key)):
+                notes[chip.key] = earlier
+        if not notes:
+            return
+        written = self._write_outcomes(notes, quiet=not moved)
+        if moved:
+            n = len(moved)
+            self.note(f"{n} note{'' if n == 1 else 's'} moved from the "
+                      f"project's memory into {self._source}"
+                      + ("." if written else " - for this session only, "
+                         "the file could not be written."))
 
     def _migrate_memory(self, chips, project) -> dict:
         """The project's old memory (formats 5.0 to 5.2) answering for
@@ -1218,9 +1248,12 @@ class ModelReviewWindow(QWidget):
         """The file open, as a path; empty with none."""
         return self._path
 
-    def _write_outcomes(self, notes: dict) -> bool:
+    def _write_outcomes(self, notes: dict, quiet: bool = False) -> bool:
         """``notes`` (chip key -> Verdict, or None to take one away)
-        into the file; False, said once, when it cannot be written."""
+        into the file; False, said once, when it cannot be written.
+        ``quiet`` says nothing and leaves that once unspent: the write
+        of the labels' places on an open (_note_places), which no one
+        asked for and which a read-only file refuses every time."""
         if not self._path or not notes:
             return False
         misplaced: list = []
@@ -1236,13 +1269,13 @@ class ModelReviewWindow(QWidget):
         try:
             outcomes.write_outcomes(self._path, notes, misplaced, anchors)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
-            if not self._write_failed:
+            if not self._write_failed and not quiet:
                 self._write_failed = True
                 self._say(f"The verdicts could not be noted in "
                           f"{self._source}: {exc}\n\nThey hold for this "
                           "session; the file keeps no memory of them.")
             return False
-        if misplaced and not self._misplaced_said:
+        if misplaced and not self._misplaced_said and not quiet:
             # The file is not the one opened: its records moved (2.9.6).
             self._misplaced_said = True
             n = len(misplaced)
@@ -1256,10 +1289,18 @@ class ModelReviewWindow(QWidget):
     def _place_labels(self, notes: dict):
         """Each note takes its label's position as it stands, whenever
         the file is written (2.10.1): what _at_its_place tests the label
-        against on the next open, in place of the chip size in hand."""
+        against on the next open, beside the chip size in hand. Only a
+        note whose chip holds that label - seated on it, or given it by
+        the import being noted - is stamped: by its id alone, a
+        stranger's label gave the note its own place before any seat
+        had tested it, and was the chip's from then on, to be removed
+        by an Ignore (hunt 2026-11-16, 2.10.2). A note not stamped keeps
+        the place it had."""
         find = getattr(self._project(), "get_label_by_id", None)
-        for verdict in notes.values():
-            if verdict is None or verdict.label_id is None or find is None:
+        for key, verdict in notes.items():
+            chip = self._by_key.get(key)
+            if (verdict is None or verdict.label_id is None or find is None
+                    or chip is None or chip.held != verdict.label_id):
                 continue
             _image, label = find(verdict.label_id)
             if label is not None:
@@ -1278,6 +1319,10 @@ class ModelReviewWindow(QWidget):
             chip.label_gone = False
             chip.verdict = None
             chip.as_new = False
+            # The label the import made for the chip, or gave it, is
+            # the chip's from here on (none, for an Ignore): held, so
+            # its note is written with its place (_place_labels).
+            chip.held = verdict.label_id
         return self._write_outcomes(notes)
 
     def rename_verdicts(self, old: str, new: str):
