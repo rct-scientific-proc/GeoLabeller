@@ -91,6 +91,10 @@ GEOD = Geod(ellps="WGS84")
 # _stored_meta_transformers. Built and used on the UI thread.
 _wgs84_transformers: dict = {}
 
+# A CRS key -> the length of a turn in its units for a geographic CRS,
+# None for a projected one (ImageData._own_x).
+_turns: dict = {}
+
 
 def _transformer_pair(crs_key):
     """(to_wgs84, from_wgs84) for a CRS, built at most once.
@@ -846,6 +850,12 @@ class ImageData:
 
         # Transform from image CRS to WGS84 (always_xy: lon, lat order)
         lon, lat = self._to_wgs84_transformer.transform(x_proj, y_proj)
+        if not -180.0 <= lon <= 180.0 and math.isfinite(lon):
+            # A geographic file written past 180 degrees says 180.01: the
+            # same meridian within -180..180, as a click on the map gives
+            # (TiledLayer.pixel_to_latlon). Move label, a label without
+            # lat / lon and the KML said 180.01 (retest whole R1, 2.10.3).
+            lon = (lon + 180.0) % 360.0 - 180.0
         return (lat, lon)
 
     def latlon_to_pixel(self, lat: float, lon: float) -> Optional[tuple[float, float]]:
@@ -864,10 +874,37 @@ class ImageData:
 
         # Transform from WGS84 to image CRS (always_xy: lon/lat -> x/y)
         x_proj, y_proj = self._from_wgs84_transformer.transform(lon, lat)
+        x_proj = self._own_x(x_proj, affine)
 
         # Apply inverse affine: projected -> pixel coordinates
         pixel_x, pixel_y = ~affine * (x_proj, y_proj)
         return (pixel_x, pixel_y)
+
+    def _own_x(self, x: float, affine: Affine) -> float:
+        """``x`` where a geographic file written past 180 degrees has it.
+
+        pixel_to_latlon gives a longitude within -180..180, and a click on
+        the map stores one; such a file's own run on past 180 (179.99 to
+        180.01), a whole turn away, so the way back brings the answer to
+        the turn nearest the file's middle (tile_reader.own_x). Every
+        other file - projected, or geographic within -180..180 - keeps
+        the transformer's answer (retest whole R1, 2.10.3).
+        """
+        turn = _turns.get(self.crs_key(), False)
+        if turn is False:
+            crs = self.get_crs()
+            turn = (2.0 * math.pi / crs.units_factor[1]
+                    if crs is not None and crs.is_geographic else None)
+            _turns[self.crs_key()] = turn
+        if turn is None:
+            return x
+        w = self.original_width or 0
+        h = self.original_height or 0
+        xs = [(affine * (c, r))[0] for c, r in ((0, 0), (w, 0), (0, h), (w, h))]
+        if -turn / 2.0 <= min(xs) and max(xs) <= turn / 2.0:
+            return x
+        middle = (affine * (w / 2.0, h / 2.0))[0]
+        return x + turn * round((middle - x) / turn)
 
     def ground_of(self, label: PointLabel) -> Optional[tuple[float, float]]:
         """(lat, lon) of a label on this image, or None.
