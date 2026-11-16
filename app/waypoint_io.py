@@ -184,6 +184,23 @@ def same_place(lat_a, lon_a, lat_b, lon_b) -> bool:
             and abs(lon_a - lon_b) <= SAME_PLACE_DEG)
 
 
+# The grid plan_import files positions in. Two tolerances to a cell, not
+# one: positions the tolerance apart then sit in one cell or in two that
+# touch whatever the division rounds to (at one tolerance a cell, a pair
+# either side of two cell edges could land two cells apart).
+_CELL_DEG = 2 * SAME_PLACE_DEG
+
+
+def _cell(lat, lon):
+    """The grid cell of a position; None for one no grid holds (not
+    finite, or too large to divide). Those are equal to nothing in a
+    cell, so they are kept together and compared with each other."""
+    try:
+        return math.floor(lat / _CELL_DEG), math.floor(lon / _CELL_DEG)
+    except (OverflowError, ValueError):
+        return None
+
+
 def plan_import(project, found) -> tuple[list, int]:
     """(new, already): the entries to add, and how many are here already.
 
@@ -191,18 +208,44 @@ def plan_import(project, found) -> tuple[list, int]:
     unnamed in the file or named the same (case and padding aside). A
     renamed waypoint at the same spot is new - the name is information.
     So importing a file twice adds nothing the second time.
+
+    Each entry is compared only with the waypoints filed in its own grid
+    cell and the eight around it, under its own name (an unnamed entry:
+    under every name). It was compared with every waypoint before it,
+    92 s on the UI thread for a 40,000-point file (hunt P2, 2.10.2). The
+    comparison itself is the one it always was, so are the answers.
     """
-    have = [(wp.name.strip().casefold(), wp.lat, wp.lon)
-            for wp in project.waypoints]
+    have: dict = {}            # cell -> {name: [(lat, lon), ...]}
+
+    def file(name, lat, lon):
+        have.setdefault(_cell(lat, lon), {}).setdefault(
+            name, []).append((lat, lon))
+
+    def here(key, lat, lon) -> bool:
+        cell = _cell(lat, lon)
+        around = [cell] if cell is None else [
+            (cell[0] + row, cell[1] + col)
+            for row in (-1, 0, 1) for col in (-1, 0, 1)]
+        for near in around:
+            names = have.get(near)
+            if not names:
+                continue
+            for places in (names.values() if not key
+                           else (names.get(key, ()),)):
+                if any(same_place(lat, lon, a, b) for a, b in places):
+                    return True
+        return False
+
+    for wp in project.waypoints:
+        file(wp.name.strip().casefold(), wp.lat, wp.lon)
     new, already = [], 0
     for entry in found:
         key = entry.name.strip().casefold()
-        if any(same_place(entry.lat, entry.lon, lat, lon)
-               and (not key or key == name) for name, lat, lon in have):
+        if here(key, entry.lat, entry.lon):
             already += 1
             continue
         new.append(entry)
-        have.append((key, entry.lat, entry.lon))   # the file's own repeats
+        file(key, entry.lat, entry.lon)            # the file's own repeats
     return new, already
 
 
