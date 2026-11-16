@@ -713,6 +713,7 @@ class MainWindow(QMainWindow):
             self.canvas.update_layer_order)
         self.layer_panel.layer_group_changed.connect(
             self._on_layer_group_changed)
+        self.layer_panel.groups_moved.connect(self._on_groups_moved)
         self.layer_panel.hard_negative_unflag_requested.connect(
             self._on_hard_negative_toggled)
         self.layer_panel.zoom_to_layer_requested.connect(
@@ -7654,6 +7655,36 @@ class MainWindow(QMainWindow):
         file_path = self.canvas.get_layer_file_path(layer_id)
         if file_path:
             self.project.update_image_group(file_path, group_path)
+            self._mark_unsaved()
+
+    def _on_groups_moved(self, moves: list):
+        """Groups were dragged elsewhere in the tree: what the project
+        keeps by group path goes with them (hunt M16, 2.10.2).
+
+        ``moves`` is the panel's [(old path, new path), ...], one for
+        each group the drag moved. Their layers were reported one by one
+        (_on_layer_group_changed) and are filed under the new paths by
+        now; a layer dragged on its own never comes here. Left behind
+        under the old path were the group's Display Settings - it then
+        drew by its new parent's, or the default - and its images the
+        tree has no row for (files missing on this machine), which a
+        later removal of the group no longer reached. An image filed
+        there that the tree shows elsewhere (a plain picture, under
+        Non-Georeferenced) did not move, and keeps its group and its
+        settings.
+        """
+        changed = False
+        for image in self.project.images.values():
+            target = display_settings.moved_path(image.group or "", moves)
+            if target is not None and not \
+                    self.layer_panel.has_layer_for(image.path):
+                image.group = target
+                changed = True
+        if display_settings.move_groups(
+                self.project.display_settings, moves,
+                still_filed=self._images_in_group):
+            changed = True
+        if changed:
             self._mark_unsaved()
 
     def _show_shortcuts(self):

@@ -472,6 +472,50 @@ def resolve(by_group: dict, group_path: str) -> DisplaySettings:
         path = path.rsplit("/", 1)[0] if "/" in path else ""
 
 
+def moved_path(group_path: str, moves) -> "str | None":
+    """``group_path`` as it reads once the groups of ``moves`` - [(old
+    path, new path), ...] - are where they were dragged to; None when it
+    is at or under none of them. Where two apply (a sub-group dragged
+    out together with its parent), the deeper one does."""
+    best = None
+    for old, new in moves:
+        if (group_path == old or group_path.startswith(old + "/")) and (
+                best is None or len(old) > len(best[0])):
+            best = (old, new)
+    return None if best is None else best[1] + group_path[len(best[0]):]
+
+
+def move_groups(by_group: dict, moves, still_filed=None) -> bool:
+    """Groups were dragged elsewhere in the tree: every entry of
+    ``by_group`` at or under a moved group's old path goes to the same
+    place under its new path. True when anything changed.
+
+    The settings are keyed by group path, so left where they were they
+    stopped applying to the group that had moved - it drew by its new
+    parent's, or the default - and waited for whichever group took the
+    old path next (hunt M16, 2.10.2).
+
+    An entry already at the destination stays, and the one that came is
+    dropped: the images found there go on being drawn as they were.
+    ``still_filed(path)`` says whether images are still filed at or
+    under an old path - a group of the same path that did not move, as
+    the tree's Non-Georeferenced twin of a folder is - and its entry
+    then stays there as well.
+    """
+    changed = False
+    for key in list(by_group):
+        target = moved_path(key, moves)
+        if target is None or target == key:
+            continue
+        if target not in by_group:
+            by_group[target] = by_group[key]
+            changed = True
+        if still_filed is None or not still_filed(key):
+            del by_group[key]
+            changed = True
+    return changed
+
+
 def settings_from_project_data(data) -> dict:
     """The "display_settings" entry of a project file, parsed."""
     if not isinstance(data, dict):

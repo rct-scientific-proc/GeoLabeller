@@ -19,6 +19,8 @@ from .settings_scope import settings as app_settings
 # against it so only layers that actually moved report a group change - the
 # whole-tree emission used to rewrite every image's project group from its
 # tree ancestry, which is not the same string for non-georeferenced images.
+# On a GROUP item: the project path the group itself was last seen at, so
+# a drag can say where a moved group came from (groups_moved, 2.10.2).
 GROUP_PATH_ROLE = Qt.UserRole + 2
 # The tree's root for non-georeferenced imagery. It names no project
 # group: an image under it is in the project group below the root.
@@ -83,6 +85,12 @@ class LayerPanel(QWidget):
     # all, after the group was "removed". MainWindow deletes them by
     # group membership.
     groups_removed = pyqtSignal(list)
+    # The GROUPS a drag-drop moved: [(old project path, new project
+    # path), ...], the outermost of them only, emitted after the
+    # per-layer layer_group_changed reports. What the project keeps by
+    # group path - a group's Display Settings - follows the group through
+    # this; a layer dragged on its own moves no group (hunt M16, 2.10.2).
+    groups_moved = pyqtSignal(list)
 
     # Group memory management signals: emitted with list of layer_ids
     group_preload_requested = pyqtSignal(list)  # layer_ids to fully load
@@ -246,7 +254,24 @@ class LayerPanel(QWidget):
             parent.addChild(item)
         else:
             self.tree.addTopLevelItem(item)
+        self._remember_group_path(item)
         return item
+
+    def _remember_group_path(self, item: QTreeWidgetItem):
+        """Note where a GROUP item is, as the project names the place:
+        what a later drag of it is told apart from (groups_moved).
+
+        With the tree's signals blocked: any change to a group item
+        reads as a click on its box (_on_item_changed), and would set
+        every layer under it to what the box says.
+        """
+        blocked = self.tree.signalsBlocked()
+        self.tree.blockSignals(True)
+        try:
+            item.setData(0, GROUP_PATH_ROLE,
+                         self._project_group(self._full_group_path(item)))
+        finally:
+            self.tree.blockSignals(blocked)
 
     @staticmethod
     def _covers(a: QTreeWidgetItem, b: QTreeWidgetItem) -> bool:
@@ -575,8 +600,15 @@ class LayerPanel(QWidget):
         each save-and-reopen and changing the group written into the H5
         export. Comparing against the path each item was last seen under
         also drops the emission from O(all layers) to O(moved).
+
+        The GROUPS the drag moved are told apart the same way and
+        reported afterwards, in one groups_moved: each with the path it
+        had and the one it has, and only the outermost - what is under a
+        moved group moved with it (hunt M16, 2.10.2).
         """
-        def emit_for_item(item: QTreeWidgetItem):
+        moved_groups = []
+
+        def emit_for_item(item: QTreeWidgetItem, within_moved: bool = False):
             """Recursively report layer descendants whose group changed."""
             item_type = item.data(0, Qt.UserRole + 1)
             if item_type == "layer":
@@ -586,11 +618,22 @@ class LayerPanel(QWidget):
                     item.setData(0, GROUP_PATH_ROLE, group_path)
                     self.layer_group_changed.emit(layer_id, group_path)
             else:
+                own_path = self._project_group(self._full_group_path(item))
+                before = item.data(0, GROUP_PATH_ROLE)
+                if own_path != before:
+                    self._remember_group_path(item)
+                    # (The Non-Georeferenced root names no project group,
+                    # wherever it is: "" is not a place to move from or to.)
+                    if before and own_path and not within_moved:
+                        moved_groups.append((before, own_path))
+                        within_moved = True
                 for i in range(item.childCount()):
-                    emit_for_item(item.child(i))
+                    emit_for_item(item.child(i), within_moved)
 
         for i in range(self.tree.topLevelItemCount()):
             emit_for_item(self.tree.topLevelItem(i))
+        if moved_groups:
+            self.groups_moved.emit(moved_groups)
 
     def _get_layer_order(self) -> list[str]:
         """Get layer IDs in current order (top to bottom in tree = front to back)."""
@@ -1251,6 +1294,7 @@ class LayerPanel(QWidget):
         item.setForeground(0, QColor(210, 140, 50))  # Orange
 
         nongeo_parent.addChild(item)
+        self._remember_group_path(item)
         return item
 
     def add_nongeo_layer(self, layer_id: str, file_path: str,
@@ -2098,6 +2142,7 @@ class CombinedLayerPanel(QWidget):
     layer_removed = pyqtSignal(str)
     layers_removed = pyqtSignal(list)  # [(layer_id, file_path), ...]
     groups_removed = pyqtSignal(list)  # project group paths
+    groups_moved = pyqtSignal(list)  # [(old project path, new), ...]
 
     # Hard-negative mirror section
     hard_negative_unflag_requested = pyqtSignal(str)  # layer_id
@@ -2209,6 +2254,7 @@ class CombinedLayerPanel(QWidget):
         self.main_panel.layer_removed.connect(self.layer_removed)
         self.main_panel.layers_removed.connect(self.layers_removed)
         self.main_panel.groups_removed.connect(self.groups_removed)
+        self.main_panel.groups_moved.connect(self.groups_moved)
 
         # Forward batch progress signals
         self.main_panel.batch_visibility_started.connect(
