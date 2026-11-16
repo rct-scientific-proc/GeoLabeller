@@ -5646,7 +5646,21 @@ class MainWindow(QMainWindow):
                 self, "HDF5 Export", "No images in the selected scope.")
             return
 
-        self._h5_last_options = dict(options, out_path=out_path)
+        remembered = dict(options, out_path=out_path)
+        if object_ids:
+            # One memory serves both dialogs, and an object export's own
+            # pair (this object, no negatives - and with no negatives the
+            # split tick reads as off) is not what the next whole-project
+            # dialog should open with. Those three stay as the last
+            # whole-project export left them, absent when there was none
+            # (hunt 2026-11-16 M19, 2.10.2: Export pressed as that dialog
+            # opened wrote no hard negatives, from layers toggled off).
+            for key in ("examples_scope", "negatives_scope",
+                        "split_negatives"):
+                remembered.pop(key, None)
+                if key in self._h5_last_options:
+                    remembered[key] = self._h5_last_options[key]
+        self._h5_last_options = remembered
         self._h5_rejected = self._rejected_on(img.path for img in images)
         options["classes"] = list(self.project.classes) + [HARD_NEGATIVE]
         self._start_h5_worker(out_path, images, options)
