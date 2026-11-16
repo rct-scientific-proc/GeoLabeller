@@ -4513,7 +4513,7 @@ class MapCanvas(QGraphicsView):
                 self._visible_layer_ids.discard(layer_id)
             for item in layer.detail_tiles.values():
                 item.setVisible(visible)
-            if layer._wraps and self._waypoint_items:
+            if self._waypoint_items and layer._wraps:
                 self._place_waypoints_again()       # retest map R2, 2.10.3
             if visible:
                 # Switched on, so it is the user's again and not the
@@ -4603,7 +4603,8 @@ class MapCanvas(QGraphicsView):
         """Remove a layer from the canvas."""
         if layer_id in self._layers:
             file_path = self._layers[layer_id].file_path
-            wraps = self._layers[layer_id]._wraps
+            wraps = (bool(self._waypoint_items)
+                     and self._layers[layer_id]._wraps)
             self._cancel_layer_load(self._layers[layer_id])
             self._clear_detail_tiles(layer_id, self._layers[layer_id])
             self._layers[layer_id].remove_from_scene(self._scene)
@@ -4611,7 +4612,7 @@ class MapCanvas(QGraphicsView):
             self._layers_by_name_group = None
             if file_path in self._path_to_layer:
                 del self._path_to_layer[file_path]
-            if wraps and self._waypoint_items:
+            if wraps:
                 self._place_waypoints_again()       # retest map R2, 2.10.3
             self._visible_layer_ids.discard(layer_id)
             # No loaded image is hiding its labels any more.
