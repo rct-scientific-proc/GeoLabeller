@@ -62,6 +62,11 @@ def outcome_from_record(record) -> "dict | None":
     return found
 
 
+# Every key outcome_to_dict may write: a note's other keys are another
+# tool's, and a write keeps them (outcomes.note_into, 2.10.3).
+NOTE_KEYS = ("became", "label_id", "label_x", "label_y", "by", "at")
+
+
 def outcome_to_dict(verdict) -> dict:
     """The note as written: what the chip became, the label it made or
     took over and where that label was when the note was written -

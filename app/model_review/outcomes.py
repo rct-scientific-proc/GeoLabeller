@@ -18,10 +18,11 @@ on the chip's own record, under "review":
 "became" is a class name, or "ignore". "label_x" / "label_y" is where
 the label was when the note was written, in pixels at the project's
 resolution (2.10.1): what the chip finds its own label by on the next
-open, whatever the chip size is set to. An open that finds the label
-elsewhere, or a note of before 2.10.1 with no place, writes the place
-as it is (2.10.2). The file is rewritten whole and
-atomically with every other field as it was, so the model team's file
+open, whatever the chip size is set to. An open writes the place of a
+note of before 2.10.1, which has none (2.10.2), and never rewrites one
+a note stores (2.10.3). The file is rewritten whole and
+atomically with every other field as it was - and every key of another
+tool's inside a note (2.10.3) - so the model team's file
 stays theirs with a note per chip. A file that cannot be written - read
 only, a share without rights - is said once; the chips keep their
 outcomes for the session. A detector's candidates file is the same
@@ -38,8 +39,8 @@ import math
 import os
 from pathlib import Path
 
-from .ledger import (OUTCOME_KEY, LedgerIndex, Verdict, image_key,
-                     outcome_to_dict)
+from .ledger import (NOTE_KEYS, OUTCOME_KEY, LedgerIndex, Verdict,
+                     image_key, outcome_to_dict)
 from .source import (_CLASS_KEYS, _IMAGE_KEYS, _LIST_KEYS, _X_KEYS,
                      _Y_KEYS, _first, _number, _tail_overlap,
                      parse_candidates)
@@ -98,7 +99,7 @@ def write_outcomes(path, outcomes: dict, misplaced=None,
             if record.pop(OUTCOME_KEY, None) is not None:
                 changed += 1
         else:
-            record[OUTCOME_KEY] = outcome_to_dict(verdict)
+            note_into(record, verdict)
             changed += 1
     if not changed:
         return 0
@@ -115,6 +116,23 @@ def write_outcomes(path, outcomes: dict, misplaced=None,
         # would gain a copy of itself beside it at every open.
         temp.unlink(missing_ok=True)
     return changed
+
+
+def note_into(record: dict, verdict):
+    """The verdict's note onto the record, merged into the note it has
+    (retest 2026-11-16 R2, 2.10.3): the keys GeoLabeller writes are set,
+    or taken away where the verdict has none; any other key - another
+    tool's, inside "review" - is kept. Replaced whole, such a key went
+    at the first write, and since 2.10.2 an open writes old notes."""
+    note = outcome_to_dict(verdict)
+    old = record.get(OUTCOME_KEY)
+    if not isinstance(old, dict):
+        record[OUTCOME_KEY] = note
+        return
+    for key in NOTE_KEYS:
+        if key not in note:
+            old.pop(key, None)
+    old.update(note)
 
 
 def _same_record(record: dict, image, anchor) -> bool:
@@ -231,7 +249,7 @@ def carry_over(records: list, previous: list, tolerance: float,
         for verdict in answers(record):
             if id(verdict) not in taken:
                 take(verdict)
-                record[OUTCOME_KEY] = outcome_to_dict(verdict)
+                note_into(record, verdict)
                 break
     for record in records:
         if record.get(OUTCOME_KEY) is not None:
