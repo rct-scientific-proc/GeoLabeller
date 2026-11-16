@@ -171,7 +171,7 @@ _STRING_COLUMNS = ("locations", "object_ids")
 #                  where EVERY band holds the nodata value - a pixel one
 #                  band of which alone holds it is data, and was counted
 #                  (and in the float formats replaced) before - or where
-#                  a band the sample is made of is NaN.
+#                  a band the sample is made of is NaN, +inf or -inf.
 #                  0 for a sample cut whole from real ground. A consumer
 #                  can weight or drop a sample that is mostly made up -
 #                  a swath-edge crop used to carry NaN unseen.

@@ -78,9 +78,18 @@ def _band_quantiles(src):
     bands = min(src.count, 64)
     out_h = min(src.height, 1024)
     out_w = min(src.width, 1024)
-    sample = src.read(indexes=list(range(1, bands + 1)),
-                      out_shape=(bands, out_h, out_w), masked=True)
-    sample = np.ma.filled(sample.astype("float32"), np.nan)
+    indexes = list(range(1, bands + 1))
+    sample = src.read(indexes=indexes, out_shape=(bands, out_h, out_w))
+    # Asked of the values as stored, before the cast: a float64 sentinel
+    # past float32's range would no longer equal itself after it.
+    empty = no_data(src, sample, indexes, used=())
+    sample = sample.astype("float32")
+    if empty is not None:
+        sample[:, empty] = np.nan
+    # No value that is not finite enters a percentile (hunt M8, 2.10.2):
+    # two percent of -inf - the dB of zero power - made the 2nd percentile
+    # -inf, the stretch fell back to 0..1 and the image drew black.
+    sample[~np.isfinite(sample)] = np.nan
     table = np.empty((bands, _QUANTILES.size), dtype="float32")
     for b in range(bands):
         band = sample[b]
@@ -169,23 +178,24 @@ def nodata_mask(data, nodata):
 
 
 # ---------------------------------------------------------------------------
-# No data: the one definition (bug hunt 2026-11-16 M6-M7, 2.10.2)
+# No data: the one definition (bug hunt 2026-11-16 M6-M8, 2.10.2)
 # ---------------------------------------------------------------------------
 #
 # Every reader used to decide this for itself, and they disagreed: the
 # canvas went by the first band it drew, the float export and the
-# detectors by any band, and nothing looked at an alpha band or a mask
-# band. A pixel holds no data when
+# detectors by any band, nothing looked at an alpha band or a mask band,
+# and an infinity was a measurement everywhere. A pixel holds no data when
 #
 #   - the file says so, as GDAL reads it: by its alpha band or its mask
 #     band - internal, or a .msk beside it - where it has one, otherwise
 #     where EVERY band holds its declared nodata value (dark water whose
 #     red alone is 0 is water, not a hole); or
-#   - its value in a band the reader goes on to use is NaN.
+#   - its value in a band the reader goes on to use is not finite: NaN,
+#     +inf or -inf.
 #
 # no_data() is that definition, and nothing else decides it: the canvas
-# loaders, the detail tiles, the snippets, both HDF5 pixel formats and
-# the detectors all ask it.
+# loaders, the detail tiles, the snippets, both HDF5 pixel formats, the
+# detectors and the sampled statistics all ask it.
 #
 # It is rasterio's dataset_mask() but for two things: that call answers
 # a four-band file with a nodata value by its fourth band's mask alone -
@@ -216,10 +226,10 @@ def _file_validity(src):
 
 def told_from_bands(src) -> bool:
     """Does no_data() go by the values of the bands a reader uses - a
-    nodata value to find in every one of them, or floats that may hold
-    a NaN? Only then need a loader hold its bands until it has asked:
-    a file with an alpha or mask band is told by that band, and the
-    ordinary file - whole numbers, nothing declared - by nothing."""
+    nodata value to find in every one of them, or floats that may not
+    be finite? Only then need a loader hold its bands until it has
+    asked: a file with an alpha or mask band is told by that band, and
+    the ordinary file - whole numbers, nothing declared - by nothing."""
     validity = _file_validity(src)
     return ((validity is not None and validity[0] == _NODATA)
             or any(str(dtype).startswith("float") for dtype in src.dtypes))
@@ -259,7 +269,7 @@ def no_data(src, planes, indexes=None, window=None, used=None):
     numbers (by default 1, 2, ... as ``src.read()`` gives them).
     ``used`` names the positions in ``planes`` whose values the reader
     goes on to use, where that is not all of them: only those are
-    tested for NaN.
+    tested for being finite.
     """
     planes = [planes] if getattr(planes, "ndim", 3) == 2 else list(planes)
     shape = planes[0].shape
@@ -282,9 +292,9 @@ def no_data(src, planes, indexes=None, window=None, used=None):
             empty = None
     for plane in (planes if used is None else [planes[i] for i in used]):
         if np.issubdtype(plane.dtype, np.floating):
-            nan = np.isnan(plane)
-            if nan.any():
-                empty = nan if empty is None else (empty | nan)
+            finite = np.isfinite(plane)
+            if not finite.all():
+                empty = ~finite if empty is None else (empty | ~finite)
     return empty
 
 
