@@ -24,7 +24,8 @@ stays theirs with a note per chip. A file that cannot be written - read
 only, a share without rights - is said once; the chips keep their
 outcomes for the session. A detector's candidates file is the same
 format and gets the same notes, and a new run carries the old file's
-notes onto the candidates it finds again (carry_over).
+notes onto the candidates it finds again (carry_over) and keeps the
+rest of what the file remembers (keep_earlier).
 
 Qt-free.
 """
@@ -38,7 +39,8 @@ from pathlib import Path
 from .ledger import (OUTCOME_KEY, LedgerIndex, Verdict, image_key,
                      outcome_to_dict)
 from .source import (_CLASS_KEYS, _IMAGE_KEYS, _LIST_KEYS, _X_KEYS,
-                     _Y_KEYS, _first, _number, parse_candidates)
+                     _Y_KEYS, _first, _number, _tail_overlap,
+                     parse_candidates)
 
 
 def _records_of(data):
@@ -139,18 +141,29 @@ def read_outcomes(path) -> list:
     coordinates: what a detector run skips, and what a new run carries
     over. An unreadable or missing file is no notes."""
     try:
+        return list(read_records(path)[1].values())
+    except OSError:
+        return []
+
+
+def read_records(path) -> tuple:
+    """(records, notes): the file's records as they are, and the notes
+    among them as read_outcomes gives them, by the record's place in
+    the list - what a detector run has to keep (keep_earlier). A
+    missing file, or one that is not a file of chips, is ([], {}); one
+    that is there and cannot be opened is an OSError - to its writer it
+    must not pass for empty."""
+    try:
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
+        records = _records_of(data)
         candidates, _malformed = parse_candidates(data)
-    except (OSError, ValueError, json.JSONDecodeError):
-        return []
-    found = []
-    for candidate in candidates:
-        if candidate.review is None:
-            continue
-        found.append(verdict_of(candidate, candidate.x, candidate.y,
-                                candidate.image, ""))
-    return found
+    except (FileNotFoundError, ValueError, json.JSONDecodeError):
+        return [], {}
+    return records, {
+        candidate.index: verdict_of(candidate, candidate.x, candidate.y,
+                                    candidate.image, "")
+        for candidate in candidates if candidate.review is not None}
 
 
 def verdict_of(candidate, pixel_x: float, pixel_y: float, image: str,
@@ -166,18 +179,27 @@ def verdict_of(candidate, pixel_x: float, pixel_y: float, image: str,
                    label_y=note.get("label_y"))
 
 
-def carry_over(records: list, previous: list, tolerance: float) -> int:
+def carry_over(records: list, previous: list, tolerance: float,
+               found_again: "list | None" = None) -> int:
     """Give each of ``records`` (dicts with image, x, y) the note of the
     nearest of ``previous`` (Verdicts, read_outcomes) within
     ``tolerance`` on the same image, each note once; how many got one.
     A detector run finds the same spots again: what was ignored last
-    time stays ignored, what was imported stays imported."""
+    time stays ignored, what was imported stays imported. The notes
+    that went to a record go into ``found_again`` when a list is given:
+    those the new records answer for, so their old records can go
+    (keep_earlier)."""
     if not previous:
         return 0
     index = LedgerIndex(previous, tolerance)
     taken: set = set()
     given = 0
     records = [r for r in records if isinstance(r, dict)]
+
+    def take(verdict):
+        taken.add(id(verdict))
+        if found_again is not None:
+            found_again.append(verdict)
 
     def answers(record):
         """The old notes within reach of the record, nearest first:
@@ -190,14 +212,18 @@ def carry_over(records: list, previous: list, tolerance: float) -> int:
         return sorted(found, key=lambda v: math.hypot(v.pixel_x - x,
                                                       v.pixel_y - y))
     # A record written with its note already (a run that kept a
-    # reviewed spot aside) holds its own; the note it carries is spent.
+    # reviewed spot aside) answers for a spot the file had: the nearest
+    # note in reach that no other record took is spent on it, and it
+    # reads as the file has it now - a verdict imported while the run
+    # was under way is not written over by the one it replaced
+    # (2.10.2). With none left in reach it keeps what it came with.
     for record in records:
-        note = record.get(OUTCOME_KEY)
-        if note is None:
+        if record.get(OUTCOME_KEY) is None:
             continue
         for verdict in answers(record):
-            if id(verdict) not in taken and outcome_to_dict(verdict) == note:
-                taken.add(id(verdict))
+            if id(verdict) not in taken:
+                take(verdict)
+                record[OUTCOME_KEY] = outcome_to_dict(verdict)
                 break
     for record in records:
         if record.get(OUTCOME_KEY) is not None:
@@ -205,9 +231,95 @@ def carry_over(records: list, previous: list, tolerance: float) -> int:
         for verdict in answers(record):
             if id(verdict) in taken:
                 continue
-            taken.add(id(verdict))
+            take(verdict)
             record[OUTCOME_KEY] = outcome_to_dict(verdict)
             given += 1
             break
     return given
+
+
+def keep_earlier(records: list, earlier: list, notes: dict, covered,
+                 images, tolerance: float) -> tuple:
+    """What a detector run leaves of the file it replaces, besides its
+    own ``records`` (hunt H2, 2.10.2). The candidates file is the review
+    memory, and a run knows only the images it looked at: written from
+    the run alone, a run on another group - or a stricter one - took
+    every ignore and import note it did not find again with it. Of the
+    ``earlier`` records (read_records, with their ``notes``):
+
+    - on an image the run looked at (``covered``, paths), one with a
+      note stays as it was unless a new record found the spot again -
+      the note is then that record's (carry_over) - and one without is
+      dropped: the run's own candidates replace it;
+    - on any other image - not chosen, not reached before a stop, not
+      readable, no longer in the project - every record stays as it
+      was, noted or not.
+
+    ``images`` are the paths of the project's images, by which a record
+    names its image (_named_among). Returns (kept, answers, elsewhere):
+    the records to write after the run's own, in the file's order, and
+    how many of them are answers not found again and how many lie on
+    images not looked at."""
+    named = _named_among(images)
+    covered = {named(path) for path in covered} - {None}
+
+    def looked_at(record) -> bool:
+        if not isinstance(record, dict):
+            return False
+        image = _first(record, _IMAGE_KEYS)
+        return isinstance(image, str) and named(image) in covered
+    there = [looked_at(record) for record in earlier]
+    found_again: list = []
+    carry_over(records, [verdict for index, verdict in notes.items()
+                         if there[index]], tolerance, found_again)
+    gone = {id(verdict) for verdict in found_again}
+
+    def answered(index, record) -> bool:
+        """Has the record a note that no new record took over. One that
+        cannot be read counts: it is not this run's to throw away."""
+        if record.get(OUTCOME_KEY) is None:
+            return False
+        verdict = notes.get(index)
+        return verdict is None or id(verdict) not in gone
+    kept, answers, elsewhere = [], 0, 0
+    for index, record in enumerate(earlier):
+        if not there[index]:
+            elsewhere += 1
+        elif answered(index, record):
+            answers += 1
+        else:
+            continue            # found again, or replaced by the run's
+        kept.append(record)
+    return kept, answers, elsewhere
+
+
+def _named_among(paths):
+    """A function from an image as a record writes it to the one of
+    ``paths`` it names, or None: the path itself, else - the imagery
+    moved, the file passed to another machine - by file name as Model
+    Review matches a record (source.match_candidates), among several of
+    one name by the longest shared folder tail, none when that does not
+    tell them apart."""
+    def spelled(path) -> str:
+        return str(path).replace("\\", "/").lower()
+    exact = {spelled(path): path for path in paths}
+    by_name: dict = {}
+    for path in exact.values():
+        by_name.setdefault(image_key(path), []).append(path)
+    known: dict = {}            # each spelling worked out once
+
+    def named(written):
+        if written not in known:
+            found = exact.get(spelled(written))
+            if found is None:
+                same = by_name.get(image_key(written), [])
+                if len(same) > 1:
+                    shared = [_tail_overlap(path, written) for path in same]
+                    best = max(shared)
+                    same = [path for path, n in zip(same, shared)
+                            if best and n == best]
+                found = same[0] if len(same) == 1 else None
+            known[written] = found
+        return known[written]
+    return named
 

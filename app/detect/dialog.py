@@ -60,6 +60,11 @@ COMMON_DOC = (
     "- within Model Review's Same chip within distance (or half the "
     "candidate's size, if that is more), if Skip what was reviewed is "
     "on. The new file keeps those answers.\n\n"
+    "What a run keeps - the candidates file is also the memory of your "
+    "answers, so a run adds to it. Every answer stays, whether this run "
+    "finds its spot again or not, and so does everything on images this "
+    "run does not look at; only the candidates without an answer on the "
+    "images it does look at are replaced by the new ones.\n\n"
     "Check against my labels counts a label as found when it lies within "
     "a candidate's own patch, or the smallest size, whichever is larger.")
 
@@ -116,7 +121,6 @@ class DetectDialog(QDialog):
         self._closing = False           # a close cancels the work's result
         self._target = None             # where the run's file goes
         self._run_settings = None
-        self._previous: list = []       # the last file's notes
         self._param_widgets: dict = {}
         self._build()
         self._restore()
@@ -479,8 +483,7 @@ class DetectDialog(QDialog):
         # The last run's file is the memory (2.9.4): what it says was
         # ignored or imported is skipped, and carried onto what is found
         # again.
-        self._previous = read_outcomes(target)
-        memory = LedgerIndex(self._previous, settings.tolerance_px)
+        memory = LedgerIndex(read_outcomes(target), settings.tolerance_px)
 
         def job(progress, should_stop):
             # The file is written here, on the window's thread, once the
@@ -505,8 +508,11 @@ class DetectDialog(QDialog):
             return
         records, report = result
         try:
+            # The file as it stands now is what the new one keeps from
+            # (hunt H2, 2.10.2): read when the run began, a verdict
+            # imported meanwhile was lost with the rewrite.
             write_candidates(self._target, records, self._run_settings,
-                             report, previous=self._previous)
+                             report, project=self._project())
         except OSError as exc:
             self.status.setText(f"Could not write {self._target}: {exc}")
             return

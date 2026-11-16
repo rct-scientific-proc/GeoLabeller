@@ -11,7 +11,9 @@ geodesic width, and pixels where it has not; an image without ground
 takes the metre figures as pixels and is counted. The candidates are
 written at full resolution into a file beside the project in the Model
 Review file format, their class "candidate", so Model Review opens it
-like any other.
+like any other. That file is also the memory of what was answered: a
+run adds to it, and takes out only the unanswered candidates of the
+images it looked at (write_candidates).
 
 Qt-free; detect_dialog.py puts the window round ``run``.
 """
@@ -19,6 +21,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,7 +32,7 @@ from .. import gdal_config, display_settings
 from ..labels import geodesic_distance
 from ..model_review.ledger import (DEFAULT_TOLERANCE_PX, OUTCOME_KEY,
                                    LedgerIndex, outcome_to_dict)
-from ..model_review.outcomes import carry_over
+from ..model_review.outcomes import keep_earlier, read_records
 from ..model_review.source import CANDIDATE
 from ..snippets import nodata_mask
 from ..version import app_version
@@ -96,11 +99,16 @@ class Report:
     images: int = 0
     unreadable: int = 0
     no_ground: int = 0          # sizes taken as pixels
-    found: int = 0
+    found: int = 0              # new candidates, this run's
     near_label: int = 0
-    reviewed: int = 0
+    reviewed: int = 0           # found again where the file has an answer
     stopped: bool = False
     stats: list = field(default_factory=list)
+    # What the file keeps besides (write_candidates, 2.10.2): answers
+    # on the images looked at that this run did not find again, and the
+    # earlier records of images it did not look at.
+    kept: int = 0
+    elsewhere: int = 0
 
     def summary(self) -> str:
         parts = [f"{self.found} candidate{'' if self.found == 1 else 's'} "
@@ -110,6 +118,12 @@ class Report:
                          "out")
         if self.reviewed:
             parts.append(f"{self.reviewed} reviewed before kept aside")
+        if self.kept:
+            parts.append(f"{self.kept} reviewed before not found again, "
+                         "kept")
+        if self.elsewhere:
+            parts.append(f"{self.elsewhere} from earlier runs on images "
+                         "not looked at, kept")
         if self.no_ground:
             parts.append(f"{self.no_ground} image"
                          f"{'' if self.no_ground == 1 else 's'} without "
@@ -390,25 +404,56 @@ def candidates_path(project_path) -> Path:
 
 
 def write_candidates(path, records: list, settings: Settings,
-                     report: "Report | None" = None, previous=()) -> int:
+                     report: "Report | None" = None, previous=(),
+                     project=None) -> int:
     """The Model Review file: a {"chips": [...]} wrapper with how it was
-    made, so a reader can tell one run from another. ``previous`` are
-    the last file's notes (outcomes.read_outcomes): a candidate found
+    made, so a reader can tell one run from another. A candidate found
     again within the tolerance keeps its note - ignored stays ignored,
-    imported stays imported (2.9.4)."""
+    imported stays imported (2.9.4).
+
+    The file is the review memory, so the one at ``path`` is read here,
+    as it stands, and what this run did not find or did not look at
+    stays in the new one (outcomes.keep_earlier; hunt H2, 2.10.2): its
+    notes are the ones carried and kept, not ``previous`` - what a
+    caller read when its run began - so a verdict imported while the
+    run was under way is kept too. The images looked at are those
+    ``report`` says were read (without one, those the records name);
+    ``project`` tells which image an earlier record names; ``report``
+    takes the counts of what was kept. The file is replaced whole or
+    not at all - not when the one there cannot be opened to see what it
+    holds (OSError, as when it cannot be written). Returns how many
+    records it now holds."""
     detector = by_key(settings.detector)
-    carry_over(records, list(previous or ()), settings.tolerance_px)
+    path = Path(path)
+    if report is not None:
+        covered = [stats.path for stats in report.stats if not stats.error]
+    else:
+        covered = [record["image"] for record in records
+                   if isinstance(record, dict) and record.get("image")]
+    images = [image.path for image in
+              (getattr(project, "images", None) or {}).values()]
+    earlier, notes = read_records(path)
+    kept, answers, elsewhere = keep_earlier(
+        records, earlier, notes, covered, images or covered,
+        settings.tolerance_px)
+    if report is not None:
+        report.kept, report.elsewhere = answers, elsewhere
     data = {
         "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "creator": f"GeoLabeller {app_version()}",
         "detector": detector.key,
         "settings": settings.to_dict(),
         "summary": report.summary() if report is not None else "",
-        "chips": list(records),
+        "chips": list(records) + kept,
     }
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=1)
-    return len(records)
+    temp = path.with_name(path.name + ".tmp")
+    try:
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=1)
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)    # only a failed write leaves one
+    return len(data["chips"])
 
 
 def source_name(settings: Settings) -> str:
