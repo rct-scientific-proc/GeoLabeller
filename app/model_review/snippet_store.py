@@ -33,6 +33,14 @@ INPUT_PX = 64                   # every chip is seen at this size
 WORKERS = 4                     # images read at once
 REPORT_EVERY = 100              # chips between progress reports
 CHUNK = 200                     # chips read between looks at Stop
+# The rule the stored chips' pixels were read by, in every file's key.
+# Raise it in any release that changes the pixels a read of an unchanged
+# file gives (what is no data, how a band is stretched or drawn): chips
+# saved before are then misses and read again. 2.10.2 changed them for
+# alpha, mask and non-finite files and the store kept 2.10.1's (retest
+# of 2.10.2, pixels R3); 2 is 2.10.3's rule. Files of an older rule stay
+# until Clear.
+PIXEL_RULE = 2
 
 
 class Cancelled(Exception):
@@ -94,7 +102,8 @@ class SnippetStore:
         """The .npz for this image at this chip size, as drawn now."""
         display = display_settings.for_image(image_path)
         key = json.dumps([os.path.normcase(os.path.abspath(image_path)),
-                          int(chip_size), self.input_px, display.to_dict()],
+                          int(chip_size), self.input_px, display.to_dict(),
+                          PIXEL_RULE],
                          sort_keys=True)
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
         return self.root / f"{Path(image_path).stem}-{digest}.npz"
