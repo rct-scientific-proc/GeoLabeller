@@ -2353,6 +2353,7 @@ class MainWindow(QMainWindow):
         image = self.project.images.get(image_path)
         if image:
             self.layer_panel.add_label_to_panel(label, image)
+            self._snippet_panel_placed(image, label)
 
         # In waterfall, show this label on the other images that contain it.
         self._update_waterfall_projections()
@@ -2388,6 +2389,7 @@ class MainWindow(QMainWindow):
 
         # Remove from labeled images panel incrementally (O(1) instead of full refresh)
         self.layer_panel.remove_label_from_panel(label_id)
+        self._snippet_panel_removed(label_id)
 
         # Its group may have shrunk to one label - that survivor's halo goes.
         self._update_ring_colors()
@@ -2930,56 +2932,93 @@ class MainWindow(QMainWindow):
 
     def _label_entries(self) -> list:
         """Every label as a plain dict, for the snippet views."""
-        entries = []
-        for image in self.project.images.values():
-            for label in image.labels:
-                lat, lon = label.lat, label.lon
-                if lat is None or lon is None:
-                    # No ground position of its own (hunt M9): by the
-                    # image, as the map draws it; None when it has none.
-                    lat, lon = image.ground_of(label) or (None, None)
-                entries.append({
-                    "label_id": label.id,
-                    "image_path": image.path,
-                    "image_name": image.name,
-                    # The group (folder) the image was loaded from, shown
-                    # under each snippet in the Snippet Editor.
-                    "group": image.group or "",
-                    "pixel_x": label.pixel_x,
-                    "pixel_y": label.pixel_y,
-                    "class_name": label.class_name,
-                    "linked": len(self.project._object_id_index.get(
-                        label.object_id, ())) > 1,
-                    "object_id": label.object_id,
-                    "group_id": label.group_id,
-                    "description": label.description,
-                    "lon": lon,
-                    "lat": lat,
-                    "orientation_px_rad": label.orientation_px_rad,
-                    "orientation_deg": label.orientation_deg,
-                    "orientation_derived": label.orientation_derived,
-                    "confidence": label.confidence,
-                    "review": label.review,
-                    "length_m": label.length_m,
-                    "width_m": label.width_m,
-                    # Copies: the Snippet Editor mutates its entries and
-                    # commits through masks_changed, never by aliasing.
-                    "masks": [dict(m) for m in label.masks],
-                    # Full image dimensions when the project knows them -
-                    # what the Snippet Editor anchors full-image RLEs against
-                    # without re-reading the file header.
-                    "image_size": (
-                        (image.original_width, image.original_height)
-                        if image.original_width and image.original_height
-                        else None),
-                })
-        return entries
+        entry = self._label_entry
+        return [entry(image, label)
+                for image in self.project.images.values()
+                for label in image.labels]
+
+    def _label_entry(self, image, label) -> dict:
+        """One label as the plain dict the snippet views take."""
+        lat, lon = label.lat, label.lon
+        if lat is None or lon is None:
+            # No ground position of its own (hunt M9): by the
+            # image, as the map draws it; None when it has none.
+            lat, lon = image.ground_of(label) or (None, None)
+        return {
+            "label_id": label.id,
+            "image_path": image.path,
+            "image_name": image.name,
+            # The group (folder) the image was loaded from, shown
+            # under each snippet in the Snippet Editor.
+            "group": image.group or "",
+            "pixel_x": label.pixel_x,
+            "pixel_y": label.pixel_y,
+            "class_name": label.class_name,
+            "linked": len(self.project._object_id_index.get(
+                label.object_id, ())) > 1,
+            "object_id": label.object_id,
+            "group_id": label.group_id,
+            "description": label.description,
+            "lon": lon,
+            "lat": lat,
+            "orientation_px_rad": label.orientation_px_rad,
+            "orientation_deg": label.orientation_deg,
+            "orientation_derived": label.orientation_derived,
+            "confidence": label.confidence,
+            "review": label.review,
+            "length_m": label.length_m,
+            "width_m": label.width_m,
+            # Copies: the Snippet Editor mutates its entries and
+            # commits through masks_changed, never by aliasing.
+            "masks": [dict(m) for m in label.masks],
+            # Full image dimensions when the project knows them -
+            # what the Snippet Editor anchors full-image RLEs against
+            # without re-reading the file header.
+            "image_size": (
+                (image.original_width, image.original_height)
+                if image.original_width and image.original_height
+                else None),
+        }
 
     def _refresh_snippet_panel(self):
         """Feed the sidebar the current labels (no-op while hidden)."""
         if not self.snippet_panel.isVisible():
             return
         self.snippet_panel.set_labels(self._label_entries())
+
+    def _snippet_panel_placed(self, image, label):
+        """The sidebar takes the label just placed on the map: its one
+        tile, at its place among the others (hunt M14, 2.10.2).
+
+        A label placed or removed with the Snippet Editor closed used to
+        leave the sidebar as it was. Feeding it every label again for
+        the one (_refresh_snippet_panel) is 137 ms at 20,000 labels, on
+        every click that places a label, so it is handed the one. Should
+        it not hold exactly the labels there were before, it is fed
+        whole after all."""
+        panel = self.snippet_panel
+        if not panel.isVisible():
+            return                          # it is fed when it is shown
+        index = total = 0
+        for other in self.project.images.values():
+            total += len(other.labels)
+            if other is image:
+                index = total - 1           # the last label of its image
+        if panel.label_count() != total - 1:
+            self._schedule_refresh("snippets")
+            return
+        panel.insert_label(index, self._label_entry(image, label))
+
+    def _snippet_panel_removed(self, label_id: int):
+        """...and lets go of a label removed there: its tile alone, or -
+        for a linked label, whose object's other labels change with it,
+        and for a sidebar that is not in step - every label fed again."""
+        panel = self.snippet_panel
+        if not panel.isVisible():
+            return
+        if (panel.label_count() != self.project.label_count + 1
+                or not panel.remove_label(label_id)):
+            self._schedule_refresh("snippets")
 
     def _schedule_refresh(self, *kinds: str):
         """Ask for project-wide refreshes once the current burst settles.

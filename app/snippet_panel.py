@@ -154,6 +154,75 @@ class SnippetPanel(QWidget):
         self._refresh_group_choices()
         self._rebuild()
 
+    # One label at a time. A label placed or removed on the map used to
+    # leave the strip as it was (hunt M14, 2.10.2), and feeding it every
+    # label again for the one (set_labels) is 137 ms at 20,000 labels -
+    # on every click that places one. So the strip takes the one; what it
+    # holds afterwards is what set_labels would have left it holding.
+
+    def label_count(self) -> int:
+        """How many labels the strip holds, listed by its filter or not:
+        what a caller checks before handing it one more, or one fewer."""
+        return len(self._entries)
+
+    def insert_label(self, index: int, entry: dict):
+        """A label on its own - not linked, as one just placed is -
+        joined the project: ``entry`` is at ``index`` of the list
+        set_labels would now be given. Its tile goes where the filter
+        in force lists it; no other entry is looked at again."""
+        self._entries.insert(index, entry)
+        if self.filter_combo.findText(
+                f"{_CLASS_PREFIX}{entry['class_name']}") < 0:
+            self._refresh_filter_choices()        # the first of its class
+        choice = self.filter_combo.currentText() or FILTER_ALL
+        if choice == FILTER_LINKED:
+            return                                # no label on its own
+        if choice.startswith(_CLASS_PREFIX):
+            wanted = choice[len(_CLASS_PREFIX):]
+            if entry["class_name"] != wanted:
+                return
+            row = sum(1 for e in self._entries[:index]
+                      if e["class_name"] == wanted)
+        else:
+            row = index
+        size = self.size_spin.value()
+        label_id = entry["label_id"]
+        item = self._make_item(entry, size)
+        self.list.insertItem(row, item)
+        self._items[label_id] = item
+        self._view_keys.insert(row, self._view_key(entry, size))
+        self._unloaded[label_id] = entry
+        self._request_in_view()
+
+    def remove_label(self, label_id: int) -> bool:
+        """A label left the project: its entry and its tile go, the rest
+        stay where they are. False, and nothing done, when the strip
+        holds no such label or holds it as linked: the other labels of
+        its object change with it (one left alone is linked no more),
+        and only set_labels brings that in."""
+        index = next((i for i, e in enumerate(self._entries)
+                      if e["label_id"] == label_id), None)
+        if index is None or self._entries[index].get("linked"):
+            return False
+        entry = self._entries.pop(index)
+        item = self._items.pop(label_id, None)
+        if item is not None:
+            row = self.list.row(item)
+            self.list.takeItem(row)
+            del self._view_keys[row]
+            self._unloaded.pop(label_id, None)
+            self._loader.cancel(label_id)
+        class_name = entry["class_name"]
+        if not any(e["class_name"] == class_name for e in self._entries):
+            # The last of its class: the class leaves the filter's list,
+            # and a filter that was that class falls back to All.
+            choice = self.filter_combo.currentText()
+            self._refresh_filter_choices()
+            if self.filter_combo.currentText() != choice:
+                self._rebuild()
+        self._request_in_view()
+        return True
+
     ALL_GROUPS = "All groups"
 
     def _refresh_group_choices(self):
