@@ -42,7 +42,8 @@ from ..debug_log import debug
 from ..labels import (REVIEW_ACCEPTED, REVIEW_RECHECK, REVIEW_REJECTED,
                       REVIEW_UNREVIEWED, valid_review)
 from ..orientation_math import (
-    pixel_angle_from_heading, principal_angle_rad, true_heading_deg)
+    crs_has_ground, pixel_angle_from_heading, principal_angle_rad,
+    true_heading_deg)
 from ..snippets import SnippetLoader, snippet_frame
 from .section import Section
 from .single_view import TOOL_ORIENT
@@ -993,13 +994,20 @@ class OrientationEditor(QWidget):
         Read from the source rather than trusted from project metadata, so
         the heading is right even for entries written before the project
         recorded transforms.
+
+        A CRS with no way to latitude and longitude (a LOCAL_CS site
+        grid: crs_has_ground) is no CRS here, as the project holds such a file as a plain
+        picture: no metres, no heading, the pixel angle only. Handed on,
+        every measured line raised in pyproj (retest map R1, 2.10.3).
+        Asked on the UI thread, once per file (the cache).
         """
         info = self._geo_cache.get(image_path)
         if info is None:
             try:
                 with rasterio.open(image_path) as src:
-                    info = (src.transform if src.crs is not None else None,
-                            src.crs, src.width, src.height)
+                    crs = src.crs if crs_has_ground(src.crs) else None
+                    info = (src.transform if crs is not None else None,
+                            crs, src.width, src.height)
             except Exception as exc:  # noqa: BLE001 - no heading, still usable
                 debug(f"orientation geo info failed: "
                       f"{Path(image_path).name}: {exc}")

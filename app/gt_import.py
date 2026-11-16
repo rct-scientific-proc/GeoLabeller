@@ -196,13 +196,17 @@ def _georeferenced(image) -> bool:
 def _from_file(image) -> "ImageData | None":
     """What ``image``'s file says of itself, for an entry that recorded
     nothing: a stand-in with its size, transform and CRS. None when the
-    file cannot be read."""
+    file cannot be read. A CRS the map cannot place (LOCAL_CS) is left
+    off, as the project holds such a file as a plain picture and
+    apply_import copies the stand-in into the record (retest map R1,
+    2.10.3)."""
+    from .canvas import crs_placeable
     try:
         with rasterio.open(image.path) as src:
             probe = ImageData(path=image.path, name=image.name,
                               group=image.group, original_width=src.width,
                               original_height=src.height)
-            if src.crs is not None:
+            if crs_placeable(src.crs):
                 probe.set_affine(src.transform, src.crs)
             return probe
     except Exception:                         # noqa: BLE001 - unreadable

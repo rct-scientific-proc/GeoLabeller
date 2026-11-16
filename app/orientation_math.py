@@ -34,6 +34,32 @@ from .labels import GEOD as _GEOD, WGS84
 # The ellipsoid lives in labels now, so the headings measured here and the
 # distances stored on a label cannot drift onto different earth models.
 
+# The WKT of a CRS -> has it a way to latitude and longitude?
+_has_ground: dict = {}
+
+
+def crs_has_ground(crs) -> bool:
+    """Can a position in ``crs`` be taken to latitude and longitude, as
+    every function below needs? A LOCAL_CS site grid cannot: since
+    2.10.2 the project holds such a file as a plain picture (hunt M4),
+    and handed one, every measured line raised in pyproj (retest map R1,
+    2.10.3). canvas.crs_placeable's question, asked of WGS84: the
+    Snippet Editor does not import the canvas. Answered once per CRS;
+    for the UI thread (pyproj).
+    """
+    if crs is None:
+        return False
+    wkt = crs.to_wkt()
+    known = _has_ground.get(wkt)
+    if known is None:
+        try:
+            Transformer.from_crs(crs, WGS84, always_xy=True)
+            known = True
+        except Exception:      # noqa: BLE001 - pyproj's ProjError, CRSError
+            known = False
+        _has_ground[wkt] = known
+    return known
+
 
 def principal_angle_rad(col_start: float, row_start: float,
                         col_end: float, row_end: float) -> float | None:

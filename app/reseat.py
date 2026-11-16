@@ -319,6 +319,15 @@ def plan(image, header: "Header | None") -> Plan:
             p.reason = "the file's CRS is not the one the project recorded"
             return p
         return _by_affine(image, header, old)
+    # A record without georeferencing and a file in a CRS the map cannot
+    # place (a LOCAL_CS site grid): the project holds it as a plain
+    # picture, and a plan applied would write that CRS into its record
+    # (retest map R1, 2.10.3). Asked on the UI thread, where plan runs.
+    from .canvas import crs_placeable
+    if not crs_placeable(header.crs):
+        p = _start(image, UNKNOWN, header)
+        p.reason = "the file has no georeferencing to go by"
+        return p
     return _by_consensus(image, header)
 
 
