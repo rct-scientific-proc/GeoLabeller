@@ -216,12 +216,67 @@ def _file_validity(src):
     flags = src.mask_flag_enums
     for band, band_flags in enumerate(flags, start=1):
         if MaskFlags.per_dataset in band_flags:
+            if MaskFlags.alpha in band_flags and not _alpha_is_alpha(src):
+                break       # a data band GDAL calls alpha: no mask at all
             return _MASK, band
     if not all(MaskFlags.nodata in band_flags for band_flags in flags):
         return None         # a band with no nodata value always holds data
-    if len(flags) in (2, 4) and src.colorinterp[-1] == ColorInterp.alpha:
+    if (len(flags) in (2, 4) and src.colorinterp[-1] == ColorInterp.alpha
+            and _alpha_is_alpha(src)):
         return _ALPHA, len(flags)
     return _NODATA, src.nodatavals
+
+
+# Is the band GDAL tags as alpha - the last of 2 or of 4 - an alpha band
+# (retest of 2.10.2, pixels R1; 2.10.3)? GDAL tags the fourth band of a
+# 4-band byte GeoTIFF written with its defaults as alpha, whatever it
+# holds: an RGB+NIR file from a script or a default gdal_translate. Its
+# NIR, 0 over water, then made the water no data. An alpha band is 0 and
+# the type's maximum and little else - a resampled edge may hold values
+# between - so the band is taken for one only when at least this share
+# of a sample of it is 0 or the maximum and some of it is the maximum;
+# otherwise the file has no alpha. By file path, as the stretch is.
+_ALPHA_SHARE = 0.98
+_ALPHA_GRID = 4             # windows a side, spread over the whole raster
+_ALPHA_WINDOW = 16          # pixels a side: one block, rarely more
+_alpha_answers: dict[str, bool] = {}
+_alpha_lock = threading.Lock()
+
+
+def _alpha_is_alpha(src) -> bool:
+    """Does the file's tagged alpha band (its last) look like one? Decided
+    once per file from a strided sample of small windows - a bounded
+    number of block reads, whatever the raster's size or overviews."""
+    key = src.name
+    with _alpha_lock:
+        known = _alpha_answers.get(key)
+    if known is not None:
+        return known
+    band = src.count
+    dtype = np.dtype(src.dtypes[band - 1])
+    share = 0.0
+    if np.issubdtype(dtype, np.integer):      # a float band has no "opaque"
+        top = np.iinfo(dtype).max
+        w = min(_ALPHA_WINDOW, src.width)
+        h = min(_ALPHA_WINDOW, src.height)
+        xs = np.unique(np.linspace(0, src.width - w, _ALPHA_GRID).astype(int))
+        ys = np.unique(np.linspace(0, src.height - h, _ALPHA_GRID).astype(int))
+        sample = np.concatenate([
+            src.read(band, window=Window(int(x), int(y), w, h)).ravel()
+            for y in ys for x in xs])
+        opaque = int((sample == top).sum())
+        share = (opaque + int((sample == 0).sum())) / sample.size
+        known = opaque > 0 and share >= _ALPHA_SHARE
+    else:
+        known = False
+    with _alpha_lock:
+        first = key not in _alpha_answers
+        known = _alpha_answers.setdefault(key, known)
+    if first and not known:
+        debug(f"{Path(key).name}: band {band} is tagged alpha but holds "
+              f"data ({share:.0%} of a sample is 0 or the maximum) - "
+              "read as a data band; the file has no alpha")
+    return known
 
 
 def told_from_bands(src) -> bool:
