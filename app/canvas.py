@@ -42,8 +42,8 @@ from rasterio.warp import transform as warp_transform
 from .labels import geodesic_distance
 from .debug_log import debug
 from .labels import ImagePaths, canonical_path
-from .snippets import (apply_band_stretch, cached_band_scaling, no_data,
-                       told_from_bands)
+from .snippets import (NoDataByBand, apply_band_stretch, cached_band_scaling,
+                       no_data, told_from_bands)
 from . import display_settings
 from .display_settings import (apply_lut, colour_table, palette_rgb,
                                paletted_band)
@@ -1152,17 +1152,39 @@ class TiledLayer:
                 # Where it is told from the bands' values the others are
                 # read before the first is warped; otherwise - the
                 # ordinary file - one at a time, as they always were.
+                # Each is told as it is read and held as the bytes it
+                # will be warped from, not raw (retest pixels R2, 2.10.3):
+                # every band held raw put a fifth to a half on the peak.
                 held = {}
-                if told_from_bands(src):
+                told = NoDataByBand(src) if told_from_bands(src) else None
+                if told is not None:
                     for i in extra:
                         self._checkpoint(cancel_check)
-                        held[i] = src.read(i, out_shape=(rd_h, rd_w))
+                        raw = src.read(i, out_shape=(rd_h, rd_w))
+                        told.add(i, raw)
+                        raw = apply_band_stretch(raw, band_scaling, i - 1)
+                        if raw.dtype != np.uint8:
+                            # A NaN casts to no byte in particular: it is
+                            # no data, zeroed below.
+                            with np.errstate(invalid="ignore"):
+                                raw = np.clip(raw, 0, 255).astype(np.uint8)
+                        held[i] = raw
+                        del raw
                 src_band1 = src.read(first, out_shape=(rd_h, rd_w))
-                empty = no_data(src, [src_band1, *held.values()],
-                                [first, *held])
+                if told is None:
+                    empty = no_data(src, [src_band1], [first])
+                else:
+                    told.add(first, src_band1)
+                    empty = told.result()
+                    del told
+                    if empty is not None:
+                        for plane in held.values():
+                            plane[empty] = 0        # as the loop below would
                 src_band1 = src_band1.astype(np.float32)
                 if empty is not None:
                     src_band1[empty] = np.nan
+                if held:
+                    empty = None    # every band still to warp is marked
                 src_band1 = apply_band_stretch(src_band1, band_scaling, first - 1)
 
                 self._checkpoint(cancel_check)
@@ -1192,14 +1214,11 @@ class TiledLayer:
                 # all bands, and the pixels marked above.
                 nodata_mask = np.isnan(dst_band1)
 
-                # Convert band 1 to uint8
-                band1_uint8 = np.clip(
-                    np.nan_to_num(
-                        dst_band1,
-                        nan=0.0),
-                    0,
-                    255).astype(
-                    np.uint8)
+                # Convert band 1 to uint8 - in place: two float copies of
+                # the frame were the peak of the load (retest pixels R2).
+                np.nan_to_num(dst_band1, copy=False, nan=0.0)
+                np.clip(dst_band1, 0, 255, out=dst_band1)
+                band1_uint8 = dst_band1.astype(np.uint8)
                 del dst_band1  # Free memory
 
                 # Reproject remaining bands directly as uint8 (faster)
@@ -1208,15 +1227,15 @@ class TiledLayer:
                     for i in extra:
                         self._checkpoint(cancel_check)
                         src_band = held.pop(i, None)
-                        if src_band is None:
-                            src_band = src.read(i, out_shape=(rd_h, rd_w))
+                        if src_band is None:    # held: stretched, bytes
+                            src_band = apply_band_stretch(
+                                src.read(i, out_shape=(rd_h, rd_w)),
+                                band_scaling, i - 1)
                         # The pixels without data (told from the raw
                         # values, before the stretch maps a sentinel like
                         # any other) are zeroed - 0 is the uint8
                         # reproject's nodata - ahead of the byte
                         # conversion, which has no answer for a NaN.
-                        src_band = apply_band_stretch(
-                            src_band, band_scaling, i - 1)
                         if empty is not None:
                             src_band[empty] = 0
                         if src_band.dtype != np.uint8:
@@ -1355,27 +1374,30 @@ class TiledLayer:
                 # so a swath exterior that is invisible on the map showed up as
                 # a black block in waterfall. Told of a pixel, not of the
                 # first band drawn (snippets.no_data; hunt M6, 2.10.2):
-                # where it is told from the bands' values the others are
-                # read first, otherwise one at a time, as before.
-                held = {}
-                if told_from_bands(src):
-                    for index in dict.fromkeys(chosen):
-                        if index != first:
-                            self._checkpoint(cancel_check)
-                            held[index] = src.read(
-                                index, out_shape=(height, width))
-                empty = no_data(src, [band1, *held.values()], [first, *held])
+                # where it is told from the bands' values each band is
+                # told as it is read, and kept only as the bytes drawn
+                # (retest pixels R2, 2.10.3) - nothing is held raw.
+                told = NoDataByBand(src) if told_from_bands(src) else None
+                if told is None:
+                    empty = no_data(src, [band1], [first])
+                else:
+                    told.add(first, band1)
                 # _as_uint8 skips the copy for an already-uint8 read; nearly
                 # all supported imagery is uint8.
                 planes = {first: _as_uint8(band1, band_scaling, first - 1)}
+                del band1
                 for index in dict.fromkeys(chosen):
                     if index not in planes:
                         self._checkpoint(cancel_check)
-                        raw = held.pop(index, None)
-                        if raw is None:
-                            raw = src.read(index, out_shape=(height, width))
+                        raw = src.read(index, out_shape=(height, width))
+                        if told is not None:
+                            told.add(index, raw)
                         planes[index] = _as_uint8(
                             raw, band_scaling, index - 1)
+                        del raw
+                if told is not None:
+                    empty = told.result()
+                    del told
                 r, g, b = (planes[c] for c in chosen)
 
             rgba = np.zeros((height, width, 4), dtype=np.uint8)

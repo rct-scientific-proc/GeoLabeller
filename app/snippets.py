@@ -290,25 +290,84 @@ def told_from_bands(src) -> bool:
             or any(str(dtype).startswith("float") for dtype in src.dtypes))
 
 
-def _all_nodata(src, seen, values, window, shape):
-    """True where every band of the file holds its nodata value - GDAL's
-    rule for a dataset - or None where no pixel does. The bands in hand
-    are compared as read, and come first: most reads are settled by
-    them, and only a pixel they leave in doubt has the other bands'
-    masks read."""
-    empty = None
-    for band in sorted(range(1, len(values) + 1), key=lambda b: b not in seen):
-        plane = seen.get(band)
-        if plane is None:
-            here = src.read_masks(band, window=window, out_shape=shape) == 0
-        elif values[band - 1] != values[band - 1]:
-            here = np.isnan(plane)      # a NaN sentinel equals nothing
-        else:
-            here = plane == values[band - 1]
-        empty = here if empty is None else (empty & here)
-        if not empty.any():
-            return None
-    return empty
+class NoDataByBand:
+    """no_data() told band by band, as a reader reads them: ``add`` each
+    band as it is read - it is looked at then and not kept - and
+    ``result`` gives what no_data() gives for all of them at once.
+
+    A whole-image load needs the answer before it warps its first band,
+    and 2.10.2 held every drawn band raw until it had it: peak memory up
+    a fifth to a half for multi-band files with a nodata value and for
+    float files (retest of 2.10.2, pixels R2; 2.10.3). What is held now
+    is two masks the size of a band, as bytes.
+
+    The bands in hand are compared as they come, the others' masks are
+    read at the end where the bands in hand leave a pixel in doubt -
+    GDAL's rule for a dataset with a nodata value on every band."""
+
+    def __init__(self, src, window=None):
+        self._src, self._window = src, window
+        self._validity = _file_validity(src)
+        self._shape = None
+        self._seen = set()
+        self._every = None      # every band so far at its nodata value
+        self._settled = False   # ...and no pixel is: nothing more to ask
+        self._alpha = None      # the alpha band's zeros, if it was added
+        self._bad = None        # not finite in a band used
+
+    def add(self, index, plane, used=True):
+        if self._shape is None:
+            self._shape = plane.shape
+        self._seen.add(index)
+        if self._validity is not None:
+            how, what = self._validity
+            if how == _NODATA and not self._settled:
+                value = what[index - 1]
+                if value != value:
+                    here = np.isnan(plane)      # a NaN sentinel equals nothing
+                else:
+                    here = plane == value
+                if self._every is None:
+                    self._every = here
+                else:
+                    self._every &= here
+                if not self._every.any():
+                    self._every, self._settled = None, True
+            elif how == _ALPHA and index == what:
+                self._alpha = plane == 0
+        if used and np.issubdtype(plane.dtype, np.floating):
+            finite = np.isfinite(plane)
+            if not finite.all():
+                bad = ~finite
+                self._bad = bad if self._bad is None else (self._bad | bad)
+
+    def result(self):
+        src, window, shape = self._src, self._window, self._shape
+        empty = None
+        if self._validity is not None:
+            how, what = self._validity
+            if how == _NODATA:
+                empty = None if self._settled else self._every
+                for band in range(1, len(what) + 1):
+                    if empty is None or band in self._seen:
+                        continue
+                    here = src.read_masks(band, window=window,
+                                          out_shape=shape) == 0
+                    empty = here if empty is None else (empty & here)
+                    if not empty.any():
+                        empty = None
+            elif how == _MASK:
+                empty = src.read_masks(what, window=window,
+                                       out_shape=shape) == 0
+            elif self._alpha is not None:
+                empty = self._alpha
+            else:
+                empty = src.read(what, window=window, out_shape=shape) == 0
+            if empty is not None and not empty.any():
+                empty = None
+        if self._bad is not None:
+            empty = self._bad if empty is None else (empty | self._bad)
+        return empty
 
 
 def no_data(src, planes, indexes=None, window=None, used=None):
@@ -327,30 +386,13 @@ def no_data(src, planes, indexes=None, window=None, used=None):
     tested for being finite.
     """
     planes = [planes] if getattr(planes, "ndim", 3) == 2 else list(planes)
-    shape = planes[0].shape
     if indexes is None:
         indexes = range(1, len(planes) + 1)
-    seen = dict(zip(indexes, planes))
-    empty = None
-    validity = _file_validity(src)
-    if validity is not None:
-        how, what = validity
-        if how == _NODATA:
-            empty = _all_nodata(src, seen, what, window, shape)
-        elif how == _MASK:
-            empty = src.read_masks(what, window=window, out_shape=shape) == 0
-        elif what in seen:
-            empty = seen[what] == 0
-        else:
-            empty = src.read(what, window=window, out_shape=shape) == 0
-        if empty is not None and not empty.any():
-            empty = None
-    for plane in (planes if used is None else [planes[i] for i in used]):
-        if np.issubdtype(plane.dtype, np.floating):
-            finite = np.isfinite(plane)
-            if not finite.all():
-                empty = ~finite if empty is None else (empty | ~finite)
-    return empty
+    used = None if used is None else set(used)
+    told = NoDataByBand(src, window)
+    for position, (index, plane) in enumerate(zip(indexes, planes)):
+        told.add(index, plane, used is None or position in used)
+    return told.result()
 
 
 def _window_pixels(src, window, channels, nodata, scaling=None,
