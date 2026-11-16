@@ -2909,6 +2909,10 @@ class MapCanvas(QGraphicsView):
         self._ruler_text: QGraphicsTextItem | None = None
         # Crosshair dropped by "Go to Coordinates" (see mark_location).
         self._location_marker: QGraphicsPathItem | None = None
+        # The layers across 180 degrees, and the (layer count, next id)
+        # they were found at (see _ground_x).
+        self._wrapping_ids: tuple = ()
+        self._wrapping_key = None
         # Waypoint markers: waypoint_id -> (marker, name text). Parented to the
         # floating-origin group, so they ride along with every rebase.
         self._waypoint_items: dict = {}
@@ -3145,6 +3149,8 @@ class MapCanvas(QGraphicsView):
             self._next_z += 1
             if layer._wraps:
                 self._move_markers_past_the_edge(layer)
+                if visible and self._waypoint_items:
+                    self._place_waypoints_again()   # retest map R2, 2.10.3
 
             # Only update tiles if visible (skip for hidden layers)
             if visible:
@@ -4507,6 +4513,8 @@ class MapCanvas(QGraphicsView):
                 self._visible_layer_ids.discard(layer_id)
             for item in layer.detail_tiles.values():
                 item.setVisible(visible)
+            if layer._wraps and self._waypoint_items:
+                self._place_waypoints_again()       # retest map R2, 2.10.3
             if visible:
                 # Switched on, so it is the user's again and not the
                 # pool's. The trim used to notice this only when it next
@@ -4595,6 +4603,7 @@ class MapCanvas(QGraphicsView):
         """Remove a layer from the canvas."""
         if layer_id in self._layers:
             file_path = self._layers[layer_id].file_path
+            wraps = self._layers[layer_id]._wraps
             self._cancel_layer_load(self._layers[layer_id])
             self._clear_detail_tiles(layer_id, self._layers[layer_id])
             self._layers[layer_id].remove_from_scene(self._scene)
@@ -4602,6 +4611,8 @@ class MapCanvas(QGraphicsView):
             self._layers_by_name_group = None
             if file_path in self._path_to_layer:
                 del self._path_to_layer[file_path]
+            if wraps and self._waypoint_items:
+                self._place_waypoints_again()       # retest map R2, 2.10.3
             self._visible_layer_ids.discard(layer_id)
             # No loaded image is hiding its labels any more.
             self._hidden_image_keys.discard(self._image_key(file_path))
@@ -4898,6 +4909,9 @@ class MapCanvas(QGraphicsView):
             layer = self._layers.get(layer_id)
             if layer is not None and layer._wraps:
                 center_x += WORLD_WIDTH
+        elif layer_id is None:
+            # Go to coordinates, Go to waypoint (retest map R2, 2.10.3).
+            center_x = self._ground_x(center_x, center_y)
 
         mercator_size = size_meters / max(math.cos(math.radians(lat)), 1e-6)
         half_size = mercator_size / 2
@@ -6763,6 +6777,12 @@ class MapCanvas(QGraphicsView):
 
         if action == add_waypoint_action and not in_pixel_zone:
             lon, lat = self._web_mercator_to_wgs84(easting, northing)
+            if lon > 180.0:
+                # Past the scene's east edge, where a layer across 180
+                # degrees is laid: the same meridian within -180..180, as
+                # a click there gives. 180.09 was stored, written to GPX,
+                # and skipped by Import Waypoints (retest map R2, 2.10.3).
+                lon -= 360.0
             self.waypoint_add_requested.emit(lon, lat)
         elif unselect_action is not None and action == unselect_action:
             self.layer_unselect_requested.emit(hit_layer_id)
@@ -7329,10 +7349,52 @@ class MapCanvas(QGraphicsView):
         """
         self.clear_location_marker()
         easting, northing = self._wgs84_to_web_mercator(lon, lat)
+        easting = self._ground_x(easting, northing)
         marker = self._make_crosshair_marker(
             easting, northing, QColor(0, 200, 255),
             self._get_label_z_base() + 7)
         self._location_marker = marker
+
+    def _ground_x(self, easting: float, northing: float) -> float:
+        """The scene x of a point given by latitude and longitude alone
+        (a waypoint, Go to): one world width east, past the scene's edge,
+        where a shown layer across the 180 degree meridian holds that
+        ground - the rule add_label_marker follows for a label's own
+        layer - else ``easting``. A waypoint on such a picture stood a
+        world away from it, and Go to its coordinates showed the empty
+        west edge (retest map R2, 2.10.3).
+
+        The layers across 180 are found once per layer added or removed,
+        not per waypoint: a project's waypoints are drawn in one loop.
+        """
+        if easting >= 0.0:
+            return easting
+        key = (len(self._layers), self._next_id)
+        if key != self._wrapping_key:
+            self._wrapping_ids = tuple(
+                layer_id for layer_id, layer in self._layers.items()
+                if layer._wraps)
+            self._wrapping_key = key
+        east = easting + WORLD_WIDTH
+        for layer_id in self._wrapping_ids:
+            layer = self._layers.get(layer_id)
+            if (layer is not None and layer_id in self._visible_layer_ids
+                    and layer.contains_point(east, northing)):
+                return east
+        return easting
+
+    def _place_waypoints_again(self):
+        """A layer across 180 degrees was shown, hidden, added or
+        removed: each waypoint marker goes where _ground_x now puts it -
+        a project opens with its layers unticked, and a waypoint drawn
+        then stayed at the west edge when the picture was ticked."""
+        for marker, text in self._waypoint_items.values():
+            x = marker.pos().x()
+            plain = x - WORLD_WIDTH if x > WORLD_WIDTH / 2.0 else x
+            placed = self._ground_x(plain, -marker.pos().y())
+            if placed != x:
+                marker.setPos(placed, marker.pos().y())
+                text.setPos(placed, text.pos().y())
 
     @staticmethod
     def _crosshair_path(arm: float = 14.0, radius: float = 6.0) -> QPainterPath:
@@ -7388,6 +7450,7 @@ class MapCanvas(QGraphicsView):
         """Draw (or redraw) the marker and name for one waypoint."""
         self.remove_waypoint_marker(waypoint_id)
         easting, northing = self._wgs84_to_web_mercator(lon, lat)
+        easting = self._ground_x(easting, northing)
         z = self._get_label_z_base() + 6
         marker = self._make_crosshair_marker(
             easting, northing, self._WAYPOINT_COLOR, z)
