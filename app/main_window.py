@@ -252,6 +252,14 @@ def local_crs_notice(count: int) -> str:
     return (f"{count} images have a local coordinate system and were "
             "added as plain pictures")
 
+
+def _recorded_plain(image) -> bool:
+    """Does the project record no georeferencing for ``image`` - no
+    affine and no CRS - as for a plain picture? What a group under
+    Non-Georeferenced may reach of the images it has no row for (retest
+    panels R1, 2.10.3)."""
+    return image.affine_coeffs is None and image.crs_key() is None
+
 # How many images either side of the current one a cycle mode reads ahead.
 # What is then kept in memory is capped by the canvas (WARM_MAX_PIXELS), so
 # raising this widens the read-ahead without uncapping what it costs.
@@ -4180,8 +4188,8 @@ class MainWindow(QMainWindow):
             self, "Merge Classes", text,
             QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
 
-    def _describe_layer_removal(self, entries: list,
-                                group_paths: list = ()) -> "str | None":
+    def _describe_layer_removal(self, entries: list, group_paths: list = (),
+                                nongeo=None) -> "str | None":
         """Confirmation text for removing these layers, or None for no prompt.
 
         ``entries`` is the panel's [(layer_id, file_path), ...] and
@@ -4192,7 +4200,7 @@ class MainWindow(QMainWindow):
         labels is the one case removed without asking - nothing of
         consequence dies.
         """
-        images = self._images_to_remove(entries, group_paths)
+        images = self._images_to_remove(entries, group_paths, nongeo)
         n_labels = sum(len(image.labels) for image in images)
         n_images = max(len(images), len(entries))
         if n_images <= 1 and n_labels == 0:
@@ -4230,7 +4238,8 @@ class MainWindow(QMainWindow):
                 return image
         return None
 
-    def _images_to_remove(self, entries: list, group_paths=()) -> list:
+    def _images_to_remove(self, entries: list, group_paths=(),
+                          nongeo=None) -> list:
         """Every project image a removal gesture covers, once each: the
         tree's rows, and what the removed groups hold that has no row
         anywhere in the tree - a shared project's images whose files are
@@ -4243,6 +4252,15 @@ class MainWindow(QMainWindow):
         left its row and its layer (hunt M15, 2.10.2). The gesture's own
         rows are ``entries``: while the tree still holds them (the
         question, asked first) they are counted there.
+
+        ``nongeo`` (the panel's, one per group path) says which groups
+        are under Non-Georeferenced: such a group reaches row-less plain
+        pictures only, not an image the project records georeferencing
+        for. It has the project path of the georeferenced group beside
+        it, and removing it deleted that group's missing image (retest
+        panels R1, 2.10.3). A georeferenced group reaches every row-less
+        image as before: a record without georeferencing may be a
+        georeferenced image's from before affines were recorded.
         """
         images, seen = [], set()
         for _layer_id, file_path in entries:
@@ -4250,8 +4268,11 @@ class MainWindow(QMainWindow):
             if image is not None and id(image) not in seen:
                 seen.add(id(image))
                 images.append(image)
-        for group_path in group_paths:
+        sides = [False] * len(group_paths) if nongeo is None else nongeo
+        for group_path, side in zip(group_paths, sides):
             for image in self._images_in_group(group_path):
+                if side and not _recorded_plain(image):
+                    continue
                 if id(image) not in seen and not \
                         self.layer_panel.has_layer_for(image.path):
                     seen.add(id(image))
@@ -4273,7 +4294,7 @@ class MainWindow(QMainWindow):
             self.project.remove_image(image.path)
         return len(images), removed_labels
 
-    def _on_groups_removed(self, group_paths: list):
+    def _on_groups_removed(self, group_paths: list, nongeo=None):
         """Groups went from the tree: delete what the project files under
         them that the tree never showed.
 
@@ -4286,7 +4307,7 @@ class MainWindow(QMainWindow):
         tree by now (the panel takes them out before it reports), so
         what still has a row is shown elsewhere and stays (hunt M15).
         """
-        images = self._images_to_remove([], group_paths)
+        images = self._images_to_remove([], group_paths, nongeo)
         if images:
             self._removed_by_group = {
                 os.path.normcase(canonical_path(image.path))
@@ -7657,7 +7678,7 @@ class MainWindow(QMainWindow):
             self.project.update_image_group(file_path, group_path)
             self._mark_unsaved()
 
-    def _on_groups_moved(self, moves: list):
+    def _on_groups_moved(self, moves: list, nongeo=None):
         """Groups were dragged elsewhere in the tree: what the project
         keeps by group path goes with them (hunt M16, 2.10.2).
 
@@ -7672,10 +7693,21 @@ class MainWindow(QMainWindow):
         there that the tree shows elsewhere (a plain picture, under
         Non-Georeferenced) did not move, and keeps its group and its
         settings.
+
+        A group under Non-Georeferenced (``nongeo``, the panel's, one per
+        move) takes no row-less image the project records georeferencing
+        for (_images_to_remove): dragging the Non-Georeferenced twin of
+        "survey" re-filed a missing georeferenced image of
+        "survey/pass_a" while its present siblings stayed (retest panels
+        R1, 2.10.3).
         """
         changed = False
+        sides = [False] * len(moves) if nongeo is None else nongeo
+        geo_moves = [move for move, side in zip(moves, sides) if not side]
         for image in self.project.images.values():
-            target = display_settings.moved_path(image.group or "", moves)
+            target = display_settings.moved_path(
+                image.group or "",
+                moves if _recorded_plain(image) else geo_moves)
             if target is not None and not \
                     self.layer_panel.has_layer_for(image.path):
                 image.group = target

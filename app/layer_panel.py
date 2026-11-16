@@ -22,6 +22,9 @@ from .settings_scope import settings as app_settings
 # On a GROUP item: the project path the group itself was last seen at, so
 # a drag can say where a moved group came from (groups_moved, 2.10.2).
 GROUP_PATH_ROLE = Qt.UserRole + 2
+# On a GROUP item: whether it was last seen under the Non-Georeferenced
+# root - the side of the tree a drag of it moves (groups_moved, 2.10.3).
+GROUP_NONGEO_ROLE = Qt.UserRole + 4
 # The tree's root for non-georeferenced imagery. It names no project
 # group: an image under it is in the project group below the root.
 NONGEO_ROOT = "Non-Georeferenced"
@@ -83,14 +86,19 @@ class LayerPanel(QWidget):
     # shared project's images that are not on this machine get no layer
     # and no row - and those went on living in the project, labels and
     # all, after the group was "removed". MainWindow deletes them by
-    # group membership.
-    groups_removed = pyqtSignal(list)
+    # group membership. The second list says, for each path, whether its
+    # group is under the Non-Georeferenced root: a georeferenced group and
+    # its Non-Georeferenced twin share a project path, and each reaches
+    # the row-less images of its own side only (retest panels R1, 2.10.3).
+    groups_removed = pyqtSignal(list, list)
     # The GROUPS a drag-drop moved: [(old project path, new project
     # path), ...], the outermost of them only, emitted after the
     # per-layer layer_group_changed reports. What the project keeps by
     # group path - a group's Display Settings - follows the group through
     # this; a layer dragged on its own moves no group (hunt M16, 2.10.2).
-    groups_moved = pyqtSignal(list)
+    # The second list: whether each was under Non-Georeferenced before
+    # the drag, as for groups_removed (2.10.3).
+    groups_moved = pyqtSignal(list, list)
 
     # Group memory management signals: emitted with list of layer_ids
     group_preload_requested = pyqtSignal(list)  # layer_ids to fully load
@@ -268,8 +276,10 @@ class LayerPanel(QWidget):
         blocked = self.tree.signalsBlocked()
         self.tree.blockSignals(True)
         try:
-            item.setData(0, GROUP_PATH_ROLE,
-                         self._project_group(self._full_group_path(item)))
+            full = self._full_group_path(item)
+            item.setData(0, GROUP_PATH_ROLE, self._project_group(full))
+            item.setData(0, GROUP_NONGEO_ROLE,
+                         full.startswith(NONGEO_ROOT + "/"))
         finally:
             self.tree.blockSignals(blocked)
 
@@ -606,7 +616,7 @@ class LayerPanel(QWidget):
         had and the one it has, and only the outermost - what is under a
         moved group moved with it (hunt M16, 2.10.2).
         """
-        moved_groups = []
+        moved_groups, nongeo = [], []
 
         def emit_for_item(item: QTreeWidgetItem, within_moved: bool = False):
             """Recursively report layer descendants whose group changed."""
@@ -620,12 +630,14 @@ class LayerPanel(QWidget):
             else:
                 own_path = self._project_group(self._full_group_path(item))
                 before = item.data(0, GROUP_PATH_ROLE)
+                was_nongeo = bool(item.data(0, GROUP_NONGEO_ROLE))
                 if own_path != before:
                     self._remember_group_path(item)
                     # (The Non-Georeferenced root names no project group,
                     # wherever it is: "" is not a place to move from or to.)
                     if before and own_path and not within_moved:
                         moved_groups.append((before, own_path))
+                        nongeo.append(was_nongeo)
                         within_moved = True
                 for i in range(item.childCount()):
                     emit_for_item(item.child(i), within_moved)
@@ -633,7 +645,7 @@ class LayerPanel(QWidget):
         for i in range(self.tree.topLevelItemCount()):
             emit_for_item(self.tree.topLevelItem(i))
         if moved_groups:
-            self.groups_moved.emit(moved_groups)
+            self.groups_moved.emit(moved_groups, nongeo)
 
     def _get_layer_order(self) -> list[str]:
         """Get layer IDs in current order (top to bottom in tree = front to back)."""
@@ -872,9 +884,10 @@ class LayerPanel(QWidget):
         entries = unique
 
         group_paths = self._project_group_paths(outermost)
+        nongeo = self._project_group_sides(outermost)
         message = None
         if self.removal_describer is not None and (entries or group_paths):
-            message = self.removal_describer(entries, group_paths)
+            message = self.removal_describer(entries, group_paths, nongeo)
         elif any(item.data(0, Qt.UserRole + 1) == "group"
                  and item.childCount() > 0 for item in outermost):
             message = "This selection contains layers. Remove anyway?"
@@ -893,7 +906,7 @@ class LayerPanel(QWidget):
         for layer_id, _path in entries:
             self.layer_removed.emit(layer_id)
         if group_paths:
-            self.groups_removed.emit(group_paths)
+            self.groups_removed.emit(group_paths, nongeo)
         if entries:
             self.layers_removed.emit(entries)
 
@@ -920,9 +933,10 @@ class LayerPanel(QWidget):
         # the project (image and label counts); without one, fall back to
         # the old generic group prompt.
         group_paths = self._project_group_paths([item])
+        nongeo = self._project_group_sides([item])
         message = None
         if self.removal_describer is not None and (entries or group_paths):
-            message = self.removal_describer(entries, group_paths)
+            message = self.removal_describer(entries, group_paths, nongeo)
         elif item_type == "group" and item.childCount() > 0:
             message = "This group contains layers. Remove anyway?"
         if message is not None:
@@ -951,7 +965,7 @@ class LayerPanel(QWidget):
         for layer_id, _path in entries:
             self.layer_removed.emit(layer_id)
         if group_paths:
-            self.groups_removed.emit(group_paths)
+            self.groups_removed.emit(group_paths, nongeo)
         if entries:
             self.layers_removed.emit(entries)
 
@@ -973,6 +987,18 @@ class LayerPanel(QWidget):
                 continue
             paths.append(self._project_group(full))
         return paths
+
+    def _project_group_sides(self, items: list) -> list:
+        """For each path _project_group_paths gives, whether its group is
+        under the Non-Georeferenced root. Such a group and a georeferenced
+        one can name the same project group (after a reopen, the plain
+        pictures of "survey" sit under "Non-Georeferenced/survey"), and
+        either reached the row-less images of both (retest panels R1,
+        2.10.3)."""
+        return [self._full_group_path(item).startswith(NONGEO_ROOT + "/")
+                for item in items
+                if item.data(0, Qt.UserRole + 1) == "group"
+                and self._full_group_path(item) != NONGEO_ROOT]
 
     @staticmethod
     def _is_ancestor_of(item: QTreeWidgetItem,
@@ -2141,8 +2167,8 @@ class CombinedLayerPanel(QWidget):
     export_object_requested = pyqtSignal(str)  # object_id
     layer_removed = pyqtSignal(str)
     layers_removed = pyqtSignal(list)  # [(layer_id, file_path), ...]
-    groups_removed = pyqtSignal(list)  # project group paths
-    groups_moved = pyqtSignal(list)  # [(old project path, new), ...]
+    groups_removed = pyqtSignal(list, list)  # project group paths, nongeo
+    groups_moved = pyqtSignal(list, list)  # [(old path, new), ...], nongeo
 
     # Hard-negative mirror section
     hard_negative_unflag_requested = pyqtSignal(str)  # layer_id
