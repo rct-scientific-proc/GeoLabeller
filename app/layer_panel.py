@@ -11,6 +11,7 @@ from PyQt5.QtGui import QColor
 
 from .collapsible import CollapsibleSection
 from .debug_log import debug
+from .labels import canonical_path
 from .settings_scope import settings as app_settings
 
 
@@ -182,6 +183,10 @@ class LayerPanel(QWidget):
             parent: Optional parent group item. If None, adds to top level.
             visible: Whether the layer should be visible (checked) initially.
         """
+        # Kept in the project's spelling, whatever the caller's: Add
+        # Directory hands over the directory walk's backslashes, and a
+        # path kept that way never met the project's (hunt M12, 2.10.2).
+        file_path = canonical_path(file_path)
         item = QTreeWidgetItem()
         item.setText(0, os.path.basename(file_path))
         item.setData(0, Qt.UserRole, layer_id)
@@ -1249,6 +1254,7 @@ class LayerPanel(QWidget):
         Same as add_layer but defaults to the non-geo root if no parent given.
         """
         nongeo_parent = parent or self.get_or_create_nongeo_root()
+        file_path = canonical_path(file_path)      # as add_layer (M12)
 
         item = QTreeWidgetItem()
         item.setText(0, os.path.basename(file_path))
@@ -1384,7 +1390,15 @@ class LabeledLayerPanel(QWidget):
         Args:
             file_path: The file path of the image
             layer_id: The layer ID assigned by the main layer panel
+
+        Every path this panel keeps - these two maps and the rows' index
+        - is in the project's spelling (canonical_path), whichever the
+        caller hands over. The tree was told a directory walk's
+        backslashes and the rows the project's forward slashes, so after
+        Add Directory on Windows no lookup between them hit: a row's box
+        neither followed nor drove its image (hunt M12, 2.10.2).
         """
+        file_path = canonical_path(file_path)
         self._layer_id_map[file_path] = layer_id
         self._path_by_layer_id[layer_id] = file_path
 
@@ -1431,6 +1445,7 @@ class LabeledLayerPanel(QWidget):
         for image in project.images.values():
             if not image.labels:
                 continue
+            image_path = canonical_path(image.path)    # see set_layer_id_map
 
             for label in image.labels:
                 object_id = label.object_id
@@ -1440,7 +1455,7 @@ class LabeledLayerPanel(QWidget):
                 object_groups[object_id].append((
                     label.id,
                     image.name,
-                    image.path,
+                    image_path,
                     label.lon,
                     label.lat,
                     label.class_name,
@@ -1570,8 +1585,9 @@ class LabeledLayerPanel(QWidget):
         label_item.setText(
             0, f"#{label.id}: {image.name} [{label.class_name}]"
                + self._measurement_suffix(label.length_m, label.width_m))
-        label_item.setData(0, Qt.UserRole, image.path)
-        self._items_by_path.setdefault(image.path, []).append(label_item)
+        image_path = canonical_path(image.path)        # see set_layer_id_map
+        label_item.setData(0, Qt.UserRole, image_path)
+        self._items_by_path.setdefault(image_path, []).append(label_item)
         label_item.setData(0, Qt.UserRole + 1, "label")
         label_item.setData(0, Qt.UserRole + 2, label.id)
         label_item.setData(0, Qt.UserRole + 3, label.lon)
@@ -1579,7 +1595,7 @@ class LabeledLayerPanel(QWidget):
         label_item.setFlags(label_item.flags() | Qt.ItemIsUserCheckable)
 
         # Check visibility
-        is_visible = visibility_checker(image.path) if visibility_checker else False
+        is_visible = visibility_checker(image_path) if visibility_checker else False
         label_item.setCheckState(0, Qt.Checked if is_visible else Qt.Unchecked)
 
         label_item.setToolTip(
@@ -1604,7 +1620,7 @@ class LabeledLayerPanel(QWidget):
         project. Structural changes (link, unlink, add, remove) still go
         through refresh().
         """
-        rows = self._items_by_path.get(image.path)
+        rows = self._items_by_path.get(canonical_path(image.path))
         if not rows:
             return False
         found = False
@@ -1784,6 +1800,7 @@ class LabeledLayerPanel(QWidget):
             file_path: The file path of the layer
             checked: True to check, False to uncheck
         """
+        file_path = canonical_path(file_path)          # see set_layer_id_map
         items = self._items_by_path.get(file_path)
         if not items:
             return
