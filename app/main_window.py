@@ -4183,8 +4183,10 @@ class MainWindow(QMainWindow):
 
     def _remove_images_from_project(self, images: list) -> tuple:
         """Delete these images and their labels; (images, labels) counts."""
-        # Removing imagery is not undoable, and a step that touches these
-        # images would put labels back on nothing: those steps go.
+        # Removing imagery is not undoable: the history forgets these
+        # images and keeps what its steps did to the rest of the project
+        # (dropping those steps whole left older ones to write stale
+        # copies back - hunt H3, 2.10.2).
         self._history.forget_images([image.path for image in images])
         removed_labels = 0
         for image in images:
@@ -7047,12 +7049,18 @@ class MainWindow(QMainWindow):
                     self.canvas.remove_layer(layer_id)
             if self.project.relocate_image(
                     old_path, os.path.abspath(res.new_path)):
-                # Steps name the image by its old path, which is gone.
-                self._history.forget_images([old_path])
                 applied += 1
                 self._mark_unsaved()
             else:
                 refused += 1
+        if applied:
+            # Steps name an image by its old path, and its labels are
+            # still in the project under the new one: nothing a step holds
+            # can be put back in the right place, so the history starts
+            # again - once, before the load below relocates what it finds
+            # beside the project file (hunt H3, 2.10.2; forgetting the old
+            # path's steps left the others stale).
+            self._history.clear()
         if not applied and not refused:
             return
         note = f" ({refused} could not be applied)" if refused else ""

@@ -25,6 +25,8 @@ import copy
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
+from .labels import canonical_path
+
 DEFAULT_LIMIT = 200
 
 # Project lists a step can carry, as attribute names on LabelProject.
@@ -37,7 +39,8 @@ class Step:
     """One undoable edit.
 
     ``labels_*`` map a label id to (image path, index in that image's
-    list, label copy), or None where the label did not exist. ``images_*``
+    list, label copy), or None where the label did not exist - or sat on
+    an image the project no longer has (forget_images). ``images_*``
     map an image path to a label-less copy of its entry (so its flags,
     and the entry itself when an edit made it, can be put back), or None
     where the project had no entry for it. ``lists_*`` map a LISTS name to a copy
@@ -66,20 +69,59 @@ class Step:
     def label_ids(self) -> set:
         return set(self.labels_before) | set(self.labels_after)
 
-    def image_paths(self) -> set:
-        paths = set(self.images_before) | set(self.images_after)
-        for state in list(self.labels_before.values()) + list(
-                self.labels_after.values()):
-            if state is not None:
-                paths.add(state[0])
-        return paths
-
     def is_empty(self) -> bool:
-        return (self.labels_before == self.labels_after
+        return (self.does_nothing()
+                and self.next_id_before == self.next_id_after)
+
+    def does_nothing(self) -> bool:
+        """No difference left for undo or redo to put back? The id
+        counter is not one: it only ever rises, so a step it alone would
+        keep undoes nothing (hunt H3, 2.10.2). The lists first: a
+        sweeping step holds every label, and they are the dear ones to
+        compare."""
+        return (self.lists_before == self.lists_after
+                and self.image_order_before == self.image_order_after
                 and self.images_before == self.images_after
-                and self.lists_before == self.lists_after
-                and self.next_id_before == self.next_id_after
-                and self.image_order_before == self.image_order_after)
+                and self.labels_before == self.labels_after)
+
+    def forget_images(self, is_gone) -> bool:
+        """Take out of the step what names an image that left the project
+        (``is_gone(path)``); True when anything went. The rule and its
+        why are EditHistory.forget_images'."""
+        went = False
+        for label_id in self.label_ids():
+            before = self.labels_before.get(label_id)
+            after = self.labels_after.get(label_id)
+            before_gone = before is not None and is_gone(before[0])
+            after_gone = after is not None and is_gone(after[0])
+            if not (before_gone or after_gone):
+                continue
+            went = True
+            # Each side by itself: a label moved between images has one
+            # side on an image that stays, and that side is kept.
+            if before_gone:
+                before = self.labels_before[label_id] = None
+            if after_gone:
+                after = self.labels_after[label_id] = None
+            if before is None and after is None:
+                self.labels_before.pop(label_id, None)
+                self.labels_after.pop(label_id, None)
+        for path in set(self.images_before) | set(self.images_after):
+            if is_gone(path):
+                self.images_before.pop(path, None)
+                self.images_after.pop(path, None)
+                went = True
+        if self.image_order_before is not None:
+            before = tuple(path for path in self.image_order_before
+                           if not is_gone(path))
+            after = tuple(path for path in self.image_order_after
+                          if not is_gone(path))
+            went = went or len(before) != len(self.image_order_before) \
+                or len(after) != len(self.image_order_after)
+            if before == after:
+                before = after = None           # nothing left to restore
+            self.image_order_before, self.image_order_after = before, after
+        return went
 
 
 # -- reading and writing project state ---------------------------------------
@@ -407,16 +449,50 @@ class EditHistory:
             self._changed()
 
     def forget_images(self, paths):
-        """Images left the project: drop every step that touches them.
+        """Images left the project for good (the layer panel's Remove,
+        which is not undoable): the history becomes the history of the
+        images that remain.
 
-        Undoing one would put labels back on an image that is gone. Steps
-        hold states, not operations, so the rest stay correct on their own.
+        From every step, undo and redo, goes exactly what names a removed
+        image. A label state that sits on one becomes "the label is not
+        there", and a label with nothing left on either side goes from
+        the step; so do the image states and the order entries of those
+        paths. Each state by itself, not each label: a label moved from
+        one image to another has a side on each, and the step stays as
+        what it did to the image that remains - moved onto the removed
+        image, the label left this one; moved off it, the label arrived
+        here. The step is kept, in its place, unless nothing it holds
+        differs any more.
+
+        Why this is exact: every state in a step is keyed by an image
+        path or is a project list, so what is left is what each step did
+        to the rest of the project, and the steps still follow one from
+        the other. Dropping the whole step, as was done until 2.10.2,
+        dropped with it what the step did to the other images and to the
+        lists, and an older step then wrote its own stale copies back:
+        deleted labels returned, a label kept a class the project had
+        lost (hunt H3).
+
+        Paths are compared as the project keys them: a step spells an
+        image as its label was indexed, the caller as the entry does.
         """
-        gone = set(paths)
+        gone = {canonical_path(path) for path in paths}
         if not gone:
             return
+        spelled: dict = {}          # a path as a step spells it -> gone?
+
+        def is_gone(path) -> bool:
+            answer = spelled.get(path)
+            if answer is None:
+                answer = spelled[path] = canonical_path(path) in gone
+            return answer
+
         before = (len(self._undo), len(self._redo))
-        self._undo = [s for s in self._undo if not (s.image_paths() & gone)]
-        self._redo = [s for s in self._redo if not (s.image_paths() & gone)]
+        self._undo = [s for s in self._undo
+                      if not (s.forget_images(is_gone) and s.does_nothing())]
+        self._redo = [s for s in self._redo
+                      if not (s.forget_images(is_gone) and s.does_nothing())]
+        # Only a step dropped changes what the menu names; one that was
+        # kept has its name, its place and its serial as before.
         if (len(self._undo), len(self._redo)) != before:
             self._changed()
