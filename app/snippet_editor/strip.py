@@ -18,6 +18,7 @@ host's toolbar, the list pane into the host's splitter. So the strip can
 move between windows without dragging a layout with it.
 """
 from dataclasses import dataclass
+from operator import itemgetter
 from typing import Callable
 
 from PyQt5 import sip
@@ -109,7 +110,9 @@ class SnippetStrip(QObject):
         # the map is showing, else the one the user asked to see in the
         # linked row, else the lowest id - so a pass down the list looks
         # at every group once, the linked row showing its views. An
-        # unlinked label is an object of one. The Show filter and its
+        # unlinked label is an object of one. Its row stands where the
+        # first of the object's views would, whichever view it is (hunt
+        # 2026-11-16 M20: see _one_per_object). The Show filter and its
         # counts go by that row's view (audit 2026-11-05 M2): listing an
         # object while ANY view needed doing, and counting it done only
         # when EVERY view was, left a Needs list that a pass of marks
@@ -267,6 +270,23 @@ class SnippetStrip(QObject):
         per view; their sections do not ask."""
         return self._members(entry) if self._collapsing() else [entry]
 
+    def row_key(self):
+        """A function giving what an entry's row is listed under, the
+        same before a refill and after it: the label's id - or, one per
+        object, its object, whose row keeps its place while the view
+        standing for it may change (the map shows another image). The
+        Grid holds its page by it (hunt 2026-11-16 M20, 2.10.2). Under
+        one class, a view of another class is in no row of its object,
+        and is told apart from it as an unlinked label is."""
+        if not self._collapsing():
+            return itemgetter("label_id")
+        kind, value = self._shown()
+        if kind != "class":
+            return self._object_key
+        return lambda entry: (self._object_key(entry)
+                              if entry["class_name"] == value
+                              else ("label", entry["label_id"]))
+
     def _representative(self, views: list) -> dict:
         """The view that stands for an object among ``views``: on the
         image the map shows, else the one the user asked to see, else
@@ -286,17 +306,25 @@ class SnippetStrip(QObject):
         order) as one row per object, in the list's order - BEFORE the
         Show filter, which then goes by the row's view (audit 2026-11-05
         M2). The snippet in hand stays its object's row: a refill must
-        not move the list under the user."""
+        not move the list under the user.
+
+        An object's place is the object's, not its row's: where the
+        first of its views stands in the list's order (the smallest
+        class, image name and label id among them), whichever view
+        stands for it. Sorted by the row's own view, the row jumped when
+        another view was clicked in the linked row or the map showed
+        another image, and Space went on from there, past objects never
+        shown (hunt 2026-11-16 M20, 2.10.2)."""
         by_object: dict = {}
         for entry in in_class:
             by_object.setdefault(self._object_key(entry), []).append(entry)
+        # In order of each object's first view, since in_class is in the
+        # list's order: the rows are not sorted again by their own view.
         rows = []
         for views in by_object.values():
             in_hand = next((e for e in views if e["label_id"] == keep_id), None)
             rows.append(in_hand if in_hand is not None
                         else self._representative(views))
-        rows.sort(key=lambda e: (e["class_name"], e["image_name"],
-                                 e["label_id"]))
         return rows
 
     def _linked_objects(self) -> list:

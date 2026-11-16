@@ -579,17 +579,30 @@ class OrientationEditor(QWidget):
         of a page, in order) the strip still lists - failing that, as
         the strip itself lands, the first chip after them in the order
         before this refill, or the nearest before; and the page as it
-        was when none of those is listed either."""
-        listed = {e["label_id"]: i
-                  for i, e in enumerate(self._shown_entries())}
-        candidates = list(label_ids)
-        before = [e["label_id"] for e in self._entries]
-        if label_ids and label_ids[-1] in before:
-            at = before.index(label_ids[-1])
-            candidates += before[at + 1:] + before[:at][::-1]
-        for label_id in candidates:
-            if label_id in listed:
-                return listed[label_id] // PAGE_SIZE
+        was when none of those is listed either. A chip is known by
+        what its row is listed under (the strip's row_key): one per
+        object that is its object, whose row keeps its place whichever
+        view stands for it after the refill - known by label id, a page
+        whose rows all took another view (the map showing another
+        image) was lost, and the order before the refill is the
+        objects', not their views' (hunt 2026-11-16 M20, 2.10.2)."""
+        key = self.strip.row_key()
+        listed = {key(e): i for i, e in enumerate(self._shown_entries())}
+        old = self._entries_by_id
+        candidates = [key(old[label_id]) if label_id in old else label_id
+                      for label_id in label_ids]
+        for candidate in candidates:
+            if candidate in listed:
+                return listed[candidate] // PAGE_SIZE
+        # None of the page's chips is listed. The order before the refill
+        # is made only now (it is every entry): one per object, each
+        # object once, where the first of its views stood.
+        before = list(dict.fromkeys(key(e) for e in self._entries))
+        if candidates and candidates[-1] in before:
+            at = before.index(candidates[-1])
+            for candidate in before[at + 1:] + before[:at][::-1]:
+                if candidate in listed:
+                    return listed[candidate] // PAGE_SIZE
         return self._page
 
     def _on_strip_rebuilt(self, chosen_anew: bool):
