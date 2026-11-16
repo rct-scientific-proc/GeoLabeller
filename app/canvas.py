@@ -1184,7 +1184,7 @@ class TiledLayer:
             self._src_height = src.height
             # Capture georeferencing if present so a clicked pixel can still be
             # mapped to lat/lon while the image is displayed raw (waterfall).
-            self._src_crs = src.crs
+            self._src_crs = _usable_crs(src.crs)
             self._src_transform = src.transform
             self._read_overview_metadata(src)
 
@@ -1217,7 +1217,7 @@ class TiledLayer:
             self._src_width = src.width
             self._src_height = src.height
             # Keep any georeferencing so pixel -> lat/lon works in waterfall mode.
-            self._src_crs = src.crs
+            self._src_crs = _usable_crs(src.crs)
             self._src_transform = src.transform
             self._read_overview_metadata(src)
 
@@ -1650,6 +1650,15 @@ class AsyncFileLoader(QObject):
             try:
                 with rasterio.open(file_path) as src:
                     src_crs = src.crs
+                    # A CRS with no path to the scene: a plain picture,
+                    # as a file with no CRS is (hunt M4, 2.10.2). The
+                    # WKT names the CRS here and for the estimate below,
+                    # which asked for it itself: one ask, as before.
+                    crs_wkt = src_crs.to_wkt() if src_crs is not None else None
+                    local_crs = (src_crs is not None
+                                 and not crs_placeable(src_crs, crs_wkt))
+                    if local_crs:
+                        src_crs = None
                     src_transform = src.transform
                     src_width = src.width
                     src_height = src.height
@@ -1660,7 +1669,7 @@ class AsyncFileLoader(QObject):
                     except Exception:
                         overviews = []
 
-                    if src.crs is not None:
+                    if src_crs is not None:
                         # The cheap boundary-sampled estimate first (the
                         # same provisional bounds a fast project load uses;
                         # the first display recomputes exact values). The
@@ -1671,7 +1680,7 @@ class AsyncFileLoader(QObject):
                         try:
                             est = _scene_grid_estimate(
                                 src.crs, src.transform,
-                                src.width, src.height)
+                                src.width, src.height, src_key=crs_wkt)
                         except Exception:
                             est = None
                         if est is not None:
@@ -1703,6 +1712,7 @@ class AsyncFileLoader(QObject):
                     'src_height': src_height,
                     'overviews': overviews,
                     'geo': geo,
+                    'local_crs': local_crs,
                 }
                 self.file_loaded.emit(file_path, layer_data)
                 loaded_count += 1
@@ -1716,6 +1726,61 @@ class AsyncFileLoader(QObject):
                 self.progress_update.emit(i + 1, total)
 
         return loaded_count, error_count
+
+
+# The WKT of a CRS -> can imagery in it be placed in the scene?
+_placeable_crs: dict = {}
+
+
+def crs_placeable(crs, wkt=None) -> bool:
+    """Has this CRS a transformation to the scene?
+
+    A LOCAL_CS / engineering CRS - the site grid a photogrammetry or
+    sonar package writes - has none, and none to latitude and longitude
+    either. Every route that adds an image asks here, and adds such a
+    file as a plain picture, the way a file without a CRS is added. It
+    used to be sent down the georeferenced path because it HAS a CRS;
+    the transform raised there, and the image was dropped without a word
+    (bug hunt 2026-11-16 M4, 2.10.2).
+
+    Answered once per CRS and kept: finding out means building a
+    transformer, milliseconds each. ``wkt`` is the CRS's WKT, for a
+    caller that already holds it.
+
+    For the UI thread and the directory loader's thread only, like
+    every other use of pyproj here: on a thread of a QThreadPool - where
+    a level load or a tile read runs - pyproj takes the process down
+    with an access violation. A load asks _usable_crs instead.
+    """
+    if crs is None:
+        return False
+    if wkt is None:
+        wkt = crs.to_wkt()
+    known = _placeable_crs.get(wkt)
+    if known is None:
+        try:
+            Transformer.from_crs(crs, WEB_MERCATOR, always_xy=True)
+            known = True
+        except Exception:      # noqa: BLE001 - pyproj's ProjError, CRSError
+            known = False
+        _placeable_crs[wkt] = known
+    return known
+
+
+def _usable_crs(crs):
+    """``crs`` for a layer shown as raw pixels - or None for one already
+    found to have no path to the map (crs_placeable), so that the picture
+    is a plain one everywhere: asked for a pixel's latitude and
+    longitude, such a CRS raised (hunt M4, 2.10.2).
+
+    The answer is looked up, never worked out: a load runs on a pool
+    thread, where pyproj must not be used. Whatever adds a raw-pixel
+    layer asks crs_placeable on the UI thread first
+    (MapCanvas.add_pixel_layer does), so it is here to be found.
+    """
+    if crs is not None and _placeable_crs.get(crs.to_wkt()) is False:
+        return None
+    return crs
 
 
 # Cached per-CRS transformers for the metadata bounds estimate: one
@@ -2880,6 +2945,12 @@ class MapCanvas(QGraphicsView):
         try:
             layer = TiledLayer(file_path, lazy=lazy, geo=False,
                                metadata=metadata, dst_crs=self.scene_crs)
+            # A CRS with no path to the map is not kept: asked here, on
+            # the UI thread, so that this layer's loads find the answer
+            # (_usable_crs; hunt M4).
+            if (layer._src_crs is not None
+                    and not crs_placeable(layer._src_crs)):
+                layer._src_crs = None
             layer.visible = visible
             layer.group_path = group_path
             display = self._resolve_display(layer)

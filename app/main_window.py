@@ -39,7 +39,7 @@ from .axis_ruler import MapCanvasWithAxes
 from .canvas import (MapCanvas, CanvasMode, CYCLE_MODES, STEP_CYCLE_MODES,
                      AsyncFileLoaderThread, LoadCancelled, TiledLayer,
                      MARKERS_DOTS, MARKERS_EVERY, MARKERS_ONE, MARKER_MODES,
-                     _emit_safely)
+                     _emit_safely, crs_placeable)
 from .class_editor import (ClassEditorDialog, DescriptionEditorDialog,
                            MaskNameEditorDialog, RenameClassDialog)
 from .close_labels import CloseLabelsWindow
@@ -240,6 +240,17 @@ def scan_directory_images(root_path: Path) -> "tuple[list, bool]":
         gdal_config.note_directory(dirpath, here)
     return sorted(set(image_files)), has_sidecars
 
+
+def local_crs_notice(count: int) -> str:
+    """What an add says, once, of the images whose CRS has no path to
+    the map - a site grid, a LOCAL_CS - and which it therefore added as
+    plain pictures (canvas.crs_placeable; bug hunt 2026-11-16 M4)."""
+    if count == 1:
+        return ("1 image has a local coordinate system and was added as "
+                "a plain picture")
+    return (f"{count} images have a local coordinate system and were "
+            "added as plain pictures")
+
 # How many images either side of the current one a cycle mode reads ahead.
 # What is then kept in memory is capped by the canvas (WARM_MAX_PIXELS), so
 # raising this widens the read-ahead without uncapping what it costs.
@@ -316,6 +327,9 @@ class MainWindow(QMainWindow):
         self._async_root_path = None
         self._async_group_cache: dict[Path, any] = {}
         self._async_loaded_count = 0
+        # Images of the load whose CRS has no path to the map, added as
+        # plain pictures: said once, when the load ends (hunt M4).
+        self._async_local_crs = 0
         self._async_total_files = 0
         self._async_loader = None
         # Queue for pending file loads
@@ -2861,7 +2875,7 @@ class MainWindow(QMainWindow):
         """Load a project image onto the canvas so its label can be shown."""
         try:
             with rasterio.open(image.path) as src:
-                has_crs = src.crs is not None
+                has_crs = crs_placeable(src.crs)
         except Exception as e:  # noqa: BLE001 - reported, not fatal
             self.statusBar.showMessage(
                 f"Could not open {Path(image.path).name}: {e}", 6000)
@@ -6156,6 +6170,7 @@ class MainWindow(QMainWindow):
             recent.remember_dir(recent.IMAGERY, file_paths[0])
 
         skipped = 0
+        local_crs = 0
         for file_path in file_paths:
             # Check if already loaded
             if self.canvas.is_path_loaded(file_path):
@@ -6164,10 +6179,15 @@ class MainWindow(QMainWindow):
 
             # Check if the file has a valid CRS
             has_crs = True
+            local = False
             try:
                 with rasterio.open(file_path) as src:
                     if src.crs is None:
                         has_crs = False
+                    elif not crs_placeable(src.crs):
+                        # A CRS with no path to the map: a plain picture.
+                        has_crs = False
+                        local = True
             except Exception:
                 pass
 
@@ -6179,6 +6199,8 @@ class MainWindow(QMainWindow):
                 layer_id = self.canvas.add_pixel_layer(file_path)
                 if layer_id:
                     self.layer_panel.add_nongeo_layer(layer_id, file_path)
+                    if local:
+                        local_crs += 1
 
             if layer_id:
                 # Track the loaded image with original dimensions and transform
@@ -6198,6 +6220,10 @@ class MainWindow(QMainWindow):
         if skipped > 0:
             self.statusBar.showMessage(
                 f"Skipped {skipped} already loaded image(s)", 3000)
+        if local_crs:
+            self.statusBar.showMessage(
+                (f"Skipped {skipped} already loaded image(s) - "
+                 if skipped else "") + local_crs_notice(local_crs), 10000)
 
     def _add_directory(self):
         """Open directory dialog and load all supported images preserving directory structure.
@@ -6282,6 +6308,7 @@ class MainWindow(QMainWindow):
         progress.setValue(0)
 
         loaded_count = 0
+        local_crs = 0
         for i, file_path in enumerate(image_files):
             if progress.wasCanceled():
                 break
@@ -6305,10 +6332,15 @@ class MainWindow(QMainWindow):
 
             # Check CRS to decide geo vs pixel-mode loading
             has_crs = True
+            local = False
             try:
                 with rasterio.open(file_path_str) as src:
                     if src.crs is None:
                         has_crs = False
+                    elif not crs_placeable(src.crs):
+                        # A CRS with no path to the map: a plain picture.
+                        has_crs = False
+                        local = True
             except Exception:
                 pass
 
@@ -6331,6 +6363,8 @@ class MainWindow(QMainWindow):
                         rel_dir.name if rel_dir != Path(".") else root_group_name)
                     self.layer_panel.add_nongeo_layer(
                         layer_id, file_path_str, nongeo_parent, visible=False)
+                    if local:
+                        local_crs += 1
 
             if layer_id:
                 name = file_path.stem
@@ -6358,6 +6392,10 @@ class MainWindow(QMainWindow):
             self.statusBar.showMessage(
                 f"Loaded {loaded_count} of {
                     len(image_files)} image files", 5000)
+        if local_crs:
+            self.statusBar.showMessage(
+                f"{self.statusBar.currentMessage()} - "
+                f"{local_crs_notice(local_crs)}", 10000)
 
     def _add_directory_async(self, root_path: Path, image_files: list,
                              assume_no_sidecars: bool = False):
@@ -6414,6 +6452,7 @@ class MainWindow(QMainWindow):
         # Store state for the async operation
         self._async_group_cache: dict[Path, any] = {}
         self._async_loaded_count = 0
+        self._async_local_crs = 0
         self._async_total_files = len(files_with_groups)
         self._async_mode = mode
         self._async_skip_project_add = skip_project_add
@@ -6665,6 +6704,8 @@ class MainWindow(QMainWindow):
                     if layer_id:
                         self.layer_panel.add_nongeo_layer(
                             layer_id, file_path, parent_group, visible=False)
+                        if layer_data.get('local_crs'):
+                            self._async_local_crs += 1
 
                 if layer_id:
                     # Track in project with original dimensions (skip for
@@ -6764,6 +6805,8 @@ class MainWindow(QMainWindow):
         if errors > 0:
             msg += f" ({errors} errors)"
         msg += ". Check layers to display."
+        if self._async_local_crs:
+            msg += f" {local_crs_notice(self._async_local_crs)}."
         self.statusBar.showMessage(msg, 10000)
 
     def _finish_async_loading_project(self, errors: int = 0):
