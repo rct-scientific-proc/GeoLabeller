@@ -33,6 +33,7 @@ import json
 import math
 import os
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -440,6 +441,22 @@ def _passes(chip, standing: str) -> bool:
     return True
 
 
+def _made_after(label, note) -> bool:
+    """Was the label created after the note was written - both times
+    known and readable (the label's attribution "created", the note's
+    "at"; UTC, as identity.now writes them)? An import's label carries
+    its note's own stamp, so is never after it (retest 2026-11-16 R1)."""
+    made = (getattr(label, "attribution", None) or {}).get("created") or {}
+    try:
+        times = [datetime.fromisoformat(text) for text in (made.get("at"),
+                                                           note.at)]
+    except (TypeError, ValueError):
+        return False
+    created, written = (t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+                        for t in times)
+    return created > written
+
+
 class ModelReviewWindow(QWidget):
     """The window. ``project_getter()`` returns the current project."""
 
@@ -466,6 +483,9 @@ class ModelReviewWindow(QWidget):
         self._path = ""                 # the file, to write its notes
         self._write_failed = False      # said once per file
         self._misplaced_said = False    # likewise, records that changed
+        # Chips holding, for this session only, a label the chip-size
+        # rule took against a stored place it is not near (_seat).
+        self._borrowed: set = set()
         self._stale = False             # the labels changed while hidden
         self._report = None
         self._classes: list = []
@@ -1143,6 +1163,7 @@ class ModelReviewWindow(QWidget):
         self._path = str(path)
         self._write_failed = False
         self._misplaced_said = False
+        self._borrowed = set()
         self._stale = False
         self._by_key = {chip.key: chip for chip in chips}
         # A project of before 2.9.4 holds its own memory: its notes on
@@ -1181,25 +1202,31 @@ class ModelReviewWindow(QWidget):
     def _note_places(self, moved: dict, places: dict):
         """The one write an open makes, once its chips are seated (hunt
         2026-11-16 M18): the notes moved in from the project's old
-        memory (``moved``), and every note whose label is not where the
-        file says (``places``, as it was read). A note of before 2.10.1
-        stores no place, and one seated by the chip-size rule kept the
-        place in memory only - so on such a file November's M1 played
-        out as before, sessions later, at a smaller chip size; a label
-        moved on the map since its note was written is the other case.
+        memory (``moved``), and every note the file stores no place for
+        (``places``, as it was read) whose chip took a label. A note of
+        before 2.10.1 stores none, and one seated by the chip-size rule
+        kept the place in memory only - so on such a file November's M1
+        played out as before, sessions later, at a smaller chip size.
+
+        Only such a note is given a place: one that stores a place is
+        never rewritten by an open (retest 2026-11-16 R1, 2.10.3). Its
+        label taken by the chip-size rule away from that place may be a
+        stranger's of the same id - a project closed unsaved after an
+        import, Combine, another labeller's project on a shared file -
+        and the write made it the chip's in every version from then on,
+        to be removed by an Ignore. Such a label is the chip's for this
+        session only (_seat).
 
         After the seat, never before it: a note is given the place of a
         label only when its chip took that label (_place_labels). Once
-        per open, not per chip, and not at all when no place changed: a
-        second open writes nothing. A file that cannot be written is
-        said only for the notes moved in; the places are found again at
-        the next open."""
+        per open, not per chip: a second open writes nothing. A file
+        that cannot be written is said only for the notes moved in; the
+        places are found again at the next open."""
         notes = dict(moved)
         for chip in self._chips:
             earlier = chip.earlier
             if (earlier is not None and chip.held is not None
-                    and (earlier.label_x, earlier.label_y)
-                    != places.get(chip.key)):
+                    and None in places.get(chip.key, (None, None))):
                 notes[chip.key] = earlier
         if not notes:
             return
@@ -1299,13 +1326,16 @@ class ModelReviewWindow(QWidget):
         the import being noted - is stamped: by its id alone, a
         stranger's label gave the note its own place before any seat
         had tested it, and was the chip's from then on, to be removed
-        by an Ignore (hunt 2026-11-16, 2.10.2). A note not stamped keeps
-        the place it had."""
+        by an Ignore (hunt 2026-11-16, 2.10.2). Nor is one whose chip
+        holds its label for this session only (_borrowed: retest
+        2026-11-16 R1) - by a rename, say. A note not stamped keeps the
+        place it had."""
         find = getattr(self._project(), "get_label_by_id", None)
         for key, verdict in notes.items():
             chip = self._by_key.get(key)
             if (verdict is None or verdict.label_id is None or find is None
-                    or chip is None or chip.held != verdict.label_id):
+                    or chip is None or chip.held != verdict.label_id
+                    or key in self._borrowed):
                 continue
             _image, label = find(verdict.label_id)
             if label is not None:
@@ -1328,6 +1358,7 @@ class ModelReviewWindow(QWidget):
             # the chip's from here on (none, for an Ignore): held, so
             # its note is written with its place (_place_labels).
             chip.held = verdict.label_id
+            self._borrowed.discard(key)
         return self._write_outcomes(notes)
 
     def rename_verdicts(self, old: str, new: str):
@@ -1468,16 +1499,27 @@ class ModelReviewWindow(QWidget):
                 # import onto it undone: the note is stale, and the chip
                 # is labelled already by that label (2.9.6).
                 label = None
-            if (label is not None and chip.held != label.id
-                    and not self._at_its_place(chip, label, reach)):
-                # Neither where the note left it nor within the chip:
-                # not this chip's label, whatever its id says. Ids used
-                # to be handed out again after an undo or Clear All, and
-                # a note then latched onto a stranger - the chip jumped
-                # onto it, and an Ignore deleted it (2.9.11). A label
-                # once taken is followed wherever the map moves it: ids
-                # only rise, so within a session that id is this label.
-                label = None
+            if label is not None and chip.held != label.id:
+                taken = self._at_its_place(chip, label, reach)
+                if not taken:
+                    # Neither where the note left it nor within the
+                    # chip: not this chip's label, whatever its id says.
+                    # Ids used to be handed out again after an undo or
+                    # Clear All, and a note then latched onto a stranger
+                    # - the chip jumped onto it, and an Ignore deleted it
+                    # (2.9.11). A label once taken is followed wherever
+                    # the map moves it: ids only rise, so within a
+                    # session that id is this label.
+                    label = None
+                elif (taken == "chip" and earlier.label_x is not None
+                        and earlier.label_y is not None):
+                    # Away from the place the note stores: moved on the
+                    # map since (M17) or a stranger of the same id - no
+                    # telling which. The chip's for this session; its
+                    # place is not written (retest 2026-11-16 R1).
+                    self._borrowed.add(chip.key)
+                else:
+                    self._borrowed.discard(chip.key)
         if label is None:
             if not chip.label_gone:
                 chip.label_gone = True
@@ -1495,8 +1537,11 @@ class ModelReviewWindow(QWidget):
         # set records an entry equal in every field (2.8.17).
         where = (float(label.pixel_x), float(label.pixel_y))
         # The note knows where its label is now: a label moved by hand,
-        # removed and brought back is taken again from there.
-        earlier.label_x, earlier.label_y = where
+        # removed and brought back is taken again from there. Not a
+        # label held for the session only: its note keeps the file's
+        # place, which any later write would carry (R1, 2.10.3).
+        if chip.key not in self._borrowed:
+            earlier.label_x, earlier.label_y = where
         if where == (chip.anchor_x, chip.anchor_y):
             return                  # nothing moved
         if chip.moved_since_import():
@@ -1505,10 +1550,11 @@ class ModelReviewWindow(QWidget):
             chip.seat(*where)
 
     def _at_its_place(self, chip, label,
-                      reach: "float | None" = None) -> bool:
-        """Is the label the chip's note names this chip's: within the
-        Import Options distance (``reach``) of the position the note
-        stores, or within a chip's width of the anchor. Ids are never
+                      reach: "float | None" = None) -> str:
+        """Is the label the chip's note names this chip's: "place" when
+        within the Import Options distance (``reach``) of the position
+        the note stores, else "chip" when within a chip's width of the
+        anchor, else "" - not this chip's. Ids are never
         handed out twice (2.9.11), so this is belt and braces against a
         stranger's id: an old project's, or another project's.
 
@@ -1521,17 +1567,23 @@ class ModelReviewWindow(QWidget):
         by it alone (2.10.1), a label tidied more than that distance on
         the map since - 10 px, a few metres - was lost the same way,
         where 2.10.0 kept it (hunt 2026-11-16 M17). A note of before
-        2.10.1 stores no position and has the chip-size rule only."""
+        2.10.1 stores no position and has the chip-size rule only.
+
+        The chip-size rule refuses a label created after the note was
+        written, when both carry a time: it cannot be the label the
+        verdict made or took (retest 2026-11-16 R1, 2.10.3)."""
         earlier = chip.earlier
         if earlier.label_x is not None and earlier.label_y is not None:
             if reach is None:
                 reach = labelled.default_distance()
             if math.hypot(float(label.pixel_x) - earlier.label_x,
                           float(label.pixel_y) - earlier.label_y) <= reach:
-                return True
-        return math.hypot(float(label.pixel_x) - chip.anchor_x,
-                          float(label.pixel_y) - chip.anchor_y) \
-            <= self.chip_spin.value()
+                return "place"
+        if math.hypot(float(label.pixel_x) - chip.anchor_x,
+                      float(label.pixel_y) - chip.anchor_y) \
+                > self.chip_spin.value() or _made_after(label, earlier):
+            return ""
+        return "chip"
 
     def note(self, text: str):
         """A word for the status line - what an import came to, say."""
