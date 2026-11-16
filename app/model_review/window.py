@@ -1334,8 +1334,11 @@ class ModelReviewWindow(QWidget):
         old_keys = self.listed_keys()
         placed = {chip.key: (chip.pixel_x, chip.pixel_y)
                   for chip in self._chips}
+        # Read once a refresh: asked of the settings for every chip, it
+        # was half of opening 20,000 reviewed chips (hunt 2026-11-16).
+        reach = labelled.default_distance()
         for chip in self._chips:
-            self._seat(chip, project)
+            self._seat(chip, project, reach)
         moved = [chip for chip in self._chips
                  if (chip.pixel_x, chip.pixel_y) != placed[chip.key]]
         changed = labelled.mark_near(self._chips, project,
@@ -1383,7 +1386,7 @@ class ModelReviewWindow(QWidget):
         else:
             self._stale = True
 
-    def _seat(self, chip, project):
+    def _seat(self, chip, project, reach: "float | None" = None):
         """The chip against the file's note on it (2.9.4; the memory's
         answer before). A verdict that is what the chip became - imported
         a moment ago, or the same thing said again - is no verdict; one
@@ -1392,7 +1395,8 @@ class ModelReviewWindow(QWidget):
         from - when the label is not there already. A note whose label
         is gone - removed by hand, an import undone - no longer stands:
         the labels are the truth, and the chip is plain again, measured
-        from the file's centre."""
+        from the file's centre. ``reach`` is the Import Options distance
+        (_at_its_place), handed in by a refresh that seats every chip."""
         earlier = chip.earlier
         if earlier is None:
             chip.label_gone = False
@@ -1415,14 +1419,14 @@ class ModelReviewWindow(QWidget):
                 # is labelled already by that label (2.9.6).
                 label = None
             if (label is not None and chip.held != label.id
-                    and not self._at_its_place(chip, label)):
-                # Not where the note left it: not this chip's label,
-                # whatever its id says. Ids used to be handed out again
-                # after an undo or Clear All, and a note then latched
-                # onto a stranger - the chip jumped onto it, and an
-                # Ignore deleted it (2.9.11). A label once taken is
-                # followed wherever the map moves it: ids only rise, so
-                # within a session that id is this label.
+                    and not self._at_its_place(chip, label, reach)):
+                # Neither where the note left it nor within the chip:
+                # not this chip's label, whatever its id says. Ids used
+                # to be handed out again after an undo or Clear All, and
+                # a note then latched onto a stranger - the chip jumped
+                # onto it, and an Ignore deleted it (2.9.11). A label
+                # once taken is followed wherever the map moves it: ids
+                # only rise, so within a session that id is this label.
                 label = None
         if label is None:
             if not chip.label_gone:
@@ -1450,22 +1454,31 @@ class ModelReviewWindow(QWidget):
         else:
             chip.seat(*where)
 
-    def _at_its_place(self, chip, label) -> bool:
-        """Is the label where the chip's note left it: within the Import
-        Options distance of the position the note stores, or - for a
-        note of before 2.10.1, which stores none - within a chip's width
-        of the anchor. Ids are never handed out twice (2.9.11), so this
-        is belt and braces against a stranger's id: an old project's, or
-        another project's. The chip-size rule measured against the size
-        in hand, a setting: a chip re-centred further than a later,
-        smaller size was "not this chip's" on the next open - plain,
-        listed again, and a second verdict made a second label (audit
-        2026-11-05 M1)."""
+    def _at_its_place(self, chip, label,
+                      reach: "float | None" = None) -> bool:
+        """Is the label the chip's note names this chip's: within the
+        Import Options distance (``reach``) of the position the note
+        stores, or within a chip's width of the anchor. Ids are never
+        handed out twice (2.9.11), so this is belt and braces against a
+        stranger's id: an old project's, or another project's.
+
+        Either is enough, and neither alone will do. The chip-size rule
+        measures against the size in hand, a setting: by it alone, a
+        chip re-centred further than a later, smaller size was "not this
+        chip's" on the next open - plain, listed again, and a second
+        verdict made a second label (audit 2026-11-05 M1). The stored
+        position is where the label was when the file was last written:
+        by it alone (2.10.1), a label tidied more than that distance on
+        the map since - 10 px, a few metres - was lost the same way,
+        where 2.10.0 kept it (hunt 2026-11-16 M17). A note of before
+        2.10.1 stores no position and has the chip-size rule only."""
         earlier = chip.earlier
         if earlier.label_x is not None and earlier.label_y is not None:
-            return math.hypot(float(label.pixel_x) - earlier.label_x,
-                              float(label.pixel_y) - earlier.label_y) \
-                <= labelled.default_distance()
+            if reach is None:
+                reach = labelled.default_distance()
+            if math.hypot(float(label.pixel_x) - earlier.label_x,
+                          float(label.pixel_y) - earlier.label_y) <= reach:
+                return True
         return math.hypot(float(label.pixel_x) - chip.anchor_x,
                           float(label.pixel_y) - chip.anchor_y) \
             <= self.chip_spin.value()
