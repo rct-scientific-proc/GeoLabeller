@@ -2563,6 +2563,16 @@ class MapCanvas(QGraphicsView):
         # that says where to; and its marker's pen, to put back.
         self._move_label_id: int | None = None
         self._move_original_pen = None
+        # A gesture waiting on a label - that Move, a Link with, a Link
+        # by Box - ends when the label is removed (hunt M13, 2.10.2). A
+        # marker also goes in order to be drawn again (an undo, a class
+        # edit, the waterfall), so whether the label went is asked once
+        # whoever removed the marker has finished.
+        self._gesture_check_timer = QTimer(self)
+        self._gesture_check_timer.setSingleShot(True)
+        self._gesture_check_timer.setInterval(0)
+        self._gesture_check_timer.timeout.connect(
+            self._end_gestures_without_a_label)
 
         # Chain-link mode state: while active, left-clicking labels links them
         # all into one object (each click links immediately); N starts a new
@@ -4315,6 +4325,11 @@ class MapCanvas(QGraphicsView):
         nobody would ever see - and the next project's first loads queued
         behind them.
         """
+        # The project is going away (New, Open, Open Recovery): what was
+        # waiting on one of its labels ends with it, and its measurement
+        # goes (hunt M13, 2.10.2).
+        self.end_gestures()
+        self._clear_ruler()
         if self._waterfall_active:
             # Nothing to restore the saved bounds onto once the layers are
             # gone; leaving the flag set hides waypoints and suppresses
@@ -4924,6 +4939,14 @@ class MapCanvas(QGraphicsView):
             self.set_chain_link_mode(False)
         # A move waits for a click in the mode it was asked in.
         self.cancel_move_mode()
+        # So does a box link: it takes every press whatever the mode,
+        # and left armed its drag linked what it boxed in Pan mode and
+        # panned nothing (hunt M13, 2.10.2). A pending "Link with" is
+        # kept: it acts on a click in a labelling mode only, and Pan is
+        # the one way to drag the map to a partner out of view with it
+        # pending (a right press in a labelling mode cancels it).
+        if self._box_link_anchor is not None:
+            self._exit_box_link_mode()
         self._mode = mode
         if mode == CanvasMode.PAN:
             # We handle panning manually
@@ -6049,6 +6072,11 @@ class MapCanvas(QGraphicsView):
             # Its marker is being rebuilt under a pending move: the pen
             # kept for it belongs to the one just removed.
             self._move_original_pen = None
+        # ...or the label itself is going, which ends what was waiting
+        # on it: looked at once the caller is done (_gesture_check_timer).
+        if label_id in (self._move_label_id, self._box_link_anchor,
+                        self._link_source_label_id):
+            self._gesture_check_timer.start()
         # A removed chain anchor can't take more links; the next chain-link
         # click anchors a fresh chain.
         if self._chain_link_active and label_id == self._chain_link_anchor:
@@ -6463,6 +6491,40 @@ class MapCanvas(QGraphicsView):
             if intersects:
                 result.append(layer_id)
         return result
+
+    # ------------------------------------------------------------------
+    # The gestures waiting for a click or a drag on a label: a Move, a
+    # Link with, a Link by Box, the link chain. Each holds a bare label
+    # id, and label ids start again at 1 in every project.
+    # ------------------------------------------------------------------
+
+    def end_gestures(self):
+        """End every pending gesture, for a project that is going away.
+
+        New, Open and Open Recovery come through clear_layers. Left
+        armed, a Move begun in one project moved the label of the same
+        number in the next at the first click, and a box link linked it
+        (hunt M13, 2.10.2).
+        """
+        self.cancel_move_mode()
+        if self._box_link_anchor is not None:
+            self._exit_box_link_mode()
+        if self._link_mode_active:
+            self._exit_link_mode()
+        self.set_chain_link_mode(False)
+
+    def _end_gestures_without_a_label(self):
+        """End the pending gestures whose label has no marker any more:
+        the label was removed, not redrawn (see _gesture_check_timer)."""
+        if (self._move_label_id is not None
+                and self._move_label_id not in self._label_items):
+            self.cancel_move_mode()
+        if (self._box_link_anchor is not None
+                and self._box_link_anchor not in self._label_items):
+            self._exit_box_link_mode()
+        if (self._link_mode_active
+                and self._link_source_label_id not in self._label_items):
+            self._exit_link_mode()
 
     def _enter_link_mode(self, source_label_id: int):
         """Enter link mode with the given label as the source."""
