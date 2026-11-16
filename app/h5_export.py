@@ -167,6 +167,7 @@ _STRING_COLUMNS = ("locations", "object_ids")
 #                  in the float formats; in uint8 they stay as their
 #                  values draw, a NaN black. No data is the application's
 #                  one definition (snippets.no_data, 2.10.2):
+#                  where the file's alpha band or mask band says so, else
 #                  where EVERY band holds the nodata value - a pixel one
 #                  band of which alone holds it is data, and was counted
 #                  (and in the float formats replaced) before - or where

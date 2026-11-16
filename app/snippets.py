@@ -20,6 +20,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
+from rasterio.enums import ColorInterp, MaskFlags
 from rasterio.windows import Window
 
 from PyQt5 import sip
@@ -168,41 +169,57 @@ def nodata_mask(data, nodata):
 
 
 # ---------------------------------------------------------------------------
-# No data: the one definition (bug hunt 2026-11-16 M6, 2.10.2)
+# No data: the one definition (bug hunt 2026-11-16 M6-M7, 2.10.2)
 # ---------------------------------------------------------------------------
 #
 # Every reader used to decide this for itself, and they disagreed: the
 # canvas went by the first band it drew, the float export and the
-# detectors by any band. A pixel holds no data when
+# detectors by any band, and nothing looked at an alpha band or a mask
+# band. A pixel holds no data when
 #
-#   - the file says so, as GDAL reads it: where EVERY band holds its
-#     declared nodata value (dark water whose red alone is 0 is water,
-#     not a hole); or
+#   - the file says so, as GDAL reads it: by its alpha band or its mask
+#     band - internal, or a .msk beside it - where it has one, otherwise
+#     where EVERY band holds its declared nodata value (dark water whose
+#     red alone is 0 is water, not a hole); or
 #   - its value in a band the reader goes on to use is NaN.
 #
 # no_data() is that definition, and nothing else decides it: the canvas
 # loaders, the detail tiles, the snippets, both HDF5 pixel formats and
 # the detectors all ask it.
+#
+# It is rasterio's dataset_mask() but for two things: that call answers
+# a four-band file with a nodata value by its fourth band's mask alone -
+# a hole wherever the fourth band of anything but RGBA holds the value -
+# and it reads every band again where the bands in hand already tell.
 
-_NODATA = "nodata"
+_MASK, _ALPHA, _NODATA = "mask", "alpha", "nodata"
 
 
 def _file_validity(src):
-    """How the file itself tells data from no data: ``(_NODATA,
-    values)`` - a nodata value on every band - or None, where every
-    pixel is data."""
-    values = src.nodatavals
-    if any(value is None for value in values):
+    """How the file itself tells data from no data, by GDAL's mask flags:
+    ``(_MASK, band)`` - a mask GDAL keeps for the whole dataset (an alpha
+    band's, a mask band's, or the one it makes of a NODATA_VALUES tag),
+    read as that band's mask; ``(_ALPHA, band)`` - an alpha band that a
+    declared nodata value hides from the flags (GDAL then reports the
+    nodata), read as it stands; ``(_NODATA, values)`` - a nodata value
+    on every band; or None, where every pixel is data."""
+    flags = src.mask_flag_enums
+    for band, band_flags in enumerate(flags, start=1):
+        if MaskFlags.per_dataset in band_flags:
+            return _MASK, band
+    if not all(MaskFlags.nodata in band_flags for band_flags in flags):
         return None         # a band with no nodata value always holds data
-    return _NODATA, values
+    if len(flags) in (2, 4) and src.colorinterp[-1] == ColorInterp.alpha:
+        return _ALPHA, len(flags)
+    return _NODATA, src.nodatavals
 
 
 def told_from_bands(src) -> bool:
     """Does no_data() go by the values of the bands a reader uses - a
     nodata value to find in every one of them, or floats that may hold
     a NaN? Only then need a loader hold its bands until it has asked:
-    the ordinary file - whole numbers, nothing declared - is told by
-    nothing."""
+    a file with an alpha or mask band is told by that band, and the
+    ordinary file - whole numbers, nothing declared - by nothing."""
     validity = _file_validity(src)
     return ((validity is not None and validity[0] == _NODATA)
             or any(str(dtype).startswith("float") for dtype in src.dtypes))
@@ -232,8 +249,8 @@ def _all_nodata(src, seen, values, window, shape):
 def no_data(src, planes, indexes=None, window=None, used=None):
     """Which pixels of a read hold no data: an (h, w) boolean array, or
     None when every pixel holds some - so a caller can skip the work,
-    and the ordinary file (whole numbers, no nodata value) costs a look
-    at its header and nothing more.
+    and the ordinary file (whole numbers, no nodata value, no alpha, no
+    mask) costs a look at its mask flags and nothing more.
 
     ``planes`` are bands of ``src`` as read - a (bands, h, w) array, a
     list of (h, w) arrays or one (h, w) array - over ``window`` (None:
@@ -252,7 +269,17 @@ def no_data(src, planes, indexes=None, window=None, used=None):
     empty = None
     validity = _file_validity(src)
     if validity is not None:
-        empty = _all_nodata(src, seen, validity[1], window, shape)
+        how, what = validity
+        if how == _NODATA:
+            empty = _all_nodata(src, seen, what, window, shape)
+        elif how == _MASK:
+            empty = src.read_masks(what, window=window, out_shape=shape) == 0
+        elif what in seen:
+            empty = seen[what] == 0
+        else:
+            empty = src.read(what, window=window, out_shape=shape) == 0
+        if empty is not None and not empty.any():
+            empty = None
     for plane in (planes if used is None else [planes[i] for i in used]):
         if np.issubdtype(plane.dtype, np.floating):
             nan = np.isnan(plane)

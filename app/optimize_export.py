@@ -17,7 +17,7 @@ import re
 from pathlib import Path
 
 import rasterio
-from rasterio.enums import Resampling
+from rasterio.enums import MaskFlags, Resampling
 from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox, QLabel,
@@ -161,16 +161,32 @@ def optimize_geotiff(src_path, dst_path, overviews=DEFAULT_OVERVIEWS,
                 profile.pop("photometric", None)
             profile.pop("jpeg_quality", None)
 
+        # A mask band - internal, or a .msk beside the source - is what
+        # says which pixels are data, and copying the bands alone lost it:
+        # the copy's collar became data (hunt M7, 2.10.2). Alpha is a band
+        # and nodata a tag, so both came across already; a mask derived
+        # from nodata values is not a band to write.
+        flags = src.mask_flag_enums[0]
+        masked = (MaskFlags.per_dataset in flags
+                  and MaskFlags.alpha not in flags
+                  and MaskFlags.nodata not in flags)
+
         # Write to a temp file, then atomically replace, so a cancelled or
-        # crashed run never leaves a half-written output in place.
+        # crashed run never leaves a half-written output in place. The mask
+        # goes INSIDE the file (and its overviews with it): beside it, it
+        # would be a .tmp.msk the replace leaves behind.
         tmp_path = dst_path.with_suffix(dst_path.suffix + ".tmp")
         try:
-            with rasterio.open(tmp_path, "w", **profile) as dst:
+            with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True), \
+                    rasterio.open(tmp_path, "w", **profile) as dst:
                 # Copy pixels block-by-block so huge rasters don't blow memory.
                 for _, window in src.block_windows(1):
                     if cancel_check and cancel_check():
                         raise _Cancelled()
                     dst.write(src.read(window=window), window=window)
+                    if masked:
+                        dst.write_mask(src.read_masks(1, window=window),
+                                       window=window)
 
                 # --- preserve metadata -------------------------------------
                 dst.colorinterp = src.colorinterp

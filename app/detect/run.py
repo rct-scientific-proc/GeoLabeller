@@ -203,7 +203,8 @@ def read_values(path: str, factor: float) -> tuple:
         data = src.read(indexes=bands, out_shape=(len(bands), out_h, out_w))
         # The one definition (snippets.no_data; hunt M6, 2.10.2): one band
         # at the nodata value used to empty the pixel here, so a vessel
-        # saturated in red was never offered.
+        # saturated in red was never offered. An alpha or mask band's
+        # collar was searched like ground (M7).
         empty = no_data(src, data, bands)
         values = data.astype(np.float32).mean(axis=0)
         if empty is not None:
