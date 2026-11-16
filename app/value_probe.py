@@ -19,6 +19,7 @@ from rasterio.windows import Window
 
 from . import display_settings, gdal_config
 from .debug_log import debug
+from .snippets import no_data
 from .tile_reader import own_x, written_past_180
 
 MAX_BANDS = 8                   # values shown before "..."
@@ -26,9 +27,9 @@ MAX_BANDS = 8                   # values shown before "..."
 
 @dataclass(frozen=True)
 class Probe:
-    """One pixel's values: one per band, None where the band is nodata;
-    and, when one band is drawn through the file's colour table, which
-    band and the colour its value takes."""
+    """One pixel's values: one per band, None where the pixel holds no
+    data (or the band a NaN); and, when one band is drawn through the
+    file's colour table, which band and the colour its value takes."""
     values: tuple
     dtype: str
     band: int | None = None
@@ -76,11 +77,17 @@ def read_values(image_path: str, x: float, y: float,
                 row, col = src.index(xs[0], ys[0])
             if not (0 <= col < src.width and 0 <= row < src.height):
                 return None
-            data = src.read(window=Window(col, row, 1, 1))[:, 0, 0]
-            nodata = src.nodata
+            window = Window(col, row, 1, 1)
+            data = src.read(window=window)
+            # The pixel is no data where the file says so, by the one
+            # definition (snippets.no_data; hunt M6, 2.10.2) - as the
+            # canvas draws it: a band at the nodata value in a pixel
+            # that holds data reads as its value. A NaN is still no
+            # value to show.
+            hollow = no_data(src, data, window=window, used=()) is not None
             values = []
-            for value in data.tolist():
-                empty = (nodata is not None and value == nodata) or (
+            for value in data[:, 0, 0].tolist():
+                empty = hollow or (
                     isinstance(value, float) and math.isnan(value))
                 values.append(None if empty else value)
             band = display_settings.paletted_band(

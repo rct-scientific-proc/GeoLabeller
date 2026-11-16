@@ -34,7 +34,7 @@ from rasterio.windows import Window
 from . import gdal_config
 from .display_settings import (DEFAULT as DEFAULT_DISPLAY, colour_table,
                                palette_rgb, paletted_band)
-from .snippets import apply_band_stretch, cached_band_scaling
+from .snippets import apply_band_stretch, cached_band_scaling, no_data
 
 # Tile edge in destination pixels. Matches the canvas's own TILE_SIZE.
 TILE_SIZE = 512
@@ -332,10 +332,11 @@ def read_tile(src, dst_crs, level: int, tx: int, ty: int,
         # The file's own colour table: the index band reprojected
         # nearest - an index is a category, not a quantity - then each
         # value's colour.
-        values = src.read(band, window=window,
-                          out_shape=(read_h, read_w)).astype(np.float32)
-        if src.nodata is not None:
-            values[values == src.nodata] = np.nan
+        values = src.read(band, window=window, out_shape=(read_h, read_w))
+        empty = no_data(src, values, [band], window=window)
+        values = values.astype(np.float32)
+        if empty is not None:
+            values[empty] = np.nan
         dst_values = np.full((out_h, out_w), np.nan, dtype=np.float32)
         reproject(source=values, destination=dst_values,
                   src_nodata=np.nan, dst_nodata=np.nan,
@@ -348,12 +349,19 @@ def read_tile(src, dst_crs, level: int, tx: int, ty: int,
         rgba[:, :, 3] = np.where(nodata_mask, 0, 255).astype(np.uint8)
         return rgba
 
+    # No data is told of a pixel, not of the first band drawn
+    # (snippets.no_data; hunt M6, 2.10.2): that band alone at the nodata
+    # value used to cut a hole in the tile.
+    planes = {index: src.read(index, window=window,
+                              out_shape=(read_h, read_w))
+              for index in dict.fromkeys(chosen)}
+    empty = no_data(src, list(planes.values()), list(planes), window=window)
+
     # The first band in float32: NaN marks both source nodata and the areas
     # the reprojection never writes, which become the alpha channel.
-    band1 = src.read(chosen[0], window=window,
-                     out_shape=(read_h, read_w)).astype(np.float32)
-    if src.nodata is not None:
-        band1[band1 == src.nodata] = np.nan
+    band1 = planes[chosen[0]].astype(np.float32)
+    if empty is not None:
+        band1[empty] = np.nan
     band1 = apply_band_stretch(band1, scaling, chosen[0] - 1)
     dst_band1 = np.full((out_h, out_w), np.nan, dtype=np.float32)
     reproject(source=band1, destination=dst_band1,
@@ -374,13 +382,12 @@ def read_tile(src, dst_crs, level: int, tx: int, ty: int,
         if index in done:
             rgba[:, :, channel] = rgba[:, :, done[index]]
             continue
-        band = src.read(index, window=window, out_shape=(read_h, read_w))
-        nodata_at = (band == src.nodata) \
-            if src.nodata is not None else None
-        band = apply_band_stretch(band, scaling, index - 1)
+        band = apply_band_stretch(planes[index], scaling, index - 1)
+        if empty is not None:
+            # Zeroed ahead of the byte conversion (a NaN has no byte);
+            # 0 is the uint8 reproject's nodata.
+            band = np.where(empty, 0, band)
         band = np.clip(band, 0, 255).astype(np.uint8)
-        if nodata_at is not None:
-            band[nodata_at] = 0
         dst_band = np.zeros((out_h, out_w), dtype=np.uint8)
         reproject(source=band, destination=dst_band,
                   src_nodata=0, dst_nodata=0, **common)

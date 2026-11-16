@@ -617,7 +617,7 @@ def colour_table_legend(src, band: int = 1, max_side: int = 512,
     ``[(value, (r, g, b), share), ...]``, most common first, at most
     ``limit`` of them. Empty when the band carries no table. Nodata and
     values the table does not reach are left out (2.8.1)."""
-    from .snippets import nodata_mask
+    from .snippets import no_data
 
     table = colour_table(src, band)
     if table is None:
@@ -627,7 +627,7 @@ def colour_table_legend(src, band: int = 1, max_side: int = 512,
     out_w = max(1, int(src.width / max(scale, 1.0)))
     out_h = max(1, int(src.height / max(scale, 1.0)))
     data = src.read(band, out_shape=(out_h, out_w))
-    empty = nodata_mask(data, src.nodata)
+    empty = no_data(src, data, [band])
     values = data[~empty] if empty is not None else data.ravel()
     values = np.rint(np.nan_to_num(values.astype(np.float64), nan=-1.0))
     values = values[(values >= 0) & (values < len(table))].astype(np.int64)
@@ -643,16 +643,17 @@ def colour_table_legend(src, band: int = 1, max_side: int = 512,
 def display_rgb(src, window, nodata, scaling, settings: DisplaySettings):
     """A window of ``src`` as (H, W, 3) uint8, drawn through ``settings``.
 
-    None when the window is entirely nodata. The bands are the settings'
-    source bands, each through the file's own display stretch, then the
-    lookup table.
+    None when the window is entirely nodata - by the one definition
+    (snippets.no_data, asked of ``src``; ``nodata`` is no longer
+    consulted). The bands are the settings' source bands, each through
+    the file's own display stretch, then the lookup table.
     """
-    from .snippets import apply_band_stretch, nodata_mask
+    from .snippets import apply_band_stretch, no_data
 
     band = paletted_band(settings, src)
     if band is not None:
         values = src.read(band, window=window)
-        empty = nodata_mask(values, nodata)
+        empty = no_data(src, values, [band], window=window)
         if empty is not None and bool(empty.all()):
             return None
         values = values.astype(np.float64)
@@ -663,7 +664,7 @@ def display_rgb(src, window, nodata, scaling, settings: DisplaySettings):
     chosen = settings.source_bands(src.count)
     unique = sorted(set(chosen))
     data = src.read(indexes=unique, window=window)
-    empty = nodata_mask(data, nodata)
+    empty = no_data(src, data, unique, window=window)
     if empty is not None and bool(empty.all()):
         return None
     planes = {}
@@ -682,14 +683,14 @@ def band_histogram(src, band: int, scaling, max_side: int = 512):
     What the Display Settings window draws behind each channel, and what
     Auto works from. Nodata is left out.
     """
-    from .snippets import apply_band_stretch, nodata_mask
+    from .snippets import apply_band_stretch, no_data
 
     band = _clamp(int(band), 1, src.count)
     scale = max(src.width, src.height) / max_side
     out_w = max(1, int(src.width / max(scale, 1.0)))
     out_h = max(1, int(src.height / max(scale, 1.0)))
     data = src.read(band, out_shape=(out_h, out_w))
-    empty = nodata_mask(data, src.nodata)
+    empty = no_data(src, data, [band])
     plane = apply_band_stretch(data, scaling, band - 1)
     if np.issubdtype(np.asarray(plane).dtype, np.floating):
         plane = np.nan_to_num(plane, nan=0.0, posinf=255.0, neginf=0.0)

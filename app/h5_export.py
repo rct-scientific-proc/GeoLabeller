@@ -37,7 +37,7 @@ from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 # sidebar/orientation views and the exports can never frame differently.
 from .masks import entry_in_window, prepare_entry
 from . import gdal_config
-from .snippets import (centered_window, nodata_mask, cached_band_scaling,
+from .snippets import (centered_window, no_data, cached_band_scaling,
                        _window_pixels)
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox, QLabel,
@@ -163,11 +163,17 @@ _STRING_COLUMNS = ("locations", "object_ids")
 #                  crop is a plain window of the source raster, which only
 #                  translates it.
 #   nodata         how many of the sample's pixels carried no data in the
-#                  source (NaN or the nodata sentinel) and were filled in:
-#                  with the window's own mean in the float32 format, black
-#                  in uint8. 0 for a sample cut whole from real ground. A
-#                  consumer can weight or drop a sample that is mostly
-#                  made up - a swath-edge crop used to carry NaN unseen.
+#                  source and were filled in: with the window's own mean
+#                  in the float formats; in uint8 they stay as their
+#                  values draw, a NaN black. No data is the application's
+#                  one definition (snippets.no_data, 2.10.2):
+#                  where EVERY band holds the nodata value - a pixel one
+#                  band of which alone holds it is data, and was counted
+#                  (and in the float formats replaced) before - or where
+#                  a band the sample is made of is NaN.
+#                  0 for a sample cut whole from real ground. A consumer
+#                  can weight or drop a sample that is mostly made up -
+#                  a swath-edge crop used to carry NaN unseen.
 _NUMERIC_GROUPS = {
     "confidence": (("confidence", "uint8", 0),),
     "orientation": (("orientation_px_rad", "float32", float("nan")),
@@ -270,25 +276,28 @@ def _float_window_pixels(src, window, nodata, stats=None):
     (mixing physical units through luminance weights would mean nothing).
     Entirely-nodata windows return None, like the uint8 reader.
 
-    Pixels without data (NaN, or the sentinel) are filled with the mean of
-    the window's real pixels - a value from the window's own range, so a
-    swath-edge crop trains on nothing it could not contain - and their
-    count goes to ``stats["nodata"]`` when a dict is given. Left as read,
-    a NaN or a -9999 went straight into the training set.
+    Pixels without data are filled with the mean of the window's real
+    pixels - a value from the window's own range, so a swath-edge crop
+    trains on nothing it could not contain - and their count goes to
+    ``stats["nodata"]`` when a dict is given. Left as read, a NaN or a
+    -9999 went straight into the training set.
+
+    "Without data" is the one definition, ``snippets.no_data``, asked of
+    ``src`` (``nodata`` is no longer consulted) for the bands used here:
+    a pixel one band of which alone held the nodata value used to be
+    replaced by the mean though it was data (hunt M6, 2.10.2).
     """
     data = src.read(window=window)
-    empty = nodata_mask(data, nodata)
-    if empty is not None and bool(empty.all()):
-        return None
     integer = np.issubdtype(data.dtype, np.integer)
-    if data.shape[0] >= 3 and integer:
+    luminance = data.shape[0] >= 3 and integer
+    missing = no_data(src, data, window=window,
+                      used=range(3) if luminance else (0,))
+    if luminance:
         gray = (0.299 * data[0].astype(np.float32)
                 + 0.587 * data[1].astype(np.float32)
                 + 0.114 * data[2].astype(np.float32))
-        missing = None if empty is None else empty[:3].any(axis=0)
     else:
         gray = data[0].astype(np.float32)
-        missing = None if empty is None else empty[0]
     if integer:
         gray /= float(np.iinfo(data.dtype).max)
     filled = 0 if missing is None else int(missing.sum())

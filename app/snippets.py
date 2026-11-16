@@ -146,6 +146,9 @@ def nodata_mask(data, nodata):
     Returns a boolean array shaped like ``data``, or None when nothing in
     it can be nodata (integer imagery with no declared sentinel), so
     callers can skip the work entirely.
+
+    Value by value, band by band - what the mask statistics want. Whether
+    a PIXEL holds data is :func:`no_data`'s to say (2.10.2), not this.
     """
     data = np.asarray(data)
     mask = None
@@ -164,19 +167,117 @@ def nodata_mask(data, nodata):
     return mask
 
 
+# ---------------------------------------------------------------------------
+# No data: the one definition (bug hunt 2026-11-16 M6, 2.10.2)
+# ---------------------------------------------------------------------------
+#
+# Every reader used to decide this for itself, and they disagreed: the
+# canvas went by the first band it drew, the float export and the
+# detectors by any band. A pixel holds no data when
+#
+#   - the file says so, as GDAL reads it: where EVERY band holds its
+#     declared nodata value (dark water whose red alone is 0 is water,
+#     not a hole); or
+#   - its value in a band the reader goes on to use is NaN.
+#
+# no_data() is that definition, and nothing else decides it: the canvas
+# loaders, the detail tiles, the snippets, both HDF5 pixel formats and
+# the detectors all ask it.
+
+_NODATA = "nodata"
+
+
+def _file_validity(src):
+    """How the file itself tells data from no data: ``(_NODATA,
+    values)`` - a nodata value on every band - or None, where every
+    pixel is data."""
+    values = src.nodatavals
+    if any(value is None for value in values):
+        return None         # a band with no nodata value always holds data
+    return _NODATA, values
+
+
+def told_from_bands(src) -> bool:
+    """Does no_data() go by the values of the bands a reader uses - a
+    nodata value to find in every one of them, or floats that may hold
+    a NaN? Only then need a loader hold its bands until it has asked:
+    the ordinary file - whole numbers, nothing declared - is told by
+    nothing."""
+    validity = _file_validity(src)
+    return ((validity is not None and validity[0] == _NODATA)
+            or any(str(dtype).startswith("float") for dtype in src.dtypes))
+
+
+def _all_nodata(src, seen, values, window, shape):
+    """True where every band of the file holds its nodata value - GDAL's
+    rule for a dataset - or None where no pixel does. The bands in hand
+    are compared as read, and come first: most reads are settled by
+    them, and only a pixel they leave in doubt has the other bands'
+    masks read."""
+    empty = None
+    for band in sorted(range(1, len(values) + 1), key=lambda b: b not in seen):
+        plane = seen.get(band)
+        if plane is None:
+            here = src.read_masks(band, window=window, out_shape=shape) == 0
+        elif values[band - 1] != values[band - 1]:
+            here = np.isnan(plane)      # a NaN sentinel equals nothing
+        else:
+            here = plane == values[band - 1]
+        empty = here if empty is None else (empty & here)
+        if not empty.any():
+            return None
+    return empty
+
+
+def no_data(src, planes, indexes=None, window=None, used=None):
+    """Which pixels of a read hold no data: an (h, w) boolean array, or
+    None when every pixel holds some - so a caller can skip the work,
+    and the ordinary file (whole numbers, no nodata value) costs a look
+    at its header and nothing more.
+
+    ``planes`` are bands of ``src`` as read - a (bands, h, w) array, a
+    list of (h, w) arrays or one (h, w) array - over ``window`` (None:
+    the whole raster) at their own height and width, so a decimated read
+    is answered at its own scale. ``indexes`` are their 1-based band
+    numbers (by default 1, 2, ... as ``src.read()`` gives them).
+    ``used`` names the positions in ``planes`` whose values the reader
+    goes on to use, where that is not all of them: only those are
+    tested for NaN.
+    """
+    planes = [planes] if getattr(planes, "ndim", 3) == 2 else list(planes)
+    shape = planes[0].shape
+    if indexes is None:
+        indexes = range(1, len(planes) + 1)
+    seen = dict(zip(indexes, planes))
+    empty = None
+    validity = _file_validity(src)
+    if validity is not None:
+        empty = _all_nodata(src, seen, validity[1], window, shape)
+    for plane in (planes if used is None else [planes[i] for i in used]):
+        if np.issubdtype(plane.dtype, np.floating):
+            nan = np.isnan(plane)
+            if nan.any():
+                empty = nan if empty is None else (empty | nan)
+    return empty
+
+
 def _window_pixels(src, window, channels, nodata, scaling=None,
                    stats=None):
     """Read a window as an (H, W, C) uint8 array, or None if entirely nodata.
 
     ``scaling`` is the per-band stretch from :func:`_band_scaling` for
     non-uint8 sources (uint8 data passes through byte-exact). A ``stats``
-    dict receives ``"nodata"``: how many pixels carried no data in any
-    band (they are painted black here; the H5 export records the count).
+    dict receives ``"nodata"``: how many pixels hold no data, by the one
+    definition (:func:`no_data`, asked of ``src``; ``nodata`` is no
+    longer consulted) - they are drawn as their values are, a NaN
+    black, and the H5 export records the count.
     """
     data = src.read(window=window)  # (bands, h, w)
-    empty = nodata_mask(data, nodata)
+    # The bands the picture is made of: the first three, or the first.
+    empty = no_data(src, data, window=window,
+                    used=range(3 if data.shape[0] >= 3 else 1))
     if stats is not None:
-        stats["nodata"] = 0 if empty is None else int(empty.any(axis=0).sum())
+        stats["nodata"] = 0 if empty is None else int(empty.sum())
     if empty is not None and bool(empty.all()):
         return None
     if scaling is not None:
@@ -456,7 +557,7 @@ def read_image_overview(image_path: str, max_side: int = 1600) -> tuple:
         band = display_settings.paletted_band(display, src)
         if band is not None:
             values = src.read(band, out_shape=(out_h, out_w))
-            empty = nodata_mask(values, src.nodata)
+            empty = no_data(src, values, [band])
             values = values.astype(np.float64)
             if empty is not None:
                 values[empty] = np.nan

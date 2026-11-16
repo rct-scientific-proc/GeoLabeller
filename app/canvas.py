@@ -42,7 +42,8 @@ from rasterio.warp import transform as warp_transform
 from .labels import geodesic_distance
 from .debug_log import debug
 from .labels import ImagePaths, canonical_path
-from .snippets import apply_band_stretch, cached_band_scaling, nodata_mask
+from .snippets import (apply_band_stretch, cached_band_scaling, no_data,
+                       told_from_bands)
 from . import display_settings
 from .display_settings import (apply_lut, colour_table, palette_rgb,
                                paletted_band)
@@ -1108,10 +1109,12 @@ class TiledLayer:
                 # index band, reprojected nearest - an index is a
                 # category, not a quantity - then each value's colour.
                 self._checkpoint(cancel_check)
-                src_values = src.read(band, out_shape=(rd_h, rd_w)).astype(
-                    np.float32)
-                if src.nodata is not None:
-                    src_values[src_values == src.nodata] = np.nan
+                src_values = src.read(band, out_shape=(rd_h, rd_w))
+                empty = no_data(src, src_values, [band])
+                src_values = src_values.astype(np.float32)
+                if empty is not None:
+                    src_values[empty] = np.nan
+                del empty
                 if same_grid:
                     dst_values = src_values
                 else:
@@ -1142,10 +1145,24 @@ class TiledLayer:
                 # by default the file's first three, or its only one.
                 chosen = self.display.source_bands(src.count)
                 first = chosen[0]
-                src_band1 = src.read(first, out_shape=(rd_h, rd_w)).astype(
-                    np.float32)
-                if src.nodata is not None:
-                    src_band1[src_band1 == src.nodata] = np.nan
+                extra = [b for b in dict.fromkeys(chosen) if b != first]
+                # No data is told of a pixel, not of the first band drawn
+                # (snippets.no_data; hunt M6, 2.10.2): that band alone at
+                # the nodata value used to cut a hole in the picture.
+                # Where it is told from the bands' values the others are
+                # read before the first is warped; otherwise - the
+                # ordinary file - one at a time, as they always were.
+                held = {}
+                if told_from_bands(src):
+                    for i in extra:
+                        self._checkpoint(cancel_check)
+                        held[i] = src.read(i, out_shape=(rd_h, rd_w))
+                src_band1 = src.read(first, out_shape=(rd_h, rd_w))
+                empty = no_data(src, [src_band1, *held.values()],
+                                [first, *held])
+                src_band1 = src_band1.astype(np.float32)
+                if empty is not None:
+                    src_band1[empty] = np.nan
                 src_band1 = apply_band_stretch(src_band1, band_scaling, first - 1)
 
                 self._checkpoint(cancel_check)
@@ -1170,8 +1187,9 @@ class TiledLayer:
                 # rest of this function unless dropped now.
                 del src_band1
 
-                # Create nodata mask from band 1 only (padding is same for all
-                # bands)
+                # The mask of what is drawn, off the first band: NaN where
+                # no pixel with data reached - the padding, the same for
+                # all bands, and the pixels marked above.
                 nodata_mask = np.isnan(dst_band1)
 
                 # Convert band 1 to uint8
@@ -1186,22 +1204,23 @@ class TiledLayer:
 
                 # Reproject remaining bands directly as uint8 (faster)
                 planes = {first: band1_uint8}
-                extra = [b for b in dict.fromkeys(chosen) if b != first]
                 if extra:
                     for i in extra:
                         self._checkpoint(cancel_check)
-                        src_band = src.read(i, out_shape=(rd_h, rd_w))
-                        # Nodata positions noted BEFORE the stretch (which maps
-                        # the sentinel value like any other), zeroed after the
-                        # byte conversion - 0 is the uint8 reproject's nodata.
-                        nodata_at = (src_band == src.nodata) \
-                            if src.nodata is not None else None
+                        src_band = held.pop(i, None)
+                        if src_band is None:
+                            src_band = src.read(i, out_shape=(rd_h, rd_w))
+                        # The pixels without data (told from the raw
+                        # values, before the stretch maps a sentinel like
+                        # any other) are zeroed - 0 is the uint8
+                        # reproject's nodata - ahead of the byte
+                        # conversion, which has no answer for a NaN.
                         src_band = apply_band_stretch(
                             src_band, band_scaling, i - 1)
+                        if empty is not None:
+                            src_band[empty] = 0
                         if src_band.dtype != np.uint8:
                             src_band = np.clip(src_band, 0, 255).astype(np.uint8)
-                        if nodata_at is not None:
-                            src_band[nodata_at] = 0
 
                         if same_grid:
                             dst_band = src_band
@@ -1317,7 +1336,7 @@ class TiledLayer:
             if band is not None:
                 # The file's own colour table: each value's colour.
                 values = src.read(band, out_shape=(height, width))
-                empty = nodata_mask(values, src.nodata)
+                empty = no_data(src, values, [band])
                 values = values.astype(np.float32)
                 if empty is not None:
                     values[empty] = np.nan
@@ -1334,17 +1353,29 @@ class TiledLayer:
                 # tiles have always turned nodata into transparency; this one
                 # painted it opaque - and for NaN it painted an undefined byte,
                 # so a swath exterior that is invisible on the map showed up as
-                # a black block in waterfall.
-                empty = nodata_mask(band1, src.nodata)
+                # a black block in waterfall. Told of a pixel, not of the
+                # first band drawn (snippets.no_data; hunt M6, 2.10.2):
+                # where it is told from the bands' values the others are
+                # read first, otherwise one at a time, as before.
+                held = {}
+                if told_from_bands(src):
+                    for index in dict.fromkeys(chosen):
+                        if index != first:
+                            self._checkpoint(cancel_check)
+                            held[index] = src.read(
+                                index, out_shape=(height, width))
+                empty = no_data(src, [band1, *held.values()], [first, *held])
                 # _as_uint8 skips the copy for an already-uint8 read; nearly
                 # all supported imagery is uint8.
                 planes = {first: _as_uint8(band1, band_scaling, first - 1)}
                 for index in dict.fromkeys(chosen):
                     if index not in planes:
                         self._checkpoint(cancel_check)
+                        raw = held.pop(index, None)
+                        if raw is None:
+                            raw = src.read(index, out_shape=(height, width))
                         planes[index] = _as_uint8(
-                            src.read(index, out_shape=(height, width)),
-                            band_scaling, index - 1)
+                            raw, band_scaling, index - 1)
                 r, g, b = (planes[c] for c in chosen)
 
             rgba = np.zeros((height, width, 4), dtype=np.uint8)

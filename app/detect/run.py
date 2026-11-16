@@ -34,7 +34,7 @@ from ..model_review.ledger import (DEFAULT_TOLERANCE_PX, OUTCOME_KEY,
                                    LedgerIndex, outcome_to_dict)
 from ..model_review.outcomes import keep_earlier, read_records
 from ..model_review.source import CANDIDATE
-from ..snippets import nodata_mask
+from ..snippets import no_data
 from ..version import app_version
 from . import by_key
 from .base import score_of
@@ -201,11 +201,10 @@ def read_values(path: str, factor: float) -> tuple:
         out_w = max(1, int(round(width / factor)))
         bands = sorted(set(display.source_bands(src.count)))
         data = src.read(indexes=bands, out_shape=(len(bands), out_h, out_w))
-        empty = None
-        for plane in data:
-            missing = nodata_mask(plane, src.nodata)
-            if missing is not None:
-                empty = missing if empty is None else (empty | missing)
+        # The one definition (snippets.no_data; hunt M6, 2.10.2): one band
+        # at the nodata value used to empty the pixel here, so a vessel
+        # saturated in red was never offered.
+        empty = no_data(src, data, bands)
         values = data.astype(np.float32).mean(axis=0)
         if empty is not None:
             values[empty] = np.nan
