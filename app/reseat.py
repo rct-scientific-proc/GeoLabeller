@@ -17,7 +17,8 @@ Tiers, by what the file's header says against the record:
   regrid   the pixel size or the rotation changed: each label is placed
            from its latitude and longitude; masks, painted on the old
            pixels, are dropped.
-  same     the file matches the record.
+  same     the file matches the record: its size, and where it lies
+           (an equal-size crop from another origin is a shift, 2.10.2).
   unknown  nothing to go by: no georeferencing on one side or the other,
            or a file that cannot be read.
 
@@ -52,6 +53,7 @@ UNKNOWN = "unknown"
 DECLINED = "declined"           # a regrid the user said no to
 TOLERANCE_PX = 0.05             # how far from a whole pixel an offset may lie
 SCALE_TOLERANCE = 1e-6          # relative: "the same pixel size"
+OFFER_LOOKS = 20                # files the offer reads to say what Yes does
 
 
 @dataclass
@@ -151,14 +153,19 @@ class Plan:
 
 # -- reading and planning -----------------------------------------------------
 
+def header_of(width, height, transform, crs) -> Header:
+    """A Header from what an opened file (or a layer that has read one)
+    holds: an identity transform is no georeferencing."""
+    affine = (None if transform is None or transform.is_identity
+              else transform)
+    return Header(int(width), int(height), affine, crs)
+
+
 def read_header(path: str) -> "Header | None":
     """The file's size and georeferencing, or None when it cannot be read."""
     try:
         with gdal_config.opened(path) as src:
-            transform = src.transform
-            affine = (None if transform is None or transform.is_identity
-                      else transform)
-            return Header(int(src.width), int(src.height), affine, src.crs)
+            return header_of(src.width, src.height, src.transform, src.crs)
     except Exception as exc:  # noqa: BLE001 - a header, not a failure
         debug(f"re-seat: cannot read {path}: {type(exc).__name__}: {exc}")
         return None
@@ -168,6 +175,41 @@ def _same_grid(old: Affine, new: Affine) -> bool:
     return all(math.isclose(a, b, rel_tol=SCALE_TOLERANCE, abs_tol=1e-12)
                for a, b in ((old.a, new.a), (old.b, new.b),
                             (old.d, new.d), (old.e, new.e)))
+
+
+def matches_record(image, header: Header) -> bool:
+    """Is the file what the project recorded: its size and, where the
+    record and the file both carry georeferencing, its place - the
+    recorded grid (_same_grid) with its origin less than a pixel from
+    where it was, on both axes?
+
+    Equal size alone was "the same" until 2.10.2, so an equal-size crop
+    from another origin kept its labels where they were, on other ground
+    (hunt M3). Less than a pixel is still the same place: it is the
+    slack is_cropped_version allows, a label is then at most a pixel
+    from its object, and a half-pixel convention (PixelIsPoint read
+    another way, a sidecar) or a sub-pixel correction must not raise a
+    question after every Open, nor send anyone into a regrid that drops
+    masks. From a pixel upwards the tiers decide, as for a change of
+    size. Without an affine and a CRS on both sides there is nothing to
+    tell a place by, and the size decides as it always did. The CRS
+    itself is not compared here (the tiers do, as before): the record
+    keeps a guessed EPSG code, which for a file with its own datum
+    shift is not equal to the file's CRS though nothing changed.
+    """
+    if (header.width, header.height) != (int(image.original_width or 0),
+                                         int(image.original_height or 0)):
+        return False
+    old, new = image.get_affine(), header.affine
+    if (old is None or image.crs_key() is None or new is None
+            or header.crs is None):
+        return True
+    if not _same_grid(old, new):
+        return False
+    if old.is_degenerate:
+        return True                 # no pixels to measure an offset in
+    col, row = ~old * (new.c, new.f)
+    return abs(col) < 1 and abs(row) < 1
 
 
 def _as_file(image, header: Header) -> ImageData:
@@ -259,8 +301,7 @@ def plan(image, header: "Header | None") -> Plan:
         p = _start(image, UNKNOWN, None)
         p.reason = "the file could not be read"
         return p
-    if (header.width, header.height) == (int(image.original_width or 0),
-                                         int(image.original_height or 0)):
+    if matches_record(image, header):
         return _start(image, SAME, header)
     if not image.original_width or not image.original_height:
         p = _start(image, UNKNOWN, header)
@@ -348,6 +389,46 @@ def _file_key(name_or_path) -> str:
     """A file name as the memory compares it: the last part, lower-cased."""
     return PurePosixPath(str(name_or_path or "").replace("\\", "/")
                          ).name.lower()
+
+
+def offer_question(count: int, labelled: int, plans=()) -> str:
+    """The question after a project opens: ``count`` images are not what
+    the project recorded, ``labelled`` of them with labels.
+
+    It says what Yes does - the labels follow the ground - and, where
+    ``plans`` (those of the labelled images, when the caller looked at
+    their files: OFFER_LOOKS) come to one whole-pixel offset, by how
+    much. The files cannot say whether they are another cut of the
+    scene, where that is right, or the same pixels with their
+    georeferencing corrected, where the labels are right as they are
+    and the answer is No: the number is what lets the user tell (hunt
+    M3, 2.10.2).
+    """
+    text = (f"{count} image{'' if count == 1 else 's'} "
+            f"{'differs' if count == 1 else 'differ'} in size or position "
+            "from what the project recorded - cropped since, perhaps - "
+            f"{labelled} of them with labels. Re-seat the labels now?\n\n")
+    offsets = {(p.dx, p.dy) if p.kind == SHIFT else None for p in plans}
+    if len(offsets) == 1 and None not in offsets:
+        dx, dy = offsets.pop()
+        moved = " and ".join(
+            f"{abs(n)} {unit}{'' if abs(n) == 1 else 's'} {way}"
+            for n, unit, way in (
+                (dx, "column", "to the left" if dx > 0 else "to the right"),
+                (dy, "row", "up" if dy > 0 else "down")) if n)
+        text += (f"Yes moves every label {moved} on its image, to keep it "
+                 "on the ground it was placed on." if moved else
+                 "The labels stay where they are; Yes brings the record up "
+                 "to date.")
+    else:
+        text += ("Yes moves each label on its image to keep it on the "
+                 "ground it was placed on.")
+    dropped = sum(len(p.dropped) for p in plans)
+    if dropped:
+        text += (f" {dropped} label{'' if dropped == 1 else 's'} now off "
+                 "the image would be dropped.")
+    return text + (" One undo step. File > Re-seat Labels to Imagery... "
+                   "does it any time.")
 
 
 def regrid_question(plans: list) -> str:
@@ -445,9 +526,10 @@ class ReportDialog(QDialog):
 
 def mismatched_paths(project, should_stop=None,
                      labelled_only: bool = False) -> list:
-    """The images whose file's size differs from the record: every
-    image with a recorded size (the command), or the labelled ones
-    (the look after a project opens, which must not turn a
+    """The images whose file is not what the project recorded
+    (matches_record: another size, or the same size somewhere else):
+    every image with a recorded size (the command), or the labelled
+    ones (the look after a project opens, which must not turn a
     metadata-only load into a read of every file; an unlabelled
     image's record is brought up to date when its layer first reads
     the file instead, 2.8.8)."""
@@ -460,8 +542,7 @@ def mismatched_paths(project, should_stop=None,
                                         and not image.labels):
             continue
         header = read_header(image.path)
-        if header is not None and (header.width, header.height) != (
-                int(image.original_width), int(image.original_height)):
+        if header is not None and not matches_record(image, header):
             paths.append(image.path)
     return paths
 
@@ -490,8 +571,8 @@ class SizeCheck(QObject):
     """Reads image headers off the UI thread: the labelled images' when
     a project has opened, every image's after an accepted re-seat (a set
     of files cropped together, 2.8.9). ``done`` carries the paths whose
-    files differ in size from the record, and whether the look was at
-    the labelled images only. A newer look supersedes."""
+    files differ from the record (mismatched_paths), and whether the
+    look was at the labelled images only. A newer look supersedes."""
 
     done = pyqtSignal(object, bool)
 

@@ -6873,10 +6873,11 @@ class MainWindow(QMainWindow):
     # -- labels on imagery cropped since it was labelled (2.8.6) --------
 
     def _on_sizes_checked(self, paths, labelled_only: bool = True):
-        """The look at the images' headers found some whose file differs
-        in size from the project's record: the labelled ones, after a
-        project opens (an offer); or every image, after an accepted
-        re-seat (the rest brought up to date quietly, 2.8.9)."""
+        """The look at the images' headers found some whose file is not
+        what the project recorded - another size, or the same size
+        somewhere else (2.10.2): the labelled ones, after a project
+        opens (an offer); or every image, after an accepted re-seat (the
+        rest brought up to date quietly, 2.8.9)."""
         if not paths:
             if not labelled_only:
                 self.statusBar.showMessage(
@@ -6894,13 +6895,12 @@ class MainWindow(QMainWindow):
                 self._reseat_images(rest, quiet=True)
             return
         n, k = len(paths), len(labelled)
-        if not self._confirm_reseat(
-                f"{n} image{'' if n == 1 else 's'} "
-                f"{'differs' if n == 1 else 'differ'} in size from what "
-                f"the project recorded - cropped since, perhaps - {k} of "
-                "them with labels. Re-seat the labels now?\n\nOne undo "
-                "step. File > Re-seat Labels to Imagery... does it any "
-                "time."):
+        # What Yes would do, by how much where a look at a few of the
+        # files can say (hunt M3, 2.10.2: see reseat.offer_question).
+        looked = [] if k > reseat.OFFER_LOOKS else [
+            reseat.plan(self.project.images[p], reseat.read_header(p))
+            for p in labelled]
+        if not self._confirm_reseat(reseat.offer_question(n, k, looked)):
             self.statusBar.showMessage(
                 "Labels not re-seated - File > Re-seat Labels to "
                 "Imagery... any time", 8000)
@@ -6924,8 +6924,12 @@ class MainWindow(QMainWindow):
                 or not image.original_width):
             return
         width, height = self.canvas.get_layer_source_dimensions(layer_id)
-        if not width or (width, height) == (image.original_width,
-                                            image.original_height):
+        # The size, and where the file lies (hunt M3, 2.10.2) - from what
+        # the layer holds of the file it has just read, nothing opened.
+        # Left with its old record, an image labelled after this would
+        # have those labels moved off their objects by the next re-seat.
+        if not width or reseat.matches_record(image, reseat.header_of(
+                width, height, *self.canvas.get_layer_transform(layer_id))):
             return
         self._reseat_images([path], quiet=True)
 
