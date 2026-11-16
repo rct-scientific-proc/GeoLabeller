@@ -5346,23 +5346,78 @@ class MapCanvas(QGraphicsView):
 
     def _topmost_visible_at(self, easting: float,
                             northing: float) -> "str | None":
-        """The shown layer with the highest z containing this point.
+        """The shown layer this point belongs to: the highest that has
+        data drawn there.
+
+        A layer whose picture is transparent at the point - a nodata
+        collar, the wedge a turned footprint leaves inside its bounding
+        box, pixels not loaded yet - does not take it from a lower layer
+        whose pixels are what the user sees there. By the box alone, a
+        click on the lower image put the label on the upper one, at a
+        pixel holding nothing, or was refused as off the upper one's
+        raster (hunt H1 and M1, 2.10.2). Where no shown layer has data
+        the answer is what it was: the highest whose box holds the
+        point.
 
         z_value is the layer's index in the z-order, maintained by
-        add_layer and update_layer_order, so this answers exactly what a
-        reverse walk of _layer_order did - without touching the layers
-        that are not shown.
+        add_layer and update_layer_order, so the highest is what a
+        reverse walk of _layer_order found - without touching the layers
+        that are not shown. This runs on every mouse move: a picture is
+        looked at only where more than one box holds the point.
         """
-        best_id = None
-        best_z = None
+        under = []
         for layer_id in self._visible_layer_ids:
             layer = self._layers.get(layer_id)
             if layer is None or not layer.contains_point(easting, northing):
                 continue
-            z = layer.z_value
-            if best_z is None or z > best_z:
-                best_id, best_z = layer_id, z
-        return best_id
+            under.append((layer.z_value, layer_id, layer))
+        if not under:
+            return None
+        if len(under) > 1:
+            under.sort(key=lambda hit: hit[0], reverse=True)
+            for _z, layer_id, layer in under:
+                if self._draws_data_at(layer_id, layer, easting, northing):
+                    return layer_id
+        return under[0][1]
+
+    def _draws_data_at(self, layer_id: str, layer: TiledLayer,
+                       easting: float, northing: float) -> bool:
+        """Whether ``layer`` has a pixel of data drawn at a point of its
+        box: the alpha of what it holds in memory, never a read of the
+        file (this is asked on mouse moves).
+
+        The detail tile over the point answers when it has been read -
+        it is the sharper picture, and one read and found empty answers
+        no; otherwise the whole-image picture does. A layer holding no
+        pixels yet draws nothing.
+        """
+        level = layer._detail_level
+        grid = layer.detail_grid(level) if level is not None else None
+        if grid is not None:
+            col, row = ~grid[0] * (easting, northing)
+            tx = int(col // DETAIL_TILE_SIZE)
+            ty = int(row // DETAIL_TILE_SIZE)
+            item = layer.detail_tiles.get((level, tx, ty))
+            if item is not None:
+                tile = item.raw_rgba
+                height, width = tile.shape[:2]
+                return bool(tile[
+                    min(max(int(row) - ty * DETAIL_TILE_SIZE, 0), height - 1),
+                    min(max(int(col) - tx * DETAIL_TILE_SIZE, 0), width - 1),
+                    3])
+            if self._tile_known_empty(layer_id, level, tx, ty):
+                return False
+        rgba = layer._rgba_data
+        if rgba is None:
+            return False
+        west, south, east, north = layer.bounds
+        if east <= west or north <= south:
+            return False
+        height, width = rgba.shape[:2]
+        col = int((easting - west) / (east - west) * width)
+        row = int((north - northing) / (north - south) * height)
+        return bool(rgba[min(max(row, 0), height - 1),
+                         min(max(col, 0), width - 1), 3])
 
     def _get_layer_and_info_at_position(
             self, easting: float, northing: float) -> tuple:
@@ -6507,6 +6562,11 @@ class MapCanvas(QGraphicsView):
         showing, even with another image drawn over the top: overlapping
         images are the normal case, and a small correction must not land
         the label on a neighbour. Otherwise the topmost image there.
+
+        Not its own image where that one's picture is transparent and
+        another image's pixels are what is drawn (hunt H1, 2.10.2): the
+        label would sit on a pixel of its own image that holds nothing.
+        Where no image draws anything there, its own, as before.
         """
         item = self._label_items.get(label_id)
         own_id = self._path_to_layer.get(item[0].data(0)) if item else None
@@ -6514,7 +6574,14 @@ class MapCanvas(QGraphicsView):
         if (own is not None and own.visible
                 and own.contains_point(easting, northing)
                 and self._point_on_layer(own, easting, northing)[4]):
-            return own
+            if self._draws_data_at(own_id, own, easting, northing):
+                return own
+            hit = self._topmost_visible_at(easting, northing)
+            other = self._layers.get(hit)
+            if other is None or not self._draws_data_at(
+                    hit, other, easting, northing):
+                return own
+            return other
         layer, _name, _group = self._get_layer_and_info_at_position(
             easting, northing)
         return layer
