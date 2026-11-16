@@ -159,6 +159,7 @@ class GroupMemoryWorker(QObject):
                     'bounds': tmp.bounds,
                     'full_width': tmp._full_width,
                     'full_grid': tmp._full_grid,
+                    'wraps': tmp._wraps,
                     'full_height': tmp._full_height,
                     'overviews': tmp._overviews,
                     'level_dims': tmp._src_level_dims,
@@ -2865,7 +2866,10 @@ class MainWindow(QMainWindow):
         ground = (image.ground_of(label)
                   if layer is not None and layer.geo else None)
         if ground is not None:
-            self.canvas.zoom_to_point(ground[1], ground[0], size_meters=10.0)
+            # The layer named: across the 180 degree meridian the label
+            # may be drawn past the map's east edge (hunt M5).
+            self.canvas.zoom_to_point(ground[1], ground[0], size_meters=10.0,
+                                      layer_id=layer_id)
         else:
             # Pixel-zone images have no meaningful lon/lat (nor has a
             # label nobody gave one, hunt M9); frame the layer.

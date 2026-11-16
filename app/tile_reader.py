@@ -88,6 +88,61 @@ def level_grid(src, dst_crs, level: int):
                           dst_crs, level)
 
 
+def scaled_grid(grid, level: int):
+    """A full-resolution grid ``(transform, width, height)`` at ``level``.
+
+    The same corner, ``level`` times fewer pixels each way, and the pixel
+    size that keeps the extent: exactly what ``calculate_default_transform``
+    makes of ``dst_width`` and ``dst_height``. For a layer whose
+    full-resolution grid is not GDAL's default one - an image across the
+    180 degree meridian, laid out past the scene's east edge, for which
+    GDAL's own answer is a grid wrapped round the world (bug hunt
+    2026-11-16 M5, 2.10.2).
+    """
+    transform, width, height = grid
+    level = max(1, int(level))
+    if level == 1:
+        return grid
+    level_width = max(1, width // level)
+    level_height = max(1, height // level)
+    return (Affine(transform.a * (width / level_width), transform.b,
+                   transform.c, transform.d,
+                   transform.e * (height / level_height), transform.f),
+            level_width, level_height)
+
+
+def own_x(crs, transform: Affine, width: int, height: int, x: float) -> float:
+    """``x`` - a coordinate in ``crs``, as a transformer answers it - where
+    a raster across the 180 degree meridian has it (hunt M5, 2.10.2).
+
+    Only a geographic raster needs this. Across the meridian its
+    longitudes run on past it - 179.99 to 180.01, or -180.01 to -179.99 -
+    while a transformer answers within -180..180: the same meridian, a
+    whole turn away, and thousands of columns off the image. The answer
+    is brought to the turn nearest the middle of the file. A projected
+    raster's coordinate is the transformer's.
+    """
+    if not crs.is_geographic:
+        return x
+    turn = 2.0 * math.pi / crs.units_factor[1]
+    middle = (transform * (width / 2.0, height / 2.0))[0]
+    return x + turn * round((middle - x) / turn)
+
+
+def written_past_180(crs, transform: Affine, width: int,
+                     height: int) -> bool:
+    """Does a geographic raster write longitudes beyond -180..180 - 179.99
+    to 180.01, say (hunt M5, 2.10.2)? Then a longitude a transformer
+    answers is a turn away from the file's own, and own_x is needed.
+    Arithmetic on the corners only; False for any projected raster."""
+    if crs is None or not crs.is_geographic:
+        return False
+    half = math.pi / crs.units_factor[1]
+    xs = [(transform * (c, r))[0] for c, r in
+          ((0, 0), (width, 0), (0, height), (width, height))]
+    return min(xs) < -half or max(xs) > half
+
+
 def tile_span(width: int, height: int, tx: int, ty: int,
               tile_size: int = TILE_SIZE):
     """Destination pixel box ``(x0, y0, x1, y1)`` of a tile, clipped to the grid.
@@ -140,11 +195,12 @@ def tiles_for_bounds(grid_transform: Affine, width: int, height: int,
             for tx in range(x_start, x_end + 1)]
 
 
-def _source_window(src, dst_crs, bounds, level: int):
+def _source_window(src, dst_crs, bounds, level: int, wraps: bool = False):
     """Source window covering ``bounds``, plus margin, and its read shape.
 
     Returns ``(window, out_height, out_width, read_transform)``, or ``None``
-    when the tile falls outside the source.
+    when the tile falls outside the source. ``wraps``: the layer lies
+    across the 180 degree meridian (see own_x).
 
     The work is done in *decimated* pixels - the grid the whole-image loader
     reads with ``out_shape=(height // level, width // level)`` - and the window
@@ -180,6 +236,12 @@ def _source_window(src, dst_crs, bounds, level: int):
     # sharpened, with one exception logged per tile per update pass.
     inverse = ~grid_transform
     west, south, east, north = src_bounds
+    if wraps:
+        # The two longitudes as the file writes them: a tile east of the
+        # meridian otherwise asks for columns a whole turn off the image,
+        # and comes back empty (hunt M5).
+        west = own_x(src.crs, src.transform, src.width, src.height, west)
+        east = own_x(src.crs, src.transform, src.width, src.height, east)
     cols, rows = [], []
     for wx, wy in ((west, north), (east, south), (west, south), (east, north)):
         col, row = inverse * (wx, wy)
@@ -211,7 +273,8 @@ def _source_window(src, dst_crs, bounds, level: int):
 
 
 def read_tile(src, dst_crs, level: int, tx: int, ty: int,
-              tile_size: int = TILE_SIZE, grid=None, display=None):
+              tile_size: int = TILE_SIZE, grid=None, display=None,
+              wraps: bool = False):
     """Reproject a single tile, reading only the source window it needs.
 
     Returns an ``(h, w, 4)`` uint8 RGBA array - alpha 0 where the tile has no
@@ -219,7 +282,9 @@ def read_tile(src, dst_crs, level: int, tx: int, ty: int,
     empty. ``grid`` may carry a precomputed :func:`level_grid` result, since
     every tile of a level shares it. ``display`` (DisplaySettings)
     chooses the bands drawn as red, green and blue; its adjustments are
-    applied later, where the tile becomes a pixmap.
+    applied later, where the tile becomes a pixmap. ``wraps``: the layer
+    lies across the 180 degree meridian and ``grid`` is its own, laid out
+    past the scene's east edge (the canvas's TiledLayer._wraps).
 
     The band handling mirrors the whole-image loader: band 1 goes through
     float32 so nodata (and the blank wedges reprojection leaves at the edges)
@@ -237,7 +302,8 @@ def read_tile(src, dst_crs, level: int, tx: int, ty: int,
 
     dst_transform = tile_transform(grid_transform, x0, y0)
     window_info = _source_window(
-        src, dst_crs, tile_bounds(grid_transform, x0, y0, x1, y1), level)
+        src, dst_crs, tile_bounds(grid_transform, x0, y0, x1, y1), level,
+        wraps)
     if window_info is None:
         return None
     window, read_h, read_w, read_transform = window_info

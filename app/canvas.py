@@ -37,6 +37,7 @@ from affine import Affine
 from pyproj import Transformer
 from rasterio.crs import CRS
 from rasterio.warp import calculate_default_transform, reproject, Resampling
+from rasterio.warp import transform as warp_transform
 
 from .labels import geodesic_distance
 from .debug_log import debug
@@ -47,7 +48,8 @@ from .display_settings import (apply_lut, colour_table, palette_rgb,
                                paletted_band)
 from . import gdal_config
 from .tile_reader import (TILE_SIZE as DETAIL_TILE_SIZE, level_grid_for,
-                          read_tile, tile_bounds, tile_span, tiles_for_bounds)
+                          own_x, read_tile, scaled_grid, tile_bounds,
+                          tile_span, tiles_for_bounds)
 
 
 # Web Mercator CRS
@@ -60,6 +62,14 @@ PIXEL_ZONE_ORIGIN_X = 25_000_000.0  # Well beyond WEB_MERCATOR_MAX (~20M)
 PIXEL_ZONE_ORIGIN_Y = 0.0
 PIXEL_ZONE_SCALE = 50.0  # Scene units per pixel (makes images ~similar size to geo layers)
 PIXEL_ZONE_GROUP_GAP = 5000.0  # Gap between group columns in scene units
+
+# The scene's east edge - Web Mercator's x at 180 degrees - and the width
+# of the world in it. An image whose footprint crosses the 180 degree
+# meridian is laid out past this edge, in one piece (TiledLayer._wraps),
+# and may reach as far as _WRAP_LIMIT_X: well short of the pixel zone.
+WORLD_EDGE = math.pi * 6378137.0
+WORLD_WIDTH = 2.0 * WORLD_EDGE
+_WRAP_LIMIT_X = PIXEL_ZONE_ORIGIN_X - 500_000.0
 
 # Ceiling on the pixels one reprojected pyramid level may occupy.
 #
@@ -396,6 +406,22 @@ class TiledLayer:
     on demand when the layer becomes visible.
     """
 
+    # Does the footprint cross the 180 degree meridian (bug hunt 2026-11-16
+    # M5, 2.10.2)? Web Mercator splits such a footprint - its west part at
+    # the scene's east edge, its east part at the west edge, a world away -
+    # so GDAL's default grid for it is the world wide and a row or none
+    # high: nothing was drawn, and nothing said. Such a layer's grid is
+    # carried on past the east edge instead (_wrapped_scene_grid), where
+    # the image is in one piece; the warp into it is the same warp into
+    # EPSG:3857, which gives a column past the edge the ground of the same
+    # column a world width back. Everything that treats such a layer
+    # differently - its level grids, a click's longitude, a marker's place
+    # - asks this first, so no other layer does one thing differently.
+    # Decided where a file's default grid is worked out, carried in the
+    # header from then on. A class default: a layer made without __init__
+    # (as tests make them) is an ordinary one.
+    _wraps = False
+
     def __init__(self, file_path: str, lazy: bool = False,
                  geo: bool = True, metadata: dict | None = None,
                  dst_crs=None):
@@ -589,6 +615,7 @@ class TiledLayer:
             "overviews": (list(self._overviews)
                           if self._overviews_known else None),
             "geo": self.geo,
+            "wraps": self._wraps,
         }
 
     def _apply_prefetched_metadata(self, metadata: dict | None) -> bool:
@@ -611,6 +638,10 @@ class TiledLayer:
         self._src_crs = metadata.get("src_crs")
         self._src_transform = metadata.get("src_transform")
         self._full_grid = metadata.get("full_grid")
+        # Across the 180 degree meridian (see _wraps): the grid that says
+        # where comes with the flag, or the flag is not taken.
+        self._wraps = bool(metadata.get("wraps")
+                           and self._full_grid is not None)
         self._src_width = int(metadata["src_width"])
         self._src_height = int(metadata["src_height"])
         factors = metadata.get("overviews")
@@ -688,6 +719,16 @@ class TiledLayer:
                 transform, width, height = calculate_default_transform(
                     src.crs, dst_crs, src.width, src.height, *src.bounds
                 )
+                # A default grid wider than half the world is that of a
+                # footprint across the 180 degree meridian, or of a raster
+                # that really is that wide: looked at again (hunt M5).
+                grid = _grid_across_180(
+                    transform.a * width, dst_crs, src.crs, src.transform,
+                    src.width, src.height)
+                if grid is not None or self._wraps:
+                    self._lay_past_the_edge(grid)
+                if grid is not None:
+                    transform, width, height = grid
 
             self._full_width = width
             self._full_height = height
@@ -702,6 +743,15 @@ class TiledLayer:
             # Calculate tile grid
             self._n_tiles_x = math.ceil(width / TILE_SIZE)
             self._n_tiles_y = math.ceil(height / TILE_SIZE)
+
+    def _lay_past_the_edge(self, grid):
+        """A read of the file has decided _wraps: ``grid`` is this layer's
+        full-resolution grid carried on past the scene's east edge, or
+        None for a footprint that does not - or no longer does - cross
+        the 180 degree meridian (hunt M5)."""
+        self._wraps = grid is not None
+        self._full_grid = grid
+        self._level_grid_cache.clear()
 
     def ensure_loaded(self, level: int | None = None, cancel_check=None):
         """Ensure raster data is loaded, optionally at a specific overview level.
@@ -826,6 +876,11 @@ class TiledLayer:
         if cached is None:
             if self._src_crs is None or self._src_transform is None:
                 return None
+            if self._wraps:
+                # Its own grid, not GDAL's default, which wraps (hunt M5).
+                cached = scaled_grid(self._full_grid, level)
+                self._level_grid_cache[level] = cached
+                return cached
             cached = level_grid_for(
                 self._src_crs, self._src_transform, self._src_width,
                 self._src_height, self._dst_crs, level)
@@ -887,6 +942,12 @@ class TiledLayer:
             self._full_height = result['full_height']
         if result.get('full_grid') is not None:
             self._full_grid = result['full_grid']
+        if (result.get('wraps') is not None
+                and result['wraps'] != self._wraps):
+            # The read decided otherwise than the header it was given
+            # (see _wraps): the level grids kept are the other kind's.
+            self._wraps = result['wraps']
+            self._level_grid_cache.clear()
         if result.get('overviews'):
             self._overviews = result['overviews']
         if result.get('overviews') is not None:
@@ -977,6 +1038,14 @@ class TiledLayer:
                 transform, width, height = calculate_default_transform(
                     src.crs, dst_crs, src.width, src.height, *src.bounds
                 )
+                # As in _load_bounds_only: a layer that reached here with
+                # no grid from a header has not been asked yet (hunt M5).
+                grid = _grid_across_180(
+                    transform.a * width, dst_crs, src.crs, src.transform,
+                    src.width, src.height)
+                if grid is not None:
+                    self._wraps = True
+                    transform, width, height = grid
                 # Remember the full-resolution grid (used for overview level
                 # selection, and to spare the next load this call) before
                 # reducing for this level.
@@ -1008,6 +1077,12 @@ class TiledLayer:
                 # same affine. Every reproject below becomes an assignment.
                 transform = src_read_transform
                 width, height = rd_w, rd_h
+            elif level > 1 and self._wraps:
+                # The full grid's own corner and extent, coarser: asked
+                # for dst_width and dst_height GDAL would wrap the grid
+                # round the world again (hunt M5).
+                transform, width, height = scaled_grid(
+                    (transform, width, height), level)
             elif level > 1:
                 dst_w = max(1, width // level)
                 dst_h = max(1, height // level)
@@ -1526,6 +1601,10 @@ class TiledLayer:
         # Transform from WGS84 to the image's native CRS using a cached transformer
         transformer = self._get_wgs84_to_native_transformer()
         x_native, y_native = transformer.transform(lon, lat)
+        if self._wraps:
+            # As the file writes that longitude (hunt M5; see own_x).
+            x_native = own_x(self._src_crs, self._src_transform,
+                             self._src_width, self._src_height, x_native)
 
         # Use inverse of geotransform to get pixel coordinates
         # ~transform gives the inverse transform
@@ -1553,6 +1632,10 @@ class TiledLayer:
         x_native, y_native = self._src_transform * (px, py)
         lon, lat = self._get_native_to_wgs84_transformer().transform(
             x_native, y_native)
+        if self._wraps and not -180.0 <= lon <= 180.0:
+            # A geographic file written past 180 degrees says 180.01:
+            # the same meridian, within -180..180 (hunt M5).
+            lon = (lon + 180.0) % 360.0 - 180.0
         return (lon, lat)
 
     def scene_to_pixel(self, easting: float, northing: float) -> tuple[float, float]:
@@ -1669,6 +1752,7 @@ class AsyncFileLoader(QObject):
                     except Exception:
                         overviews = []
 
+                    full_grid = None
                     if src_crs is not None:
                         # The cheap boundary-sampled estimate first (the
                         # same provisional bounds a fast project load uses;
@@ -1692,6 +1776,13 @@ class AsyncFileLoader(QObject):
                                     src.width, src.height, *src.bounds)
                             bounds = rasterio.transform.array_bounds(
                                 height, width, transform)
+                        # Wider than half the world: across the 180
+                        # degree meridian, perhaps (TiledLayer._wraps).
+                        full_grid = _grid_across_180(
+                            bounds[2] - bounds[0], WEB_MERCATOR, src.crs,
+                            src.transform, src.width, src.height)
+                        if full_grid is not None:
+                            bounds, width, height = _grid_extent(full_grid)
                         geo = True
                     else:
                         width = src.width
@@ -1713,6 +1804,8 @@ class AsyncFileLoader(QObject):
                     'overviews': overviews,
                     'geo': geo,
                     'local_crs': local_crs,
+                    'full_grid': full_grid,
+                    'wraps': full_grid is not None,
                 }
                 self.file_loaded.emit(file_path, layer_data)
                 loaded_count += 1
@@ -1848,6 +1941,92 @@ def _scene_grid_estimate(src_crs, src_transform,
     return (west, south, east, north), width, height
 
 
+# The source boundary as _wrapped_scene_grid walks it: 21 points to an
+# edge (GDAL's own count), as fractions of the width and of the height,
+# round the ring from pixel (0, 0). Point 41 is the opposite corner.
+_RING_STEPS = np.linspace(0.0, 1.0, 21)
+_RING_COLS = np.concatenate(
+    [_RING_STEPS, np.ones(21), _RING_STEPS[::-1], np.zeros(21)])
+_RING_ROWS = np.concatenate(
+    [np.zeros(21), _RING_STEPS, np.ones(21), _RING_STEPS[::-1]])
+
+
+def _wrapped_scene_grid(src_crs, src_transform, src_width: int,
+                        src_height: int):
+    """The full-resolution scene grid ``(transform, width, height)`` of a
+    raster whose footprint crosses the 180 degree meridian, carried on
+    past the scene's east edge - or None for any other raster (bug hunt
+    2026-11-16 M5, 2.10.2; see TiledLayer._wraps).
+
+    The footprint crosses when, walking the source boundary, the scene x
+    jumps by more than half the world between two points: a longitude
+    that jumped by more than 180 degrees. The far side is then moved one
+    world width east, and what must come out is one piece that starts
+    this side of the edge and ends short of the pixel zone. A footprint
+    round a pole, a whole-world raster and one written 0..360 are not
+    one piece there and stay as they were.
+
+    The grid is the tight box round that piece, in square pixels of the
+    source's own size along its diagonal: GDAL's default for a north-up
+    image, without the wrap. The warp into it is the ordinary warp into
+    EPSG:3857 - Web Mercator's x is the longitude, so a column past the
+    edge takes the ground of the same column a world width back, by the
+    same datum path as every other layer.
+
+    Through GDAL's own transform, not pyproj: this can run where a level
+    load does, on a pool thread, where pyproj must not be used.
+    """
+    try:
+        xs, ys = src_transform * (_RING_COLS * src_width,
+                                  _RING_ROWS * src_height)
+        gx, gy = warp_transform(src_crs, WEB_MERCATOR, xs.tolist(),
+                                ys.tolist())
+    except Exception:      # noqa: BLE001 - a point GDAL will not place
+        return None
+    gx, gy = np.asarray(gx, dtype=float), np.asarray(gy, dtype=float)
+    if not (np.all(np.isfinite(gx)) and np.all(np.isfinite(gy))):
+        return None
+    if not (np.abs(np.diff(gx, append=gx[0])) > WORLD_EDGE).any():
+        return None                     # does not cross the meridian
+    ux = np.where(gx < 0.0, gx + WORLD_WIDTH, gx)
+    if (np.abs(np.diff(ux, append=ux[0])) > WORLD_EDGE).any():
+        return None                     # not one piece past the edge
+    west, east = float(ux.min()), float(ux.max())
+    south, north = float(gy.min()), float(gy.max())
+    if not (west < WORLD_EDGE < east < _WRAP_LIMIT_X and south < north):
+        return None
+    pixel = (math.hypot(ux[41] - ux[0], gy[41] - gy[0])
+             / math.hypot(src_width, src_height))
+    if not pixel > 0.0:
+        return None
+    return (Affine(pixel, 0.0, west, 0.0, -pixel, north),
+            max(1, int((east - west) / pixel + 0.5)),
+            max(1, int((north - south) / pixel + 0.5)))
+
+
+def _grid_across_180(scene_width: float, dst_crs, src_crs, src_transform,
+                     src_width: int, src_height: int):
+    """_wrapped_scene_grid for a raster whose default scene grid - GDAL's,
+    or the estimate - came out ``scene_width`` wide; None otherwise.
+
+    A footprint across the 180 degree meridian has a default grid as
+    wide as the world, so only a grid wider than half of it is looked at
+    again: for every other image this is one comparison (hunt M5). Only
+    in a Web Mercator scene, which is where the edge is.
+    """
+    if scene_width <= WORLD_EDGE or dst_crs is not WEB_MERCATOR:
+        return None
+    return _wrapped_scene_grid(src_crs, src_transform, src_width,
+                               src_height)
+
+
+def _grid_extent(grid) -> tuple:
+    """``(bounds, width, height)`` of a grid, as an estimate gives them."""
+    transform, width, height = grid
+    return (rasterio.transform.array_bounds(height, width, transform),
+            width, height)
+
+
 class _OrderedIds:
     """A set of layer ids that remembers the order they arrived in.
 
@@ -1933,6 +2112,14 @@ def stored_layer_metadata(file_path: str, group_path: str,
         if est is None:
             return None
         bounds, width, height = est
+        # Wider than half the world: across the 180 degree meridian,
+        # perhaps - then the grid is exact, and past the scene's east
+        # edge (TiledLayer._wraps).
+        full_grid = _grid_across_180(
+            bounds[2] - bounds[0], WEB_MERCATOR, src_crs, src_transform,
+            int(src_width), int(src_height))
+        if full_grid is not None:
+            bounds, width, height = _grid_extent(full_grid)
         return {
             'file_path': file_path,
             'group_path': group_path,
@@ -1949,6 +2136,8 @@ def stored_layer_metadata(file_path: str, group_path: str,
             # option, and the real factors arrive with its result.
             'overviews': None,
             'geo': True,
+            'full_grid': full_grid,
+            'wraps': full_grid is not None,
         }
     except Exception as exc:  # noqa: BLE001 - fall back to opening the file
         debug(f"stored metadata rejected for "
@@ -2110,13 +2299,14 @@ class _TileLoadRunnable(QRunnable):
 
     def __init__(self, layer_id: str, file_path: str, level: int,
                  tx: int, ty: int, signals: "_TileLoadSignals", grid=None,
-                 dst_crs=None, display=None):
+                 dst_crs=None, display=None, wraps: bool = False):
         """Store the tile identity and the signal group to report through.
 
         ``grid`` is the layer's cached level grid; every tile of a level
         shares it, and recomputing it per tile cost each read a redundant
         densified CRS transform of the whole image bounds. ``dst_crs`` is
         the scene's projection, the same one the layer was given.
+        ``wraps`` is the layer's own flag (TiledLayer._wraps).
         """
         super().__init__()
         self._layer_id = layer_id
@@ -2128,6 +2318,7 @@ class _TileLoadRunnable(QRunnable):
         self._grid = grid
         self._dst_crs = dst_crs if dst_crs is not None else WEB_MERCATOR
         self._display = display
+        self._wraps = wraps
         self._cancelled = False
 
     def cancel(self):
@@ -2148,7 +2339,7 @@ class _TileLoadRunnable(QRunnable):
             with gdal_config.opened(self._file_path) as src:
                 rgba = read_tile(src, self._dst_crs, self._level,
                                  self._tx, self._ty, grid=self._grid,
-                                 display=self._display)
+                                 display=self._display, wraps=self._wraps)
             if self._cancelled:
                 self._fail()
                 return
@@ -2264,6 +2455,7 @@ class _LevelLoadRunnable(QRunnable):
                 'full_width': tmp._full_width,
                 'full_height': tmp._full_height,
                 'full_grid': tmp._full_grid,
+                'wraps': tmp._wraps,
                 'overviews': tmp._overviews,
                 'level_dims': tmp._src_level_dims,
                 'src_crs': tmp._src_crs,
@@ -2898,6 +3090,8 @@ class MapCanvas(QGraphicsView):
             # Restamping every layer here made bulk imports quadratic.
             layer.set_z_value(self._next_z)
             self._next_z += 1
+            if layer._wraps:
+                self._move_markers_past_the_edge(layer)
 
             # Only update tiles if visible (skip for hidden layers)
             if visible:
@@ -2920,6 +3114,25 @@ class MapCanvas(QGraphicsView):
                   f"{type(e).__name__}: {e}")
             debug(traceback.format_exc())
             return None
+
+    def _move_markers_past_the_edge(self, layer: TiledLayer):
+        """A layer across the 180 degree meridian has been added after
+        some of its image's markers were drawn: those on the far side of
+        the meridian stand at the scene's west edge, where Web Mercator
+        has their longitude, and go one world width east, where the layer
+        shows that ground (hunt M5; add_label_marker puts the later ones
+        there itself)."""
+        for label_id in self._labels_by_image.get(
+                self._image_key(layer.file_path), ()):
+            item = self._label_items.get(label_id)
+            if item is None:
+                continue
+            ellipse, caption = item
+            if ellipse.pos().x() < 0.0:
+                ellipse.setPos(ellipse.pos().x() + WORLD_WIDTH,
+                               ellipse.pos().y())
+                caption.setPos(caption.x + WORLD_WIDTH, caption.y)
+                self._marker_index = None
 
     def add_pixel_layer(self, file_path: str, group_path: str = "",
                         lazy: bool = True, visible: bool = True,
@@ -3678,7 +3891,7 @@ class MapCanvas(QGraphicsView):
         runnable = _TileLoadRunnable(
             layer_id, layer.file_path, level, tx, ty, signals,
             grid=layer.detail_grid(level), dst_crs=self.scene_crs,
-            display=layer.display)
+            display=layer.display, wraps=layer._wraps)
         self._pending_tiles[(layer_id, level, tx, ty)] = runnable
         self._tile_pool.start(runnable)
 
@@ -4605,7 +4818,8 @@ class MapCanvas(QGraphicsView):
             # switched on just before, say) into the one pass.
             self._tile_update_timer.start(0)
 
-    def zoom_to_point(self, lon: float, lat: float, size_meters: float = 10.0):
+    def zoom_to_point(self, lon: float, lat: float, size_meters: float = 10.0,
+                      layer_id: "str | None" = None):
         """Zoom the view to center on a point with a given GROUND extent.
 
         Args:
@@ -4613,6 +4827,10 @@ class MapCanvas(QGraphicsView):
             lat: Latitude (WGS84)
             size_meters: The width/height of the view in metres ON THE
                 GROUND (default 10m)
+            layer_id: The layer the point is on, when it is on one (a
+                label's): on a layer across the 180 degree meridian a
+                point on the far side is shown past the scene's east
+                edge, where its marker is (hunt M5, 2.10.2).
 
         Web Mercator metres are stretched by 1/cos(latitude), so asking for
         a 10 m view in scene units gives 7.7 m of ground at 40 degrees and
@@ -4623,6 +4841,10 @@ class MapCanvas(QGraphicsView):
         """
         # Convert point to Web Mercator
         center_x, center_y = self._wgs84_to_web_mercator(lon, lat)
+        if center_x < 0.0 and layer_id is not None:
+            layer = self._layers.get(layer_id)
+            if layer is not None and layer._wraps:
+                center_x += WORLD_WIDTH
 
         mercator_size = size_meters / max(math.cos(math.radians(lat)), 1e-6)
         half_size = mercator_size / 2
@@ -5287,6 +5509,8 @@ class MapCanvas(QGraphicsView):
                 self._queue_coords_emit(0.0, 0.0, layer_name, group_path, True)
         else:
             lon, lat = self._web_mercator_to_wgs84(easting, northing)
+            if lon > 180.0 and layer is not None and layer._wraps:
+                lon -= 360.0    # past the east edge, on a layer laid there
             self._queue_coords_emit(
                 lon, lat, layer_name, group_path, False,
                 layer.file_path if layer is not None and layer.geo else "")
@@ -5539,6 +5763,11 @@ class MapCanvas(QGraphicsView):
         (pixel_x, pixel_y, lon, lat, inside its source pixels)."""
         if layer.geo:
             lon, lat = self._web_mercator_to_wgs84(easting, northing)
+            if lon > 180.0 and layer._wraps:
+                # Past the scene's east edge, on a layer across the 180
+                # degree meridian: the same meridian, within -180..180
+                # (hunt M5, 2.10.2).
+                lon -= 360.0
             pixel_x, pixel_y = layer.latlon_to_pixel(lon, lat)
         else:
             # Raw/non-geo display (incl. waterfall): scene coords map
@@ -5628,6 +5857,12 @@ class MapCanvas(QGraphicsView):
         else:
             # Geo layer: convert lat/lon to Web Mercator
             x, y = self._wgs84_to_web_mercator(lon, lat)
+            if x < 0.0 and layer is not None and layer._wraps:
+                # On a layer across the 180 degree meridian, ground on
+                # the far side is drawn one world width east, past the
+                # scene's edge: the marker goes where the picture is
+                # (hunt M5, 2.10.2).
+                x += WORLD_WIDTH
 
         ellipse, text = self._make_label_marker_items(
             x, y, class_name, color, image_path, ring_color=ring_color)

@@ -39,6 +39,7 @@ from . import display_settings, gdal_config
 from .debug_log import debug
 from .settings_scope import settings as app_settings
 from .snippets import read_display_window, read_label_snippet
+from .tile_reader import own_x, written_past_180
 
 HOVER_KEY = "view/hover_snippet_px"
 HOVER_SIZES = (0, 96, 128, 192, 256)      # 0 is Off
@@ -121,6 +122,16 @@ def read_map_oriented_snippet(image_path: str, pixel_x: float,
                    affine * (pixel_x, pixel_y + 1)]
         xs, ys = _transform(crs, MAP_CRS, [c[0] for c in corners],
                             [c[1] for c in corners])
+        past_180 = written_past_180(crs, affine, width, height)
+        if past_180:
+            # A geographic file written across 180 degrees (hunt M5): the
+            # map square goes on the side of the scene's edge where the
+            # file's own longitudes lie, so the warp finds its pixels.
+            unit = crs.units_factor[1]          # radians per file unit
+            own = own_x(crs, affine, width, height,
+                        xs[0] / 6378137.0 / unit) * unit
+            shift = own * 6378137.0 - xs[0]
+            xs = [x + shift for x in xs]
         along_col = math.hypot(xs[1] - xs[0], ys[1] - ys[0])
         along_row = math.hypot(xs[2] - xs[0], ys[2] - ys[0])
         res = (along_col + along_row) / 2.0
@@ -132,6 +143,8 @@ def read_map_oriented_snippet(image_path: str, pixel_x: float,
         box_x = [xs[0] - half, xs[0] + half, xs[0] + half, xs[0] - half]
         box_y = [ys[0] - half, ys[0] - half, ys[0] + half, ys[0] + half]
         sx, sy = _transform(MAP_CRS, crs, box_x, box_y)
+        if past_180:
+            sx = [own_x(crs, affine, width, height, x) for x in sx]
         cols, rows = zip(*[~affine * (x, y) for x, y in zip(sx, sy)])
         x0 = max(0, int(math.floor(min(cols))) - 2)
         y0 = max(0, int(math.floor(min(rows))) - 2)

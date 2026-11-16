@@ -19,6 +19,7 @@ from rasterio.windows import Window
 
 from . import display_settings, gdal_config
 from .debug_log import debug
+from .tile_reader import own_x, written_past_180
 
 MAX_BANDS = 8                   # values shown before "..."
 
@@ -67,6 +68,11 @@ def read_values(image_path: str, x: float, y: float,
                 if src.crs is None:
                     return None
                 xs, ys = warp_transform("EPSG:4326", src.crs, [x], [y])
+                if written_past_180(src.crs, src.transform, src.width,
+                                    src.height):
+                    # The file's own spelling of the longitude (hunt M5).
+                    xs = [own_x(src.crs, src.transform, src.width,
+                                src.height, xs[0])]
                 row, col = src.index(xs[0], ys[0])
             if not (0 <= col < src.width and 0 <= row < src.height):
                 return None
