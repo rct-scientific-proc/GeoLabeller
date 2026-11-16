@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from collections import Counter
 from pathlib import Path
 
@@ -1253,8 +1254,12 @@ class ModelReviewWindow(QWidget):
         into the file; False, said once, when it cannot be written.
         ``quiet`` says nothing and leaves that once unspent: the write
         of the labels' places on an open (_note_places), which no one
-        asked for and which a read-only file refuses every time."""
+        asked for and which a read-only file refuses every time - so
+        such a file is not even tried: every open would write a copy
+        beside it on the team's share only to take it away again."""
         if not self._path or not notes:
+            return False
+        if quiet and not os.access(self._path, os.W_OK):
             return False
         misplaced: list = []
         # Each chip's record as it was opened, so a note cannot land on
