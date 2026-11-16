@@ -5849,18 +5849,25 @@ class MainWindow(QMainWindow):
                         errors.append(f"Image has no CRS: {image_path}")
                         continue
 
-                    # Label pixel in the ORIGINAL image (absolute pixel coords)
-                    pixel_x = int(round(label.pixel_x))
-                    pixel_y = int(round(label.pixel_y))
-
-                    # Skip if pixel coordinates are outside image bounds
-                    if (pixel_x < 0 or pixel_x >= src.width
-                            or pixel_y < 0 or pixel_y >= src.height):
+                    # Skip if the label is outside image bounds. Tested
+                    # where it is, as the canvas tests a click, so that
+                    # a label anywhere inside the raster gets a sub-image
+                    # (hunt 2026-11-16 M2, 2.10.2: rounded to a whole
+                    # pixel first, one in the last half pixel of its
+                    # image was reported outside it).
+                    if not (0 <= label.pixel_x < src.width
+                            and 0 <= label.pixel_y < src.height):
                         errors.append(
                             f"Label {label.id}: pixel coords "
-                            f"({pixel_x}, {pixel_y}) outside image bounds "
+                            f"({label.pixel_x:.2f}, {label.pixel_y:.2f}) "
+                            f"outside image bounds "
                             f"({src.width}x{src.height})")
                         continue
+
+                    # The pixel the label is in, in the ORIGINAL image
+                    # (absolute pixel coords)
+                    pixel_x = int(label.pixel_x)
+                    pixel_y = int(label.pixel_y)
 
                     # True ground metres per pixel at the label, measured from
                     # the actual pixel geometry so it is correct for any CRS
@@ -5874,13 +5881,17 @@ class MainWindow(QMainWindow):
                             f"resolution")
                         continue
 
-                    # Pixels spanning the requested square ground region.
-                    half_size_px_x = max(
-                        1, int((size_meters / 2) / pixel_width_m))
-                    half_size_px_y = max(
-                        1, int((size_meters / 2) / pixel_height_m))
-                    full_size_px_x = half_size_px_x * 2
-                    full_size_px_y = half_size_px_y * 2
+                    # Pixels spanning the requested square ground region:
+                    # the nearest whole number to the metres asked for,
+                    # at least one, on each axis from its own ground
+                    # pixel size (M2: HALF the size was cut down to whole
+                    # pixels and doubled, so 10 m of 1 m pixels - a hair
+                    # over 1 m on the ground near a UTM zone's central
+                    # meridian - came out 8 x 8, and 10 x 10 further out).
+                    full_size_px_x = max(
+                        1, int(round(size_meters / pixel_width_m)))
+                    full_size_px_y = max(
+                        1, int(round(size_meters / pixel_height_m)))
 
                     # Centre the window on the label using the shared rule the
                     # HDF5 snippet export also uses, so a given label frames
