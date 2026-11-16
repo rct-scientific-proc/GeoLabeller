@@ -967,6 +967,12 @@ class LayerPanel(QWidget):
             if file_path and self._path_items.get(file_path) is item:
                 del self._path_items[file_path]
 
+    def has_layer_for(self, file_path: str) -> bool:
+        """Whether a layer row of the tree is this file's. What the main
+        window asks before it deletes an image with a removed group: one
+        shown elsewhere in the tree is not that group's (hunt M15)."""
+        return canonical_path(file_path) in self._path_items
+
     # Above this many actually-changed layers, recomputing every group
     # from scratch is cheaper than walking each changed item's ancestry.
     _ANCESTOR_REFRESH_LIMIT = 32
@@ -2438,6 +2444,10 @@ class CombinedLayerPanel(QWidget):
         """Add a layer to the Non-Georeferenced section."""
         self.main_panel.add_nongeo_layer(layer_id, file_path, parent, visible)
         self.labeled_panel.set_layer_id_map(file_path, layer_id)
+
+    def has_layer_for(self, file_path: str) -> bool:
+        """Whether the Layers tree has a row for this file."""
+        return self.main_panel.has_layer_for(file_path)
 
     def clear(self):
         """Clear all items from both trees."""

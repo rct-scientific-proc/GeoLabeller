@@ -4231,7 +4231,18 @@ class MainWindow(QMainWindow):
 
     def _images_to_remove(self, entries: list, group_paths=()) -> list:
         """Every project image a removal gesture covers, once each: the
-        tree's rows, and whatever the removed groups hold besides."""
+        tree's rows, and what the removed groups hold that has no row
+        anywhere in the tree - a shared project's images whose files are
+        not on this machine (2.1.1).
+
+        Not an image filed under such a group that has a row elsewhere.
+        A plain picture sits under Non-Georeferenced in the tree and
+        under its import path in the project, so removing the
+        georeferenced group beside it took it out of the project and
+        left its row and its layer (hunt M15, 2.10.2). The gesture's own
+        rows are ``entries``: while the tree still holds them (the
+        question, asked first) they are counted there.
+        """
         images, seen = [], set()
         for _layer_id, file_path in entries:
             image = self._project_image_for(file_path)
@@ -4240,7 +4251,8 @@ class MainWindow(QMainWindow):
                 images.append(image)
         for group_path in group_paths:
             for image in self._images_in_group(group_path):
-                if id(image) not in seen:
+                if id(image) not in seen and not \
+                        self.layer_panel.has_layer_for(image.path):
                     seen.add(id(image))
                     images.append(image)
         return images
@@ -4269,24 +4281,31 @@ class MainWindow(QMainWindow):
         Locate Missing Images), so the tree's own removal never reached
         them - and their labels stayed in every save and export after the
         group was "removed". The rows the tree did have follow in
-        _on_layers_removed, which also refreshes.
+        _on_layers_removed, which also refreshes. They are out of the
+        tree by now (the panel takes them out before it reports), so
+        what still has a row is shown elsewhere and stays (hunt M15).
         """
+        images = self._images_to_remove([], group_paths)
+        if images:
+            self._removed_by_group = {
+                os.path.normcase(canonical_path(image.path))
+                for image in images}
+            removed_images, removed_labels = \
+                self._remove_images_from_project(images)
+            self._mark_unsaved()
+        # A group's Display Settings go with it - once no image is left
+        # under it. One the tree shows elsewhere stays in the project
+        # (hunt M15, 2.10.2), and goes on being drawn as it was.
         dropped = [key for key in self.project.display_settings
                    if any(key == g or key.startswith(g + "/")
-                          for g in group_paths)]
+                          for g in group_paths)
+                   and not self._images_in_group(key)]
         for key in dropped:
             del self.project.display_settings[key]
         if dropped:
             self._mark_unsaved()
-        images = self._images_to_remove([], group_paths)
-        if not images:
-            return
-        self._removed_by_group = {
-            os.path.normcase(canonical_path(image.path)) for image in images}
-        removed_images, removed_labels = \
-            self._remove_images_from_project(images)
-        self._mark_unsaved()
-        self._after_project_removal(removed_images, removed_labels)
+        if images:
+            self._after_project_removal(removed_images, removed_labels)
 
     def _on_layers_removed(self, entries: list):
         """Complete a panel removal: delete the images from the project.
