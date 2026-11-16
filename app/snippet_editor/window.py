@@ -201,10 +201,13 @@ class SnippetEditor(QWidget):
             "(the linked row shows them); Classes differ lists an object "
             "when any of its views disagree.\n"
             "A review mark (A, X, F) or a confidence rating given to a row "
-            "reaches every view of its object, as one undo step - so does "
-            "the Grid's Accept the rest of the page, and its Change class "
-            "takes every view of each picked object. Masks, orientation "
-            "and size stay with the view they were drawn on.\n"
+            "reaches every view of its object, as one undo step, and the "
+            "Grid's Change class takes every view of each picked object. "
+            "The Grid's Accept the rest of the page accepts only views "
+            "that have no mark: of an unmarked row's object, each view "
+            "not marked on its own - one rejected, flagged or accepted "
+            "already stays as it is. Masks, orientation and size stay "
+            "with the view they were drawn on.\n"
             "Choosing one object in the Class list shows all of its views "
             "as ever, each marked on its own. Remembered.")
         self.one_per_object_button.toggled.connect(

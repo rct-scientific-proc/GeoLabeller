@@ -936,9 +936,16 @@ class OrientationEditor(QWidget):
         self._show_review(label_id)
 
     def accept_page(self):
-        """Accept every snippet on this page nobody has marked - one per
-        object, every view of each such object (M2) - and go on to the
-        next page."""
+        """Accept every snippet on this page nobody has marked, and go
+        on to the next page. One per object a cell is its object (M2),
+        and the page accepts only views that have no mark: a marked row
+        is passed over whole, and of an unmarked row's object the views
+        that are themselves unmarked are accepted - one rejected,
+        flagged or accepted on its own stays as it is (hunt 2026-11-16
+        H4, 2.10.2: every view was accepted, which turned a view
+        rejected on purpose back and into the next HDF5 export, under a
+        button that says rejected ones stay as they are). A single mark
+        on a row still reaches every view (_mark)."""
         if self._mode != MODE_REVIEW:
             return
         self.flush_review()
@@ -949,7 +956,7 @@ class OrientationEditor(QWidget):
                     != REVIEW_UNREVIEWED):
                 continue
             for view in self.strip.stands_for(entry):
-                if valid_review(view.get("review")) != REVIEW_ACCEPTED:
+                if valid_review(view.get("review")) == REVIEW_UNREVIEWED:
                     view["review"] = REVIEW_ACCEPTED
                     accepted.append(view["label_id"])
         if accepted:
