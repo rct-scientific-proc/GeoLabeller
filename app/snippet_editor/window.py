@@ -32,7 +32,7 @@ from PyQt5.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QKeySequence
 from PyQt5.QtWidgets import (QGroupBox, QAbstractSpinBox, QApplication, QButtonGroup,
                              QCheckBox, QComboBox, QHBoxLayout, QLabel,
-                             QLineEdit, QPlainTextEdit, QPushButton,
+                             QLineEdit, QMenu, QPlainTextEdit, QPushButton,
                              QScrollArea, QShortcut, QSplitter,
                              QStackedWidget, QTextEdit, QVBoxLayout, QWidget)
 
@@ -148,6 +148,11 @@ class SnippetEditor(QWidget):
     # so the order matches what was done across both windows.
     undo_requested = pyqtSignal()
     redo_requested = pyqtSignal()
+    # (label_id): show this label on the main window's map - its image
+    # loaded and ticked, the view centred on it, the map brought forward
+    # (2026-11-19: J, the toolbar button, or a right-click on the list or
+    # the linked row).
+    show_on_map_requested = pyqtSignal(int)
 
     SINGLE, GRID = 0, 1
 
@@ -231,6 +236,16 @@ class SnippetEditor(QWidget):
             button.setCheckable(True)
             self._view_buttons.addButton(button, index)
             toolbar.addWidget(button)
+        toolbar.addSpacing(16)
+        # From the snippet to where it sits on the map (2026-11-19).
+        self.show_on_map_button = QPushButton("Show on Map (J)")
+        self.show_on_map_button.setToolTip(
+            "Show the snippet in hand on the map: its image is loaded and "
+            "ticked, the view is centred on the label, and the main window "
+            "comes to the front. This window stays open.\n"
+            "Also a right-click on a snippet in the list or the linked row. "
+            "(key J, in the Single view)")
+        toolbar.addWidget(self.show_on_map_button)
         layout.addLayout(toolbar)
 
         # The Single view's tools, one per section that owns one, at the
@@ -285,6 +300,14 @@ class SnippetEditor(QWidget):
         self.linked_row.picked.connect(self._pick_linked)
         self.linked_row.reclass_requested.connect(self.object_class_requested)
         self.linked_row.unlink_requested.connect(self.unlink_requested)
+        # A right-click on a snippet in the list or the linked row offers
+        # Show on Map for that one - in the linked row, any view of the
+        # object, whichever image it is on.
+        for widget in (self.strip.list_widget,
+                       self.linked_row.list_widget):
+            widget.setContextMenuPolicy(Qt.CustomContextMenu)
+            widget.customContextMenuRequested.connect(
+                lambda pos, w=widget: self._map_menu(w, pos))
         single_page = QWidget()
         single_box = QVBoxLayout(single_page)
         single_box.setContentsMargins(0, 0, 0, 0)
@@ -374,6 +397,7 @@ class SnippetEditor(QWidget):
     def _wire(self):
         self._view_buttons.idClicked.connect(self.set_view)
         self.save_button.clicked.connect(self._request_save)
+        self.show_on_map_button.clicked.connect(lambda: self.show_on_map())
         for tool_id, button in self._tools.items():
             button.clicked.connect(
                 lambda _checked=False, t=tool_id: self.set_tool(t))
@@ -443,6 +467,9 @@ class SnippetEditor(QWidget):
         combo.setCurrentText(current)
         combo.setEnabled(entry is not None and self.view() == self.SINGLE)
         combo.blockSignals(False)
+        # Show on Map acts on the snippet in hand, as the class does.
+        self.show_on_map_button.setEnabled(
+            entry is not None and self.view() == self.SINGLE)
 
     _class_focus_out = False        # the class box just lost focus
 
@@ -517,6 +544,34 @@ class SnippetEditor(QWidget):
         """A grid cell was double-clicked: look at it closer."""
         if self.strip.select(label_id):
             self.set_view(self.SINGLE)
+
+    def show_on_map(self, label_id=None):
+        """The snippet in hand - or ``label_id`` - on the main window's
+        map (2026-11-19). The main window does what Zoom to Label does
+        there (loads and ticks the image, puts this label's marker
+        forward, centres on it) and comes to the front; this window stays
+        as it is. The snippet in hand is the Single view's: the Grid has
+        no one snippet in hand."""
+        if label_id is None:
+            entry = self.strip.current_entry()
+            if entry is None or self.view() != self.SINGLE:
+                return
+            label_id = entry["label_id"]
+        # A mark the Grid has shown is stored before the main window
+        # takes over, as before any other step away.
+        self.grid.flush_review()
+        self.show_on_map_requested.emit(int(label_id))
+
+    def _map_menu(self, widget, pos):
+        """Right-click on a snippet in the list or the linked row."""
+        item = widget.itemAt(pos)
+        label_id = item.data(Qt.UserRole) if item is not None else None
+        if label_id is None:
+            return
+        menu = QMenu(self)
+        show = menu.addAction("Show on Map")
+        if menu.exec_(widget.viewport().mapToGlobal(pos)) is show:
+            self.show_on_map(label_id)
 
     def _pick_linked(self, label_id: int):
         """A snippet clicked in the linked row: put it in hand.
@@ -707,6 +762,12 @@ class SnippetEditor(QWidget):
         if event.key() == Qt.Key_Space:
             self.strip.cycle(
                 -1 if event.modifiers() & Qt.ControlModifier else 1)
+            return True
+        if event.key() == Qt.Key_J and not event.modifiers() & (
+                Qt.ControlModifier | Qt.AltModifier):
+            # Show on Map (2026-11-19). Before the number box below: a
+            # letter means nothing to one.
+            self.show_on_map()
             return True
         # Digits in a number box are the value being typed, and the keys
         # that edit it stay with it; a letter means nothing to a number

@@ -2886,6 +2886,18 @@ class MainWindow(QMainWindow):
             # label nobody gave one, hunt M9); frame the layer.
             self.canvas.zoom_to_layer(layer_id)
 
+    def _show_label_on_map(self, label_id: int):
+        """The Snippet Editor's Show on Map (J; 2026-11-19): Zoom to Label,
+        then this window to the front - the editor is a window of its
+        own, often over this one, and the reveal is no use unseen. Raised
+        when the label is not shown too (a missing image), so the status
+        bar's reason is in view."""
+        self._reveal_label(label_id)
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
     def _add_layer_for_reveal(self, image) -> str | None:
         """Load a project image onto the canvas so its label can be shown."""
         try:
@@ -3288,6 +3300,7 @@ class MainWindow(QMainWindow):
             editor.save_requested.connect(self._save_project)
             editor.undo_requested.connect(self._undo)
             editor.redo_requested.connect(self._redo)
+            editor.show_on_map_requested.connect(self._show_label_on_map)
         self._snippet_editor.set_mask_names(self._mask_name_presets())
         self._snippet_editor.set_classes(self.project.classes)
         self._snippet_editor.set_labels(self._label_entries(),

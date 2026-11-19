@@ -137,6 +137,8 @@ SHORTCUT_SECTIONS = [
         ("X", "Review: reject, then next"),
         ("F", "Review: look at again, then next"),
         ("Ctrl+1-9", "Label class by its place in the list (whole object)"),
+        ("J", "Show on Map: the snippet in hand on the main window's map"),
+        ("Right-click (list, linked row)", "Show that snippet on the map"),
         ("O / P / G / D / M / V",
          "Tool: Orient / Paint masks / Polygon / Wand / Measure / Move label"),
         ("Click (Wand)", "Take the connected pixels that look like this one"),
