@@ -153,6 +153,9 @@ class SnippetEditor(QWidget):
     # (2026-11-19: J, the toolbar button, or a right-click on the list or
     # the linked row).
     show_on_map_requested = pyqtSignal(int)
+    # (label_id): Object Cycle on the map from this label's image - the
+    # images its linked object is on, one at a time (2026-11-19).
+    object_cycle_requested = pyqtSignal(int)
 
     SINGLE, GRID = 0, 1
 
@@ -570,8 +573,18 @@ class SnippetEditor(QWidget):
             return
         menu = QMenu(self)
         show = menu.addAction("Show on Map")
-        if menu.exec_(widget.viewport().mapToGlobal(pos)) is show:
+        # A linked snippet's object, image by image on the map.
+        entry = self.strip.entry(label_id)
+        cycle = (menu.addAction("Cycle Object on Map")
+                 if entry is not None and entry.get("linked") else None)
+        chosen = menu.exec_(widget.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is show:
             self.show_on_map(label_id)
+        elif chosen is cycle:
+            self.grid.flush_review()
+            self.object_cycle_requested.emit(int(label_id))
 
     def _pick_linked(self, label_id: int):
         """A snippet clicked in the linked row: put it in hand.

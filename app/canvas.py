@@ -356,16 +356,17 @@ class CanvasMode(Enum):
     RULER = auto()    # Measure ground distance by dragging
     WATERFALL = auto()  # Group's images stacked vertically; hold Space to glide
     LABELED_CYCLE = auto()  # Cycle the group's images that have labels
+    OBJECT_CYCLE = auto()   # Cycle the images one linked object is on
 
 
 # Cycle-style modes: left click labels, right-drag pans, wheel zooms. WATERFALL
 # shares these interactions but navigates by gliding rather than stepping.
 CYCLE_MODES = (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE, CanvasMode.WATERFALL,
-               CanvasMode.LABELED_CYCLE)
+               CanvasMode.LABELED_CYCLE, CanvasMode.OBJECT_CYCLE)
 
 # Modes that step through layers one at a time (Space advances one layer).
 STEP_CYCLE_MODES = (CanvasMode.CYCLE, CanvasMode.VIEW_CYCLE,
-                    CanvasMode.LABELED_CYCLE)
+                    CanvasMode.LABELED_CYCLE, CanvasMode.OBJECT_CYCLE)
 
 # Modes where a left click places a label.
 LABELING_MODES = (CanvasMode.LABEL,) + CYCLE_MODES
@@ -2628,6 +2629,9 @@ class MapCanvas(QGraphicsView):
     # "give me every view of this one object", so the object a label belongs
     # to is the selection unit, not the label and not the class.
     export_object_requested = pyqtSignal(int)      # label_id
+    # (label_id): step through the images this label's linked object is
+    # on, starting at this label's (Object Cycle, 2026-11-19).
+    object_cycle_requested = pyqtSignal(int)
 
     label_removed = pyqtSignal(int, str)
 
@@ -6554,6 +6558,15 @@ class MapCanvas(QGraphicsView):
             index = self._marker_index = ([row[0] for row in rows], rows)
         return index
 
+    def label_under_cursor(self) -> "int | None":
+        """The label whose marker is under the mouse pointer, if the
+        pointer is over the map - for a key that acts on the label
+        pointed at (Shift+O, Object Cycle)."""
+        pos = self.viewport().mapFromGlobal(QCursor.pos())
+        if not self.viewport().rect().contains(pos):
+            return None
+        return self._get_label_at_position(pos)[0]
+
     def _get_label_at_position(
             self, view_pos) -> tuple[int | None, str | None]:
         """Find the label at the given view position.
@@ -6655,8 +6668,13 @@ class MapCanvas(QGraphicsView):
             # "Show Linked" action is gone: linked groups now carry an
             # always-on coloured halo, so there is nothing to reveal.
             unlink_action = None
+            object_cycle_action = None
             if is_linked:
                 unlink_action = menu.addAction("Unlink")
+                # The images this object is on, one at a time, from this
+                # one (2026-11-19).
+                object_cycle_action = menu.addAction(
+                    "Cycle This Object's Images (Shift+O)")
 
             menu.addSeparator()
 
@@ -6706,6 +6724,8 @@ class MapCanvas(QGraphicsView):
                     label_id, class_actions[action])
             elif action == unlink_action:
                 self.label_unlinked.emit(label_id)
+            elif action is not None and action == object_cycle_action:
+                self.object_cycle_requested.emit(label_id)
             elif action == toggle_layer_action:
                 # Get the layer_id from the image_path and emit toggle signal
                 if image_path in self._path_to_layer:

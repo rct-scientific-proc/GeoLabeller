@@ -63,6 +63,8 @@ SHORTCUT_SECTIONS = [
         ("V", "View Cycle (the selected group's images on screen)"),
         ("Shift+C", "Labeled Cycle (the selected group's images that "
                     "have labels)"),
+        ("Shift+O", "Object Cycle (the images the linked label under the "
+                    "pointer is on, from its own)"),
         ("W", "Waterfall mode (stack group vertically)"),
         ("R", "Ruler mode"),
     ]),

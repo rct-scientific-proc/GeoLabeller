@@ -422,6 +422,12 @@ class MainWindow(QMainWindow):
         # image); forgotten only by being hidden. Layer ids are never
         # reused, so a stale one can only miss, never hit another layer.
         self._cycle_shown: str | None = None
+        # Object Cycle (2026-11-19): the linked object being cycled, the
+        # label a start asked for (the stop it opens on), and for each
+        # stop - a layer - the object's label on it.
+        self._object_cycle_object: str | None = None
+        self._object_cycle_start: int | None = None
+        self._object_cycle_views: dict[str, int] = {}
         # Waterfall mode: the group stacked, and the images it switched on
         # to show the whole stack - switched off again on the way out.
         self._waterfall_group: list[str] = []
@@ -776,6 +782,7 @@ class MainWindow(QMainWindow):
         self.canvas.label_hover_ended.connect(self._on_label_hover_ended)
         self.canvas.labels_linked.connect(self._on_labels_linked)
         self.canvas.label_unlinked.connect(self._on_label_unlinked)
+        self.canvas.object_cycle_requested.connect(self._start_object_cycle)
         self.canvas.label_describe_requested.connect(self._describe_label)
         self.canvas.label_group_id_requested.connect(self._edit_group_id)
         self.canvas.label_class_change_requested.connect(
@@ -1310,6 +1317,18 @@ class MainWindow(QMainWindow):
             lambda: self._set_mode(CanvasMode.LABELED_CYCLE))
         toolbar.addAction(self.labeled_cycle_action)
 
+        self.object_cycle_action = QAction("Object Cycle", self)
+        self.object_cycle_action.setCheckable(True)
+        self.object_cycle_action.setShortcut("Shift+O")
+        self.object_cycle_action.setToolTip(
+            "Object Cycle (Shift+O): step through the images one linked "
+            "object is on, starting at the label you pick - the one under "
+            "the mouse pointer, or the Snippet Editor's snippet in hand; or "
+            "right-click a linked label > Cycle This Object's Images.\n"
+            "Space = next, Ctrl+Space = previous.")
+        self.object_cycle_action.triggered.connect(self._object_cycle_key)
+        toolbar.addAction(self.object_cycle_action)
+
         self.waterfall_action = QAction("Waterfall", self)
         self.waterfall_action.setCheckable(True)
         self.waterfall_action.setShortcut("W")
@@ -1448,6 +1467,7 @@ class MainWindow(QMainWindow):
         self.view_cycle_action.setChecked(mode == CanvasMode.VIEW_CYCLE)
         self.labeled_cycle_action.setChecked(
             mode == CanvasMode.LABELED_CYCLE)
+        self.object_cycle_action.setChecked(mode == CanvasMode.OBJECT_CYCLE)
         self.ruler_action.setChecked(mode == CanvasMode.RULER)
         self.waterfall_action.setChecked(mode == CanvasMode.WATERFALL)
 
@@ -1511,6 +1531,8 @@ class MainWindow(QMainWindow):
             self._start_cycle_mode()
         elif mode == CanvasMode.VIEW_CYCLE:
             self._start_view_cycle_mode()
+        elif mode == CanvasMode.OBJECT_CYCLE:
+            self._start_object_cycle_mode()
         else:
             self._start_labeled_cycle_mode()
 
@@ -1688,12 +1710,15 @@ class MainWindow(QMainWindow):
             return "view cycle", "V"
         if self.canvas._mode == CanvasMode.LABELED_CYCLE:
             return "labeled images", "Shift+C"
+        if self.canvas._mode == CanvasMode.OBJECT_CYCLE:
+            return "object", "Shift+O"
         return "group", "C"
 
     def _show_cycle_status(self, prefix: str | None = None):
         if prefix is None:
             prefix = {CanvasMode.VIEW_CYCLE: "View Cycle",
-                      CanvasMode.LABELED_CYCLE: "Labeled Cycle"}.get(
+                      CanvasMode.LABELED_CYCLE: "Labeled Cycle",
+                      CanvasMode.OBJECT_CYCLE: "Object Cycle"}.get(
                           self._cycle_mode, "Cycle mode")
         position, count = self._cycle_position()
         self.statusBar.showMessage(
@@ -1726,6 +1751,12 @@ class MainWindow(QMainWindow):
         # Its labels are marked: where images overlap, the neighbours'
         # labels lie over this one and nothing else says which are its.
         self.canvas.set_active_image(layer.file_path)
+        if self._cycle_mode == CanvasMode.OBJECT_CYCLE:
+            # The object's own view is the marker drawn for it here (one
+            # marker per object, 2.9.2).
+            view = self._object_cycle_views.get(layer_id)
+            if view is not None:
+                self.canvas.prefer_label(view)
         self._cycle_zoom_to(layer_id)
 
     def _cycle_zoom_to(self, layer_id: str):
@@ -1868,6 +1899,219 @@ class MainWindow(QMainWindow):
             "Labeled Cycle resumed" if resumed is not None
             else "Labeled Cycle")
         self.canvas.setFocus()
+
+    # -- Object Cycle (2026-11-19) ----------------------------------------
+    #
+    # Asked for by Ryan: step through the images one linked object is on -
+    # Labeled Cycle, but for that object only. One stop per image, each
+    # image fitted as Labeled Cycle fits it, and a run always opens on the
+    # image of the label it was started from.
+
+    _OBJECT_CYCLE_HOW = ("Object Cycle: point at a linked label and press "
+                         "Shift+O, or right-click it > Cycle This Object's "
+                         "Images")
+
+    def _object_cycle_key(self):
+        """Shift+O, or the toolbar's Object Cycle. The label it starts
+        from is the one under the mouse pointer, else the Snippet
+        Editor's snippet in hand. With neither: in the mode, stay (or
+        start the object again from its first image, at the end of a
+        run); out of it, resume the run a detour left."""
+        label_id = self.canvas.label_under_cursor()
+        if label_id is None:
+            editor = self._snippet_editor
+            if editor is not None and editor.isVisible():
+                entry = editor.strip.current_entry()
+                if entry is not None:
+                    label_id = entry["label_id"]
+        if label_id is not None:
+            self._start_object_cycle(label_id)
+            return
+        if self.canvas._mode == CanvasMode.OBJECT_CYCLE:
+            self._sync_mode_actions(CanvasMode.OBJECT_CYCLE)
+            if self._cycle_at_end and self._object_cycle_object is not None:
+                self._suspend_cycle()
+                self._cycle_parked.pop(CanvasMode.OBJECT_CYCLE, None)
+                self._start_object_cycle_mode()
+            return
+        if (self._object_cycle_object is not None
+                and CanvasMode.OBJECT_CYCLE in self._cycle_parked):
+            self._set_mode(CanvasMode.OBJECT_CYCLE)
+            return
+        self._sync_mode_actions(self.canvas._mode)
+        self.statusBar.showMessage(self._OBJECT_CYCLE_HOW, 6000)
+
+    def _object_cycle_from_editor(self, label_id: int):
+        """The Snippet Editor's Cycle Object on Map: the map comes to the
+        front with it, as for Show on Map."""
+        self._start_object_cycle(label_id)
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _start_object_cycle(self, label_id: int):
+        """Cycle the images ``label_id``'s linked object is on, opening
+        on this label's image - a new run, whatever was parked."""
+        image, label = self.project.get_label_by_id(label_id)
+        if label is None or image is None:
+            return
+        paths = set()
+        for member in self.project._object_id_index.get(label.object_id, ()):
+            other_image, other = self.project.get_label_by_id(member)
+            if other is not None and other_image is not None:
+                paths.add(other_image.path)
+        if len(paths) < 2:
+            self._sync_mode_actions(self.canvas._mode)
+            self.statusBar.showMessage(
+                "Object Cycle: this label is not linked to a label on "
+                "another image", 6000)
+            return
+        self._object_cycle_object = label.object_id
+        self._object_cycle_start = label_id
+        self._cycle_parked.pop(CanvasMode.OBJECT_CYCLE, None)
+        if self.canvas._mode == CanvasMode.OBJECT_CYCLE:
+            self._suspend_cycle()
+            self._cycle_parked.pop(CanvasMode.OBJECT_CYCLE, None)
+            self._start_object_cycle_mode()
+            self._sync_mode_actions(CanvasMode.OBJECT_CYCLE)
+        else:
+            self._set_mode(CanvasMode.OBJECT_CYCLE)
+
+    def _object_cycle_stops(self, object_id) -> tuple[list, dict, int]:
+        """The object's stops, in the Snippet Editor's linked-row order
+        (image name, then label id): one layer per image - a second view
+        on one image is no second stop - with the object's label on each,
+        and how many of its images could not be shown (file missing). An
+        image not on the map yet is added, hidden, for the cycle to show."""
+        views = []
+        for member in self.project._object_id_index.get(object_id, ()):
+            image, label = self.project.get_label_by_id(member)
+            if label is not None and image is not None:
+                views.append((image.name, label.id, image))
+        views.sort(key=lambda view: (view[0], view[1]))
+        layers, on, missing, seen = [], {}, 0, set()
+        for _name, member, image in views:
+            if image.path in seen:
+                continue
+            seen.add(image.path)
+            layer_id = self.canvas._path_to_layer.get(image.path)
+            if layer_id is None:
+                if not os.path.exists(image.path):
+                    missing += 1
+                    continue
+                layer_id = self._add_layer_for_reveal(image)
+                if layer_id is None:
+                    missing += 1
+                    continue
+                # Added shown (a reveal shows it); the cycle shows it at
+                # its stop and hides it after, as one it switched on.
+                self.layer_panel.uncheck_layers([layer_id])
+            layers.append(layer_id)
+            on[layer_id] = member
+        return layers, on, missing
+
+    def _object_cycle_title(self, object_id, count: int,
+                            missing: int = 0) -> str:
+        """"Object Cycle: vessel 'convoy lead' - 4 images"."""
+        name = ""
+        for member in self.project._object_id_index.get(object_id, ()):
+            _image, label = self.project.get_label_by_id(member)
+            if label is not None:
+                name = label.class_name + (
+                    f" '{label.group_id}'" if label.group_id else "")
+                break
+        lost = f", {missing} not found" if missing else ""
+        return f"Object Cycle: {name} - {count} images{lost}"
+
+    def _start_object_cycle_mode(self):
+        """Enter Object Cycle. A start asked for opens on its label's
+        image; without one, the run a detour left resumes where it was,
+        and a fresh run opens on the first image."""
+        object_id = self._object_cycle_object
+        parked = self._cycle_parked.pop(CanvasMode.OBJECT_CYCLE, None)
+        start, self._object_cycle_start = self._object_cycle_start, None
+        if object_id is None:
+            self.statusBar.showMessage(self._OBJECT_CYCLE_HOW, 6000)
+            self._cycle_index = -1
+            return
+        layers, views, missing = self._object_cycle_stops(object_id)
+        if not layers:
+            self.statusBar.showMessage(
+                "Object Cycle: none of this object's images is on this "
+                "machine - use File > Locate Missing Images", 6000)
+            self._cycle_index = -1
+            return
+        # Walked from the end of the queue to its start, as every cycle is.
+        queue = list(reversed(layers))
+        index = None
+        if start is not None:
+            image, _label = self.project.get_label_by_id(start)
+            layer_id = (self.canvas._path_to_layer.get(image.path)
+                        if image is not None else None)
+            if layer_id in queue:
+                index = queue.index(layer_id)
+        elif parked is not None and 0 <= parked[1] < len(parked[0]):
+            was_on = parked[0][parked[1]]
+            if was_on in queue:
+                index = queue.index(was_on)
+        resumed = start is None and index is not None
+        if index is None:
+            index = len(queue) - 1
+        self._object_cycle_views = views
+        self._cycle_layers = queue
+        self._cycle_group = list(queue)
+        self._cycle_mode = CanvasMode.OBJECT_CYCLE
+        self._cycle_at_end = False
+        self._cycle_end_view = None
+        self._cycle_index = index
+        self.group_label.setText(
+            self._object_cycle_title(object_id, len(queue), missing))
+        self._cycle_show(queue[index])
+        position, count = self._cycle_position()
+        debug(f"object cycle {'resume' if resumed else 'start'}: "
+              f"{object_id} - {count} images; at "
+              f"{self._layer_name(queue[index])} [{position}/{count}]")
+        self._show_cycle_status(
+            "Object Cycle resumed" if resumed else "Object Cycle")
+        self.canvas.setFocus()
+
+    def _refresh_object_cycle(self) -> bool:
+        """Before a step: the stops as the object is now - a view linked,
+        unlinked or removed since the last step changes them - keeping
+        the place by image. False, and said, when there is nothing left
+        to step to."""
+        object_id = self._object_cycle_object
+        layers, views, missing = (self._object_cycle_stops(object_id)
+                                  if object_id is not None else ([], {}, 0))
+        queue = list(reversed(layers))
+        self._object_cycle_views = views
+        if queue == self._cycle_layers:
+            return True
+        current = (self._cycle_layers[self._cycle_index]
+                   if 0 <= self._cycle_index < len(self._cycle_layers)
+                   else None)
+        if len(queue) < 2:
+            self._cycle_layers = queue
+            self._cycle_group = list(queue)
+            self._cycle_index = 0 if queue else -1
+            self._cycle_at_end = False
+            self.statusBar.showMessage(
+                "Object Cycle: this object is no longer on more than one "
+                "image", 6000)
+            return False
+        if current in queue:
+            index = queue.index(current)
+        else:
+            # Its image left the object: the place in the run is kept.
+            index = min(max(self._cycle_index, 0), len(queue) - 1)
+        self._cycle_layers = queue
+        self._cycle_group = list(queue)
+        self._cycle_index = index
+        self._cycle_at_end = False
+        self.group_label.setText(
+            self._object_cycle_title(object_id, len(queue), missing))
+        return True
 
     def _start_view_cycle_mode(self):
         """Cycle the selected group's images that intersect the view.
@@ -2096,6 +2340,9 @@ class MainWindow(QMainWindow):
 
     def _cycle_to_next_layer(self):
         """Toggle off current layer, turn on and zoom to the next layer in the cycle."""
+        if (self._cycle_mode == CanvasMode.OBJECT_CYCLE
+                and not self._refresh_object_cycle()):
+            return
         if not self._cycle_layers or self._cycle_index < 0:
             self.statusBar.showMessage("No layers to cycle through", 3000)
             return
@@ -2141,6 +2388,9 @@ class MainWindow(QMainWindow):
 
     def _cycle_to_prev_layer(self):
         """Go back to the previous layer in the cycle (undo the last forward step)."""
+        if (self._cycle_mode == CanvasMode.OBJECT_CYCLE
+                and not self._refresh_object_cycle()):
+            return
         if not self._cycle_layers or self._cycle_index < 0:
             self.statusBar.showMessage("No layers to cycle through", 3000)
             return
@@ -3301,6 +3551,8 @@ class MainWindow(QMainWindow):
             editor.undo_requested.connect(self._undo)
             editor.redo_requested.connect(self._redo)
             editor.show_on_map_requested.connect(self._show_label_on_map)
+            editor.object_cycle_requested.connect(
+                self._object_cycle_from_editor)
         self._snippet_editor.set_mask_names(self._mask_name_presets())
         self._snippet_editor.set_classes(self.project.classes)
         self._snippet_editor.set_labels(self._label_entries(),
@@ -4511,6 +4763,9 @@ class MainWindow(QMainWindow):
         self._cycle_parked.clear()
         self._cycle_turned_on.clear()
         self._cycle_shown = None
+        self._object_cycle_object = None
+        self._object_cycle_start = None
+        self._object_cycle_views = {}
 
     def _seat_project_controls(self, title: str):
         """Every control that reads the project, onto the project just
