@@ -1687,6 +1687,23 @@ class TiledLayer:
         return (west + left * width, north - bottom * height,
                 west + right * width, north - top * height)
 
+    def data_at(self, x: float, y: float) -> "bool | None":
+        """Whether the picture holds data at world (x, y) - as drawn,
+        nodata transparent - or None when there is no picture to ask
+        (2.10.8: a cycle stops only at objects on an image's data)."""
+        rgba = self._rgba_data
+        if rgba is None or self.bounds is None or rgba.ndim != 3:
+            return None
+        west, south, east, north = self.bounds
+        if not (west <= x <= east and south <= y <= north):
+            return False
+        height, width = rgba.shape[:2]
+        col = min(int((x - west) / max(east - west, 1e-12) * width),
+                  width - 1)
+        row = min(int((north - y) / max(north - south, 1e-12) * height),
+                  height - 1)
+        return bool(rgba[row, col, 3] > 0) if rgba.shape[2] >= 4 else True
+
     def contains_point(self, easting: float, northing: float) -> bool:
         """Check if a point (in Web Mercator) is within this layer's bounds."""
         if self.bounds is None:
@@ -3005,6 +3022,9 @@ class MapCanvas(QGraphicsView):
         # Waypoint markers: waypoint_id -> (marker, name text). Parented to the
         # floating-origin group, so they ride along with every rebase.
         self._waypoint_items: dict = {}
+        # A cycle stop's marks: where the other images put its object
+        # (2.10.8, set_stop_marks).
+        self._stop_mark_items: list = []
         # User toggle from the waypoints panel.
         self._waypoints_visible = True
         # Suppressed while waterfall mode is active: the stacked images are raw
@@ -4971,7 +4991,27 @@ class MapCanvas(QGraphicsView):
         # The data, not the raster: empty rows and columns round an image
         # left it off to one side of the view (2026-11-20; frame_bounds).
         layer = self._layers[layer_id]
-        west, south, east, north = layer.frame_bounds()
+        self._fit_world(layer.frame_bounds())
+        # Never read yet - the first image of a cycle, one not read ahead:
+        # the raster is framed now, and its data once the picture shows
+        # where that is, if nothing has moved the view meanwhile
+        # (_frame_data_when_read). A picture let go left its fraction.
+        self._frame_waiting = (
+            (layer_id, self._get_view_bounds())
+            if layer._rgba_data is None and layer._data_fraction is None
+            else None)
+        self._tiles_after_zoom(immediate)
+
+    def zoom_to_world(self, bounds: tuple, immediate: bool = False):
+        """Fit the view to ``bounds`` (west, south, east, north, Web
+        Mercator) - a cycle's stop at an object (2.10.8). As
+        zoom_to_layer, ``immediate`` updates the tiles now."""
+        self._fit_world(bounds)
+        self._frame_waiting = None
+        self._tiles_after_zoom(immediate)
+
+    def _fit_world(self, bounds: tuple):
+        west, south, east, north = bounds
         # The floating origin stays where it is: the fit below rebases it
         # (_maybe_rebase_origin) only when the layer lies far enough off
         # for device coordinates to overflow. It used to move on every
@@ -4981,19 +5021,13 @@ class MapCanvas(QGraphicsView):
         rect = self._world_rect_to_scene(
             QRectF(west, -north, east - west, north - south))
         self._fit_view(rect)
-        # Never read yet - the first image of a cycle, one not read ahead:
-        # the raster is framed now, and its data once the picture shows
-        # where that is, if nothing has moved the view meanwhile
-        # (_frame_data_when_read). A picture let go left its fraction.
-        self._frame_waiting = (
-            (layer_id, self._get_view_bounds())
-            if layer._rgba_data is None and layer._data_fraction is None
-            else None)
         # Markers are sized in scene units against the view scale, so a
         # zoom that skips this leaves them sub-pixel (after stepping out
         # from a metre-scale wheel zoom) or covering the image (after a
         # whole-project view). Cycle mode reaches here on every step.
         self.update_label_markers_scale()
+
+    def _tiles_after_zoom(self, immediate: bool):
         if immediate:
             # After the fit above, never before it: a cycle step switches
             # its image on BEFORE zooming, and an update judged at the
@@ -7576,6 +7610,48 @@ class MapCanvas(QGraphicsView):
         marker.setZValue(z)
         marker.setPos(easting, -northing)
         return marker
+
+    # -- a cycle stop's marks (2.10.8) ------------------------------------
+
+    _STOP_MARK_RADIUS = 15.0    # screen pixels: round a marker, not on it
+
+    def set_stop_marks(self, places: list):
+        """Mark ``places`` - world (x, y) where other images put the object
+        a cycle has stopped at - with dashed rings round them, white over
+        a dark stroke so they read on any imagery, and in no class's
+        colour, so they are not taken for labels; the same size on screen
+        at any zoom. They take no clicks: a label is placed through them.
+        Replaces the marks there were."""
+        self.clear_stop_marks()
+        under = QPen(QColor(0, 0, 0, 150), 3.0)
+        over = QPen(QColor(255, 255, 255, 230), 1.5, Qt.DashLine)
+        for pen in (under, over):
+            pen.setCosmetic(True)
+        r = self._STOP_MARK_RADIUS
+        z = self._get_label_z_base() + 4
+        for x, y in places:
+            for pen in (under, over):
+                ring = QGraphicsEllipseItem(-r, -r, 2 * r, 2 * r,
+                                            self._overlay_group)
+                ring.setPen(pen)
+                ring.setBrush(QBrush(Qt.NoBrush))
+                ring.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+                ring.setAcceptedMouseButtons(Qt.NoButton)
+                ring.setAcceptHoverEvents(False)
+                ring.setZValue(z)
+                ring.setPos(x, -y)
+                self._stop_mark_items.append(ring)
+
+    def clear_stop_marks(self):
+        for item in self._stop_mark_items:
+            if item.scene() is not None:
+                self._scene.removeItem(item)
+        self._stop_mark_items = []
+
+    def stop_marks(self) -> list:
+        """World (x, y) of the stop marks showing, one a place."""
+        return [(item.pos().x(), -item.pos().y())
+                for item in self._stop_mark_items[1::2]]
 
     def clear_location_marker(self):
         """Remove the go-to crosshair, if one is showing."""

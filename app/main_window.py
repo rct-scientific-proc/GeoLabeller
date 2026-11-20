@@ -3,6 +3,7 @@ import hashlib
 from collections import deque
 import html
 import json
+import math
 import os
 from contextlib import contextmanager
 import platform
@@ -62,7 +63,8 @@ from .h5_export import (EXAMPLES_ALL, EXAMPLES_OBJECT,
 from .debug_log import debug, debug_log, DebugConsole
 from .shortcuts import SHIFTED_DIGITS, ShortcutsDialog
 from . import (display_settings, duplicates, gdal_config, identity,
-               kml_export, recent, reseat, settings_scope, waypoint_io)
+               kml_export, known_objects, recent, reseat, settings_scope,
+               waypoint_io)
 from .about import AboutDialog
 from .release_notes import ReleaseNotesDialog
 from .history import EditHistory
@@ -78,7 +80,7 @@ from .snippet_editor import SnippetEditor
 from .snippet_editor.size_section import shares_with_linked, size_text
 from .snippet_panel import SnippetPanel
 from .snippets import SnippetLoader, cached_band_scaling
-from .value_probe import ValueProbe
+from .value_probe import ValueProbe, read_values
 from .resources import howto_path, icd_path
 from .version import app_title, app_version
 
@@ -381,9 +383,26 @@ class MainWindow(QMainWindow):
 
         # Cycle mode state
         self._cycle_layers: list[str] = []  # Layer IDs to cycle through
-        # Which way the last step went: -1 forward (Space), +1 back. Only
-        # orders the prefetch, so the likelier image is read first.
+        # Which way the last step went: -1 forward (Space), +1 back. It
+        # orders the prefetch, so the likelier image is read first, and
+        # says which end of an image's stops a step lands on.
         self._cycle_direction = -1
+        # Stops at objects other images' labels put on the image shown
+        # (2.10.8, View > Cycling; app/known_objects.py): the image's
+        # stops, the one the view is at (-1: none, the image framed), the
+        # zoom the user chose at a stop (metres a screen pixel) and the
+        # zoom the last stop set, to tell a change of the user's from it.
+        self._stops: list = []
+        self._stop_index = -1
+        self._stop_zoom: float | None = None
+        self._stop_scale_set: float | None = None
+        # Every object's place, rebuilt when the project has changed
+        # (_known_objects); whether an object is on an image's data, and
+        # the images covering an Object Cycle's object, for the project.
+        self._object_index = None
+        self._object_index_key = None
+        self._stop_data: dict = {}
+        self._covering: dict = {}
         # Current position in cycle (-1 means not started)
         self._cycle_index: int = -1
         # Per cycle mode, the (layers, index) kept while the user steps out
@@ -1176,6 +1195,36 @@ class MainWindow(QMainWindow):
         hover_menu.addAction(self.hover_north_up_action)
         self.canvas.set_hover_enabled(chosen > 0)
 
+        # Cycle steps that stop at the objects other images' labels put on
+        # the image shown, and link a label placed there (2.10.8).
+        cycling_menu = view_menu.addMenu("C&ycling")
+        self.stop_at_objects_action = QAction(
+            "Stop at &Objects Labelled on Other Images", self)
+        self.stop_at_objects_action.setCheckable(True)
+        self.stop_at_objects_action.setChecked(
+            self._cycle_flag(self._STOPS_KEY, False))
+        self.stop_at_objects_action.setStatusTip(
+            "Cycle, View Cycle and Labeled Cycle stop at each object other "
+            "images' labels put on the image and not labelled on it yet, "
+            "zoomed to it, before the next image; Object Cycle also visits "
+            "the images that cover its object")
+        self.stop_at_objects_action.toggled.connect(self._set_stops_wanted)
+        cycling_menu.addAction(self.stop_at_objects_action)
+        self.link_to_stop_action = QAction(
+            "&Link a New Label to the Stop's Object", self)
+        self.link_to_stop_action.setCheckable(True)
+        self.link_to_stop_action.setChecked(
+            self._cycle_flag(self._LINK_STOP_KEY, True))
+        self.link_to_stop_action.setEnabled(
+            self.stop_at_objects_action.isChecked())
+        self.link_to_stop_action.setStatusTip(
+            "A label placed at a stop, of the object's class, is linked to "
+            "that object - Ctrl+Z undoes the link and keeps the label")
+        self.link_to_stop_action.toggled.connect(
+            lambda on: settings_scope.settings().setValue(
+                self._LINK_STOP_KEY, "true" if on else "false"))
+        cycling_menu.addAction(self.link_to_stop_action)
+
         # Remove the crosshair that Go to Coordinates leaves behind
         clear_marker_action = QAction("Clear Coordinate &Marker", self)
         clear_marker_action.triggered.connect(self._clear_coordinate_marker)
@@ -1669,6 +1718,16 @@ class MainWindow(QMainWindow):
         self.canvas.clear_warmed_layers()
         # ...and the marking of "this image's labels" with the cycle too.
         self.canvas.set_active_image(None)
+        # A detour comes back to the stop it left (2.10.8) - kept through
+        # a second leave on the way (no stop then), taken by the next
+        # image shown.
+        if 0 <= self._stop_index < len(self._stops):
+            self._stop_resume = (self._cycle_shown,
+                                 self._stops[self._stop_index].obj.object_id)
+        self._stops, self._stop_index = [], -1
+        self._stop_scale_set = None
+        self.canvas.clear_stop_marks()
+        self._cycle_direction = -1
         mode = self._cycle_mode
         if self._cycle_layers and self._cycle_index >= 0 and mode is not None:
             # Each mode parks its own run. A finished View Cycle is not
@@ -1732,8 +1791,8 @@ class MainWindow(QMainWindow):
                           self._cycle_mode, "Cycle mode")
         position, count = self._cycle_position()
         self.statusBar.showMessage(
-            f"{prefix}: Layer {position}/{count} - Space=next, "
-            "Ctrl+Space=prev", 0)
+            f"{prefix}: Layer {position}/{count}{self._stop_status()} - "
+            "Space=next, Ctrl+Space=prev", 0)
 
     def _cycle_show(self, layer_id: str):
         """Show ``layer_id`` as the cycle's image, hiding the one before.
@@ -1770,14 +1829,269 @@ class MainWindow(QMainWindow):
         self._cycle_zoom_to(layer_id)
 
     def _cycle_zoom_to(self, layer_id: str):
-        """Zoom to a cycled layer."""
+        """Zoom to a cycled layer - to its first stop when it has stops
+        (its last, arriving backwards), else the whole of its data."""
         # A measurement belongs to the image it was taken on; leaving that
         # image behind should not leave the line hanging over the next one.
         self.canvas.clear_ruler()
-        # At once: a step is one event, not motion to be coalesced, and its
-        # image is normally in memory already (the prefetch below).
-        self.canvas.zoom_to_layer(layer_id, immediate=True)
+        self._stops = self._stops_for(layer_id)
+        resume, self._stop_resume = self._stop_resume, None
+        if self._stops:
+            self._stop_index = (0 if self._cycle_direction < 0
+                                else len(self._stops) - 1)
+            if resume is not None and resume[0] == layer_id:
+                for index, stop in enumerate(self._stops):
+                    if stop.obj.object_id == resume[1]:
+                        self._stop_index = index
+            self._go_to_stop(layer_id)
+        else:
+            self._stop_index = -1
+            self._stop_scale_set = None
+            self.canvas.clear_stop_marks()
+            # At once: a step is one event, not motion to be coalesced, and
+            # its image is normally in memory already (the prefetch below).
+            self.canvas.zoom_to_layer(layer_id, immediate=True)
         self._prefetch_cycle_neighbours()
+
+    # -- Stops at objects labelled on other images (2.10.8) -----------------
+    #
+    # Asked for 2026-11-20: in a survey flown in passes, an object labelled
+    # on five images is almost always on a sixth covering the same ground,
+    # and finding it there meant zooming in by hand on every image. With
+    # View > Cycling > Stop at Objects Labelled on Other Images, Space
+    # stops at each object the other images' labels put on this image's
+    # data and not labelled here yet, one stop per object (Ryan), zoomed to
+    # where the other passes put it, their places marked; then the next
+    # image. A label placed at a stop is linked to its object (the second
+    # switch). In Object Cycle every image is one stop at its object, and
+    # the images covering it without its label come into the run.
+
+    _STOPS_KEY = "cycle/stop_at_objects"
+    _LINK_STOP_KEY = "cycle/link_to_stop"
+    # Source pixels across the view's shorter side at a stop, until the
+    # user zooms at one: then their zoom is kept for the stops after.
+    _STOP_PIXELS = 192
+    _stop_resume = None         # (layer_id, object_id) a detour left
+
+    @staticmethod
+    def _cycle_flag(key: str, default: bool) -> bool:
+        return str(settings_scope.settings().value(
+            key, "true" if default else "false")).lower() != "false"
+
+    def _stops_enabled(self) -> bool:
+        action = getattr(self, "stop_at_objects_action", None)
+        return action is not None and action.isChecked()
+
+    def _set_stops_wanted(self, on: bool):
+        settings_scope.settings().setValue(self._STOPS_KEY,
+                                           "true" if on else "false")
+        self.link_to_stop_action.setEnabled(bool(on))
+        # Mid-run, the image shown takes the switch at once.
+        if (self.canvas._mode in STEP_CYCLE_MODES
+                and self._cycle_shown is not None
+                and 0 <= self._cycle_index < len(self._cycle_layers)):
+            if self._cycle_mode == CanvasMode.OBJECT_CYCLE:
+                self._refresh_object_cycle()
+                if not 0 <= self._cycle_index < len(self._cycle_layers):
+                    return
+                self._cycle_show(self._cycle_layers[self._cycle_index])
+            else:
+                self._cycle_zoom_to(self._cycle_shown)
+            self._show_cycle_status()
+
+    def _known_objects(self) -> known_objects.ObjectIndex:
+        """Every object's place, built again only when the project has
+        changed since: an edit moves the history, an open replaces the
+        project."""
+        key = (id(self.project), self._history.position(),
+               self.project.label_count, self.project._next_id,
+               len(self.project.images))
+        if self._object_index is None or key != self._object_index_key:
+            if (self._object_index_key is None
+                    or key[0] != self._object_index_key[0]):
+                # Another project: what was on which image's data is
+                # asked again (it holds from one run to the next).
+                self._stop_data.clear()
+                self._covering.clear()
+            self._object_index = known_objects.ObjectIndex.of(self.project)
+            self._object_index_key = key
+        return self._object_index
+
+    def _on_data(self, layer_id: str, layer, obj, x: float, y: float) -> bool:
+        """Whether ``obj``'s place (x, y) is on the layer's data - asked of
+        its picture when it has one, else of the file - once a run."""
+        key = (layer_id, obj.object_id)
+        known = self._stop_data.get(key)
+        if known is None:
+            known = layer.data_at(x, y)
+            if known is None:
+                lon, lat = known_objects.to_lonlat(x, y)
+                probe = read_values(layer.file_path, lon, lat, False)
+                known = probe is not None and any(
+                    value is not None for value in probe.values)
+            self._stop_data[key] = known
+        return known
+
+    def _stops_for(self, layer_id: str) -> list:
+        """The stops on a cycled image, in order; none with the switch
+        off, or on an image without georeferencing."""
+        if not self._stops_enabled():
+            return []
+        layer = self.canvas.get_layer(layer_id)
+        if layer is None or not layer.geo or layer.bounds is None:
+            return []
+        index = self._known_objects()
+        if self._cycle_mode == CanvasMode.OBJECT_CYCLE:
+            obj = index.by_id.get(self._object_cycle_object)
+            if obj is None:
+                return []
+            view = self._object_cycle_views.get(layer_id)
+            place = obj.place_of(view) if view is not None else None
+            x, y = place if place is not None else (obj.x, obj.y)
+            return [known_objects.Stop(
+                obj, known_objects.x_on(layer.bounds, layer._wraps, x), y,
+                labelled_here=view is not None)]
+        return known_objects.stops_on(
+            index, layer.bounds, layer._wraps, layer.file_path,
+            lambda obj, x, y: self._on_data(layer_id, layer, obj, x, y))
+
+    def _stop_floor(self, layer) -> float:
+        """Metres a screen pixel at a stop: the user's own zoom at a stop
+        before, else _STOP_PIXELS of the image across the view."""
+        if self._stop_zoom is not None:
+            return self._stop_zoom
+        west, _south, east, _north = layer.bounds
+        pixel = (east - west) / max(1, layer._src_width or 1)
+        viewport = self.canvas.viewport()
+        return (self._STOP_PIXELS * pixel
+                / max(1, min(viewport.width(), viewport.height())))
+
+    def _go_to_stop(self, layer_id: str | None = None):
+        """Zoom to the stop the run is at, and mark where the other images
+        put its object."""
+        layer = self.canvas.get_layer(layer_id or self._cycle_shown)
+        if layer is None or not 0 <= self._stop_index < len(self._stops):
+            return
+        stop = self._stops[self._stop_index]
+        viewport = self.canvas.viewport()
+        self.canvas.zoom_to_world(
+            known_objects.window(stop, self._stop_floor(layer),
+                                 viewport.width(), viewport.height()),
+            immediate=True)
+        self._stop_scale_set = self.canvas._scene_units_per_pixel()
+        view = (self._object_cycle_views.get(layer_id or self._cycle_shown)
+                if self._cycle_mode == CanvasMode.OBJECT_CYCLE else None)
+        self.canvas.set_stop_marks(
+            [(known_objects.x_on(layer.bounds, layer._wraps, x), y)
+             for member, x, y in stop.obj.places if member != view])
+
+    def _learn_stop_zoom(self):
+        """Leaving a stop: a zoom the user changed there is how close they
+        like to look - the stops after take it."""
+        if self._stop_index < 0 or not self._stop_scale_set:
+            return
+        now = self.canvas._scene_units_per_pixel()
+        if now > 0 and abs(now - self._stop_scale_set) > (
+                0.02 * self._stop_scale_set):
+            self._stop_zoom = now
+
+    def _step_stop(self, step: int) -> bool:
+        """Space (+1) or Ctrl+Space (-1) between the stops of the image
+        shown; False when the step leaves the image."""
+        self._learn_stop_zoom()
+        index = self._stop_index + step
+        if self._stop_index < 0 or not 0 <= index < len(self._stops):
+            return False
+        self._cycle_direction = -step
+        self._stop_index = index
+        # Back off the final image's last stop: no longer at the end.
+        self._cycle_at_end = False
+        self._go_to_stop()
+        self._show_cycle_status()
+        self.canvas.setFocus()
+        return True
+
+    def _stop_status(self) -> str:
+        """" - object 2/4: vessel 'convoy lead', labelled on 3 other
+        images" for the status bar, or nothing away from a stop."""
+        if not 0 <= self._stop_index < len(self._stops):
+            return ""
+        stop = self._stops[self._stop_index]
+        if self._cycle_mode == CanvasMode.OBJECT_CYCLE:
+            return ("" if stop.labelled_here
+                    else " - not labelled on this image yet")
+        others = len(stop.obj.paths)
+        return (f" - object {self._stop_index + 1}/{len(self._stops)}: "
+                f"{stop.obj.name}, labelled on {others} other "
+                f"image{'' if others == 1 else 's'}")
+
+    def _link_to_stop(self, label_id: int, image_path: str):
+        """A label just placed at a stop joins the stop's object - when the
+        switch is on, the label is on the image the run is at, the object
+        is not labelled there already (a second label placed at one stop
+        is not linked), and the classes agree. Its own undo step, after
+        the placement's: Ctrl+Z unlinks and keeps the label."""
+        if not (self._stops_enabled() and self.link_to_stop_action.isChecked()
+                and self.canvas._mode in STEP_CYCLE_MODES
+                and 0 <= self._stop_index < len(self._stops)):
+            return
+        if self.canvas._path_to_layer.get(image_path) != self._cycle_shown:
+            return
+        stop = self._stops[self._stop_index]
+        _image, label = self.project.get_label_by_id(label_id)
+        if label is None:
+            return
+        here = known_objects.path_key(image_path)
+        members, images = [], set()
+        for member in sorted(self.project._object_id_index.get(
+                stop.obj.object_id, ())):
+            if member == label_id:
+                continue
+            other_image, other = self.project.get_label_by_id(member)
+            if other is None or other_image is None:
+                continue
+            if known_objects.path_key(other_image.path) == here:
+                return                  # labelled here already
+            members.append(other)
+            images.add(known_objects.path_key(other_image.path))
+        if not members:
+            return
+        if label.class_name not in {member.class_name for member in members}:
+            self.statusBar.showMessage(
+                f"Added {label.class_name} - not linked: the object at this "
+                f"stop is labelled {stop.obj.name}", 6000)
+            return
+        self._on_labels_linked(members[0].id, label_id)
+        self.statusBar.showMessage(
+            f"Added {label.class_name} and linked it to the object at this "
+            f"stop, now on {len(images) + 1} images (Ctrl+Z unlinks it)",
+            6000)
+
+    def _covering_layers(self, object_id) -> list:
+        """(layer_id, image name) of every image on the map whose data
+        holds the object's place - for Object Cycle with the stops on.
+        Kept for the run while the place and the map stay as they are."""
+        obj = self._known_objects().by_id.get(object_id)
+        if obj is None:
+            return []
+        key = (object_id, round(obj.x, 3), round(obj.y, 3),
+               len(self.canvas._layers))
+        if key in self._covering:
+            return self._covering[key]
+        found = []
+        for layer_id, layer in list(self.canvas._layers.items()):
+            if not layer.geo or layer.bounds is None:
+                continue
+            west, south, east, north = layer.bounds
+            x = known_objects.x_on(layer.bounds, layer._wraps, obj.x)
+            if not (west <= x <= east and south <= obj.y <= north):
+                continue
+            if self._on_data(layer_id, layer, obj, x, obj.y):
+                image = self._project_image_for(layer.file_path)
+                found.append((layer_id, image.name if image is not None
+                              else layer.name))
+        self._covering = {key: found}
+        return found
 
     def _prefetch_cycle_neighbours(self):
         """Read the images either side of this one before they are asked for.
@@ -1970,10 +2284,21 @@ class MainWindow(QMainWindow):
         for member in self.project._object_id_index.get(label.object_id, ()):
             other_image, other = self.project.get_label_by_id(member)
             if other is not None and other_image is not None:
-                paths.add(other_image.path)
-        if len(paths) < 2:
+                paths.add(known_objects.path_key(other_image.path))
+        covering = set()
+        if self._stops_enabled():
+            # Images covering it count too (2.10.8): one label is enough
+            # to go looking for the object on the rest.
+            covering = {
+                known_objects.path_key(self.canvas._layers[lid].file_path)
+                for lid, _name in self._covering_layers(label.object_id)
+                if lid in self.canvas._layers}
+        if len(paths | covering) < 2:
             self._sync_mode_actions(self.canvas._mode)
             self.statusBar.showMessage(
+                "Object Cycle: this label is not linked to a label on "
+                "another image, and no other image covers it"
+                if self._stops_enabled() else
                 "Object Cycle: this label is not linked to a label on "
                 "another image", 6000)
             return
@@ -1993,14 +2318,18 @@ class MainWindow(QMainWindow):
         (image name, then label id): one layer per image - a second view
         on one image is no second stop - with the object's label on each,
         and how many of its images could not be shown (file missing). An
-        image not on the map yet is added, hidden, for the cycle to show."""
+        image not on the map yet is added, hidden, for the cycle to show.
+
+        With the stops at objects on (2.10.8), the images on the map that
+        cover the object without a label of it join in, in name order
+        among the others, each with None for its label."""
         views = []
         for member in self.project._object_id_index.get(object_id, ()):
             image, label = self.project.get_label_by_id(member)
             if label is not None and image is not None:
                 views.append((image.name, label.id, image))
         views.sort(key=lambda view: (view[0], view[1]))
-        layers, on, missing, seen = [], {}, 0, set()
+        entries, on, missing, seen = [], {}, 0, set()
         for _name, member, image in views:
             if image.path in seen:
                 continue
@@ -2017,13 +2346,20 @@ class MainWindow(QMainWindow):
                 # Added shown (a reveal shows it); the cycle shows it at
                 # its stop and hides it after, as one it switched on.
                 self.layer_panel.uncheck_layers([layer_id])
-            layers.append(layer_id)
+            entries.append((_name, member, layer_id))
             on[layer_id] = member
-        return layers, on, missing
+        if self._stops_enabled():
+            for layer_id, name in self._covering_layers(object_id):
+                if layer_id not in on:
+                    entries.append((name, math.inf, layer_id))
+                    on[layer_id] = None
+            entries.sort(key=lambda entry: (entry[0], entry[1]))
+        return [entry[2] for entry in entries], on, missing
 
     def _object_cycle_title(self, object_id, count: int,
                             missing: int = 0) -> str:
-        """"Object Cycle: vessel 'convoy lead' - 4 images"."""
+        """"Object Cycle: vessel 'convoy lead' - 4 images, 2 not labelled
+        yet"."""
         name = ""
         for member in self.project._object_id_index.get(object_id, ()):
             _image, label = self.project.get_label_by_id(member)
@@ -2032,6 +2368,10 @@ class MainWindow(QMainWindow):
                     f" '{label.group_id}'" if label.group_id else "")
                 break
         lost = f", {missing} not found" if missing else ""
+        unlabelled = sum(1 for view in self._object_cycle_views.values()
+                         if view is None)
+        if unlabelled:
+            lost = f", {unlabelled} not labelled yet" + lost
         return f"Object Cycle: {name} - {count} images{lost}"
 
     def _start_object_cycle_mode(self):
@@ -2216,6 +2556,7 @@ class MainWindow(QMainWindow):
 
     def _restart_from_the_top(self):
         """Run the current queue again from its first image."""
+        self._cycle_direction = -1
         self._cycle_at_end = False
         self._cycle_end_view = None
         self._cycle_index = len(self._cycle_layers) - 1
@@ -2356,6 +2697,8 @@ class MainWindow(QMainWindow):
         if not self._cycle_layers or self._cycle_index < 0:
             self.statusBar.showMessage("No layers to cycle through", 3000)
             return
+        if self._step_stop(+1):         # the image's next stop (2.10.8)
+            return
 
         self._cycle_direction = -1
 
@@ -2403,6 +2746,8 @@ class MainWindow(QMainWindow):
             return
         if not self._cycle_layers or self._cycle_index < 0:
             self.statusBar.showMessage("No layers to cycle through", 3000)
+            return
+        if self._step_stop(-1):         # the image's stop before (2.10.8)
             return
 
         self._cycle_direction = 1
@@ -2642,6 +2987,8 @@ class MainWindow(QMainWindow):
                     lat:.6f}) on {image_name}",
                 3000
             )
+        # At a cycle's stop: joined to the stop's object (2.10.8).
+        self._link_to_stop(label.id, image_path)
 
     def _on_label_removed(self, label_id: int, image_path: str):
         """Handle a label being removed."""
