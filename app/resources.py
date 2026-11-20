@@ -12,6 +12,7 @@ from pathlib import Path
 
 ICD_NAME = "GeoLabeller-ICD.pdf"
 HOWTO_NAME = "GeoLabeller-HowTo.pdf"
+RELEASE_NOTES_NAME = "RELEASE_NOTES.md"
 
 
 def install_root() -> Path:
@@ -42,3 +43,9 @@ def icd_path() -> Path:
 def howto_path() -> Path:
     """Where the How-To guide is, if it shipped."""
     return _document_path(HOWTO_NAME)
+
+
+def release_notes_path() -> Path:
+    """Where the release notes are (Help > Release Notes), if they
+    shipped - written at each release by build/make_release_notes.py."""
+    return _document_path(RELEASE_NOTES_NAME)

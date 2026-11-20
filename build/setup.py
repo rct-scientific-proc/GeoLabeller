@@ -90,11 +90,13 @@ _version_file = _repo_root / "VERSION"
 if _version_file.exists():
     include_files.append((str(_version_file), "VERSION"))
 
-# Ships the Interface Control Document and the How-To guide so Help > ICD
-# and Help > How-To have something to open. app/resources.py looks for
-# them beside the executable, which is where include_files puts them -
-# the docs/ directory itself is not copied.
-for _document in ("GeoLabeller-ICD.pdf", "GeoLabeller-HowTo.pdf"):
+# Ships the Interface Control Document, the How-To guide and the release
+# notes so Help > ICD, Help > How-To and Help > Release Notes have
+# something to open. app/resources.py looks for them beside the
+# executable, which is where include_files puts them - the docs/
+# directory itself is not copied.
+for _document in ("GeoLabeller-ICD.pdf", "GeoLabeller-HowTo.pdf",
+                  "RELEASE_NOTES.md"):
     _document_file = _repo_root / "docs" / _document
     if _document_file.exists():
         include_files.append((str(_document_file), _document))

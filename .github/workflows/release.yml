@@ -47,12 +47,13 @@ jobs:
       # cx_Freeze bakes this interpreter into the executable, so pin it rather
       # than inheriting whatever the runner image happens to ship. It is the
       # Python the test suite runs on (the development venv), so the release
-      # ships what was tested; tests/test_installer_authoring.py holds the
+      # ships what was tested - to the bug-fix release: "3.14" took whatever
+      # 3.14.x the runner had. tests/test_installer_authoring.py holds the
       # two together.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: "3.14.10"
 
       - name: Resolve version
         id: version
@@ -73,6 +74,16 @@ jobs:
           if ($declared -ne $version) {
             throw ("VERSION says $declared but this build is $version. " +
                    "Update VERSION, rebuild the ICD, commit, then move the tag.")
+          }
+          # Help > Release Notes ships docs/RELEASE_NOTES.md, written before
+          # the tag by build/make_release_notes.py --next. A build of a
+          # version it does not name would ship notes that stop a release
+          # short.
+          $notes = Get-Content docs/RELEASE_NOTES.md -Raw
+          if ($notes -notmatch ("(?m)^## " + [regex]::Escape($version) + " \(")) {
+            throw ("docs/RELEASE_NOTES.md has no entry for $version. Run " +
+                   "python build/make_release_notes.py --next $version " +
+                   "--notes <the tag's message>, commit, then move the tag.")
           }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT `
             -Encoding utf8 -Append

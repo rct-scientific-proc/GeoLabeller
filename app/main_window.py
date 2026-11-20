@@ -64,6 +64,7 @@ from .shortcuts import SHIFTED_DIGITS, ShortcutsDialog
 from . import (display_settings, duplicates, gdal_config, identity,
                kml_export, recent, reseat, settings_scope, waypoint_io)
 from .about import AboutDialog
+from .release_notes import ReleaseNotesDialog
 from .history import EditHistory
 from .orientation_math import pixel_angle_from_heading
 from .display_dialog import DisplaySettingsDialog
@@ -1251,6 +1252,14 @@ class MainWindow(QMainWindow):
             "Open the Interface Control Document (PDF)")
         icd_action.triggered.connect(self._show_icd)
         help_menu.addAction(icd_action)
+        # What changed in each release (2026-11-20), shipped with the
+        # application like the guides (app/release_notes.py).
+        release_notes_action = QAction("&Release Notes", self)
+        release_notes_action.setStatusTip(
+            "What changed in each release of GeoLabeller, newest first")
+        release_notes_action.triggered.connect(self._show_release_notes)
+        help_menu.addAction(release_notes_action)
+        self.release_notes_action = release_notes_action
 
         # About: what this build is made of, with a Copy button for a
         # bug report
@@ -8026,6 +8035,10 @@ class MainWindow(QMainWindow):
                 self, title,
                 "Could not open the PDF viewer. The document is at:\n\n"
                 f"{path}")
+
+    def _show_release_notes(self):
+        """Help > Release Notes (app/release_notes.py)."""
+        ReleaseNotesDialog(self).exec_()
 
     def _show_about(self):
         """Help > About: the versions window (app/about.py)."""
