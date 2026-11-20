@@ -36,7 +36,7 @@ from ..model_review.outcomes import keep_earlier, read_records
 from ..model_review.source import CANDIDATE
 from ..snippets import no_data
 from ..version import app_version
-from . import by_key
+from . import by_key, filters
 from .base import score_of
 
 CLASS = CANDIDATE               # what the review grid calls them
@@ -375,13 +375,14 @@ def run(project, images, settings: Settings, progress=None,
     report = Report()
     images = list(images)
     total = len(images)
-    for done, image in enumerate(images):
-        if should_stop():
+    for image, result in images_side_by_side(
+            images, lambda image: detect_image(image, project, settings,
+                                               detector, memory),
+            progress, should_stop, "Looking at"):
+        if image is None:
             report.stopped = True
             break
-        progress(f"Looking at {Path(str(image.path)).name}", done, total)
-        found, stats = detect_image(image, project, settings, detector,
-                                    memory)
+        found, stats = result
         report.stats.append(stats)
         report.images += 1
         if stats.error:
@@ -395,6 +396,39 @@ def run(project, images, settings: Settings, progress=None,
         report.reviewed += stats.reviewed
     progress("Done", total, total)
     return records, report
+
+
+IMAGES_AT_ONCE = 2              # images searched side by side
+
+
+def images_side_by_side(images: list, search, progress, should_stop,
+                        verb: str):
+    """(image, search(image)) for each image, in the images' order, the
+    searches run IMAGES_AT_ONCE at a time on threads (2026-11-20): numpy
+    and GDAL let go of the interpreter lock for their work, so a second
+    image's read and blurs proceed while the first's are under way, and
+    the FFT budget is shared between them (filters.sharing_budget).
+    ``should_stop()`` is asked before each image is handed on, as it was
+    one image at a time: when it says stop, one (None, None) ends the
+    run, and an image already searched beside the last one handed on is
+    not reported. Results come in order, so a run's records and report
+    read as they did one image at a time."""
+    total = len(images)
+    at_once = max(1, min(IMAGES_AT_ONCE, total))
+    with filters.sharing_budget(at_once):
+        for start in range(0, total, at_once):
+            if should_stop():
+                yield None, None
+                return
+            batch = images[start:start + at_once]
+            names = ", ".join(Path(str(image.path)).name for image in batch)
+            progress(f"{verb} {names}", start, total)
+            results = filters._in_threads(search, batch)
+            for index, (image, result) in enumerate(zip(batch, results)):
+                if index and should_stop():
+                    yield None, None
+                    return
+                yield image, result
 
 
 def candidates_path(project_path) -> Path:

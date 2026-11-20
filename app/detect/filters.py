@@ -11,6 +11,8 @@ would add forty megabytes to the installer for four functions.
 from __future__ import annotations
 
 import math
+import os
+import threading
 import warnings
 
 import numpy as np
@@ -25,12 +27,36 @@ def _integral(a: np.ndarray) -> np.ndarray:
     return out
 
 
+SHIFTED_SUM_MAX = 4             # radii summed by shifted copies
+
+
+def _shifted_window_sum(a: np.ndarray, r: int) -> np.ndarray:
+    """window_sum for a small radius: 2r + 1 shifted copies added along
+    each axis. An integral image is two cumulative sums over a padded
+    float64 copy whatever the radius; at radius 1 - the Contrast
+    detector's smoothing, at the working scale's six-pixel smallest
+    object - this is twenty times quicker (1.1 s against 0.06 s for its
+    three box blurs at 2,400 px; 2026-11-20)."""
+    a = np.asarray(a, dtype=np.float64)
+    rows = a.copy()
+    for d in range(1, r + 1):
+        rows[d:] += a[:-d]
+        rows[:-d] += a[d:]
+    out = rows.copy()
+    for d in range(1, r + 1):
+        out[:, d:] += rows[:, :-d]
+        out[:, :-d] += rows[:, d:]
+    return out
+
+
 def window_sum(a: np.ndarray, radius: int) -> np.ndarray:
     """The sum over the (2r + 1) square window round each pixel, the
     image taken as zero beyond its edges."""
     r = int(radius)
     if r <= 0:
         return a.astype(np.float64)
+    if r <= SHIFTED_SUM_MAX:
+        return _shifted_window_sum(a, r)
     h, w = a.shape
     padded = np.zeros((h + 2 * r, w + 2 * r), dtype=np.float64)
     padded[r:r + h, r:r + w] = a
@@ -122,9 +148,11 @@ def gaussian_blurs(values: np.ndarray, mask: np.ndarray, sigmas):
         weight = np.zeros((big_h, big_w), dtype=np.float64)
         weight[pad:pad + h, pad:pad + w] = mask
         weight_spectrum = np.fft.rfft2(weight)
+        coarse = _CoarseWeight(weight, pad, h, w)
     fy = np.fft.fftfreq(big_h)
     fx = np.fft.rfftfreq(big_w)
-    for sigma in sigmas:
+
+    def one(sigma):
         c = -2.0 * math.pi * math.pi * sigma * sigma
         # The Gaussian separates in frequency too: two short exponentials
         # and a product, not an exponential per cell of the grid.
@@ -138,6 +166,8 @@ def gaussian_blurs(values: np.ndarray, mask: np.ndarray, sigmas):
                                   n=big_h)[pad:pad + h]
             seen_x = np.fft.irfft(cols_spectrum * kx, n=big_w)[pad:pad + w]
             seen = seen_y[:, None] * seen_x[None, :]
+        elif coarse.step(sigma) > 1:
+            seen = coarse.blur(sigma)
         else:
             seen = np.fft.irfft2(weight_spectrum * kernel, s=(big_h, big_w))
             seen = seen[pad:pad + h, pad:pad + w]
@@ -145,7 +175,168 @@ def gaussian_blurs(values: np.ndarray, mask: np.ndarray, sigmas):
             result = np.where(seen > 1e-3, blurred / np.maximum(seen, 1e-3),
                               np.nan)
         result[~mask] = np.nan
-        yield sigma, result.astype(np.float32)
+        return sigma, result.astype(np.float32)
+
+    # The sigmas are independent given the one forward transform, and
+    # numpy's FFTs let go of the interpreter lock: several at once run in
+    # parallel (eight took 1.04 s one after another, 0.16 s on eight
+    # threads; 2026-11-20). As many at a time as memory allows - a
+    # 3,000 px working image pads to a canvas where one sigma in flight
+    # holds over half a gigabyte - and in order, a batch at a time, so a
+    # ladder's caller still sees them one by one.
+    workers = fft_workers(big_h * big_w)
+    for start in range(0, len(sigmas), workers):
+        yield from _in_threads(one, sigmas[start:start + workers])
+
+
+# -- running the ladder's sigmas side by side (2026-11-20) -------------------
+
+FFT_MEMORY_BUDGET = 1_200_000_000   # bytes the sigmas in flight may hold
+# What one sigma in flight holds per canvas cell, measured with
+# tracemalloc at 2,816 px: 30.2 B (no nodata), 32.4 B (nodata inside).
+FFT_BYTES_PER_CELL = 32
+FFT_MAX_WORKERS = 4
+
+
+_sharing = 1                    # images being searched at once (run.py)
+
+
+def fft_workers(cells: int) -> int:
+    """How many sigmas to transform at once on a canvas of ``cells``:
+    the cores there are, at most FFT_MAX_WORKERS, within the budget -
+    the budget split between the images run.py searches side by side."""
+    budget = FFT_MEMORY_BUDGET // max(1, _sharing)
+    by_memory = budget // max(1, cells * FFT_BYTES_PER_CELL)
+    return int(max(1, min(FFT_MAX_WORKERS, os.cpu_count() or 1,
+                          by_memory)))
+
+
+class sharing_budget:
+    """``with sharing_budget(n):`` - n images are being searched at once,
+    so each gets 1/n of FFT_MEMORY_BUDGET."""
+
+    def __init__(self, images: int):
+        self.images = max(1, int(images))
+
+    def __enter__(self):
+        global _sharing
+        self._before, _sharing = _sharing, self.images
+        return self
+
+    def __exit__(self, *_exc):
+        global _sharing
+        _sharing = self._before
+        return False
+
+
+def _in_threads(fn, items: list) -> list:
+    """[fn(item) for item in items], one thread per item, in order; the
+    first error any raised is raised here. Threads, not a pool: the
+    installed build leaves concurrent.futures out (as snippet_store.py
+    found)."""
+    if len(items) <= 1:
+        return [fn(item) for item in items]
+    results: list = [None] * len(items)
+    errors: list = []
+
+    def work(index, item):
+        try:
+            results[index] = fn(item)
+        except BaseException as exc:  # noqa: BLE001 - raised below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work, args=(i, item), daemon=True,
+                                name="detect-fft")
+               for i, item in enumerate(items)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if errors:
+        raise errors[0]
+    return results
+
+
+# -- the nodata weight's blur on a coarser grid (2026-11-20) -----------------
+
+COARSE_STEP_PER_SIGMA = 4.0     # the grid step at most sigma / this
+COARSE_STEP_MAX = 64
+
+
+class _CoarseWeight:
+    """The blur of the "where is there data" weight for wide sigmas,
+    worked on a grid ``step`` times coarser and brought back by linear
+    interpolation.
+
+    On an image with nodata in it, every sigma of a ladder paid a second
+    full-size inverse transform just for the weight that normalises the
+    blur by a nodata edge: a third of Blob's time on a collared image.
+    The weight is a 0/1 mask, and its blur at a wide sigma is smooth on
+    the scale of that sigma, so a grid ``step`` = the largest power of
+    two at most sigma / 4 holds it: its block means are blurred by the
+    Gaussian less the block's own variance ((step^2 - 1) / 12), and the
+    result read back at each pixel's place. Narrow sigmas, where the
+    weight changes within a few pixels of an edge, keep the full
+    transform. Measured against the exact blur on a corner wedge, holes
+    and a rotated collar (docs_workspace check_coarse_weight.py): the
+    weight is off by at most 0.0043, so where there is data (weight
+    over a half) a blurred value is off by at most 0.64% - at nodata
+    edges only; away from them the weight is 1 either way. The error
+    falls as the square of the step: sigma / 2 was 0.017 (2.4%), which
+    is too much.
+    """
+
+    def __init__(self, weight: np.ndarray, pad: int, h: int, w: int):
+        self.weight, self.pad, self.h, self.w = weight, pad, h, w
+        self._spectra: dict = {}
+
+    @staticmethod
+    def step(sigma: float) -> int:
+        """The grid's step for ``sigma``: 1 - the exact, full-size
+        transform - below 8 px, where a step of 2 would be more than a
+        quarter of the sigma."""
+        step = 1
+        while (step * 2 <= sigma / COARSE_STEP_PER_SIGMA
+               and step * 2 <= COARSE_STEP_MAX):
+            step *= 2
+        return step
+
+    def _spectrum(self, step: int):
+        held = self._spectra.get(step)
+        if held is None:
+            big_h, big_w = self.weight.shape        # multiples of 64
+            blocks = self.weight.reshape(big_h // step, step,
+                                         big_w // step, step).mean(
+                                             axis=(1, 3))
+            held = self._spectra[step] = (np.fft.rfft2(blocks), blocks.shape)
+        return held
+
+    def blur(self, sigma: float) -> np.ndarray:
+        step = self.step(sigma)
+        spectrum, (ch, cw) = self._spectrum(step)
+        # The block mean already blurred by a box of ``step``: the rest.
+        rest = math.sqrt(max(sigma * sigma - (step * step - 1) / 12.0,
+                             0.25)) / step
+        c = -2.0 * math.pi * math.pi * rest * rest
+        fy = np.fft.fftfreq(ch)
+        fx = np.fft.rfftfreq(cw)
+        kernel = np.exp(c * fy * fy)[:, None] * np.exp(c * fx * fx)[None, :]
+        small = np.fft.irfft2(spectrum * kernel, s=(ch, cw))
+        # A canvas pixel p lies at (p - (step - 1) / 2) / step in blocks.
+        offset = (step - 1) / 2.0
+        rows = (np.arange(self.pad, self.pad + self.h) - offset) / step
+        cols = (np.arange(self.pad, self.pad + self.w) - offset) / step
+        return _bilinear(small, rows, cols)
+
+
+def _bilinear(grid: np.ndarray, rows: np.ndarray, cols: np.ndarray):
+    """``grid`` read at fractional (rows x cols), one axis at a time."""
+    r0 = np.clip(np.floor(rows).astype(np.int64), 0, grid.shape[0] - 2)
+    tr = np.clip(rows - r0, 0.0, 1.0)[:, None]
+    c0 = np.clip(np.floor(cols).astype(np.int64), 0, grid.shape[1] - 2)
+    tc = np.clip(cols - c0, 0.0, 1.0)[None, :]
+    by_row = grid[r0] * (1.0 - tr) + grid[r0 + 1] * tr
+    return by_row[:, c0] * (1.0 - tc) + by_row[:, c0 + 1] * tc
 
 
 def block_median_mad(values: np.ndarray, mask: np.ndarray,

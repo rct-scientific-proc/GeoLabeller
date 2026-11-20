@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import by_key
-from .run import Settings, detect_image, sizes_in_pixels
+from .run import (Settings, detect_image, images_side_by_side,
+                  sizes_in_pixels)
 
 DEFAULT_SWEEP = (2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 8.0)
 
@@ -85,14 +86,14 @@ def check(project, images, settings: Settings, sweep=DEFAULT_SWEEP,
     plain.skip_reviewed = False
     plain.per_image = 0
     out = Check(points=[Point(s) for s in sweep])
-    total = len(labelled)
-    for done, image in enumerate(labelled):
-        if should_stop():
+    for image, result in images_side_by_side(
+            labelled, lambda image: detect_image(image, project, plain,
+                                                 detector, floor=floor),
+            progress, should_stop, "Checking"):
+        if image is None:
             out.stopped = True
             break
-        progress(f"Checking {image.name}", done, total)
-        records, stats = detect_image(image, project, plain, detector,
-                                      floor=floor)
+        records, stats = result
         if stats.error:
             out.unreadable += 1
             continue
@@ -131,5 +132,5 @@ def check(project, images, settings: Settings, sweep=DEFAULT_SWEEP,
             for lx, ly in labels:
                 if cx.size and bool((np.hypot(cx - lx, cy - ly) <= within).any()):
                     point.found += 1
-    progress("Done", total, total)
+    progress("Done", len(labelled), len(labelled))
     return out
