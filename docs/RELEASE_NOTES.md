@@ -2,6 +2,17 @@
 
 Newest first. Each release's notes are the message of its release tag on GitHub.
 
+## 2.10.6 (2026-11-20)
+
+Help > Release Notes: what changed in each release of GeoLabeller, newest
+first. The window opens on the version you are running, marked "this
+version", with every release listed beside the notes to jump to. The
+notes ship with the application, so they work installed and offline.
+
+The installer is built with Python 3.14.10, the bug-fix release the
+software is developed and tested on; earlier installers took whichever
+3.14 release the build machine had.
+
 ## 2.10.5 (2026-11-19)
 
 Object Cycle (Shift+O): step through the images one linked object is
