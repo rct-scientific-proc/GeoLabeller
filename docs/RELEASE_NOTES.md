@@ -2,6 +2,29 @@
 
 Newest first. Each release's notes are the message of its release tag on GitHub.
 
+## 2.10.8 (2026-11-20)
+
+Cycles can stop at objects labelled on other images. Switch on View >
+Cycling > Stop at Objects Labelled on Other Images, and Cycle, View Cycle
+and Labeled Cycle stop at each object that other images' labels put on
+the image shown and that is not labelled there yet - one stop per object,
+zoomed to where the other images put it - before moving on to the next
+image. Objects that fall in the image's no-data areas are skipped, and
+an image with no such objects is framed whole as before. Dashed rings
+mark where each other image's label is, and the status bar names the
+object and counts the stops. Ctrl+Space steps back a stop, and back onto
+an image at its last stop. Zoom in or out at a stop and the stops after
+keep that zoom.
+
+A label placed at a stop is linked to the stop's object when it is of
+the object's class and the object has no label on that image yet (View >
+Cycling > Link a New Label to the Stop's Object, on by default). Ctrl+Z
+undoes the link and keeps the label.
+
+With the switch on, Object Cycle also visits the images that cover the
+object but have no label of it yet (the title counts them), zooms each
+image to the object, and can start from a label not linked to any other.
+
 ## 2.10.7 (2026-11-20)
 
 Cycle steps frame the image's data. An image with empty no-data columns
