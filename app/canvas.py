@@ -401,6 +401,57 @@ def _crosshair_cursor() -> QCursor:
     return _crosshair
 
 
+# -- where an image's data is, for framing it (2026-11-20) --------------------
+
+# A row or a column of the picture counts as holding data when at least
+# this many of its pixels do: a stray speck in an empty margin - JPEG
+# noise in a collar, one odd pixel - does not stretch the frame to it.
+MIN_DATA_PIXELS = 2
+
+# Rows of the picture looked at in one go: a mask of the whole picture is a
+# byte a pixel, and the plain-file load measures it at the top of its peak
+# (test_fix_2103_pixfix holds that peak to 2.10.1's).
+FRACTION_ROWS = 32
+
+
+def data_fraction(rgba) -> "tuple | None":
+    """(left, top, right, bottom) of the data in a loaded picture, as
+    fractions of its width and height, one picture pixel wider all round
+    so a frame never clips data; None when the whole picture is data, or
+    none of it is (nothing to frame by but the raster).
+
+    The data is the picture's opaque pixels - nodata, an alpha or mask
+    band's collar, a rotated footprint's wedges, all drawn transparent
+    (snippets.no_data). Users' images carry empty columns at the start
+    and the end, empty rows, holes: a cycle step framed the raster, empty
+    margins and all, and the image sat off to one side of the view.
+    """
+    if rgba is None or getattr(rgba, "ndim", 0) != 3 or rgba.shape[2] < 4:
+        return None
+    height, width = rgba.shape[:2]
+    if not height or not width:
+        return None
+    alpha = rgba[:, :, 3]
+    per_row = np.empty(height, dtype=np.intp)
+    per_col = np.zeros(width, dtype=np.intp)
+    for start in range(0, height, FRACTION_ROWS):
+        data = alpha[start:start + FRACTION_ROWS] > 0
+        per_row[start:start + len(data)] = np.count_nonzero(data, axis=1)
+        per_col += np.count_nonzero(data, axis=0)
+    rows = np.flatnonzero(per_row >= MIN_DATA_PIXELS)
+    cols = np.flatnonzero(per_col >= MIN_DATA_PIXELS)
+    if not rows.size or not cols.size:
+        # Data too thin for the rule (a one-pixel line): any data at all.
+        rows, cols = np.flatnonzero(per_row), np.flatnonzero(per_col)
+        if not rows.size:
+            return None
+    left, right = max(int(cols[0]) - 1, 0), min(int(cols[-1]) + 2, width)
+    top, bottom = max(int(rows[0]) - 1, 0), min(int(rows[-1]) + 2, height)
+    if (left, top, right, bottom) == (0, 0, width, height):
+        return None
+    return (left / width, top / height, right / width, bottom / height)
+
+
 class TiledLayer:
     """Manages tiled rendering for a single raster layer.
 
@@ -489,6 +540,10 @@ class TiledLayer:
 
         # Image data (kept in memory after reprojection)
         self._rgba_data: np.ndarray | None = None
+        # Where its data is in it (data_fraction), measured with each
+        # picture and kept when the picture is let go; frame_bounds frames
+        # by it.
+        self._data_fraction: "tuple | None" = None
         self._width = 0
         self._height = 0
 
@@ -936,6 +991,8 @@ class TiledLayer:
         existing pixel-zone bounds.
         """
         self._rgba_data = result['rgba']
+        # Measured with the picture, on the worker that read it.
+        self._data_fraction = result.get('data_fraction')
         self._width = result['width']
         self._height = result['height']
         if result.get('full_width'):
@@ -1275,6 +1332,7 @@ class TiledLayer:
             rgba_full[:, :, 3][nodata_mask] = 0
 
             self._rgba_data = rgba_full
+            self._data_fraction = data_fraction(rgba_full)
 
             # Store bounds in Web Mercator
             self.bounds = rasterio.transform.array_bounds(
@@ -1410,6 +1468,7 @@ class TiledLayer:
                 rgba[:, :, 3][empty] = 0
 
             self._rgba_data = rgba
+            self._data_fraction = data_fraction(rgba)
             self._width = width
             self._height = height
             self._n_tiles_x = math.ceil(width / TILE_SIZE)
@@ -1596,6 +1655,10 @@ class TiledLayer:
                 scene.removeItem(item)
             self.detail_tiles.clear()
         self._rgba_data = None
+        # _data_fraction is kept: where the data lies does not change when
+        # memory is let go, and a cycle coming back to this image frames
+        # its data at once rather than the raster first. The next picture
+        # measures it again.
         self._fully_loaded = False
 
     def remove_from_scene(self, scene: QGraphicsScene):
@@ -1606,6 +1669,23 @@ class TiledLayer:
         for item in self.detail_tiles.values():
             scene.removeItem(item)
         self.detail_tiles.clear()
+
+    def frame_bounds(self) -> "tuple | None":
+        """(west, south, east, north) to frame the layer by: the rectangle
+        of its data once a picture has shown where that is
+        (data_fraction), else its bounds. The fractions go with the
+        picture, so the frame follows the layer wherever it is laid out
+        (the waterfall's stack, the far side of 180 degrees)."""
+        if self.bounds is None:
+            return None
+        fraction = self._data_fraction
+        if fraction is None:
+            return self.bounds
+        west, south, east, north = self.bounds
+        width, height = east - west, north - south
+        left, top, right, bottom = fraction
+        return (west + left * width, north - bottom * height,
+                west + right * width, north - top * height)
 
     def contains_point(self, easting: float, northing: float) -> bool:
         """Check if a point (in Web Mercator) is within this layer's bounds."""
@@ -2517,6 +2597,7 @@ class _LevelLoadRunnable(QRunnable):
                 'src_width': tmp._src_width,
                 'src_height': tmp._src_height,
                 'level': tmp._loaded_level,
+                'data_fraction': tmp._data_fraction,
             }
         except LoadCancelled:
             self._safe_emit(self._signals.cancelled, self._layer_id,
@@ -2877,6 +2958,10 @@ class MapCanvas(QGraphicsView):
         # that says where to; and its marker's pen, to put back.
         self._move_label_id: int | None = None
         self._move_original_pen = None
+        # A layer zoom_to_layer framed before its picture showed where its
+        # data is, and the view it left: framed again by its data when the
+        # picture comes, if the view is still that one (2026-11-20).
+        self._frame_waiting: "tuple | None" = None
         # A gesture waiting on a label - that Move, a Link with, a Link
         # by Box - ends when the label is removed (hunt M13, 2.10.2). A
         # marker also goes in order to be drawn again (an undo, a class
@@ -4170,7 +4255,7 @@ class MapCanvas(QGraphicsView):
         """
         if layer.bounds is None:
             return None
-        west, south, east, north = layer.bounds
+        west, south, east, north = layer.frame_bounds()
         view_width = max(1, self.viewport().width())
         view_height = max(1, self.viewport().height())
         return max((east - west) / view_width, (north - south) / view_height)
@@ -4409,6 +4494,7 @@ class MapCanvas(QGraphicsView):
             # Once something is displayed, a stale level is genuinely obsolete.
             if not layer.is_fully_loaded():
                 layer.apply_level_result(result)
+                self._frame_data_when_read(layer_id)
                 self.layer_read.emit(layer.file_path)
                 debug(f"preview level {level}: {layer.name} "
                       f"{layer._width}x{layer._height} "
@@ -4427,6 +4513,7 @@ class MapCanvas(QGraphicsView):
 
         first_answer = not layer._overviews_known
         layer.apply_level_result(result)
+        self._frame_data_when_read(layer_id)
         self.layer_read.emit(layer.file_path)
         debug(f"applied level {level}: {layer.name} "
               f"{layer._width}x{layer._height}")
@@ -4441,6 +4528,32 @@ class MapCanvas(QGraphicsView):
             # ask again now rather than waiting for the view to move.
             self._apply_layer_lod(layer_id, layer,
                                   self._scene_units_per_pixel())
+
+    def _frame_data_when_read(self, layer_id: str):
+        """A picture of ``layer_id`` has come. If zoom_to_layer framed the
+        layer before it had one and its data is not the whole raster, frame
+        the data - after this event, so the level's own tile work is done
+        first, and only if the view is still where that zoom left it: a
+        pan or a zoom in the meantime is the user's, and is kept."""
+        waiting = self._frame_waiting
+        if waiting is None or waiting[0] != layer_id:
+            return
+        layer = self._layers.get(layer_id)
+        if layer is None or layer._data_fraction is None:
+            self._frame_waiting = None      # the raster frame is the data's
+            return
+        QTimer.singleShot(0, lambda: self._frame_if_still(waiting))
+
+    def _frame_if_still(self, waiting: tuple):
+        if self._frame_waiting is not waiting:
+            return                          # another zoom since
+        self._frame_waiting = None
+        layer_id, view = waiting
+        now = self._get_view_bounds()
+        span = max(abs(view[2] - view[0]), abs(view[3] - view[1]), 1e-9)
+        if any(abs(a - b) > span * 1e-6 for a, b in zip(now, view)):
+            return                          # the view was moved meanwhile
+        self.zoom_to_layer(layer_id)
 
     def _on_level_load_error(self, layer_id: str, level: int, message: str,
                              runnable=None):
@@ -4855,8 +4968,10 @@ class MapCanvas(QGraphicsView):
         if layer_id not in self._layers:
             return
 
-        bounds = self._layers[layer_id].bounds
-        west, south, east, north = bounds
+        # The data, not the raster: empty rows and columns round an image
+        # left it off to one side of the view (2026-11-20; frame_bounds).
+        layer = self._layers[layer_id]
+        west, south, east, north = layer.frame_bounds()
         # The floating origin stays where it is: the fit below rebases it
         # (_maybe_rebase_origin) only when the layer lies far enough off
         # for device coordinates to overflow. It used to move on every
@@ -4866,6 +4981,14 @@ class MapCanvas(QGraphicsView):
         rect = self._world_rect_to_scene(
             QRectF(west, -north, east - west, north - south))
         self._fit_view(rect)
+        # Never read yet - the first image of a cycle, one not read ahead:
+        # the raster is framed now, and its data once the picture shows
+        # where that is, if nothing has moved the view meanwhile
+        # (_frame_data_when_read). A picture let go left its fraction.
+        self._frame_waiting = (
+            (layer_id, self._get_view_bounds())
+            if layer._rgba_data is None and layer._data_fraction is None
+            else None)
         # Markers are sized in scene units against the view scale, so a
         # zoom that skips this leaves them sub-pixel (after stepping out
         # from a metre-scale wheel zoom) or covering the image (after a

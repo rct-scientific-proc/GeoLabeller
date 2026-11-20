@@ -169,6 +169,7 @@ class GroupMemoryWorker(QObject):
                     'src_width': tmp._src_width,
                     'src_height': tmp._src_height,
                     'level': tmp._loaded_level,
+                    'data_fraction': tmp._data_fraction,
                 }
                 self.layer_ready.emit(layer_id, result)
             except LoadCancelled:
