@@ -1,6 +1,6 @@
 # GeoLabeller release notes
 
-Newest first. Each release's notes are also on its GitHub release.
+Newest first. Each release's notes are the message of its release tag on GitHub.
 
 ## 2.10.5 (2026-11-19)
 
@@ -1313,8 +1313,7 @@ No project format change - still 5.0.
 
 Model Review: the model team's mistakes, labelled and imported.
 
-  * Labels > Model Review... reads a JSON file from the ML team listing
-    the chips their classifier was confidently wrong about - clutter it
+  * Labels > Model Review... reads a JSON file listing the chips a classifier was confidently wrong about - clutter it
     took for a real class - and shows them in a grid, one predicted
     class at a time, surest first. Images are matched by file name,
     centres stated at another image size are scaled across, and the
@@ -1333,7 +1332,7 @@ Model Review: the model team's mistakes, labelled and imported.
     new class, retrain, review the next file.
 
 Project format 5.0: an optional top-level "model_review" array. Older
-projects open unchanged. The file format for the ML team is ICD
+projects open unchanged. The review file's format is ICD
 section 3.11; the How-To has a new Part 3.
 
 ## 2.4.4 (2026-10-05)
@@ -1999,7 +1998,7 @@ Orientation Editor windows, which are gone along with their menu items.
   * A column of sections - Orientation, Masks, Confidence - each
     switching on and off, taking its panel, its pair on the Show filter,
     its overlay, its tool and its keys with it. Switched-off sections are
-    remembered. The next value the ML team asks for is a new module and
+    remembered. The next value asked for is a new module and
     one line in that list.
   * Confidence: every label can be rated 1 (lowest) to 5 (highest) - the
     buttons, or keys 1-5 in the Single view, with 0 to clear. Stored per
@@ -2859,10 +2858,6 @@ decided when it was built: install for everyone or just you, which shortcuts
 to create, and where. An existing install is reported and named before it is
 replaced, and the licence page shows the project's own licence. Installs made
 by the old packager upgrade to this one.
-
-## 1.3.0 (2026-08-17)
-
-No notes were written for this release.
 
 ## 1.2.1 (2026-08-17) - cleanup and a crash fix
 
