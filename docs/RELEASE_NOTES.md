@@ -2,6 +2,23 @@
 
 Newest first. Each release's notes are the message of its release tag on GitHub.
 
+## 2.10.7 (2026-11-20)
+
+Cycle steps frame the image's data. An image with empty no-data columns
+at its start and end, or empty rows, was framed by its whole raster: the
+data sat off to one side and the empty margin filled the rest of the
+view. Every cycle mode (C, V, Shift+C, Shift+O) and Zoom to Layer now fit
+the view to the rectangle the data covers, one pixel wider all round.
+No-data holes inside an image do not change the frame, and a stray pixel
+in an empty margin does not stretch it. An image framed before its
+picture has been read is framed again by its data when the picture
+comes, unless you have panned or zoomed in the meantime.
+
+Find Candidates is quicker and finds the same candidates: on survey
+tiles, Contrast runs 1.6 to 2.3 times as fast and Blob 1.6 to 1.8 times.
+The work on each image is spread over several processor cores, within a
+memory limit, and two images are searched at a time.
+
 ## 2.10.6 (2026-11-20)
 
 Help > Release Notes: what changed in each release of GeoLabeller, newest
