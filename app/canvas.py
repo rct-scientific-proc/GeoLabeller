@@ -3022,9 +3022,6 @@ class MapCanvas(QGraphicsView):
         # Waypoint markers: waypoint_id -> (marker, name text). Parented to the
         # floating-origin group, so they ride along with every rebase.
         self._waypoint_items: dict = {}
-        # A cycle stop's marks: where the other images put its object
-        # (2.10.8, set_stop_marks).
-        self._stop_mark_items: list = []
         # User toggle from the waypoints panel.
         self._waypoints_visible = True
         # Suppressed while waterfall mode is active: the stacked images are raw
@@ -7610,48 +7607,6 @@ class MapCanvas(QGraphicsView):
         marker.setZValue(z)
         marker.setPos(easting, -northing)
         return marker
-
-    # -- a cycle stop's marks (2.10.8) ------------------------------------
-
-    _STOP_MARK_RADIUS = 15.0    # screen pixels: round a marker, not on it
-
-    def set_stop_marks(self, places: list):
-        """Mark ``places`` - world (x, y) where other images put the object
-        a cycle has stopped at - with dashed rings round them, white over
-        a dark stroke so they read on any imagery, and in no class's
-        colour, so they are not taken for labels; the same size on screen
-        at any zoom. They take no clicks: a label is placed through them.
-        Replaces the marks there were."""
-        self.clear_stop_marks()
-        under = QPen(QColor(0, 0, 0, 150), 3.0)
-        over = QPen(QColor(255, 255, 255, 230), 1.5, Qt.DashLine)
-        for pen in (under, over):
-            pen.setCosmetic(True)
-        r = self._STOP_MARK_RADIUS
-        z = self._get_label_z_base() + 4
-        for x, y in places:
-            for pen in (under, over):
-                ring = QGraphicsEllipseItem(-r, -r, 2 * r, 2 * r,
-                                            self._overlay_group)
-                ring.setPen(pen)
-                ring.setBrush(QBrush(Qt.NoBrush))
-                ring.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
-                ring.setAcceptedMouseButtons(Qt.NoButton)
-                ring.setAcceptHoverEvents(False)
-                ring.setZValue(z)
-                ring.setPos(x, -y)
-                self._stop_mark_items.append(ring)
-
-    def clear_stop_marks(self):
-        for item in self._stop_mark_items:
-            if item.scene() is not None:
-                self._scene.removeItem(item)
-        self._stop_mark_items = []
-
-    def stop_marks(self) -> list:
-        """World (x, y) of the stop marks showing, one a place."""
-        return [(item.pos().x(), -item.pos().y())
-                for item in self._stop_mark_items[1::2]]
 
     def clear_location_marker(self):
         """Remove the go-to crosshair, if one is showing."""

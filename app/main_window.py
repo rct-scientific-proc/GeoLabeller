@@ -1726,7 +1726,6 @@ class MainWindow(QMainWindow):
                                  self._stops[self._stop_index].obj.object_id)
         self._stops, self._stop_index = [], -1
         self._stop_scale_set = None
-        self.canvas.clear_stop_marks()
         self._cycle_direction = -1
         mode = self._cycle_mode
         if self._cycle_layers and self._cycle_index >= 0 and mode is not None:
@@ -1847,7 +1846,6 @@ class MainWindow(QMainWindow):
         else:
             self._stop_index = -1
             self._stop_scale_set = None
-            self.canvas.clear_stop_marks()
             # At once: a step is one event, not motion to be coalesced, and
             # its image is normally in memory already (the prefetch below).
             self.canvas.zoom_to_layer(layer_id, immediate=True)
@@ -1967,8 +1965,9 @@ class MainWindow(QMainWindow):
                 / max(1, min(viewport.width(), viewport.height())))
 
     def _go_to_stop(self, layer_id: str | None = None):
-        """Zoom to the stop the run is at, and mark where the other images
-        put its object."""
+        """Zoom to the stop the run is at. (2.10.8 ringed where each other
+        image put its object as well; users found the rings overwhelming,
+        and those labels are drawn as markers anyway - 2.10.9.)"""
         layer = self.canvas.get_layer(layer_id or self._cycle_shown)
         if layer is None or not 0 <= self._stop_index < len(self._stops):
             return
@@ -1979,11 +1978,6 @@ class MainWindow(QMainWindow):
                                  viewport.width(), viewport.height()),
             immediate=True)
         self._stop_scale_set = self.canvas._scene_units_per_pixel()
-        view = (self._object_cycle_views.get(layer_id or self._cycle_shown)
-                if self._cycle_mode == CanvasMode.OBJECT_CYCLE else None)
-        self.canvas.set_stop_marks(
-            [(known_objects.x_on(layer.bounds, layer._wraps, x), y)
-             for member, x, y in stop.obj.places if member != view])
 
     def _learn_stop_zoom(self):
         """Leaving a stop: a zoom the user changed there is how close they

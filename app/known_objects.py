@@ -8,14 +8,20 @@ before the next image; and Object Cycle visits, as well as the images the
 object is labelled on, the ones that cover it without its label.
 
 Ryan's answers: one stop per object; objects labelled on the image already
-are skipped; the other passes' places are marked, and a label placed at a
-stop is linked to its object (a second switch); Object Cycle takes in the
-images that cover the object.
+are skipped; a label placed at a stop is linked to its object (a second
+switch); Object Cycle takes in the images that cover the object.
+
+Users' feedback on 2.10.8 (2.10.9): the rings 2.10.8 drew round each other
+view's place were overwhelming - gone; and an object whose views had
+spread widely was framed to hold every one of them, so one stray view
+zoomed the stop out until the object itself was lost. An object's place
+is now its CLUMP: the tightest group holding at least half its views,
+with any others near that group (_clump) - stray views count for nothing,
+neither where the stop is nor how wide.
 
 This module is the bookkeeping, free of Qt: every object's place on the
-ground (the median of its labels' places, so one stray view does not move
-it), how far its labels spread, and which objects lie on a layer. Places
-are Web Mercator metres, the map's own units.
+ground, the views that agree on it, and which objects lie on a layer.
+Places are Web Mercator metres, the map's own units.
 """
 import math
 import os
@@ -65,10 +71,10 @@ class KnownObject:
     """One object with a place on the ground: a linked set of labels, or
     a label linked to none."""
     object_id: str
-    x: float                # the median of its labels' places
+    x: float                # the median of its clump
     y: float
-    spread: float           # the furthest of them from (x, y), in metres
-    places: tuple           # ((label_id, x, y), ...) of its labels
+    places: tuple           # ((label_id, x, y), ...) of all its labels
+    clump: tuple            # ((x, y), ...) of the views that agree
     paths: frozenset        # path_key of every image it is labelled on
     classes: frozenset
     name: str               # "vessel 'convoy lead'"
@@ -109,6 +115,50 @@ def _median(values: list) -> float:
     return (ordered[middle - 1] + ordered[middle]) / 2.0
 
 
+# Views further from the clump's core than this many times the core's own
+# reach are strays; nearer, they join it.
+CLUMP_REACH = 3.0
+# From this many views the distances are worked out by numpy at once (for
+# fewer, its overhead costs more than the loop).
+NUMPY_FROM = 16
+
+
+def _clump(points: list) -> list:
+    """The views of ``points`` (x, y) that agree on where the object is.
+
+    The core is the tightest group of at least half of them (two at
+    least): the view whose k-th nearest view (itself the first) is
+    nearest, with those k. Of two groups as large, the tighter wins. The
+    views within CLUMP_REACH times the core's reach of its median join
+    it; the rest are strays. One view is its own clump; two are one
+    clump, however far apart - neither is "most"."""
+    n = len(points)
+    if n < 2:
+        return list(points)
+    k = max(2, (n + 1) // 2)
+    if n < NUMPY_FROM:
+        best, best_radius = 0, math.inf
+        for i, (px, py) in enumerate(points):
+            radius = sorted(math.hypot(qx - px, qy - py)
+                            for qx, qy in points)[k - 1]
+            if radius < best_radius:
+                best, best_radius = i, radius
+        px, py = points[best]
+        core = sorted(points,
+                      key=lambda q: math.hypot(q[0] - px, q[1] - py))[:k]
+    else:
+        at = np.asarray(points, dtype=float)
+        apart = np.hypot(at[:, None, 0] - at[None, :, 0],
+                         at[:, None, 1] - at[None, :, 1])
+        radii = np.partition(apart, k - 1, axis=1)[:, k - 1]
+        best = int(np.argmin(radii))
+        core = [points[i] for i in np.argsort(apart[best], kind="stable")[:k]]
+    cx = _median([x for x, _y in core])
+    cy = _median([y for _x, y in core])
+    reach = CLUMP_REACH * max(math.hypot(x - cx, y - cy) for x, y in core)
+    return [(x, y) for x, y in points if math.hypot(x - cx, y - cy) <= reach]
+
+
 def object_from(object_id: str, members: list) -> "KnownObject | None":
     """``members``: (label, image) pairs of one object. None when none of
     them has a place on the ground."""
@@ -128,11 +178,14 @@ def object_from(object_id: str, members: list) -> "KnownObject | None":
         return None
     xs = _median_x([x for _id, x, _y in places])
     ys = [y for _id, _x, y in places]
-    cx, cy = float(_median(xs)), float(_median(ys))
+    clump = _clump(list(zip(xs, ys)))
+    cx = float(_median([x for x, _y in clump]))
+    cy = float(_median([y for _x, y in clump]))
     if cx > WORLD_WIDTH / 2:
         cx -= WORLD_WIDTH
-    spread = max(math.hypot(x - cx, y - cy) for x, y in zip(xs, ys))
-    return KnownObject(object_id, cx, cy, spread, tuple(places),
+    clump = tuple((x - WORLD_WIDTH if x > WORLD_WIDTH / 2 else x, y)
+                  for x, y in clump)
+    return KnownObject(object_id, cx, cy, tuple(places), clump,
                        frozenset(paths), frozenset(classes), name)
 
 
@@ -195,11 +248,13 @@ def window(stop: Stop, floor_scale: float, view_w: int, view_h: int,
            margin: float = 1.5) -> tuple:
     """(west, south, east, north) to show a stop in: the view at
     ``floor_scale`` metres a screen pixel, centred on the stop - wider
-    when that does not hold every place its labels were put, with
-    ``margin`` round them."""
+    when that does not hold the object's clump, with ``margin`` round it.
+    Strays are not held (2.10.9), nor anything round a stop at the
+    object's own label on the image (Object Cycle): that label is what is
+    looked at there."""
     view_w, view_h = max(1, view_w), max(1, view_h)
     reach = 0.0
-    for _id, x, y in stop.obj.places:
+    for x, y in (() if stop.labelled_here else stop.obj.clump):
         dx = x - stop.x
         if abs(dx) > WORLD_WIDTH / 2:       # the far side of 180 degrees
             dx -= math.copysign(WORLD_WIDTH, dx)
