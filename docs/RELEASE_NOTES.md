@@ -2,6 +2,20 @@
 
 Newest first. Each release's notes are the message of its release tag on GitHub.
 
+## 2.10.9 (2026-11-20)
+
+Changes to the cycle stops at objects labelled on other images (View >
+Cycling, new in 2.10.8), from users' feedback.
+
+The dashed rings drawn round each other image's label at a stop are
+gone. Those labels still show as their own markers.
+
+A stop now centres on where most of the object's labels agree, and is
+zoomed to hold only those. A stray label far from the rest no longer
+moves the stop or zooms it out until the object is lost, nor decides
+which images the object is looked for on. Two labels far apart, with
+neither in the majority, are still both shown.
+
 ## 2.10.8 (2026-11-20)
 
 Cycles can stop at objects labelled on other images. Switch on View >
