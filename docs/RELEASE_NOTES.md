@@ -2,6 +2,20 @@
 
 Newest first. Each release's notes are the message of its release tag on GitHub.
 
+## 2.10.10 (2026-11-24)
+
+The modes are now a menu. The Mode menu, between Labels and View, lists
+Pan, Label, Cycle, View Cycle, Labeled Cycle, Object Cycle, Waterfall
+and Ruler, each with its key and a tick on the one in use, and the Chain
+Link switch below them. The keys work as before.
+
+Class and Description have moved to the right end of the menu bar, with
+the mode the map is in named beside them ("Mode: Cycle", and "+ Chain
+Link" while that is on).
+
+The toolbar row these were on is gone, and its height given to the map
+and the panels.
+
 ## 2.10.9 (2026-11-20)
 
 Changes to the cycle stops at objects labelled on other images (View >
