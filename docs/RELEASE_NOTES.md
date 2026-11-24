@@ -2,6 +2,38 @@
 
 Newest first. Each release's notes are the message of its release tag on GitHub.
 
+## 2.11.0 (2026-11-24)
+
+Suggested confidence ratings. Where PyTorch is installed (a run from
+source with requirements-ml.txt; the installed GeoLabeller leaves it
+out), GeoLabeller can learn from the confidence ratings people gave and
+suggest a rating for every label without one. Open it with Labels >
+Suggest Confidence Ratings..., or Suggest ratings... in the Snippet
+Editor's Confidence section, which is greyed, saying why, without
+PyTorch.
+
+Train learns a model for each class. A class needs 30 rated labels, a
+rating is learned only from 5 examples of it, and there must be two
+ratings to tell apart; a table says per class how the model did on
+labels held out of training, and what could not be learned and why. Each
+label is rated from its own snippet. Rejected labels are left out.
+
+The suggestions are shown in a large grid of their own, the highest
+rating first and the ones the model is least sure of first within a
+rating. Pick snippets - click, Shift-click, Ctrl-click or drag a box -
+and press 1 to 5 to rate them yourself; 0 takes that back. Train again
+learns from your corrections too.
+
+Nothing is in the project until it is accepted, so a suggestion never
+reaches an export on its own: Accept picked (A), Accept page, or Accept
+all shown at or above a certainty you choose. Accepting is one step of
+Undo. A label rated in the meantime keeps its rating, and closing the
+window with corrections not yet accepted asks whether to write them.
+
+Ratings accepted from suggestions are not learned from the next time -
+only ratings given by hand, or corrected in the grid - so the model is
+never trained on its own guesses.
+
 ## 2.10.10 (2026-11-24)
 
 The modes are now a menu. The Mode menu, between Labels and View, lists
