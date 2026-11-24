@@ -36,6 +36,13 @@ MIN_RATED = 30                      # rated labels a class needs
 MIN_PER_RATING = _learner.MIN_PER_CLASS     # examples a rating needs (5)
 MIN_RATINGS = _learner.MIN_CLASSES          # ratings to tell apart (2)
 CHIP_PX = 224                       # source pixels a snippet is read at
+# Bounds on what is held at once (2.11.1): at 20,000 unrated labels one
+# suggest() stacked every snippet as floats - some 2 GB - and a class
+# with thousands of rated labels trained on all of them. A rating's
+# examples are capped (taken evenly through them), and suggestions are
+# made a batch at a time, their pixels let go after (the store has them).
+EXAMPLES_PER_RATING = 500
+SUGGEST_BATCH = 1000
 # On a label's attribution: its rating was accepted from a suggestion,
 # not given by hand. Read by examples() alone; nothing exports it.
 SUGGESTED_KEY = "confidence_suggested"
@@ -238,8 +245,6 @@ class Trainer:
             result = outcome.results[name] = ClassResult(plan)
             if plan.reason() is not None:
                 continue
-            if should_stop():
-                raise Cancelled()
 
             def said(text, done, total, _name=name):
                 progress(f"{_name}: {text}", done, total)
@@ -249,24 +254,53 @@ class Trainer:
                 result.report = learner.train(
                     [Example(view.image_path, view.pixel_x, view.pixel_y,
                              str(rating), "label")
-                     for view, rating in prepared.rated[name]],
+                     for view, rating in capped(prepared.rated[name])],
                     said, should_stop)
             except ValueError as exc:   # too few of its snippets readable
                 result.failed = str(exc)
                 continue
             views = prepared.waiting.get(name, [])
-            suggested = learner.suggest(
-                [(v.image_path, v.pixel_x, v.pixel_y) for v in views],
-                said, should_stop)
-            for view, suggestion in zip(views, suggested):
-                if suggestion is None:
-                    continue
-                outcome.suggestions[view.label_id] = Suggestion(
-                    int(suggestion.class_name), suggestion.confidence,
-                    {int(r): p
-                     for r, p in suggestion.probabilities.items()})
-                result.suggested += 1
+            for start in range(0, len(views), SUGGEST_BATCH):
+                if should_stop():
+                    raise Cancelled()
+                batch = views[start:start + SUGGEST_BATCH]
+                places = [(v.image_path, v.pixel_x, v.pixel_y) for v in batch]
+                suggested = learner.suggest(places, said, should_stop)
+                for view, suggestion in zip(batch, suggested):
+                    if suggestion is None:
+                        continue
+                    outcome.suggestions[view.label_id] = Suggestion(
+                        int(suggestion.class_name), suggestion.confidence,
+                        {int(r): p
+                         for r, p in suggestion.probabilities.items()})
+                    result.suggested += 1
+                # Their pixels are not wanted again this session.
+                pixels = getattr(learner, "_pixels", None)
+                if pixels is not None:
+                    for place in places:
+                        pixels.pop(learner._key(*place), None)
+            if result.report is not None:
+                # The learner counts only its last batch.
+                result.report.suggested = result.suggested
         return outcome
+
+
+def capped(rated: list, per_rating: "int | None" = None) -> list:
+    """``rated`` - [(View, rating)] - with at most ``per_rating`` examples
+    of a rating, taken evenly through them (so no image or stretch of the
+    survey is all that is learned from)."""
+    limit = EXAMPLES_PER_RATING if per_rating is None else per_rating
+    by_rating: dict = {}
+    for item in rated:
+        by_rating.setdefault(item[1], []).append(item)
+    kept = []
+    for rating in sorted(by_rating):
+        items = by_rating[rating]
+        if len(items) > limit:
+            step = len(items) / limit
+            items = [items[int(i * step)] for i in range(limit)]
+        kept.extend(items)
+    return kept
 
 
 @dataclass

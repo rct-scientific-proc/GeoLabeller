@@ -26,7 +26,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from PyQt5.QtCore import QEvent, QSize, Qt, pyqtSignal
+from PyQt5.QtCore import QEvent, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QBrush, QColor, QIcon, QImage, QPixmap
 from PyQt5.QtWidgets import (QAbstractItemView, QComboBox, QDoubleSpinBox,
                              QHBoxLayout, QHeaderView, QLabel, QListView,
@@ -104,6 +104,12 @@ class SuggestWindow(QWidget):
         self._items: dict = {}          # label id -> item, on this page
         self._discard_on_close = False
         self._prepared = None           # what the training in hand runs on
+        # The project was edited: what no longer stands is dropped once
+        # the edit is over (sync_soon; 2.11.1).
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setSingleShot(True)
+        self._sync_timer.setInterval(0)
+        self._sync_timer.timeout.connect(self.sync)
         self.loader = SnippetLoader(self)
         self.loader.ready.connect(self._on_snippet)
         self._setup_ui()
@@ -574,6 +580,10 @@ class SuggestWindow(QWidget):
         views.update(prepared.views())
         self._views = views
         self._suggestions = {**kept, **outcome.suggestions}
+        # The project may have been edited while the model trained - a
+        # label rated, removed, accepted here: nothing is suggested for
+        # what no longer stands (2.11.1).
+        self._drop_stale()
         self._outcome = outcome
         self._note = outcome.summary()
         self._show_report(outcome)
@@ -621,20 +631,36 @@ class SuggestWindow(QWidget):
 
     # -- accepting ------------------------------------------------------------
 
-    def sync(self):
-        """Drop what no longer stands: a label removed, rated elsewhere,
-        moved or given another class since it was suggested for."""
+    def _drop_stale(self) -> bool:
+        """Forget every label that is no longer as it was suggested for;
+        True when there were any."""
         project = self._get_project()
         gone = [i for i, view in self._views.items()
                 if not ratings.still_open(project, view)]
-        if not gone:
-            return
         for label_id in gone:
             self._views.pop(label_id, None)
             self._suggestions.pop(label_id, None)
             self._corrections.pop(label_id, None)
-        self._fill_filters()
-        self._refilter()
+        return bool(gone)
+
+    def sync(self):
+        """Drop what no longer stands: a label removed, rated elsewhere,
+        moved or given another class since it was suggested for."""
+        if self._drop_stale():
+            self._fill_filters()
+            self._refilter()
+
+    def sync_soon(self):
+        """The project was edited: sync once the edit is over - many
+        edits in a turn are one look."""
+        if self._views:
+            self._sync_timer.start()
+
+    def changeEvent(self, event):
+        # Back to the front: whatever was edited meanwhile is followed.
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow():
+            self.sync_soon()
+        super().changeEvent(event)
 
     def _sure_ids(self) -> list:
         threshold = self.accept_spin.value()
@@ -659,15 +685,18 @@ class SuggestWindow(QWidget):
     def accept_sure(self):
         self._request(self._sure_ids())
 
-    def accepted(self, label_ids):
-        """The main window wrote these: they are done with here."""
+    def accepted(self, label_ids, written: "int | None" = None):
+        """The main window dealt with these - ``written`` of them rated
+        (the rest were rated already): they are done with here."""
         for label_id in label_ids:
             self._views.pop(label_id, None)
             self._suggestions.pop(label_id, None)
             self._corrections.pop(label_id, None)
-        n = len(label_ids)
+        n = len(label_ids) if written is None else written
         self._note = (f"{n} rating{'' if n == 1 else 's'} written to the "
-                      "project (Ctrl+Z in the main window undoes them).")
+                      "project (Ctrl+Z in the main window undoes them)."
+                      if n else "Nothing written: those labels are rated "
+                      "already.")
         self._fill_filters()
         self._refilter()
         self._show_state()
@@ -698,6 +727,21 @@ class SuggestWindow(QWidget):
         self._discard_on_close = True
         self.close()
 
+    def settle_corrections(self) -> bool:
+        """Before the project is replaced or the application closes:
+        corrections not accepted are asked about, as on closing the
+        window. False when the user cancels - nothing is to go ahead."""
+        if not self.pending():
+            return True
+        choice = self._ask_close()
+        if choice == "cancel":
+            return False
+        if choice == "save":
+            self._request(list(self._corrections))
+        else:
+            self._corrections.clear()
+        return True
+
     def closeEvent(self, event):
         if not self._discard_on_close and self.pending():
             choice = self._ask_close()
@@ -707,6 +751,7 @@ class SuggestWindow(QWidget):
             if choice == "save":
                 self._request(list(self._corrections))
         self.save_settings()
+        self._sync_timer.stop()
         self.loader.shutdown()
         if self._working is not None:
             self._working.stop()

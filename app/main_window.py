@@ -606,6 +606,10 @@ class MainWindow(QMainWindow):
         self.setWindowModified(True)
         self._push_save_state(stored=True)
         self._recovery_dirty = True
+        # A suggested rating stands only while its label is as it was
+        # (2.11.1: rated in the editor, it stayed in the grid).
+        if self._confidence_suggest is not None:
+            self._confidence_suggest.sync_soon()
 
     def _push_save_state(self, stored: bool = False,
                          label_id: "int | None" = None):
@@ -667,6 +671,13 @@ class MainWindow(QMainWindow):
         review = self._model_review
         if review is not None and review.pending() \
                 and not review._confirm_discard(f"{action.capitalize()} anyway?"):
+            return False
+        # ...and the suggested-ratings window's corrections, which are
+        # not in the project either until accepted (2.11.1: a new project
+        # dropped them unasked). Saved, they are in the project - before
+        # it is asked about below.
+        suggest = self._confidence_suggest
+        if suggest is not None and not suggest.settle_corrections():
             return False
         if not self._has_unsaved_changes():
             return True
@@ -6213,7 +6224,7 @@ class MainWindow(QMainWindow):
             if n else "No rating accepted: those labels are rated already",
             4000)
         if self._confidence_suggest is not None:
-            self._confidence_suggest.accepted(list(ratings_by_id))
+            self._confidence_suggest.accepted(list(ratings_by_id), n)
 
     def _add_class_from_review(self, name: str):
         """A class typed in the Model Review window for the clutter it

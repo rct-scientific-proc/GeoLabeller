@@ -64,7 +64,14 @@ class ConfidencePanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        # The rating itself, switched off in the Grid view - apart from
+        # Suggest ratings..., which is not about the snippet in hand
+        # (2.11.1: greyed with the rest, it gave no reason).
+        self.rating_box = QWidget()
+        outer.addWidget(self.rating_box)
+        layout = QVBoxLayout(self.rating_box)
         layout.setContentsMargins(0, 0, 0, 0)
         question = QLabel("How sure are you of this label?  "
                           f"{CONFIDENCE_MIN} lowest, {CONFIDENCE_MAX} "
@@ -104,7 +111,7 @@ class ConfidencePanel(QWidget):
         layout.addWidget(hint)
         self.suggest_button = QPushButton("Suggest ratings...")
         self.suggest_button.clicked.connect(self.suggest_requested)
-        layout.addWidget(self.suggest_button)
+        outer.addWidget(self.suggest_button)
         self._value = CONFIDENCE_UNSET
         self.set_suggest_unavailable(None)
 
@@ -190,7 +197,7 @@ class ConfidenceSection(Section):
 
     def view_changed(self, single):
         # Rated on the snippet in hand, which the Grid view does not show.
-        self.panel.setEnabled(single)
+        self.panel.rating_box.setEnabled(single)
         return ("" if single else "Ratings are given in the Single view - "
                                   "double-click a snippet to open it there.")
 
