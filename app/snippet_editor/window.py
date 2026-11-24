@@ -122,6 +122,8 @@ class SnippetEditor(QWidget):
     # ([label ids], rating 0-5): every view of an object rated at once,
     # One per object (audit 2026-11-05 M2) - one undo step.
     confidences_changed = pyqtSignal(list, int)
+    # The Confidence section's Suggest ratings... (2.11.0).
+    suggest_confidence_requested = pyqtSignal()
     # (label_id, class name): the main window applies it to the label's
     # whole linked object - the same thing seen in different images.
     class_changed = pyqtSignal(int, str, bool)   # +also the linked labels
@@ -414,6 +416,8 @@ class SnippetEditor(QWidget):
             self.confidence_changed)
         self.section_objects["confidence"].confidences_changed.connect(
             self.confidences_changed)
+        self.section_objects["confidence"].suggest_requested.connect(
+            self.suggest_confidence_requested)
         self.section_objects["size"].size_changed.connect(self.size_changed)
         review = self.section_objects["review"]
         review.review_changed.connect(self.review_changed)
@@ -449,6 +453,11 @@ class SnippetEditor(QWidget):
 
     def set_mask_names(self, names: list):
         self.masks.set_mask_names(names)
+
+    def set_suggest_unavailable(self, why: "str | None"):
+        """Why the Confidence section's Suggest ratings... cannot be used
+        (no PyTorch), or None when it can (2.11.0)."""
+        self.section_objects["confidence"].panel.set_suggest_unavailable(why)
 
     def set_classes(self, names: list):
         """The project's classes, in order, for the Label class picker -

@@ -74,6 +74,9 @@ from .display_dialog import DisplaySettingsDialog
 from .gt_import import apply_import, confirm_import, plan_import
 from .model_review.importer import apply_verdicts
 from .model_review.window import ModelReviewWindow
+from .model_review.learner import checked as learning_checked
+from .confidence_review.ratings import SUGGESTED_KEY
+from .confidence_review.window import SuggestWindow
 from .detect.dialog import EVERY, SELECTED, DetectDialog
 from .relocate import (RelocateImagesDialog, RemoveMissingImagesDialog,
                        missing_images, silently_resolve)
@@ -519,6 +522,8 @@ class MainWindow(QMainWindow):
         # mistakes, labelled and imported. Created on first open, closed
         # when the project is replaced.
         self._model_review = None
+        # The suggested-ratings window (2.11.0), while it is open.
+        self._confidence_suggest = None
         self._detect_dialog = None      # Labels > Find Candidates...
         self._cleaner = None            # Labels > Clean Close Labels...
         # View > Hover Snippet (app/hover_snippet, 2.9.2): the window,
@@ -1069,6 +1074,16 @@ class MainWindow(QMainWindow):
             "one image, side by side, and remove one, both or neither")
         clean_action.triggered.connect(self._open_cleaner)
         labels_menu.addAction(clean_action)
+
+        # A model per class learned from the ratings people gave, to
+        # suggest one for the labels nobody rated (2.11.0).
+        suggest_action = QAction("Suggest &Confidence Ratings...", self)
+        suggest_action.setStatusTip(
+            "Train on the confidence ratings given so far and suggest a "
+            "rating for every label without one - to correct, then accept "
+            "(needs PyTorch)")
+        suggest_action.triggered.connect(self._open_confidence_suggest)
+        labels_menu.addAction(suggest_action)
 
         labels_menu.addSeparator()
 
@@ -3951,8 +3966,16 @@ class MainWindow(QMainWindow):
             editor.show_on_map_requested.connect(self._show_label_on_map)
             editor.object_cycle_requested.connect(
                 self._object_cycle_from_editor)
+            editor.suggest_confidence_requested.connect(
+                self._open_confidence_suggest)
         self._snippet_editor.set_mask_names(self._mask_name_presets())
         self._snippet_editor.set_classes(self.project.classes)
+        # Suggest ratings... is greyed, saying why, once PyTorch has been
+        # looked for and not found (the editor's package may not ask the
+        # learner itself: test_snippet_editor_embed).
+        known = learning_checked()
+        self._snippet_editor.set_suggest_unavailable(
+            known[1] if known is not None and known[0] is None else None)
         self._snippet_editor.set_labels(self._label_entries(),
                                         shown_image=self._shown_image_path())
         self._push_save_state()
@@ -4184,6 +4207,8 @@ class MainWindow(QMainWindow):
         with self._recorded("Rate confidence",
                             labels=[label.id for label in labels]):
             for label in labels:
+                # By hand now, whatever it was (2.11.0): learned from.
+                label.attribution.pop(SUGGESTED_KEY, None)
                 if label.confidence != value:
                     label.confidence = value
                     self._stamp(label, "confidence")
@@ -4204,6 +4229,8 @@ class MainWindow(QMainWindow):
         if value != CONFIDENCE_UNSET and valid_confidence(value) != value:
             return          # not a rating; leave what is stored alone
         with self._recorded("Rate confidence", labels=[label_id]):
+            # By hand now, whatever it was (2.11.0): learned from.
+            label.attribution.pop(SUGGESTED_KEY, None)
             if label.confidence != value:
                 label.confidence = value
                 self._stamp(label, "confidence")
@@ -4703,6 +4730,9 @@ class MainWindow(QMainWindow):
         # (2.9.5: hidden, it was refreshed on every undo and never when
         # shown again).
         self._refresh_review()
+        # A suggested rating stands only while its label is as it was.
+        if self._confidence_suggest is not None:
+            self._confidence_suggest.sync()
         # A removal undone brings its pairs back only on the next Find;
         # what it shows must at least exist.
         self._refresh_cleaner()
@@ -6115,6 +6145,75 @@ class MainWindow(QMainWindow):
             # already answered for the project's unsaved work.
             window.discard_and_close()
             window.deleteLater()
+        # The suggested ratings were for the old project's labels too.
+        self._close_confidence_suggest()
+
+    # ------------------------------------------------------------------
+    # Suggested confidence ratings (app/confidence_review, 2.11.0)
+    # ------------------------------------------------------------------
+
+    def _open_confidence_suggest(self):
+        """Labels > Suggest Confidence Ratings..., or the Snippet
+        Editor's Confidence section: the window that trains on the
+        ratings given and suggests the rest."""
+        if self._confidence_suggest is None:
+            window = self._confidence_suggest = SuggestWindow(
+                lambda: self.project)
+            window.accept_requested.connect(self._accept_suggested_confidence)
+            window.closed.connect(self._confidence_suggest_closed)
+        self._confidence_suggest.show()
+        self._confidence_suggest.raise_()
+        self._confidence_suggest.activateWindow()
+
+    def _confidence_suggest_closed(self):
+        """Closed: what it held is gone with it; the next one is new."""
+        window, self._confidence_suggest = self._confidence_suggest, None
+        if window is not None:
+            window.deleteLater()
+
+    def _close_confidence_suggest(self):
+        window = self._confidence_suggest
+        if window is not None:
+            window.discard_and_close()      # -> _confidence_suggest_closed
+
+    def _accept_suggested_confidence(self, ratings_by_id: dict,
+                                     corrected: list):
+        """Write the ratings accepted in the suggestions window, as one
+        undo step. Only onto labels still without a rating: one rated
+        since, in the editor, keeps the rating it was given. A rating
+        the user corrected in the window is theirs, given by hand; the
+        rest carry the mark of an accepted suggestion, which keeps them
+        out of later trainings (and of nothing else - they export as any
+        rating does)."""
+        corrected = set(corrected)
+        todo = []
+        for label_id, rating in ratings_by_id.items():
+            _image, label = self.project.get_label_by_id(label_id)
+            if (label is not None and valid_confidence(rating) == rating
+                    and rating != CONFIDENCE_UNSET
+                    and label.confidence == CONFIDENCE_UNSET):
+                todo.append((label, rating))
+        if todo:
+            with self._recorded("Accept suggested confidence",
+                                labels=[label.id for label, _r in todo]):
+                for label, rating in todo:
+                    label.confidence = rating
+                    self._stamp(label, "confidence")
+                    if label.id in corrected:
+                        label.attribution.pop(SUGGESTED_KEY, None)
+                    else:
+                        label.attribution[SUGGESTED_KEY] = {
+                            "by": "model", "at": identity.now()}
+            self._mark_unsaved()
+            # The Snippet Editor holds its own copy of every rating.
+            self._editor_follows()
+        n = len(todo)
+        self.statusBar.showMessage(
+            f"{n} confidence rating{'' if n == 1 else 's'} accepted"
+            if n else "No rating accepted: those labels are rated already",
+            4000)
+        if self._confidence_suggest is not None:
+            self._confidence_suggest.accepted(list(ratings_by_id))
 
     def _add_class_from_review(self, name: str):
         """A class typed in the Model Review window for the clutter it

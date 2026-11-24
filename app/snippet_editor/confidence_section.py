@@ -15,6 +15,10 @@ a row is the object's: every view takes it, as one undo step
 2026-11-05 M2, where a pass of 5 down "Needs confidence" rated one view
 per object and the list never shrank.
 
+Suggest ratings... (2.11.0) opens the window that learns from the ratings
+given and suggests the rest (app/confidence_review) - greyed, with the
+reason, where PyTorch is not to be had.
+
 The smallest complete Section (section.py): a worklist, a panel, a key
 handler - no overlay and no tool. The next per-snippet value can start
 from a copy of this file.
@@ -52,6 +56,11 @@ class ConfidencePanel(QWidget):
     """Five buttons and Clear for the snippet in hand."""
 
     rated = pyqtSignal(int)              # 0 (clear) to 5
+    suggest_requested = pyqtSignal()
+
+    _SUGGEST_TIP = ("Train on the ratings given so far and suggest a "
+                    "rating for every label without one - to look over, "
+                    "correct and accept. Needs PyTorch.")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -93,7 +102,19 @@ class ConfidencePanel(QWidget):
         hint.setWordWrap(True)
         hint.setStyleSheet("color: palette(mid);")
         layout.addWidget(hint)
+        self.suggest_button = QPushButton("Suggest ratings...")
+        self.suggest_button.clicked.connect(self.suggest_requested)
+        layout.addWidget(self.suggest_button)
         self._value = CONFIDENCE_UNSET
+        self.set_suggest_unavailable(None)
+
+    def set_suggest_unavailable(self, why: "str | None"):
+        """Grey Suggest ratings..., saying ``why`` - PyTorch looked for
+        and not found - or, with None, leave it live (its window says
+        what it finds). The main window tells; this package does not
+        reach into the learner."""
+        self.suggest_button.setEnabled(why is None)
+        self.suggest_button.setToolTip(why or self._SUGGEST_TIP)
 
     def value(self) -> int:
         return self._value
@@ -121,6 +142,8 @@ class ConfidenceSection(Section):
     # ([label ids], rating 0-5): every view of an object rated at once
     # (One per object, M2) - one undo step.
     confidences_changed = pyqtSignal(list, int)
+    # Suggest ratings... was pressed: the main window opens the window.
+    suggest_requested = pyqtSignal()
 
     def __init__(self, strip=None, parent=None):
         """``strip`` is the list, which says what a row stands for
@@ -129,6 +152,7 @@ class ConfidenceSection(Section):
         self._entry = None
         self._strip = strip
         self.panel.rated.connect(self.rate)
+        self.panel.suggest_requested.connect(self.suggest_requested)
         self.show_entry(None)
 
     def show_entry(self, entry):
