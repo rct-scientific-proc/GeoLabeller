@@ -27,14 +27,15 @@ from PyQt5.QtWidgets import (
     QFileDialog,
     QStatusBar,
     QLabel,
-    QToolBar,
     QCheckBox,
     QComboBox,
+    QHBoxLayout,
     QMessageBox,
     QProgressDialog,
     QApplication,
     QProgressBar,
-    QInputDialog)
+    QInputDialog,
+    QWidget)
 
 from .axis_ruler import MapCanvasWithAxes
 from .canvas import (MapCanvas, CanvasMode, CYCLE_MODES, STEP_CYCLE_MODES,
@@ -538,7 +539,7 @@ class MainWindow(QMainWindow):
 
         self._setup_ui()
         self._setup_menu()
-        self._setup_toolbar()
+        self._setup_modes()
 
         # Read the previous session's marker BEFORE arming this one -
         # _start_crash_detection writes the file _check_for_recovery would
@@ -848,8 +849,9 @@ class MainWindow(QMainWindow):
             self.canvas.set_waypoints_visible)
 
     def _on_chain_link_changed(self, active: bool, message: str):
-        """Sync the Chain Link toolbar toggle and status bar with the canvas."""
+        """Sync the Chain Link switch and status bar with the canvas."""
         self.chain_link_action.setChecked(active)
+        self._show_mode(self.canvas._mode)
         if message:
             self.statusBar.showMessage(message, 0)
         elif not active:
@@ -1088,6 +1090,9 @@ class MainWindow(QMainWindow):
         clear_labels_action = QAction("Clear All Labels", self)
         clear_labels_action.triggered.connect(self._clear_all_labels)
         labels_menu.addAction(clear_labels_action)
+
+        # Mode menu: filled by _setup_modes, here for its place in the bar.
+        self.mode_menu = menubar.addMenu("&Mode")
 
         # View menu
         view_menu = menubar.addMenu("&View")
@@ -1328,14 +1333,27 @@ class MainWindow(QMainWindow):
         debug_action.triggered.connect(self._show_debug_console)
         help_menu.addAction(debug_action)
 
-    def _setup_toolbar(self):
-        """Set up the toolbar for labeling."""
-        toolbar = QToolBar("Labeling")
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
+    # The modes by name, for the indicator beside the Class box.
+    _MODE_NAMES = {
+        CanvasMode.PAN: "Pan", CanvasMode.LABEL: "Label",
+        CanvasMode.CYCLE: "Cycle", CanvasMode.VIEW_CYCLE: "View Cycle",
+        CanvasMode.LABELED_CYCLE: "Labeled Cycle",
+        CanvasMode.OBJECT_CYCLE: "Object Cycle",
+        CanvasMode.WATERFALL: "Waterfall", CanvasMode.RULER: "Ruler"}
 
-        # Mode selector
-        toolbar.addWidget(QLabel(" Mode: "))
+    def _setup_modes(self):
+        """The Mode menu, and - at the right end of the menu bar - which
+        mode the map is in, the Class box and the Description box.
+
+        These were a toolbar row of their own until 2.10.10: users asked
+        for the modes as a menu and the row given back to the map and the
+        panels (Ryan chose the menu bar's free end for the boxes, and a
+        mode indicator, the buttons that showed the mode being gone). The
+        shortcuts are the actions', so they work as before."""
+        menu = self.mode_menu
+        # Their tooltips, not status tips: a status tip would wipe a
+        # cycle's "Layer 3/120" off the status bar on the way to Ruler.
+        menu.setToolTipsVisible(True)
 
         self.pan_action = QAction("Pan", self)
         self.pan_action.setCheckable(True)
@@ -1343,28 +1361,28 @@ class MainWindow(QMainWindow):
         self.pan_action.setShortcut("P")
         self.pan_action.triggered.connect(
             lambda: self._set_mode(CanvasMode.PAN))
-        toolbar.addAction(self.pan_action)
+        menu.addAction(self.pan_action)
 
         self.label_action = QAction("Label", self)
         self.label_action.setCheckable(True)
         self.label_action.setShortcut("L")
         self.label_action.triggered.connect(
             lambda: self._set_mode(CanvasMode.LABEL))
-        toolbar.addAction(self.label_action)
+        menu.addAction(self.label_action)
 
         self.cycle_action = QAction("Cycle", self)
         self.cycle_action.setCheckable(True)
         self.cycle_action.setShortcut("C")
         self.cycle_action.triggered.connect(
             lambda: self._set_mode(CanvasMode.CYCLE))
-        toolbar.addAction(self.cycle_action)
+        menu.addAction(self.cycle_action)
 
         self.view_cycle_action = QAction("View Cycle", self)
         self.view_cycle_action.setCheckable(True)
         self.view_cycle_action.setShortcut("V")
         self.view_cycle_action.triggered.connect(
             lambda: self._set_mode(CanvasMode.VIEW_CYCLE))
-        toolbar.addAction(self.view_cycle_action)
+        menu.addAction(self.view_cycle_action)
 
         self.labeled_cycle_action = QAction("Labeled Cycle", self)
         self.labeled_cycle_action.setCheckable(True)
@@ -1374,7 +1392,7 @@ class MainWindow(QMainWindow):
             "images that have labels.\nSpace = next, Ctrl+Space = previous.")
         self.labeled_cycle_action.triggered.connect(
             lambda: self._set_mode(CanvasMode.LABELED_CYCLE))
-        toolbar.addAction(self.labeled_cycle_action)
+        menu.addAction(self.labeled_cycle_action)
 
         self.object_cycle_action = QAction("Object Cycle", self)
         self.object_cycle_action.setCheckable(True)
@@ -1386,7 +1404,7 @@ class MainWindow(QMainWindow):
             "right-click a linked label > Cycle This Object's Images.\n"
             "Space = next, Ctrl+Space = previous.")
         self.object_cycle_action.triggered.connect(self._object_cycle_key)
-        toolbar.addAction(self.object_cycle_action)
+        menu.addAction(self.object_cycle_action)
 
         self.waterfall_action = QAction("Waterfall", self)
         self.waterfall_action.setCheckable(True)
@@ -1398,18 +1416,7 @@ class MainWindow(QMainWindow):
             "stay visible.")
         self.waterfall_action.triggered.connect(
             lambda: self._set_mode(CanvasMode.WATERFALL))
-        toolbar.addAction(self.waterfall_action)
-
-        self.chain_link_action = QAction("Chain Link", self)
-        self.chain_link_action.setCheckable(True)
-        self.chain_link_action.setShortcut("K")
-        self.chain_link_action.setToolTip(
-            "Chain link (K): click labels to link them all into one object.\n"
-            "N starts a new chain, Esc finishes. Works in any labeling mode.")
-        # The canvas is created after the toolbar; defer the attribute lookup.
-        self.chain_link_action.triggered.connect(
-            lambda checked: self.canvas.set_chain_link_mode(checked))
-        toolbar.addAction(self.chain_link_action)
+        menu.addAction(self.waterfall_action)
 
         self.ruler_action = QAction("Ruler", self)
         self.ruler_action.setCheckable(True)
@@ -1419,28 +1426,66 @@ class MainWindow(QMainWindow):
             "Shift+drag measures from any mode without leaving it.")
         self.ruler_action.triggered.connect(
             lambda: self._set_mode(CanvasMode.RULER))
-        toolbar.addAction(self.ruler_action)
+        menu.addAction(self.ruler_action)
 
-        toolbar.addSeparator()
+        # Not a mode but a switch that works in several: below the line.
+        menu.addSeparator()
+        self.chain_link_action = QAction("Chain Link", self)
+        self.chain_link_action.setCheckable(True)
+        self.chain_link_action.setShortcut("K")
+        self.chain_link_action.setToolTip(
+            "Chain link (K): click labels to link them all into one object.\n"
+            "N starts a new chain, Esc finishes. Works in any labeling mode.")
+        # Looked up when triggered, not now.
+        self.chain_link_action.triggered.connect(
+            lambda checked: self.canvas.set_chain_link_mode(checked))
+        menu.addAction(self.chain_link_action)
+
+        # The menu bar's right end. In the window, never the desktop's
+        # own menu bar (macOS, some Linux desktops): that has no corner.
+        self.menuBar().setNativeMenuBar(False)
+        fields = QWidget()
+        row = QHBoxLayout(fields)
+        row.setContentsMargins(6, 1, 6, 1)
+        row.setSpacing(4)
+
+        # Which mode the map is in: nothing else shows it for Pan, Label
+        # and Ruler now the buttons are gone.
+        self.mode_label = QLabel()
+        self.mode_label.setToolTip("The map's mode - change it in the Mode "
+                                   "menu, or by its key")
+        row.addWidget(self.mode_label)
+        row.addSpacing(10)
 
         # Class selector
-        toolbar.addWidget(QLabel(" Class: "))
+        row.addWidget(QLabel("Class:"))
         self.class_combo = QComboBox()
         self.class_combo.setMinimumWidth(150)
         self.class_combo.currentTextChanged.connect(self._on_class_changed)
-        toolbar.addWidget(self.class_combo)
+        row.addWidget(self.class_combo)
+        row.addSpacing(6)
 
         # Active description preset: applied to every newly placed label.
         # Index 0 is always the "apply nothing" entry (Shift+0).
-        toolbar.addWidget(QLabel(" Description: "))
+        row.addWidget(QLabel("Description:"))
         self.description_combo = QComboBox()
         self.description_combo.setMinimumWidth(150)
         self.description_combo.setToolTip(
             "Applied to every label you place (Shift+1-9 to switch, "
             "Shift+0 for none). Edit the presets under Labels > Edit "
             "Descriptions...")
-        toolbar.addWidget(self.description_combo)
+        row.addWidget(self.description_combo)
+        self.menuBar().setCornerWidget(fields, Qt.TopRightCorner)
         self._update_description_combo()
+        self._show_mode(CanvasMode.PAN)
+
+    def _show_mode(self, mode: CanvasMode):
+        """Name the map's mode beside the Class box, and Chain Link when
+        it is on - the menu's ticks are out of sight until it is opened."""
+        name = self._MODE_NAMES.get(mode, "")
+        if self.chain_link_action.isChecked():
+            name += " + Chain Link"
+        self.mode_label.setText(f"Mode: <b>{name}</b>")
 
     def keyPressEvent(self, event: QKeyEvent):
         """Handle global key press events.
@@ -1519,7 +1564,9 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def _sync_mode_actions(self, mode: CanvasMode):
-        """Keep the toolbar's checked states in step with the canvas."""
+        """Keep the Mode menu's ticks, and the mode named on the menu
+        bar, in step with the canvas."""
+        self._show_mode(mode)
         self.pan_action.setChecked(mode == CanvasMode.PAN)
         self.label_action.setChecked(mode == CanvasMode.LABEL)
         self.cycle_action.setChecked(mode == CanvasMode.CYCLE)
@@ -2230,7 +2277,7 @@ class MainWindow(QMainWindow):
                          "Images")
 
     def _object_cycle_key(self):
-        """Shift+O, or the toolbar's Object Cycle. The label it starts
+        """Shift+O, or the Mode menu's Object Cycle. The label it starts
         from is the one under the mouse pointer, else the Snippet
         Editor's snippet in hand. With neither: in the mode, stay (or
         start the object again from its first image, at the end of a
@@ -2918,7 +2965,7 @@ class MainWindow(QMainWindow):
             return
 
         # Add to project, seeded with the active description preset (the
-        # toolbar picker / Shift+1-9), so a "spring" pass never retypes it.
+        # Description box / Shift+1-9), so a "spring" pass never retypes it.
         self._mark_unsaved()
         with self._recorded("Place label"):
             label = self.project.add_label(

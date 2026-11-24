@@ -195,7 +195,7 @@ class DescriptionEditorDialog(QDialog):
         layout = QVBoxLayout(self)
         instructions = QLabel(
             "Enter description presets, one per line. The active preset "
-            "(toolbar dropdown, or Shift+1-9; Shift+0 for none) is applied "
+            "(the Description box, or Shift+1-9; Shift+0 for none) is applied "
             "to every newly placed label.\n\n"
             "The first nine lines map to Shift+1-9. Removing a preset "
             "never changes existing labels."
