@@ -2,6 +2,31 @@
 
 Newest first. Each release's notes are the message of its release tag on GitHub.
 
+## 2.11.1 (2026-11-24)
+
+Fixes to the suggested confidence ratings of 2.11.0.
+
+A label rated, removed or accepted while the model was training came
+back as a suggestion when the training ended. It no longer does.
+
+Starting a new project, opening another or leaving GeoLabeller dropped
+corrections made in the suggestions window and not yet accepted, without
+asking. It now asks whether to write them, as closing the window does.
+
+A label rated in the Snippet Editor stayed in the suggestions grid until
+the next Accept or Train. It leaves the grid at once.
+
+Suggest ratings... in the Snippet Editor's Confidence section was greyed
+in the Grid view. It works in both views.
+
+With many thousands of unrated labels, suggesting took far more memory
+than it needed, and a class with thousands of rated labels trained on
+all of them. Suggestions are now made a thousand at a time, and at most
+500 examples of a rating are learned from, taken evenly through them.
+
+After an Accept the window says how many ratings were written, rather
+than how many were asked for.
+
 ## 2.11.0 (2026-11-24)
 
 Suggested confidence ratings. Where PyTorch is installed (a run from
